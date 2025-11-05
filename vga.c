@@ -772,6 +772,7 @@ static void vga_text_refresh(VGAState *s,
 #endif
         cx_min = width;
         cx_max = -1;
+        bool line_has_changes = false;
 #ifdef SCALE_3_2
         for(cx = 0; cx < cxend - cxbegin; cx++) {
 #else
@@ -784,6 +785,7 @@ static void vga_text_refresh(VGAState *s,
             if (full_update || ch_attr != s->last_ch_attr[cy * width + cx] || cursor_offset == ch_addr) {
                 s->last_ch_attr[cy * width + cx] = ch_attr;
 #endif
+                line_has_changes = true;
                 cx_min = cx_min > cx ? cx : cx_min;
                 cx_max = cx_max < cx ? cx : cx_max;
                 ch = ch_attr & 0xff;
@@ -847,11 +849,12 @@ static void vga_text_refresh(VGAState *s,
                 memcpy(s->tmpbuf, s->tmpbuf + (k - 3) * stride, yt * stride);
         }
 #endif
-//        if (cx_max >= cx_min) {
-//            redraw_func(opaque,
-//                        x1 + cx_min * cwidth, y1 + cy * cheight,
-//                        (cx_max - cx_min + 1) * cwidth, cheight);
-//        }
+        if (line_has_changes && cx_max >= cx_min) {
+            // Partial update: only redraw changed characters in this line
+            redraw_func(opaque,
+                        x1 + cx_min * cwidth, y1 + cy * cheight,
+                        (cx_max - cx_min + 1) * cwidth, cheight);
+        }
         ch_addr1 += line_offset;
     }
 #ifdef SCALE_3_2
@@ -861,7 +864,10 @@ static void vga_text_refresh(VGAState *s,
     stride = (cxend - cxbegin) * cwidth * (BPP / 8);
     }
 #endif
-    redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
+    // Only do full update if full_update flag is set or if no partial updates occurred
+    if (full_update) {
+        redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
+    }
 }
 
 static void vga_graphic_refresh(VGAState *s,
@@ -1098,6 +1104,8 @@ static void vga_graphic_refresh(VGAState *s,
         }
 #endif
     }
+    // For graphic mode, we always do full update (dirty rectangle tracking not implemented)
+    // TODO: Implement dirty rectangle tracking for graphic mode
     redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
 }
 
