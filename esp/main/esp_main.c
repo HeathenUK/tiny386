@@ -142,9 +142,9 @@ static void vga_task(void *arg)
 		.cs_gpio_num = TDECK_LCD_CS_PIN,
 		.dc_gpio_num = TDECK_LCD_DC_PIN,
 		.spi_mode = 0,
-		.pclk_hz = 40 * 1000 * 1000, // 40MHz
+		.pclk_hz = 60 * 1000 * 1000, // 60MHz (increased from 40MHz for better throughput)
 		.trans_queue_depth = 10,
-		.on_color_trans_done = NULL,
+		.on_color_trans_done = NULL, // DMA completion handled by queue depth
 	};
 	ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)TEST_LCD_SPI_HOST, &io_config, &io_handle));
 

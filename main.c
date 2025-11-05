@@ -1271,19 +1271,47 @@ static void redraw(void *opaque,
 {
 	Console *s = opaque;
 	if (thepanel) {
-		// T-Deck: 240x320 display, update in chunks
-		for (int i = 0; i < NN; i++) {
+		// Partial update support: only update changed region
+		// Clamp to display bounds
+		if (x < 0) x = 0;
+		if (y < 0) y = 0;
+		if (x + w > 240) w = 240 - x;
+		if (y + h > 320) h = 320 - y;
+		
+		if (w <= 0 || h <= 0) return;
+		
+		// For small updates, send directly; for large updates, use chunks
+		if (w * h < 4800) { // Less than ~15% of screen
+			// Small update: single transfer
 			uint16_t *src = s->fb;
-			src += 240 * 320 / NN * i;
-			memcpy(s->fb1, src, 240 * 320 / NN * 2);
+			src += y * 240 + x;
+			memcpy(s->fb1, src, w * h * 2);
 			ESP_ERROR_CHECK(
 				esp_lcd_panel_draw_bitmap(
 					thepanel,
-					0, 320 / NN * i,
-					240, 320 / NN * (i + 1),
+					x, y,
+					x + w, y + h,
 					s->fb1));
-			vga_step(s->pc->vga);
-			usleep(900);
+		} else {
+			// Large update: use chunks for better DMA throughput
+			int chunk_height = h / NN;
+			if (chunk_height < 1) chunk_height = 1;
+			
+			for (int i = 0; i < NN && (y + i * chunk_height) < (y + h); i++) {
+				int chunk_y = y + i * chunk_height;
+				int chunk_h = (chunk_y + chunk_height > y + h) ? 
+				              (y + h - chunk_y) : chunk_height;
+				
+				uint16_t *src = s->fb;
+				src += chunk_y * 240 + x;
+				memcpy(s->fb1, src, w * chunk_h * 2);
+				ESP_ERROR_CHECK(
+					esp_lcd_panel_draw_bitmap(
+						thepanel,
+						x, chunk_y,
+						x + w, chunk_y + chunk_h,
+						s->fb1));
+			}
 		}
 	}
 }
