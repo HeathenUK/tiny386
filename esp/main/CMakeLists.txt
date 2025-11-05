@@ -17,6 +17,9 @@ idf_component_register(SRCS "esp_main.c"
 "../../sb16.c"
 "../../pcspk.c"
 "wifi.c"
+"st7789_panel.c"
+"tdeck_keyboard.c"
+"tdeck_trackball.c"
 INCLUDE_DIRS "")
 
 set_source_files_properties("../../adlib.c" PROPERTIES COMPILE_FLAGS "-Wno-all")

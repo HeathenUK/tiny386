@@ -1254,8 +1254,9 @@ Console *console_init(int width, int height)
 {
 	Console *c = malloc(sizeof(Console));
 #ifdef BUILD_ESP32
-	c->fb1 = fbmalloc(480 * 320 / NN * 2);
-	c->fb = bigmalloc(480 * 320 * 2);
+	// T-Deck: 240x320 display
+	c->fb1 = fbmalloc(240 * 320 / NN * 2);
+	c->fb = bigmalloc(240 * 320 * 2);
 #else
 	c->fb = bigmalloc(width * height * 4);
 #endif
@@ -1264,21 +1265,22 @@ Console *console_init(int width, int height)
 
 #ifdef BUILD_ESP32
 extern void *thepanel;
-#include "esp_lcd_axs15231b.h"
+#include "esp_lcd_panel_ops.h"
 static void redraw(void *opaque,
 		   int x, int y, int w, int h)
 {
 	Console *s = opaque;
 	if (thepanel) {
+		// T-Deck: 240x320 display, update in chunks
 		for (int i = 0; i < NN; i++) {
 			uint16_t *src = s->fb;
-			src += 480 * 320 / NN * i;
-			memcpy(s->fb1, src, 480 * 320 / NN * 2);
+			src += 240 * 320 / NN * i;
+			memcpy(s->fb1, src, 240 * 320 / NN * 2);
 			ESP_ERROR_CHECK(
 				esp_lcd_panel_draw_bitmap(
 					thepanel,
-					0, 480 / NN * i,
-					320, 480 / NN * (i + 1),
+					0, 320 / NN * i,
+					240, 320 / NN * (i + 1),
 					s->fb1));
 			vga_step(s->pc->vga);
 			usleep(900);
