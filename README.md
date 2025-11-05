@@ -1,4 +1,4 @@
-# Tiny386
+# Tiny386-TD
 
 ## Introduction
 Tiny386 is a x86 PC emulator written in C99. The highlight of the project is its portability. It now boots Windows 9x/NT on MCU such as ESP32-S3.
