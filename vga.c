@@ -1104,14 +1104,9 @@ static void vga_graphic_refresh(VGAState *s,
         }
 #endif
     }
-    // Only do full update if full_update flag is set
-    if (full_update) {
-        redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
-    } else {
-        // For graphic mode, we could track dirty regions, but for now do full update
-        // TODO: Implement dirty rectangle tracking for graphic mode
-        redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
-    }
+    // For graphic mode, we always do full update (dirty rectangle tracking not implemented)
+    // TODO: Implement dirty rectangle tracking for graphic mode
+    redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
 }
 
 static void simplefb_clear(FBDevice *fb_dev,
