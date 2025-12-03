@@ -86,40 +86,32 @@ void EL133UF1::_reset() {
 }
 
 bool EL133UF1::_busyWait(uint32_t timeoutMs) {
-    // From Python reference:
-    // - If busy_pin is HIGH (pulled up), assume no signal from display
-    //   and wait the timeout period to be safe
-    // - Otherwise wait while busy pin is HIGH (ACTIVE)
+    // From working CircuitPython reference - TWO PHASE wait:
+    // 1. First wait for busy to ASSERT (go LOW) - display starts working
+    // 2. Then wait for busy to DEASSERT (go HIGH) - display finished
     //
-    // The Python code uses gpiod with PULL_UP on busy pin.
-    // When display is busy, it pulls the line LOW.
-    // When display is ready, line goes HIGH (or floats high via pull-up).
-    //
-    // However, the Python busy_wait logic is a bit unusual - it waits
-    // while ACTIVE (high). This suggests the Pimoroni HAT may have
-    // inverted logic or the panel signals differently.
-    //
-    // Looking at the Python more carefully:
-    // - It first checks if busy is HIGH at start - if so, waits full timeout
-    //   (assumes display not connected/responding)
-    // - Then waits in a loop while busy is HIGH
-    //
-    // For safety, let's implement similar logic:
+    // This ensures we catch the full busy cycle, not just part of it.
     
     uint32_t startTime = millis();
     
-    // Check initial state - if HIGH at start, might not be connected
-    // Give it a moment to potentially go LOW if display is working
-    delay(10);
+    // Phase 1: Wait for busy to go LOW (display acknowledges command)
+    while (digitalRead(_busyPin) == HIGH) {
+        if (millis() - startTime > timeoutMs) {
+            // If it never went low, the display might not be responding
+            // or the command completed very fast
+            Serial.println("EL133UF1: Busy never asserted (stayed HIGH)");
+            return true;  // Continue anyway - might be OK
+        }
+        delay(10);
+    }
     
-    // Wait while busy pin is LOW (display is busy)
-    // Most e-ink displays: LOW = busy, HIGH = ready
+    // Phase 2: Wait for busy to go HIGH (display finished)
     while (digitalRead(_busyPin) == LOW) {
         if (millis() - startTime > timeoutMs) {
-            Serial.println("EL133UF1: Busy wait timeout");
+            Serial.println("EL133UF1: Busy timeout (stuck LOW)");
             return false;
         }
-        delay(100);  // Python uses 0.1s polling interval
+        delay(10);
     }
     
     return true;
@@ -137,10 +129,9 @@ void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, siz
     }
 
     // Send command (DC low = command mode)
-    // Python has time.sleep(0.3) = 300ms here! That seems excessive but
-    // we'll use a shorter delay that should still be sufficient
+    // CircuitPython reference uses time.sleep(0.1) = 100ms here
     digitalWrite(_dcPin, LOW);
-    delay(1);  // 1ms delay for DC setup (Python uses 300ms but that seems excessive)
+    delay(100);  // 100ms delay for DC setup (matches working CircuitPython)
     _spi->transfer(cmd);
 
     // Send data if present (DC high = data mode)
@@ -165,8 +156,9 @@ void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, siz
 }
 
 void EL133UF1::_initSequence() {
-    // Initialization sequence based on both Python (Pimoroni) and ESP32 references
-    // The order matches the Python implementation which is known to work
+    // Initialization sequence from working CircuitPython reference
+    // Note: CircuitPython sends power commands to CS_BOTH (differs from Pimoroni Python)
+    // but both approaches appear to work
     
     // ANTM - Anti-crosstalk magic (CS0 only) - must be sent first after reset
     const uint8_t antm[] = {0xC0, 0x1C, 0x1C, 0xCC, 0xCC, 0xCC, 0x15, 0x15, 0x55};
@@ -180,7 +172,7 @@ void EL133UF1::_initSequence() {
     const uint8_t psr[] = {0xDF, 0x69};
     _sendCommand(CMD_PSR, CS_BOTH_SEL, psr, sizeof(psr));
 
-    // PLL Control (both CS) - Note: ESP32 code omits this but Python has it
+    // PLL Control (both CS)
     const uint8_t pll[] = {0x08};
     _sendCommand(CMD_PLL, CS_BOTH_SEL, pll, sizeof(pll));
 
@@ -205,39 +197,42 @@ void EL133UF1::_initSequence() {
     _sendCommand(CMD_CCSET, CS_BOTH_SEL, ccset, sizeof(ccset));
 
     // TRES - Resolution Setting (both CS)
-    // 0x04B0 = 1200 (height), 0x0320 = 800 (half-width per controller)
+    // 0x04B0 = 1200, 0x0320 = 800
     const uint8_t tres[] = {0x04, 0xB0, 0x03, 0x20};
     _sendCommand(CMD_TRES, CS_BOTH_SEL, tres, sizeof(tres));
 
-    // === Power settings - CS0 (master) only ===
+    // === Power settings ===
+    // CircuitPython sends these to CS_BOTH and it works
+    // Pimoroni Python sends to CS0_SEL only
+    // Using CS_BOTH_SEL to match working CircuitPython reference
     
     // PWR - Power Setting
     const uint8_t pwr[] = {0x0F, 0x00, 0x28, 0x2C, 0x28, 0x38};
-    _sendCommand(CMD_PWR, CS0_SEL, pwr, sizeof(pwr));
+    _sendCommand(CMD_PWR, CS_BOTH_SEL, pwr, sizeof(pwr));
 
     // EN_BUF - Enable Buffer
     const uint8_t en_buf[] = {0x07};
-    _sendCommand(CMD_EN_BUF, CS0_SEL, en_buf, sizeof(en_buf));
+    _sendCommand(CMD_EN_BUF, CS_BOTH_SEL, en_buf, sizeof(en_buf));
 
     // BTST_P - Booster Soft Start Positive
     const uint8_t btst_p[] = {0xD8, 0x18};
-    _sendCommand(CMD_BTST_P, CS0_SEL, btst_p, sizeof(btst_p));
+    _sendCommand(CMD_BTST_P, CS_BOTH_SEL, btst_p, sizeof(btst_p));
 
     // BOOST_VDDP_EN
     const uint8_t boost_vddp[] = {0x01};
-    _sendCommand(CMD_BOOST_VDDP_EN, CS0_SEL, boost_vddp, sizeof(boost_vddp));
+    _sendCommand(CMD_BOOST_VDDP_EN, CS_BOTH_SEL, boost_vddp, sizeof(boost_vddp));
 
     // BTST_N - Booster Soft Start Negative
     const uint8_t btst_n[] = {0xD8, 0x18};
-    _sendCommand(CMD_BTST_N, CS0_SEL, btst_n, sizeof(btst_n));
+    _sendCommand(CMD_BTST_N, CS_BOTH_SEL, btst_n, sizeof(btst_n));
 
     // BUCK_BOOST_VDDN
     const uint8_t buck_boost[] = {0x01};
-    _sendCommand(CMD_BUCK_BOOST_VDDN, CS0_SEL, buck_boost, sizeof(buck_boost));
+    _sendCommand(CMD_BUCK_BOOST_VDDN, CS_BOTH_SEL, buck_boost, sizeof(buck_boost));
 
     // TFT_VCOM_POWER
     const uint8_t vcom_power[] = {0x02};
-    _sendCommand(CMD_TFT_VCOM_POWER, CS0_SEL, vcom_power, sizeof(vcom_power));
+    _sendCommand(CMD_TFT_VCOM_POWER, CS_BOTH_SEL, vcom_power, sizeof(vcom_power));
 
     Serial.println("EL133UF1: Init sequence complete");
 }

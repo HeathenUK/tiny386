@@ -70,8 +70,9 @@
 #define CMD_BUCK_BOOST_VDDN  0xB0  // Buck Boost VDDN
 
 // Default SPI speed (can be overridden)
+// CircuitPython reference uses 40 MHz successfully
 #ifndef EL133UF1_SPI_SPEED
-#define EL133UF1_SPI_SPEED 10000000  // 10 MHz
+#define EL133UF1_SPI_SPEED 40000000  // 40 MHz
 #endif
 
 // Buffer size for half panel (1200 rows * 600 cols / 2 pixels per byte)

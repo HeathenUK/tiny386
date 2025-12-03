@@ -22,18 +22,19 @@
 #include <Arduino.h>
 #include "EL133UF1.h"
 
-// Pin definitions for Pico Plus 2 W
-// Using SPI0 with custom pin mapping
-#define PIN_SPI_SCK   18    // SPI0 SCK
-#define PIN_SPI_MOSI  19    // SPI0 TX (MOSI)
-#define PIN_CS0       17    // Chip Select 0
-#define PIN_CS1       16    // Chip Select 1
-#define PIN_DC        20    // Data/Command
-#define PIN_RESET     21    // Reset
-#define PIN_BUSY      22    // Busy
+// Pin definitions for Pimoroni Pico Plus 2 W with Inky Impression 13.3"
+// These match the working CircuitPython reference
+#define PIN_SPI_SCK   10    // SPI1 SCK (GP10)
+#define PIN_SPI_MOSI  11    // SPI1 TX/MOSI (GP11)
+#define PIN_CS0       26    // Chip Select 0 - left half (GP26)
+#define PIN_CS1       16    // Chip Select 1 - right half (GP16)
+#define PIN_DC        22    // Data/Command (GP22)
+#define PIN_RESET     27    // Reset (GP27)
+#define PIN_BUSY      17    // Busy (GP17)
 
-// Create display instance using default SPI (SPI0)
-EL133UF1 display(&SPI);
+// Create display instance using SPI1
+// (SPI1 is the correct bus for GP10/GP11 on Pico)
+EL133UF1 display(&SPI1);
 
 // Forward declaration
 void drawDemoPattern();
@@ -62,10 +63,10 @@ void setup() {
     Serial.printf("  BUSY:     GP%d\n", PIN_BUSY);
     Serial.println();
 
-    // Configure SPI pins BEFORE initializing display
+    // Configure SPI1 pins BEFORE initializing display
     // arduino-pico requires pin configuration before SPI.begin()
-    SPI.setSCK(PIN_SPI_SCK);
-    SPI.setTX(PIN_SPI_MOSI);
+    SPI1.setSCK(PIN_SPI_SCK);
+    SPI1.setTX(PIN_SPI_MOSI);
 
     // Initialize the display
     Serial.println("Initializing display...");

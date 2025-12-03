@@ -18,19 +18,21 @@ A PlatformIO/Arduino-Pico driver for the EL133UF1 13.3" Spectra 6 e-ink panel, d
 
 ## Wiring
 
+Default pin configuration for **Pimoroni Inky Impression 13.3"** connected to **Pico Plus 2 W**:
+
 | Display Pin | Pico Plus 2 W Pin | Description |
 |-------------|-------------------|-------------|
-| MOSI        | GP19              | SPI0 TX (MOSI) |
-| SCLK        | GP18              | SPI0 SCK |
-| CS0         | GP17              | Chip Select 0 |
-| CS1         | GP16              | Chip Select 1 |
-| DC          | GP20              | Data/Command |
-| RESET       | GP21              | Reset |
-| BUSY        | GP22              | Busy signal |
+| MOSI        | GP11              | SPI1 TX (MOSI) |
+| SCLK        | GP10              | SPI1 SCK |
+| CS0         | GP26              | Chip Select 0 (left half) |
+| CS1         | GP16              | Chip Select 1 (right half) |
+| DC          | GP22              | Data/Command |
+| RESET       | GP27              | Reset |
+| BUSY        | GP17              | Busy signal |
 | GND         | GND               | Ground |
 | 3.3V        | 3V3               | Power (3.3V) |
 
-> **Note**: The EL133UF1 uses two chip select lines because the panel is driven by two controllers (left and right halves).
+> **Note**: The EL133UF1 uses two chip select lines because the panel is driven by two controllers (left and right halves). Uses **SPI1** (not SPI0).
 
 ## Installation
 
@@ -63,24 +65,24 @@ Copy the `lib/EL133UF1` folder to your Arduino libraries folder or PlatformIO li
 #include <Arduino.h>
 #include "EL133UF1.h"
 
-// Pin definitions
-#define PIN_SPI_SCK   18
-#define PIN_SPI_MOSI  19
-#define PIN_CS0       17
-#define PIN_CS1       16
-#define PIN_DC        20
-#define PIN_RESET     21
-#define PIN_BUSY      22
+// Pin definitions for Pimoroni Pico Plus 2 W + Inky Impression 13.3"
+#define PIN_SPI_SCK   10    // SPI1 SCK
+#define PIN_SPI_MOSI  11    // SPI1 MOSI
+#define PIN_CS0       26    // Left half
+#define PIN_CS1       16    // Right half
+#define PIN_DC        22
+#define PIN_RESET     27
+#define PIN_BUSY      17
 
-EL133UF1 display(&SPI);
+EL133UF1 display(&SPI1);  // Use SPI1
 
 void setup() {
     Serial.begin(115200);
     
-    // Configure SPI pins BEFORE initializing display
+    // Configure SPI1 pins BEFORE initializing display
     // (arduino-pico requires pin configuration before SPI.begin())
-    SPI.setSCK(PIN_SPI_SCK);
-    SPI.setTX(PIN_SPI_MOSI);
+    SPI1.setSCK(PIN_SPI_SCK);
+    SPI1.setTX(PIN_SPI_MOSI);
     
     // Initialize display
     if (!display.begin(PIN_CS0, PIN_CS1, PIN_DC, PIN_RESET, PIN_BUSY)) {
@@ -122,12 +124,12 @@ EL133UF1_GREEN   // 6
 #### Initialization
 
 ```cpp
-// Create display instance
-EL133UF1 display(&SPI);
+// Create display instance (use SPI1 for GP10/GP11)
+EL133UF1 display(&SPI1);
 
 // Configure SPI pins before calling begin() (arduino-pico requirement)
-SPI.setSCK(sckPin);
-SPI.setTX(mosiPin);
+SPI1.setSCK(10);   // GP10
+SPI1.setTX(11);    // GP11
 
 // Initialize with pin configuration
 bool begin(int8_t cs0Pin, int8_t cs1Pin, int8_t dcPin, 
