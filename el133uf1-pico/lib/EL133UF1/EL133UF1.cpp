@@ -124,94 +124,46 @@ EL133UF1::EL133UF1(SPIClass* spi) :
 
 bool EL133UF1::begin(int8_t cs0Pin, int8_t cs1Pin, int8_t dcPin, 
                      int8_t resetPin, int8_t busyPin) {
-    Serial.println("EL133UF1::begin() starting...");
-    
     _cs0Pin = cs0Pin;
     _cs1Pin = cs1Pin;
     _dcPin = dcPin;
     _resetPin = resetPin;
     _busyPin = busyPin;
 
-    Serial.printf("  Pins: CS0=%d CS1=%d DC=%d RST=%d BUSY=%d\n", 
-                  _cs0Pin, _cs1Pin, _dcPin, _resetPin, _busyPin);
-
-    // Allocate frame buffer using pmalloc (PSRAM malloc)
-    Serial.println("  Allocating frame buffer in PSRAM...");
-    
+    // Allocate frame buffer in PSRAM (1.92MB)
     _buffer = (uint8_t*)pmalloc(EL133UF1_WIDTH * EL133UF1_HEIGHT);
     _packedMode = false;
     _bufferRight = nullptr;
     
     if (_buffer == nullptr) {
-        Serial.println("EL133UF1: pmalloc failed!");
-        Serial.println("  Make sure PSRAM is available on this board.");
+        Serial.println("EL133UF1: PSRAM allocation failed!");
         return false;
     }
-    
-    Serial.printf("  PSRAM buffer allocated at %p (%d bytes)\n", 
-                  _buffer, EL133UF1_WIDTH * EL133UF1_HEIGHT);
-    
-    // Verify we can write to it
-    _buffer[0] = 0xAA;
-    _buffer[1] = 0x55;
-    if (_buffer[0] != 0xAA || _buffer[1] != 0x55) {
-        Serial.println("EL133UF1: PSRAM buffer verification failed!");
-        free(_buffer);
-        _buffer = nullptr;
-        return false;
-    }
-    Serial.println("  PSRAM buffer verified OK");
     
     // Clear to white
     memset(_buffer, EL133UF1_WHITE, EL133UF1_WIDTH * EL133UF1_HEIGHT);
-    Serial.println("  Buffer cleared to white");
-    
-    // Initialize buffer to white
-    memset(_buffer, EL133UF1_WHITE, EL133UF1_WIDTH * EL133UF1_HEIGHT);
 
     // Configure GPIO pins
-    Serial.println("  Configuring GPIO pins...");
     pinMode(_cs0Pin, OUTPUT);
     pinMode(_cs1Pin, OUTPUT);
     pinMode(_dcPin, OUTPUT);
     pinMode(_resetPin, OUTPUT);
     pinMode(_busyPin, INPUT_PULLUP);
 
-    // Set initial pin states (CS pins are active low, so set high)
     digitalWrite(_cs0Pin, HIGH);
     digitalWrite(_cs1Pin, HIGH);
     digitalWrite(_dcPin, LOW);
     digitalWrite(_resetPin, HIGH);
-    Serial.println("  GPIO configured");
 
     // Initialize SPI
-    Serial.println("  Starting SPI...");
     _spi->begin();
-    Serial.printf("  SPI started (speed=%d Hz)\n", EL133UF1_SPI_SPEED);
 
-    // Perform hardware reset
-    Serial.println("  Performing hardware reset...");
+    // Hardware reset and init sequence
     _reset();
-    Serial.println("  Reset complete");
-
-    // Check busy pin state
-    Serial.printf("  BUSY pin state after reset: %s\n", 
-                  digitalRead(_busyPin) ? "HIGH" : "LOW");
-
-    // Wait for display to be ready
-    Serial.println("  Waiting for display ready (busy_wait)...");
-    if (!_busyWait(1000)) {
-        Serial.println("EL133UF1: Display not responding after reset");
-        // Continue anyway for debugging
-    }
-    Serial.println("  Display ready");
-
-    // Send initialization sequence
-    Serial.println("  Sending init sequence...");
+    _busyWait(1000);
     _initSequence();
 
     _initialized = true;
-    Serial.println("EL133UF1: Initialization complete");
     return true;
 }
 
@@ -225,27 +177,18 @@ void EL133UF1::_reset() {
 }
 
 bool EL133UF1::_busyWait(uint32_t timeoutMs) {
-    // From working CircuitPython reference - TWO PHASE wait:
-    // 1. First wait for busy to ASSERT (go LOW) - display starts working
-    // 2. Then wait for busy to DEASSERT (go HIGH) - display finished
-    
+    // Two-phase wait: wait for busy to assert (LOW) then deassert (HIGH)
     uint32_t startTime = millis();
     
-    // Phase 1: Wait for busy to go LOW (display acknowledges command)
+    // Phase 1: Wait for busy to go LOW
     while (digitalRead(_busyPin) == HIGH) {
-        if (millis() - startTime > timeoutMs) {
-            Serial.println("EL133UF1: Busy never asserted (stayed HIGH)");
-            return true;  // Continue anyway - might be OK
-        }
+        if (millis() - startTime > timeoutMs) return true;
         delay(1);
     }
     
-    // Phase 2: Wait for busy to go HIGH (display finished)
+    // Phase 2: Wait for busy to go HIGH
     while (digitalRead(_busyPin) == LOW) {
-        if (millis() - startTime > timeoutMs) {
-            Serial.println("EL133UF1: Busy timeout (stuck LOW)");
-            return false;
-        }
+        if (millis() - startTime > timeoutMs) return false;
         delay(10);
     }
     
@@ -297,85 +240,61 @@ void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, siz
 
 void EL133UF1::_initSequence() {
     // Initialization sequence from working CircuitPython reference
-    Serial.println("    _initSequence: Starting...");
+    // 17 commands total, each with 90ms DC setup delay = ~1.5s
     
-    // ANTM - Anti-crosstalk magic (CS0 only) - must be sent first after reset
-    Serial.println("    Sending ANTM (0x74) to CS0...");
+    // ANTM - Anti-crosstalk magic (CS0 only, must be first)
     const uint8_t antm[] = {0xC0, 0x1C, 0x1C, 0xCC, 0xCC, 0xCC, 0x15, 0x15, 0x55};
     _sendCommand(CMD_ANTM, CS0_SEL, antm, sizeof(antm));
 
-    // CMD66 / 0xF0 (both CS)
     const uint8_t cmd66[] = {0x49, 0x55, 0x13, 0x5D, 0x05, 0x10};
     _sendCommand(CMD_CMD66, CS_BOTH_SEL, cmd66, sizeof(cmd66));
 
-    // PSR - Panel Setting (both CS)
     const uint8_t psr[] = {0xDF, 0x69};
     _sendCommand(CMD_PSR, CS_BOTH_SEL, psr, sizeof(psr));
 
-    // PLL Control (both CS)
     const uint8_t pll[] = {0x08};
     _sendCommand(CMD_PLL, CS_BOTH_SEL, pll, sizeof(pll));
 
-    // CDI - VCOM and Data Interval (both CS)
     const uint8_t cdi[] = {0xF7};
     _sendCommand(CMD_CDI, CS_BOTH_SEL, cdi, sizeof(cdi));
 
-    // TCON Setting (both CS)
     const uint8_t tcon[] = {0x03, 0x03};
     _sendCommand(CMD_TCON, CS_BOTH_SEL, tcon, sizeof(tcon));
 
-    // AGID - Auto Gate ID (both CS)
     const uint8_t agid[] = {0x10};
     _sendCommand(CMD_AGID, CS_BOTH_SEL, agid, sizeof(agid));
 
-    // PWS - Power Saving (both CS)
     const uint8_t pws[] = {0x22};
     _sendCommand(CMD_PWS, CS_BOTH_SEL, pws, sizeof(pws));
 
-    // CCSET - Cascade Setting (both CS)
     const uint8_t ccset[] = {0x01};
     _sendCommand(CMD_CCSET, CS_BOTH_SEL, ccset, sizeof(ccset));
 
-    // TRES - Resolution Setting (both CS)
-    // 0x04B0 = 1200, 0x0320 = 800
+    // Resolution: 1200 x 800 per half (0x04B0 x 0x0320)
     const uint8_t tres[] = {0x04, 0xB0, 0x03, 0x20};
     _sendCommand(CMD_TRES, CS_BOTH_SEL, tres, sizeof(tres));
 
-    // === Power settings ===
-    // CircuitPython sends these to CS_BOTH and it works
-    // Pimoroni Python sends to CS0_SEL only
-    // Using CS_BOTH_SEL to match working CircuitPython reference
-    
-    // PWR - Power Setting
+    // Power configuration
     const uint8_t pwr[] = {0x0F, 0x00, 0x28, 0x2C, 0x28, 0x38};
     _sendCommand(CMD_PWR, CS_BOTH_SEL, pwr, sizeof(pwr));
 
-    // EN_BUF - Enable Buffer
     const uint8_t en_buf[] = {0x07};
     _sendCommand(CMD_EN_BUF, CS_BOTH_SEL, en_buf, sizeof(en_buf));
 
-    // BTST_P - Booster Soft Start Positive
     const uint8_t btst_p[] = {0xD8, 0x18};
     _sendCommand(CMD_BTST_P, CS_BOTH_SEL, btst_p, sizeof(btst_p));
 
-    // BOOST_VDDP_EN
     const uint8_t boost_vddp[] = {0x01};
     _sendCommand(CMD_BOOST_VDDP_EN, CS_BOTH_SEL, boost_vddp, sizeof(boost_vddp));
 
-    // BTST_N - Booster Soft Start Negative
     const uint8_t btst_n[] = {0xD8, 0x18};
     _sendCommand(CMD_BTST_N, CS_BOTH_SEL, btst_n, sizeof(btst_n));
 
-    // BUCK_BOOST_VDDN
     const uint8_t buck_boost[] = {0x01};
     _sendCommand(CMD_BUCK_BOOST_VDDN, CS_BOTH_SEL, buck_boost, sizeof(buck_boost));
 
-    // TFT_VCOM_POWER
-    Serial.println("    Sending TFT_VCOM_POWER...");
     const uint8_t vcom_power[] = {0x02};
     _sendCommand(CMD_TFT_VCOM_POWER, CS_BOTH_SEL, vcom_power, sizeof(vcom_power));
-
-    Serial.println("    _initSequence: Complete");
 }
 
 void EL133UF1::clear(uint8_t color) {
