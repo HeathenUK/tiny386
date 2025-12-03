@@ -538,15 +538,14 @@ void EL133UF1::drawChar(int16_t x, int16_t y, char c, uint8_t color, uint8_t bg,
         uint8_t* ptr = _buffer + y * EL133UF1_WIDTH + x;
         for (int8_t row = 0; row < 8; row++) {
             uint8_t rowData = charData[row];
-            // Flip bit order horizontally (read LSB to MSB instead of MSB to LSB)
-            ptr[0] = (rowData & 0x01) ? fgc : bgc;
-            ptr[1] = (rowData & 0x02) ? fgc : bgc;
-            ptr[2] = (rowData & 0x04) ? fgc : bgc;
-            ptr[3] = (rowData & 0x08) ? fgc : bgc;
-            ptr[4] = (rowData & 0x10) ? fgc : bgc;
-            ptr[5] = (rowData & 0x20) ? fgc : bgc;
-            ptr[6] = (rowData & 0x40) ? fgc : bgc;
-            ptr[7] = (rowData & 0x80) ? fgc : bgc;
+            ptr[0] = (rowData & 0x80) ? fgc : bgc;
+            ptr[1] = (rowData & 0x40) ? fgc : bgc;
+            ptr[2] = (rowData & 0x20) ? fgc : bgc;
+            ptr[3] = (rowData & 0x10) ? fgc : bgc;
+            ptr[4] = (rowData & 0x08) ? fgc : bgc;
+            ptr[5] = (rowData & 0x04) ? fgc : bgc;
+            ptr[6] = (rowData & 0x02) ? fgc : bgc;
+            ptr[7] = (rowData & 0x01) ? fgc : bgc;
             ptr += EL133UF1_WIDTH;
         }
         return;
@@ -556,8 +555,7 @@ void EL133UF1::drawChar(int16_t x, int16_t y, char c, uint8_t color, uint8_t bg,
     for (int8_t row = 0; row < 8; row++) {
         uint8_t rowData = charData[row];
         for (int8_t col = 0; col < 8; col++) {
-            // Flip bit order: use col instead of (7 - col)
-            bool pixel = (rowData >> col) & 0x01;
+            bool pixel = (rowData >> (7 - col)) & 0x01;
             uint8_t pixelColor = pixel ? fgc : bgc;
             
             if (size == 1) {
@@ -619,6 +617,7 @@ void EL133UF1::_sendBuffer() {
     Serial.printf("    Buffer alloc:   %4lu ms\n", millis() - stepStart);
 
     // Process the buffer with rotation
+    // Trying counter-clockwise rotation instead of clockwise
     stepStart = millis();
     
     size_t idxA = 0;
@@ -627,9 +626,9 @@ void EL133UF1::_sendBuffer() {
     for (int newRow = 0; newRow < 1600; newRow++) {
         // First half (columns 0-599 of rotated image go to bufA)
         for (int newCol = 0; newCol < 600; newCol += 2) {
-            int oldCol = 1599 - newRow;
-            int oldRow0 = 1199 - newCol;
-            int oldRow1 = 1199 - (newCol + 1);
+            int oldCol = newRow;
+            int oldRow0 = newCol;
+            int oldRow1 = newCol + 1;
             
             uint8_t p0 = _buffer[oldRow0 * EL133UF1_WIDTH + oldCol] & 0x07;
             uint8_t p1 = _buffer[oldRow1 * EL133UF1_WIDTH + oldCol] & 0x07;
@@ -638,9 +637,9 @@ void EL133UF1::_sendBuffer() {
         
         // Second half (columns 600-1199 of rotated image go to bufB)
         for (int newCol = 600; newCol < 1200; newCol += 2) {
-            int oldCol = 1599 - newRow;
-            int oldRow0 = 1199 - newCol;
-            int oldRow1 = 1199 - (newCol + 1);
+            int oldCol = newRow;
+            int oldRow0 = newCol;
+            int oldRow1 = newCol + 1;
             
             uint8_t p0 = _buffer[oldRow0 * EL133UF1_WIDTH + oldCol] & 0x07;
             uint8_t p1 = _buffer[oldRow1 * EL133UF1_WIDTH + oldCol] & 0x07;
