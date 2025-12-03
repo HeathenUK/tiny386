@@ -241,6 +241,30 @@ public:
      */
     void setImage(const uint8_t* data, size_t len);
 
+    /**
+     * @brief Draw a character at specified position
+     * 
+     * @param x X coordinate (top-left of character)
+     * @param y Y coordinate (top-left of character)
+     * @param c Character to draw
+     * @param color Foreground color
+     * @param bg Background color (use same as color for transparent)
+     * @param size Scale factor (1 = 8x8 pixels, 2 = 16x16, etc.)
+     */
+    void drawChar(int16_t x, int16_t y, char c, uint8_t color, uint8_t bg, uint8_t size = 1);
+
+    /**
+     * @brief Draw a string at specified position
+     * 
+     * @param x X coordinate
+     * @param y Y coordinate  
+     * @param text String to draw
+     * @param color Foreground color
+     * @param bg Background color
+     * @param size Scale factor
+     */
+    void drawText(int16_t x, int16_t y, const char* text, uint8_t color, uint8_t bg, uint8_t size = 1);
+
 private:
     SPIClass* _spi;
     SPISettings _spiSettings;

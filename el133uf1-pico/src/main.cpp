@@ -132,78 +132,82 @@ void loop() {
  * @brief Draw a demonstration pattern showing all 6 colors
  */
 void drawDemoPattern() {
-    Serial.println("Drawing demo pattern...");
+    Serial.println("Drawing orientation test pattern...");
     
-    const uint16_t w = display.width();
-    const uint16_t h = display.height();
+    const uint16_t w = display.width();   // 1600
+    const uint16_t h = display.height();  // 1200
     
     // Clear to white
     display.clear(EL133UF1_WHITE);
     
-    // Draw color bars across the top third
-    const uint16_t barHeight = h / 4;
-    const uint16_t barWidth = w / 6;
-    
-    display.fillRect(0 * barWidth, 0, barWidth, barHeight, EL133UF1_BLACK);
-    display.fillRect(1 * barWidth, 0, barWidth, barHeight, EL133UF1_WHITE);
-    display.fillRect(2 * barWidth, 0, barWidth, barHeight, EL133UF1_RED);
-    display.fillRect(3 * barWidth, 0, barWidth, barHeight, EL133UF1_YELLOW);
-    display.fillRect(4 * barWidth, 0, barWidth, barHeight, EL133UF1_GREEN);
-    display.fillRect(5 * barWidth, 0, barWidth, barHeight, EL133UF1_BLUE);
-    
     // Draw a black border around the whole display
-    display.drawRect(0, 0, w, h, EL133UF1_BLACK);
-    display.drawRect(1, 1, w - 2, h - 2, EL133UF1_BLACK);
-    
-    // Draw some rectangles in the middle section
-    const uint16_t midY = barHeight + 50;
-    const uint16_t rectSize = 150;
-    const uint16_t spacing = 50;
-    uint16_t xPos = (w - (6 * rectSize + 5 * spacing)) / 2;
-    
-    // Filled rectangles
-    display.fillRect(xPos, midY, rectSize, rectSize, EL133UF1_BLACK);
-    xPos += rectSize + spacing;
-    display.fillRect(xPos, midY, rectSize, rectSize, EL133UF1_RED);
-    xPos += rectSize + spacing;
-    display.fillRect(xPos, midY, rectSize, rectSize, EL133UF1_YELLOW);
-    xPos += rectSize + spacing;
-    display.fillRect(xPos, midY, rectSize, rectSize, EL133UF1_GREEN);
-    xPos += rectSize + spacing;
-    display.fillRect(xPos, midY, rectSize, rectSize, EL133UF1_BLUE);
-    xPos += rectSize + spacing;
-    display.fillRect(xPos, midY, rectSize, rectSize, EL133UF1_WHITE);
-    display.drawRect(xPos, midY, rectSize, rectSize, EL133UF1_BLACK);
-    
-    // Draw outlined rectangles below
-    xPos = (w - (6 * rectSize + 5 * spacing)) / 2;
-    const uint16_t outlineY = midY + rectSize + spacing;
-    
-    for (int i = 0; i < 6; i++) {
-        uint8_t colors[] = {EL133UF1_BLACK, EL133UF1_RED, EL133UF1_YELLOW, 
-                           EL133UF1_GREEN, EL133UF1_BLUE, EL133UF1_BLACK};
-        for (int j = 0; j < 5; j++) {
-            display.drawRect(xPos + j, outlineY + j, 
-                           rectSize - 2*j, rectSize - 2*j, colors[i]);
-        }
-        xPos += rectSize + spacing;
+    for (int i = 0; i < 5; i++) {
+        display.drawRect(i, i, w - 2*i, h - 2*i, EL133UF1_BLACK);
     }
     
-    // Draw diagonal lines pattern in bottom section
-    const uint16_t patternY = outlineY + rectSize + spacing;
-    const uint16_t patternHeight = h - patternY - 20;
+    // Text size for corner labels (size 6 = 48x48 pixels per char)
+    const uint8_t textSize = 6;
+    const uint16_t charW = 8 * textSize;  // 48 pixels per character
+    const uint16_t charH = 8 * textSize;  // 48 pixels tall
+    const uint16_t margin = 30;
     
-    // Draw a checkerboard pattern
-    const uint16_t checkSize = 40;
-    uint8_t colors[] = {EL133UF1_BLACK, EL133UF1_RED, EL133UF1_YELLOW, 
-                       EL133UF1_GREEN, EL133UF1_BLUE, EL133UF1_WHITE};
+    // Top-Left corner label
+    display.fillRect(margin, margin, charW * 8 + 20, charH + 20, EL133UF1_WHITE);
+    display.drawRect(margin, margin, charW * 8 + 20, charH + 20, EL133UF1_BLACK);
+    display.drawText(margin + 10, margin + 10, "TOP-LEFT", EL133UF1_BLACK, EL133UF1_WHITE, textSize);
     
-    for (uint16_t y = patternY; y < patternY + patternHeight; y += checkSize) {
-        for (uint16_t x = 20; x < w - 20; x += checkSize) {
-            int colorIdx = ((x / checkSize) + (y / checkSize)) % 6;
-            display.fillRect(x, y, checkSize, checkSize, colors[colorIdx]);
-        }
+    // Top-Right corner label  
+    uint16_t trX = w - margin - (charW * 9 + 20);
+    display.fillRect(trX, margin, charW * 9 + 20, charH + 20, EL133UF1_WHITE);
+    display.drawRect(trX, margin, charW * 9 + 20, charH + 20, EL133UF1_BLACK);
+    display.drawText(trX + 10, margin + 10, "TOP-RIGHT", EL133UF1_BLACK, EL133UF1_WHITE, textSize);
+    
+    // Bottom-Left corner label
+    uint16_t blY = h - margin - (charH + 20);
+    display.fillRect(margin, blY, charW * 11 + 20, charH + 20, EL133UF1_WHITE);
+    display.drawRect(margin, blY, charW * 11 + 20, charH + 20, EL133UF1_BLACK);
+    display.drawText(margin + 10, blY + 10, "BOTTOM-LEFT", EL133UF1_BLACK, EL133UF1_WHITE, textSize);
+    
+    // Bottom-Right corner label
+    uint16_t brX = w - margin - (charW * 12 + 20);
+    display.fillRect(brX, blY, charW * 12 + 20, charH + 20, EL133UF1_WHITE);
+    display.drawRect(brX, blY, charW * 12 + 20, charH + 20, EL133UF1_BLACK);
+    display.drawText(brX + 10, blY + 10, "BOTTOM-RIGHT", EL133UF1_BLACK, EL133UF1_WHITE, textSize);
+    
+    // Draw colored corners to make orientation obvious
+    // Top-left: RED square
+    display.fillRect(margin, margin + charH + 40, 100, 100, EL133UF1_RED);
+    display.drawText(margin, margin + charH + 150, "RED", EL133UF1_RED, EL133UF1_WHITE, 3);
+    
+    // Top-right: BLUE square
+    display.fillRect(w - margin - 100, margin + charH + 40, 100, 100, EL133UF1_BLUE);
+    display.drawText(w - margin - 100, margin + charH + 150, "BLUE", EL133UF1_BLUE, EL133UF1_WHITE, 3);
+    
+    // Bottom-left: GREEN square
+    display.fillRect(margin, blY - 150, 100, 100, EL133UF1_GREEN);
+    display.drawText(margin, blY - 170, "GREEN", EL133UF1_GREEN, EL133UF1_WHITE, 3);
+    
+    // Bottom-right: YELLOW square
+    display.fillRect(w - margin - 100, blY - 150, 100, 100, EL133UF1_YELLOW);
+    display.drawText(w - margin - 140, blY - 170, "YELLOW", EL133UF1_YELLOW, EL133UF1_WHITE, 3);
+    
+    // Center info
+    const char* centerText1 = "EL133UF1 Display";
+    const char* centerText2 = "1600 x 1200 pixels";
+    uint16_t cx = w / 2;
+    uint16_t cy = h / 2;
+    
+    display.drawText(cx - (16 * 8 * 4) / 2, cy - 50, centerText1, EL133UF1_BLACK, EL133UF1_WHITE, 4);
+    display.drawText(cx - (18 * 8 * 3) / 2, cy + 30, centerText2, EL133UF1_BLACK, EL133UF1_WHITE, 3);
+    
+    // Draw arrows pointing to edges
+    // Arrow pointing UP at top center
+    int16_t arrowX = cx;
+    int16_t arrowY = 150;
+    for (int i = 0; i < 30; i++) {
+        display.drawHLine(arrowX - i, arrowY + i, i * 2 + 1, EL133UF1_BLACK);
     }
+    display.drawText(arrowX - 24, arrowY + 40, "UP", EL133UF1_BLACK, EL133UF1_WHITE, 3);
     
-    Serial.println("Demo pattern drawn to buffer");
+    Serial.println("Orientation test pattern drawn to buffer");
 }
