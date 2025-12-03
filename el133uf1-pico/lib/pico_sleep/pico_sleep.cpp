@@ -84,32 +84,48 @@ static void ensure_timer_running(void) {
 void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
     _dormant_source = dormant_source;
 
-    Serial.println("  [1] Setting up powman timer...");
+    Serial.println("  [1] Checking powman timer...");
     Serial.flush();
 
     if (dormant_source == DORMANT_SOURCE_LPOSC) {
-        // Start timer if not running
-        if (!powman_timer_is_running()) {
-            Serial.println("  [2] Starting timer...");
+        // Check if timer is already running on LPOSC (from previous sleep cycle)
+        bool timer_running = powman_timer_is_running();
+        bool using_lposc = (powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) != 0;
+        
+        Serial.printf("  [2] Timer running: %d, using LPOSC: %d\n", timer_running, using_lposc);
+        Serial.flush();
+        
+        if (timer_running && using_lposc) {
+            // Already set up from previous cycle - don't touch it!
+            Serial.println("  [3] Timer already configured, preserving time");
+            uint64_t current = powman_timer_get_ms();
+            Serial.printf("  [4] Current time: %llu ms\n", current);
+            Serial.flush();
+            return;
+        }
+        
+        // First time setup - need to configure timer
+        if (!timer_running) {
+            Serial.println("  [3] Starting timer...");
             Serial.flush();
             powman_timer_set_ms(0);
             powman_timer_start();
         }
         
-        Serial.println("  [3] Switching to LPOSC...");
+        Serial.println("  [4] Switching to LPOSC...");
         Serial.flush();
         
         // Switch to LPOSC (keeps running during deep sleep)
         powman_timer_set_1khz_tick_source_lposc();
         
-        Serial.printf("  [4] Timer using LPOSC: %d\n", 
+        Serial.printf("  [5] Timer using LPOSC: %d\n", 
                       (powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) ? 1 : 0);
         
         // Verify timer is counting
         uint64_t t1 = powman_timer_get_ms();
         delay(100);
         uint64_t t2 = powman_timer_get_ms();
-        Serial.printf("  [5] Timer test: %llu -> %llu (delta=%llu)\n", t1, t2, t2-t1);
+        Serial.printf("  [6] Timer test: %llu -> %llu (delta=%llu)\n", t1, t2, t2-t1);
         Serial.flush();
     }
 }
