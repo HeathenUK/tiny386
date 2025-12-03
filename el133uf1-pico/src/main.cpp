@@ -20,15 +20,19 @@
  */
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <time.h>
 #include "EL133UF1.h"
 #include "pico_sleep.h"
+#include "hardware/structs/powman.h"
 
-// For CYW43 WiFi module control (needs to be deinitialized for deep sleep)
-#ifdef ARDUINO_RASPBERRY_PI_PICO_W
-extern "C" {
-    #include "pico/cyw43_arch.h"
-}
-#endif
+// WiFi credentials
+const char* WIFI_SSID = "JELLING";
+const char* WIFI_PSK = "Crusty jugglers";
+
+// NTP settings
+const char* NTP_SERVER1 = "pool.ntp.org";
+const char* NTP_SERVER2 = "time.nist.gov";
 
 // Pin definitions for Pimoroni Pico Plus 2 W with Inky Impression 13.3"
 // These match the working CircuitPython reference
@@ -44,8 +48,82 @@ extern "C" {
 // (SPI1 is the correct bus for GP10/GP11 on Pico)
 EL133UF1 display(&SPI1);
 
-// Forward declaration
+// Forward declarations
 void drawDemoPattern();
+bool connectWiFiAndGetNTP();
+void formatTime(uint64_t time_ms, char* buf, size_t len);
+
+// ================================================================
+// Connect to WiFi and sync NTP time
+// ================================================================
+bool connectWiFiAndGetNTP() {
+    Serial.println("\n=== Connecting to WiFi ===");
+    Serial.printf("SSID: %s\n", WIFI_SSID);
+    
+    WiFi.begin(WIFI_SSID, WIFI_PSK);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\nWiFi connection failed!");
+        return false;
+    }
+    
+    Serial.println("\nWiFi connected!");
+    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    
+    // Configure and get NTP time using arduino-pico NTP class
+    Serial.println("\n=== Getting NTP time ===");
+    NTP.begin(NTP_SERVER1, NTP_SERVER2);
+    
+    // Wait for time to sync
+    int retry = 0;
+    time_t now = 0;
+    while (now < 1000000000 && retry < 20) {  // Valid time is > year 2001
+        Serial.print(".");
+        delay(500);
+        now = time(nullptr);
+        retry++;
+    }
+    
+    if (now < 1000000000) {
+        Serial.println("\nFailed to get NTP time!");
+        WiFi.disconnect(true);
+        return false;
+    }
+    
+    // Get time as milliseconds since epoch
+    uint64_t now_ms = (uint64_t)now * 1000;
+    
+    // Set the powman timer to current time
+    sleep_set_time_ms(now_ms);
+    
+    struct tm* timeinfo = gmtime(&now);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", timeinfo);
+    Serial.printf("\nNTP time: %s\n", buf);
+    Serial.printf("Epoch ms: %llu\n", now_ms);
+    
+    // Disconnect WiFi to save power
+    WiFi.disconnect(true);
+    Serial.println("WiFi disconnected (saving power)");
+    
+    return true;
+}
+
+// ================================================================
+// Format time from powman timer (ms since epoch) to readable string
+// ================================================================
+void formatTime(uint64_t time_ms, char* buf, size_t len) {
+    time_t time_sec = (time_t)(time_ms / 1000);
+    struct tm* timeinfo = gmtime(&time_sec);
+    strftime(buf, len, "%Y-%m-%d %H:%M:%S UTC", timeinfo);
+}
 
 void doDisplayUpdate(int updateNumber);  // Forward declaration
 
@@ -91,8 +169,12 @@ void setup() {
         Serial.println("EL133UF1 13.3\" Spectra 6 E-Ink Display Demo");
         Serial.println("===========================================\n");
         
-        // Initialize the RTC timer
-        sleep_set_time_ms(0);
+        // Connect to WiFi and get NTP time
+        if (!connectWiFiAndGetNTP()) {
+            Serial.println("WARNING: Using local time (starting from 0)");
+            sleep_set_time_ms(0);
+        }
+        
         setUpdateCount(0);
     }
     
@@ -198,7 +280,12 @@ void setup() {
 void doDisplayUpdate(int updateNumber) {
     Serial.printf("\n=== Display Update #%d ===\n", updateNumber);
     
-    uint32_t uptime = sleep_get_uptime_seconds();
+    // Get current time from powman timer (persists across sleep!)
+    uint64_t now_ms = sleep_get_time_ms();
+    char timeStr[32];
+    formatTime(now_ms, timeStr, sizeof(timeStr));
+    
+    Serial.printf("Current time: %s\n", timeStr);
     
     // Reinitialize SPI
     SPI1.setSCK(PIN_SPI_SCK);
@@ -217,37 +304,42 @@ void doDisplayUpdate(int updateNumber) {
     display.clear(EL133UF1_WHITE);
     
     // Title
-    display.drawText(200, 100, "RP2350 Deep Sleep Demo", EL133UF1_BLACK, EL133UF1_WHITE, 5);
+    display.drawText(250, 80, "RP2350 Deep Sleep Clock", EL133UF1_BLACK, EL133UF1_WHITE, 4);
     
-    // Update number - big and colorful
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Update #%d", updateNumber);
+    // Current time - big display
+    // Extract just the time portion
+    time_t time_sec = (time_t)(now_ms / 1000);
+    struct tm* tm = gmtime(&time_sec);
+    char timeBuf[16];
+    strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", tm);
     
     // Cycle through colors based on update number
     uint8_t colors[] = {EL133UF1_RED, EL133UF1_GREEN, EL133UF1_BLUE, EL133UF1_YELLOW};
     uint8_t color = colors[(updateNumber - 1) % 4];
     
-    display.fillRect(200, 250, 800, 200, color);
-    display.drawText(280, 300, buf, EL133UF1_WHITE, color, 8);
+    display.fillRect(150, 200, 900, 200, color);
+    display.drawText(200, 250, timeBuf, EL133UF1_WHITE, color, 10);
     
-    // RTC time
-    uint32_t hours = uptime / 3600;
-    uint32_t mins = (uptime % 3600) / 60;
-    uint32_t secs = uptime % 60;
-    snprintf(buf, sizeof(buf), "Uptime: %02lu:%02lu:%02lu", hours, mins, secs);
-    display.drawText(350, 550, buf, EL133UF1_BLACK, EL133UF1_WHITE, 4);
+    // Date
+    char dateBuf[32];
+    strftime(dateBuf, sizeof(dateBuf), "%A, %d %B %Y", tm);
+    display.drawText(300, 450, dateBuf, EL133UF1_BLACK, EL133UF1_WHITE, 3);
+    
+    // Update count
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Update #%d", updateNumber);
+    display.drawText(550, 550, buf, EL133UF1_BLACK, EL133UF1_WHITE, 4);
     
     // Info
-    display.drawText(250, 700, "10 sec deep sleep between updates", EL133UF1_BLACK, EL133UF1_WHITE, 3);
-    display.drawText(300, 800, "RTC maintained via powman timer", EL133UF1_BLACK, EL133UF1_WHITE, 3);
+    display.drawText(200, 700, "NTP synced on boot, time maintained during sleep", EL133UF1_BLACK, EL133UF1_WHITE, 2);
+    display.drawText(250, 780, "Next update in 10 seconds (deep sleep)", EL133UF1_BLACK, EL133UF1_WHITE, 2);
     
     Serial.printf("Drawing took: %lu ms\n", millis() - drawStart);
     
     // Update display
     display.update(false);
     
-    Serial.printf("Update #%d complete. Uptime: %02lu:%02lu:%02lu\n", 
-                  updateNumber, hours, mins, secs);
+    Serial.printf("Update #%d complete. Time: %s\n", updateNumber, timeStr);
 }
 
 void loop() {
