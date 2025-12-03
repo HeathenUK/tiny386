@@ -77,14 +77,8 @@ bool EL133UF1::begin(int8_t cs0Pin, int8_t cs1Pin, int8_t dcPin,
 }
 
 void EL133UF1::_reset() {
-    // The ESP32 reference implementation does a TRIPLE reset pulse
-    // This appears to be more reliable for this panel
-    digitalWrite(_resetPin, HIGH);
-    delay(30);
-    digitalWrite(_resetPin, LOW);
-    delay(30);
-    digitalWrite(_resetPin, HIGH);
-    delay(30);
+    // Reset sequence from Python reference (verified working)
+    // Pull reset LOW, wait 30ms, then HIGH, wait 30ms
     digitalWrite(_resetPin, LOW);
     delay(30);
     digitalWrite(_resetPin, HIGH);
@@ -92,17 +86,40 @@ void EL133UF1::_reset() {
 }
 
 bool EL133UF1::_busyWait(uint32_t timeoutMs) {
+    // From Python reference:
+    // - If busy_pin is HIGH (pulled up), assume no signal from display
+    //   and wait the timeout period to be safe
+    // - Otherwise wait while busy pin is HIGH (ACTIVE)
+    //
+    // The Python code uses gpiod with PULL_UP on busy pin.
+    // When display is busy, it pulls the line LOW.
+    // When display is ready, line goes HIGH (or floats high via pull-up).
+    //
+    // However, the Python busy_wait logic is a bit unusual - it waits
+    // while ACTIVE (high). This suggests the Pimoroni HAT may have
+    // inverted logic or the panel signals differently.
+    //
+    // Looking at the Python more carefully:
+    // - It first checks if busy is HIGH at start - if so, waits full timeout
+    //   (assumes display not connected/responding)
+    // - Then waits in a loop while busy is HIGH
+    //
+    // For safety, let's implement similar logic:
+    
     uint32_t startTime = millis();
     
-    // BUSY pin logic: LOW = busy, HIGH = idle (ready)
-    // This matches the ESP32 reference: while(!DEV_Digital_Read(EPD_BUSY_PIN))
-    // Wait while busy pin is LOW (device is busy)
+    // Check initial state - if HIGH at start, might not be connected
+    // Give it a moment to potentially go LOW if display is working
+    delay(10);
+    
+    // Wait while busy pin is LOW (display is busy)
+    // Most e-ink displays: LOW = busy, HIGH = ready
     while (digitalRead(_busyPin) == LOW) {
         if (millis() - startTime > timeoutMs) {
             Serial.println("EL133UF1: Busy wait timeout");
             return false;
         }
-        delay(5);  // ESP32 uses 5ms polling interval
+        delay(100);  // Python uses 0.1s polling interval
     }
     
     return true;
@@ -120,14 +137,15 @@ void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, siz
     }
 
     // Send command (DC low = command mode)
+    // Python has time.sleep(0.3) = 300ms here! That seems excessive but
+    // we'll use a shorter delay that should still be sufficient
     digitalWrite(_dcPin, LOW);
-    delayMicroseconds(10);  // Setup time for DC
+    delay(1);  // 1ms delay for DC setup (Python uses 300ms but that seems excessive)
     _spi->transfer(cmd);
 
     // Send data if present (DC high = data mode)
     if (data != nullptr && len > 0) {
         digitalWrite(_dcPin, HIGH);
-        delayMicroseconds(10);  // Setup time for DC
         
         // Send data in chunks to avoid issues with large transfers
         const size_t chunkSize = 4096;
@@ -460,32 +478,28 @@ void EL133UF1::update() {
 
     Serial.println("EL133UF1: Starting display update...");
     
-    // Re-run init sequence to ensure display is ready
+    // Run setup/init sequence (Python calls self.setup() in _update)
     _initSequence();
     
-    // Send buffer data
+    // Send buffer data to both controllers
     _sendBuffer();
 
-    // Power on sequence (matches ESP32 reference)
+    // Power on (Python: self._send_command(EL133UF1_PON, CS_BOTH_SEL))
     Serial.println("EL133UF1: Power on...");
     _sendCommand(CMD_PON, CS_BOTH_SEL);
-    _busyWait(1000);  // Wait for power-on to complete
-    
-    delay(30);  // Additional settle time (ESP32 uses 30ms)
+    _busyWait(200);  // Python: self._busy_wait(0.2)
 
-    // Display refresh
+    // Display refresh (Python: self._send_command(EL133UF1_DRF, CS_BOTH_SEL, [0x00]))
     Serial.println("EL133UF1: Triggering refresh (this takes ~30 seconds)...");
     const uint8_t drf[] = {0x00};
     _sendCommand(CMD_DRF, CS_BOTH_SEL, drf, sizeof(drf));
-    
-    // Wait for refresh to complete (can take up to 32 seconds for Spectra 6)
-    _busyWait(40000);
+    _busyWait(32000);  // Python: self._busy_wait(32.0)
 
-    // Power off
+    // Power off (Python: self._send_command(EL133UF1_POF, CS_BOTH_SEL, [0x00]))
     Serial.println("EL133UF1: Power off...");
     const uint8_t pof[] = {0x00};
     _sendCommand(CMD_POF, CS_BOTH_SEL, pof, sizeof(pof));
-    _busyWait(1000);
+    _busyWait(200);  // Python: self._busy_wait(0.2)
 
     Serial.println("EL133UF1: Display update complete");
 }
