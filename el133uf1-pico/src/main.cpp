@@ -30,9 +30,9 @@
 const char* WIFI_SSID = "JELLING";
 const char* WIFI_PSK = "Crusty jugglers";
 
-// NTP servers
-const char* NTP_SERVER1 = "pool.ntp.org";
-const char* NTP_SERVER2 = "time.nist.gov";
+// NTP servers (hostnames for display, IPs for actual use)
+const char* NTP_SERVER1_NAME = "time.nist.gov";
+const char* NTP_SERVER2_NAME = "pool.ntp.org";
 
 // Pin definitions for Pimoroni Pico Plus 2 W with Inky Impression 13.3"
 // These match the working CircuitPython reference
@@ -82,11 +82,30 @@ bool connectWiFiAndGetNTP() {
     // Small delay to let network stack stabilize
     delay(1000);
     
-    // Use arduino-pico's NTP class (like the example)
+    // Use arduino-pico's NTP class
     Serial.println("\n=== Getting NTP time ===");
-    Serial.printf("Servers: %s, %s\n", NTP_SERVER1, NTP_SERVER2);
     
-    NTP.begin(NTP_SERVER1, NTP_SERVER2);
+    // Try DNS resolution first
+    IPAddress ntpServer1, ntpServer2;
+    bool dns1 = WiFi.hostByName(NTP_SERVER1_NAME, ntpServer1);
+    bool dns2 = WiFi.hostByName(NTP_SERVER2_NAME, ntpServer2);
+    
+    Serial.printf("DNS %s: %s -> %s\n", NTP_SERVER1_NAME, dns1 ? "OK" : "FAIL", 
+                  dns1 ? ntpServer1.toString().c_str() : "N/A");
+    Serial.printf("DNS %s: %s -> %s\n", NTP_SERVER2_NAME, dns2 ? "OK" : "FAIL",
+                  dns2 ? ntpServer2.toString().c_str() : "N/A");
+    
+    // If DNS failed, use hardcoded IPs
+    if (!dns1) {
+        ntpServer1 = IPAddress(129, 6, 15, 28);  // time-a-g.nist.gov
+        Serial.printf("Using fallback IP: %s\n", ntpServer1.toString().c_str());
+    }
+    if (!dns2) {
+        ntpServer2 = IPAddress(129, 6, 15, 29);  // time-b-g.nist.gov
+    }
+    
+    // Use IPAddress overload to ensure sntp_init() is called
+    NTP.begin(ntpServer1, ntpServer2);
     
     Serial.print("Waiting for NTP time sync: ");
     time_t now = time(nullptr);
