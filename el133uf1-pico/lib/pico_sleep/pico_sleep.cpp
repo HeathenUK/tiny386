@@ -32,74 +32,30 @@
 #define SYSTICK_CSR (*(volatile uint32_t*)0xE000E010)
 
 // ========================================================================
-// Sleep state - preserved across deep sleep (in RAM)
+// Sleep state - use powman scratch registers (preserved across reset!)
 // ========================================================================
 
-static volatile bool _woke_from_deep_sleep = false;
+#define SLEEP_SCRATCH_MAGIC    0xDEE95EE7  // Magic value to detect wake
+#define SLEEP_SCRATCH_REG      0           // Which scratch register to use
+
 static dormant_source_t _dormant_source = DORMANT_SOURCE_LPOSC;
 
-// ========================================================================
-// Wake-up callback - user provides this
-// ========================================================================
-static void (*_wake_callback)(void) = nullptr;
-
-void sleep_set_wake_callback(void (*callback)(void)) {
-    _wake_callback = callback;
+// Check if we woke from deep sleep by looking at scratch register
+bool sleep_woke_from_deep_sleep(void) {
+    return (powman_hw->scratch[SLEEP_SCRATCH_REG] == SLEEP_SCRATCH_MAGIC);
 }
 
-// ========================================================================
-// Wake-up handler - called when we wake from deep sleep
-// This runs instead of main() after deep sleep
-// ========================================================================
+void sleep_clear_wake_flag(void) {
+    powman_hw->scratch[SLEEP_SCRATCH_REG] = 0;
+}
 
-void __not_in_flash_func(deep_sleep_wake_handler)() {
-    // Reinitialize the C runtime (but preserve RAM)
-    runtime_init();
-    
-    // Mark that we woke from deep sleep
-    _woke_from_deep_sleep = true;
-    
-    // Re-enable clocks
-    clocks_hw->sleep_en0 = ~0u;
-    clocks_hw->sleep_en1 = ~0u;
-    clocks_init();
-    
-    // Re-enable systick
-    SYSTICK_CSR |= 1;
-    
-    // Switch powman timer back to XOSC
-    powman_timer_set_1khz_tick_source_xosc();
-    
-    // Reinitialize serial
-    Serial.begin(115200);
-    delay(100);
-    
-    Serial.println("\n\n========================================");
-    Serial.println("*** WOKE FROM DEEP SLEEP! ***");
-    Serial.println("========================================\n");
-    
-    // Call user's wake callback if set
-    if (_wake_callback) {
-        _wake_callback();
-    }
-    
-    // Enter infinite loop (user callback should handle everything)
-    while(1) {
-        delay(1000);
-    }
+static void sleep_set_wake_flag(void) {
+    powman_hw->scratch[SLEEP_SCRATCH_REG] = SLEEP_SCRATCH_MAGIC;
 }
 
 // ========================================================================
 // Public API
 // ========================================================================
-
-bool sleep_woke_from_deep_sleep(void) {
-    return _woke_from_deep_sleep;
-}
-
-void sleep_clear_wake_flag(void) {
-    _woke_from_deep_sleep = false;
-}
 
 void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
     _dormant_source = dormant_source;
@@ -143,26 +99,11 @@ void sleep_goto_dormant_for_ms(uint32_t delay_ms) {
     uint64_t alarm_time = powman_timer_get_ms() + delay_ms;
     Serial.printf("  [sleep] Alarm at: %llu ms (in %lu ms)\n", alarm_time, delay_ms);
     
+    // Set flag so we know we're waking from sleep (survives reset!)
+    sleep_set_wake_flag();
+    
     // Set up alarm wakeup
     powman_enable_alarm_wakeup_at_ms(alarm_time);
-    
-    // Set up boot vector for wake-up
-    // When we wake, execution will jump to deep_sleep_wake_handler
-    uintptr_t boot_addr = (uintptr_t)deep_sleep_wake_handler;
-#ifndef __riscv
-    boot_addr |= 1;  // OR with 1 for ARM thumb mode
-#endif
-    
-    uintptr_t stack_pointer;
-    asm volatile("mov %0, sp" : "=r" (stack_pointer));
-    
-    // Write boot vector to powman registers
-    powman_hw->boot[0] = POWMAN_BOOT_MAGIC_NUM;
-    powman_hw->boot[1] = (~POWMAN_BOOT_MAGIC_NUM + 1) ^ boot_addr;  // -magic ^ addr
-    powman_hw->boot[2] = stack_pointer;
-    powman_hw->boot[3] = boot_addr;
-    
-    Serial.printf("  [sleep] Boot vector: 0x%08lx, SP: 0x%08lx\n", boot_addr, stack_pointer);
     
     // Configure power states:
     // Sleep state: SW core OFF, keep XIP cache + SRAM (0x07)
@@ -173,26 +114,25 @@ void sleep_goto_dormant_for_ms(uint32_t delay_ms) {
     bool valid = powman_configure_wakeup_state(sleep_state, wake_state);
     if (!valid) {
         Serial.println("  ERROR: Invalid wakeup state configuration!");
+        sleep_clear_wake_flag();
         return;
     }
     
     Serial.println("  [sleep] Entering DEEP SLEEP (core powered down)...");
+    Serial.println("  [sleep] Will reboot on wake - check sleep_woke_from_deep_sleep()");
     Serial.flush();
-    
-    // Wait for serial to complete
     delay(100);
     
     // Power down the switched core - THIS IS THE DEEP SLEEP
-    // Execution will NOT continue past this point
-    // When alarm fires, we'll wake at deep_sleep_wake_handler()
+    // On wake, the chip will REBOOT but the scratch register preserves our flag
     powman_set_power_state(sleep_state);
     __wfi();
     
-    // We should never reach here - wake goes to boot vector
+    // We should never reach here
     Serial.println("  ERROR: Should not reach here!");
 }
 
 void sleep_power_up(void) {
-    // This is now handled by deep_sleep_wake_handler
-    // Called automatically on wake
+    // Not needed for deep sleep - system reboots on wake
+    // Use sleep_woke_from_deep_sleep() to detect wake state
 }

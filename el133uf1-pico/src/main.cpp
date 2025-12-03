@@ -44,50 +44,10 @@ extern "C" {
 // (SPI1 is the correct bus for GP10/GP11 on Pico)
 EL133UF1 display(&SPI1);
 
-// Forward declarations
+// Forward declaration
 void drawDemoPattern();
-void onWakeFromSleep();
 
-// ========================================================================
-// Wake callback - runs after deep sleep wake
-// ========================================================================
-void onWakeFromSleep() {
-    Serial.println("=== Continuing after deep sleep ===\n");
-    
-    // Reinitialize SPI
-    Serial.println("Reinitializing SPI1...");
-    SPI1.setSCK(PIN_SPI_SCK);
-    SPI1.setTX(PIN_SPI_MOSI);
-    SPI1.begin();
-    
-    // Reinitialize display (just GPIO, not full init)
-    Serial.println("Reinitializing display GPIO...");
-    pinMode(PIN_CS0, OUTPUT);
-    pinMode(PIN_CS1, OUTPUT);
-    pinMode(PIN_DC, OUTPUT);
-    pinMode(PIN_RESET, OUTPUT);
-    pinMode(PIN_BUSY, INPUT_PULLUP);
-    digitalWrite(PIN_CS0, HIGH);
-    digitalWrite(PIN_CS1, HIGH);
-    
-    // Modify the display buffer (it should still be in PSRAM!)
-    Serial.println("\n=== Drawing modification ===");
-    uint32_t drawStart = millis();
-    display.fillRect(700, 500, 200, 200, EL133UF1_RED);
-    display.drawText(710, 550, "WAKE!", EL133UF1_WHITE, EL133UF1_RED, 4);
-    Serial.printf("Modification took: %lu ms\n", millis() - drawStart);
-    
-    // Second update - skip init since display is still powered
-    Serial.println("\n=== Second update (after deep sleep) ===");
-    display.update(true);  // true = skip init
-    
-    Serial.println("\n=== Demo complete! ===");
-    Serial.println("Successfully demonstrated:");
-    Serial.println("  - TRUE deep sleep (switched core powered down)");
-    Serial.println("  - Wake via powman timer alarm");
-    Serial.println("  - RAM preserved across sleep");
-    Serial.println("  - Display update after wake");
-}
+void doSecondUpdate();  // Forward declaration
 
 void setup() {
     // Initialize serial for debugging
@@ -95,10 +55,31 @@ void setup() {
     
     // Wait for serial connection (useful for debugging)
     uint32_t startWait = millis();
-    while (!Serial && (millis() - startWait < 5000)) {
+    while (!Serial && (millis() - startWait < 3000)) {
         delay(100);
     }
     
+    // ================================================================
+    // Check if we woke from deep sleep
+    // ================================================================
+    if (sleep_woke_from_deep_sleep()) {
+        Serial.println("\n\n========================================");
+        Serial.println("*** WOKE FROM DEEP SLEEP! ***");
+        Serial.println("========================================\n");
+        
+        // Clear the flag for next time
+        sleep_clear_wake_flag();
+        
+        // Do the second update
+        doSecondUpdate();
+        
+        Serial.println("\nDemo complete! Entering idle loop.");
+        while(1) delay(10000);
+    }
+    
+    // ================================================================
+    // Normal startup (first boot)
+    // ================================================================
     Serial.println("\n\n===========================================");
     Serial.println("EL133UF1 13.3\" Spectra 6 E-Ink Display Demo");
     Serial.println("===========================================\n");
@@ -184,44 +165,70 @@ void setup() {
     // Enter deep sleep for 10 seconds
     Serial.println("\n=== Entering deep sleep for 10 seconds ===");
     Serial.println("Using RP2350 powman - TRUE deep sleep (core powers down)");
-    Serial.println("NOTE: On wake, code restarts from boot vector");
+    Serial.println("On wake, system reboots but we detect it via scratch register");
     
     Serial.flush();
     delay(100);
-    
-    // Set up wake callback - this runs when we wake from deep sleep
-    sleep_set_wake_callback(onWakeFromSleep);
     
     // Prepare powman timer for deep sleep
     Serial.println("Preparing for deep sleep...");
     sleep_run_from_lposc();
     
     // Go to deep sleep for 10 seconds
-    // WARNING: Execution does NOT continue past this point!
-    // On wake, the boot vector runs (which calls onWakeFromSleep)
+    // On wake, the chip REBOOTS but sleep_woke_from_deep_sleep() returns true
     sleep_goto_dormant_for_ms(10000);
     
-    // We should never reach here - execution restarts from boot vector on wake
+    // We should never reach here
     Serial.println("ERROR: Should not reach here after deep sleep!");
     while(1) delay(1000);
+}
+
+// ================================================================
+// Called after waking from deep sleep
+// ================================================================
+void doSecondUpdate() {
+    Serial.println("=== Continuing after deep sleep ===\n");
     
-    // Modify the display
-    Serial.println("\n=== Drawing modification ===");
-    drawStart = millis();
-    display.fillRect(700, 500, 200, 200, EL133UF1_RED);
-    display.drawText(710, 550, "2nd", EL133UF1_WHITE, EL133UF1_RED, 4);
-    Serial.printf("Modification took: %lu ms\n", millis() - drawStart);
+    // Reinitialize SPI
+    Serial.println("Reinitializing SPI1...");
+    SPI1.setSCK(PIN_SPI_SCK);
+    SPI1.setTX(PIN_SPI_MOSI);
+    SPI1.begin();
     
-    // Second update - skip init (faster!)
-    Serial.println("\n=== Second update (skip init - faster!) ===");
-    display.update(true);  // true = skip init sequence
+    // Reinitialize display
+    Serial.println("Reinitializing display...");
+    if (!display.begin(PIN_CS0, PIN_CS1, PIN_DC, PIN_RESET, PIN_BUSY)) {
+        Serial.println("ERROR: Display reinitialization failed!");
+        return;
+    }
     
-    Serial.println("\nDemo complete!");
-    Serial.println("\nFeatures demonstrated:");
-    Serial.println("  - Deep sleep using RP2350 powman + LPOSC (10 sec between updates)");
-    Serial.println("  - update(true) skips init sequence (~1.5s faster)");
-    Serial.println("  - updateAsync() returns immediately, panel refreshes in background");
-    Serial.println("  - setPreRotatedMode(true) for faster updates but slower drawing");
+    // Draw something different for the second update
+    Serial.println("\n=== Drawing for second update ===");
+    uint32_t drawStart = millis();
+    
+    display.clear(EL133UF1_WHITE);
+    display.fillRect(100, 100, 400, 300, EL133UF1_GREEN);
+    display.drawText(150, 200, "AFTER", EL133UF1_WHITE, EL133UF1_GREEN, 6);
+    display.drawText(150, 280, "SLEEP!", EL133UF1_WHITE, EL133UF1_GREEN, 6);
+    
+    display.fillRect(600, 100, 400, 300, EL133UF1_BLUE);
+    display.drawText(650, 200, "DEEP", EL133UF1_WHITE, EL133UF1_BLUE, 6);
+    display.drawText(650, 280, "SLEEP", EL133UF1_WHITE, EL133UF1_BLUE, 6);
+    
+    display.drawText(400, 600, "RP2350 powman demo", EL133UF1_BLACK, EL133UF1_WHITE, 4);
+    display.drawText(350, 700, "10 second deep sleep worked!", EL133UF1_RED, EL133UF1_WHITE, 3);
+    
+    Serial.printf("Drawing took: %lu ms\n", millis() - drawStart);
+    
+    // Second update - with init since we rebooted
+    Serial.println("\n=== Second update ===");
+    display.update(false);
+    
+    Serial.println("\n=== Demo complete! ===");
+    Serial.println("Successfully demonstrated:");
+    Serial.println("  - TRUE deep sleep (switched core powered down)");
+    Serial.println("  - Wake via powman timer alarm after 10 seconds");
+    Serial.println("  - State preserved via powman scratch register");
 }
 
 void loop() {

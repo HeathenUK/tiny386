@@ -76,15 +76,6 @@ bool sleep_woke_from_deep_sleep(void);
  */
 void sleep_clear_wake_flag(void);
 
-/**
- * @brief Set callback function to run after waking from deep sleep
- * 
- * This callback will be called after the system reinitializes on wake.
- * Use this to continue your application after deep sleep.
- * 
- * @param callback Function to call on wake (or NULL to disable)
- */
-void sleep_set_wake_callback(void (*callback)(void));
 
 #ifdef __cplusplus
 }
