@@ -590,25 +590,21 @@ bool EL133UF1::isBusy() {
 void EL133UF1::_sendBuffer() {
     if (_buffer == nullptr) return;
 
-    Serial.println("EL133UF1: Preparing buffer data...");
+    uint32_t stepStart;
 
     if (_packedMode) {
         // Packed mode: buffers are already in the correct format
-        // Just send them directly to the display
-        Serial.println("  Using packed mode - sending directly");
-        
+        stepStart = millis();
         _sendCommand(CMD_DTM, CS0_SEL, _buffer, PACKED_HALF_SIZE);
         _sendCommand(CMD_DTM, CS1_SEL, _bufferRight, PACKED_HALF_SIZE);
-        
-        Serial.println("EL133UF1: Image data sent");
+        Serial.printf("    SPI transmit:   %4lu ms (packed mode)\n", millis() - stepStart);
         return;
     }
 
     // Unpacked mode: need to rotate and pack the buffer
-    // Allocate temporary buffers for packed data (480000 bytes each)
-    // Must use pmalloc since these are too large for regular RAM
     const size_t SEND_HALF_SIZE = PACKED_HALF_SIZE;  // 480000 bytes
     
+    stepStart = millis();
     uint8_t* bufA = (uint8_t*)pmalloc(SEND_HALF_SIZE);
     uint8_t* bufB = (uint8_t*)pmalloc(SEND_HALF_SIZE);
     
@@ -618,12 +614,10 @@ void EL133UF1::_sendBuffer() {
         if (bufB) free(bufB);
         return;
     }
-    
-    Serial.printf("  Send buffers: bufA=%p, bufB=%p\n", bufA, bufB);
+    Serial.printf("    Buffer alloc:   %4lu ms\n", millis() - stepStart);
 
     // Process the buffer with rotation
-    // 90° clockwise rotation with horizontal flip correction
-    // Maps buffer (1600w x 1200h) to panel (1600 rows x 1200 cols, split into two 600-col halves)
+    stepStart = millis();
     
     size_t idxA = 0;
     size_t idxB = 0;
@@ -631,7 +625,6 @@ void EL133UF1::_sendBuffer() {
     for (int newRow = 0; newRow < 1600; newRow++) {
         // First half (columns 0-599 of rotated image go to bufA)
         for (int newCol = 0; newCol < 600; newCol += 2) {
-            // Flip horizontally by using (1599 - newRow) instead of newRow
             int oldCol = 1599 - newRow;
             int oldRow0 = 1199 - newCol;
             int oldRow1 = 1199 - (newCol + 1);
@@ -652,17 +645,22 @@ void EL133UF1::_sendBuffer() {
             bufB[idxB++] = (p0 << 4) | p1;
         }
     }
+    Serial.printf("    Rotate/pack:    %4lu ms\n", millis() - stepStart);
 
-    Serial.println("EL133UF1: Sending image data to display...");
-    
     // Send data to display
+    stepStart = millis();
     _sendCommand(CMD_DTM, CS0_SEL, bufA, SEND_HALF_SIZE);
+    uint32_t spiTimeA = millis() - stepStart;
+    
+    stepStart = millis();
     _sendCommand(CMD_DTM, CS1_SEL, bufB, SEND_HALF_SIZE);
+    uint32_t spiTimeB = millis() - stepStart;
+    
+    Serial.printf("    SPI transmit:   %4lu ms (CS0: %lu, CS1: %lu)\n", 
+                  spiTimeA + spiTimeB, spiTimeA, spiTimeB);
 
     free(bufA);
     free(bufB);
-    
-    Serial.println("EL133UF1: Image data sent");
 }
 
 void EL133UF1::update() {
@@ -671,30 +669,42 @@ void EL133UF1::update() {
         return;
     }
 
-    Serial.println("EL133UF1: Starting display update...");
+    Serial.println("\n=== EL133UF1: Display Update Profiling ===");
+    uint32_t totalStart = millis();
+    uint32_t stepStart;
     
-    // Run setup/init sequence (Python calls self.setup() in _update)
+    // Run setup/init sequence
+    stepStart = millis();
     _initSequence();
+    Serial.printf("  Init sequence:    %4lu ms\n", millis() - stepStart);
     
     // Send buffer data to both controllers
+    stepStart = millis();
     _sendBuffer();
+    Serial.printf("  Send buffer:      %4lu ms\n", millis() - stepStart);
 
-    // Power on (Python: self._send_command(EL133UF1_PON, CS_BOTH_SEL))
-    Serial.println("EL133UF1: Power on...");
+    // Power on
+    stepStart = millis();
     _sendCommand(CMD_PON, CS_BOTH_SEL);
-    _busyWait(200);  // Python: self._busy_wait(0.2)
+    _busyWait(200);
+    Serial.printf("  Power on:         %4lu ms\n", millis() - stepStart);
 
-    // Display refresh (Python: self._send_command(EL133UF1_DRF, CS_BOTH_SEL, [0x00]))
-    Serial.println("EL133UF1: Triggering refresh (this takes ~30 seconds)...");
+    // Display refresh (this is the long one - panel physically updating)
+    stepStart = millis();
     const uint8_t drf[] = {0x00};
     _sendCommand(CMD_DRF, CS_BOTH_SEL, drf, sizeof(drf));
-    _busyWait(32000);  // Python: self._busy_wait(32.0)
+    _busyWait(32000);
+    Serial.printf("  Panel refresh:    %4lu ms\n", millis() - stepStart);
 
-    // Power off (Python: self._send_command(EL133UF1_POF, CS_BOTH_SEL, [0x00]))
-    Serial.println("EL133UF1: Power off...");
+    // Power off
+    stepStart = millis();
     const uint8_t pof[] = {0x00};
     _sendCommand(CMD_POF, CS_BOTH_SEL, pof, sizeof(pof));
-    _busyWait(200);  // Python: self._busy_wait(0.2)
+    _busyWait(200);
+    Serial.printf("  Power off:        %4lu ms\n", millis() - stepStart);
 
-    Serial.println("EL133UF1: Display update complete");
+    uint32_t totalTime = millis() - totalStart;
+    Serial.printf("  -------------------------\n");
+    Serial.printf("  TOTAL:            %4lu ms (%.1f sec)\n", totalTime, totalTime / 1000.0);
+    Serial.println("===========================================\n");
 }

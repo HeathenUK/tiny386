@@ -114,10 +114,13 @@ void setup() {
     Serial.println();
 
     // Draw demo pattern
+    uint32_t drawStart = millis();
     drawDemoPattern();
+    uint32_t drawTime = millis() - drawStart;
+    Serial.printf("Drawing took: %lu ms\n", drawTime);
     
     // Update the display
-    Serial.println("Updating display (this will take ~30 seconds)...");
+    Serial.println("\nUpdating display (this will take ~30 seconds)...");
     display.update();
     
     Serial.println("\nDemo complete!");
