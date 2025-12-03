@@ -616,30 +616,86 @@ void EL133UF1::_sendBuffer() {
     }
     Serial.printf("    Buffer alloc:   %4lu ms\n", millis() - stepStart);
 
-    // Single-core rotation (dual-core doesn't help due to PSRAM bandwidth contention)
-    stepStart = millis();
+    // SRAM-accelerated rotation
+    // Strategy: Copy horizontal strips to SRAM, then read columns from fast SRAM
+    // Strip size: 1600 cols × STRIP_ROWS rows = STRIP_ROWS * 1600 bytes
     
-    uint8_t* pA = bufA;
-    uint8_t* pB = bufB;
+    const int STRIP_ROWS = 100;  // 160KB per strip - fits comfortably in SRAM
+    const size_t STRIP_SIZE = EL133UF1_WIDTH * STRIP_ROWS;
     
-    for (int srcCol = 1599; srcCol >= 0; srcCol--) {
-        const uint8_t* srcPtr = _buffer + srcCol;
+    uint8_t* sramStrip = (uint8_t*)malloc(STRIP_SIZE);  // Regular malloc uses SRAM
+    if (sramStrip == nullptr) {
+        Serial.println("EL133UF1: Failed to allocate SRAM strip buffer, falling back");
+        // Fallback to direct PSRAM access
+        stepStart = millis();
+        uint8_t* pA = bufA;
+        uint8_t* pB = bufB;
+        for (int srcCol = 1599; srcCol >= 0; srcCol--) {
+            const uint8_t* srcPtr = _buffer + srcCol;
+            for (int i = 0; i < 300; i++) {
+                *pA++ = ((srcPtr[0] & 0x07) << 4) | (srcPtr[EL133UF1_WIDTH] & 0x07);
+                srcPtr += EL133UF1_WIDTH * 2;
+            }
+            for (int i = 0; i < 300; i++) {
+                *pB++ = ((srcPtr[0] & 0x07) << 4) | (srcPtr[EL133UF1_WIDTH] & 0x07);
+                srcPtr += EL133UF1_WIDTH * 2;
+            }
+        }
+        Serial.printf("    Rotate/pack:    %4lu ms (fallback)\n", millis() - stepStart);
+    } else {
+        stepStart = millis();
         
-        for (int i = 0; i < 300; i++) {
-            uint8_t p0 = srcPtr[0] & 0x07;
-            uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
-            *pA++ = (p0 << 4) | p1;
-            srcPtr += EL133UF1_WIDTH * 2;
+        // Process bufA (source rows 0-599) in strips
+        for (int stripStart = 0; stripStart < 600; stripStart += STRIP_ROWS) {
+            int stripEnd = min(stripStart + STRIP_ROWS, 600);
+            int stripH = stripEnd - stripStart;
+            
+            // Copy strip from PSRAM to SRAM (sequential read - fast)
+            memcpy(sramStrip, _buffer + stripStart * EL133UF1_WIDTH, stripH * EL133UF1_WIDTH);
+            
+            // Process this strip - read columns from SRAM (random access but fast)
+            // For each source column, we write to a specific position in bufA
+            // Output position: srcCol maps to output row (1599-srcCol)
+            // stripStart..stripEnd maps to output column range
+            
+            for (int srcCol = 1599; srcCol >= 0; srcCol--) {
+                int outRow = 1599 - srcCol;
+                // Output bytes for this row, columns stripStart to stripEnd (packed pairs)
+                uint8_t* outPtr = bufA + outRow * 300 + (stripStart / 2);
+                const uint8_t* sramCol = sramStrip + srcCol;
+                
+                for (int r = 0; r < stripH; r += 2) {
+                    uint8_t p0 = sramCol[r * EL133UF1_WIDTH] & 0x07;
+                    uint8_t p1 = sramCol[(r + 1) * EL133UF1_WIDTH] & 0x07;
+                    *outPtr++ = (p0 << 4) | p1;
+                }
+            }
         }
         
-        for (int i = 0; i < 300; i++) {
-            uint8_t p0 = srcPtr[0] & 0x07;
-            uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
-            *pB++ = (p0 << 4) | p1;
-            srcPtr += EL133UF1_WIDTH * 2;
+        // Process bufB (source rows 600-1199) in strips
+        for (int stripStart = 600; stripStart < 1200; stripStart += STRIP_ROWS) {
+            int stripEnd = min(stripStart + STRIP_ROWS, 1200);
+            int stripH = stripEnd - stripStart;
+            
+            memcpy(sramStrip, _buffer + stripStart * EL133UF1_WIDTH, stripH * EL133UF1_WIDTH);
+            
+            for (int srcCol = 1599; srcCol >= 0; srcCol--) {
+                int outRow = 1599 - srcCol;
+                int outColStart = stripStart - 600;
+                uint8_t* outPtr = bufB + outRow * 300 + (outColStart / 2);
+                const uint8_t* sramCol = sramStrip + srcCol;
+                
+                for (int r = 0; r < stripH; r += 2) {
+                    uint8_t p0 = sramCol[r * EL133UF1_WIDTH] & 0x07;
+                    uint8_t p1 = sramCol[(r + 1) * EL133UF1_WIDTH] & 0x07;
+                    *outPtr++ = (p0 << 4) | p1;
+                }
+            }
         }
+        
+        free(sramStrip);
+        Serial.printf("    Rotate/pack:    %4lu ms (SRAM-accelerated)\n", millis() - stepStart);
     }
-    Serial.printf("    Rotate/pack:    %4lu ms\n", millis() - stepStart);
 
     stepStart = millis();
     _sendCommand(CMD_DTM, CS0_SEL, bufA, SEND_HALF_SIZE);
