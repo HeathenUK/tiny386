@@ -232,29 +232,21 @@ bool EL133UF1::_busyWait(uint32_t timeoutMs) {
     uint32_t startTime = millis();
     
     // Phase 1: Wait for busy to go LOW (display acknowledges command)
-    // Use fast polling initially, then slow down
-    uint32_t pollDelay = 0;
     while (digitalRead(_busyPin) == HIGH) {
         if (millis() - startTime > timeoutMs) {
             Serial.println("EL133UF1: Busy never asserted (stayed HIGH)");
             return true;  // Continue anyway - might be OK
         }
-        if (pollDelay < 100) {
-            delayMicroseconds(100);  // Fast polling initially
-            pollDelay++;
-        } else {
-            delay(1);  // Then 1ms polling
-        }
+        delay(1);
     }
     
     // Phase 2: Wait for busy to go HIGH (display finished)
-    // This can take ~30 seconds for refresh, so use longer polling
     while (digitalRead(_busyPin) == LOW) {
         if (millis() - startTime > timeoutMs) {
             Serial.println("EL133UF1: Busy timeout (stuck LOW)");
             return false;
         }
-        delay(50);  // 50ms is fine for long waits
+        delay(10);
     }
     
     return true;
@@ -272,10 +264,9 @@ void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, siz
     }
 
     // Send command (DC low = command mode)
-    // CircuitPython uses 100ms but that's very conservative
-    // Most e-ink displays work fine with much shorter delays
+    // CircuitPython uses 100ms - trying 1ms as a balance
     digitalWrite(_dcPin, LOW);
-    delayMicroseconds(10);  // 10µs should be plenty for DC setup
+    delay(1);  // 1ms delay for DC setup
     
     _spi->beginTransaction(_spiSettings);
     _spi->transfer(cmd);
@@ -634,38 +625,31 @@ void EL133UF1::_sendBuffer() {
     // After 90° clockwise rotation (rot90 with k=-1):
     // new[new_row][new_col] = old[cols - 1 - new_col][new_row]
     // where old is (1200 rows x 1600 cols), new is (1600 rows x 1200 cols)
-    //
-    // Optimized: process column by column for better cache locality
-    // oldCol = newRow, so we iterate through source columns
     
-    uint8_t* pA = bufA;
-    uint8_t* pB = bufB;
+    size_t idxA = 0;
+    size_t idxB = 0;
     
-    for (int srcCol = 0; srcCol < 1600; srcCol++) {
-        // For this source column, read pixels from bottom to top (rows 1199 down to 0)
-        // and pack them into the destination buffers
-        
-        // Buffer A: rotated columns 0-599 come from source rows 1199-600
-        const uint8_t* srcRowPtr = _buffer + 1199 * EL133UF1_WIDTH + srcCol;
-        
-        for (int i = 0; i < 300; i++) {  // 600 pixels / 2 = 300 bytes
-            uint8_t p0 = (*srcRowPtr) & 0x07;
-            srcRowPtr -= EL133UF1_WIDTH;  // Move up one row
-            uint8_t p1 = (*srcRowPtr) & 0x07;
-            srcRowPtr -= EL133UF1_WIDTH;  // Move up one row
-            *pA++ = (p0 << 4) | p1;
+    for (int newRow = 0; newRow < 1600; newRow++) {
+        // First half (columns 0-599 of rotated image go to bufA)
+        for (int newCol = 0; newCol < 600; newCol += 2) {
+            int oldCol = newRow;
+            int oldRow0 = 1199 - newCol;
+            int oldRow1 = 1199 - (newCol + 1);
+            
+            uint8_t p0 = _buffer[oldRow0 * EL133UF1_WIDTH + oldCol] & 0x07;
+            uint8_t p1 = _buffer[oldRow1 * EL133UF1_WIDTH + oldCol] & 0x07;
+            bufA[idxA++] = (p0 << 4) | p1;
         }
         
-        // Buffer B: rotated columns 600-1199 come from source rows 599-0
-        // srcRowPtr is now at row 600, continue from 599
-        srcRowPtr = _buffer + 599 * EL133UF1_WIDTH + srcCol;
-        
-        for (int i = 0; i < 300; i++) {  // 600 pixels / 2 = 300 bytes
-            uint8_t p0 = (*srcRowPtr) & 0x07;
-            srcRowPtr -= EL133UF1_WIDTH;
-            uint8_t p1 = (*srcRowPtr) & 0x07;
-            srcRowPtr -= EL133UF1_WIDTH;
-            *pB++ = (p0 << 4) | p1;
+        // Second half (columns 600-1199 of rotated image go to bufB)
+        for (int newCol = 600; newCol < 1200; newCol += 2) {
+            int oldCol = newRow;
+            int oldRow0 = 1199 - newCol;
+            int oldRow1 = 1199 - (newCol + 1);
+            
+            uint8_t p0 = _buffer[oldRow0 * EL133UF1_WIDTH + oldCol] & 0x07;
+            uint8_t p1 = _buffer[oldRow1 * EL133UF1_WIDTH + oldCol] & 0x07;
+            bufB[idxB++] = (p0 << 4) | p1;
         }
     }
 
