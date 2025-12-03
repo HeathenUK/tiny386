@@ -47,42 +47,58 @@ EL133UF1 display(&SPI1);
 // Forward declaration
 void drawDemoPattern();
 
-void doSecondUpdate();  // Forward declaration
+void doDisplayUpdate(int updateNumber);  // Forward declaration
+
+// Track how many updates we've done (stored in scratch register 1)
+#define UPDATE_COUNT_REG 1
+
+int getUpdateCount() {
+    return (int)powman_hw->scratch[UPDATE_COUNT_REG];
+}
+
+void setUpdateCount(int count) {
+    powman_hw->scratch[UPDATE_COUNT_REG] = (uint32_t)count;
+}
 
 void setup() {
     // Initialize serial for debugging
     Serial.begin(115200);
     
-    // Wait for serial connection (useful for debugging)
+    // Wait for serial connection
     uint32_t startWait = millis();
-    while (!Serial && (millis() - startWait < 3000)) {
+    while (!Serial && (millis() - startWait < 2000)) {
         delay(100);
     }
+    
+    // Get current update count and RTC time
+    int updateCount = sleep_woke_from_deep_sleep() ? getUpdateCount() : 0;
+    uint32_t uptime = sleep_get_uptime_seconds();
     
     // ================================================================
     // Check if we woke from deep sleep
     // ================================================================
     if (sleep_woke_from_deep_sleep()) {
         Serial.println("\n\n========================================");
-        Serial.println("*** WOKE FROM DEEP SLEEP! ***");
+        Serial.printf("*** WOKE FROM DEEP SLEEP! (update #%d) ***\n", updateCount + 1);
+        Serial.printf("*** RTC uptime: %lu seconds ***\n", uptime);
         Serial.println("========================================\n");
         
-        // Clear the flag for next time
+        // Clear the wake flag
         sleep_clear_wake_flag();
+    } else {
+        // First boot
+        Serial.println("\n\n===========================================");
+        Serial.println("EL133UF1 13.3\" Spectra 6 E-Ink Display Demo");
+        Serial.println("===========================================\n");
         
-        // Do the second update
-        doSecondUpdate();
-        
-        Serial.println("\nDemo complete! Entering idle loop.");
-        while(1) delay(10000);
+        // Initialize the RTC timer
+        sleep_set_time_ms(0);
+        setUpdateCount(0);
     }
     
     // ================================================================
-    // Normal startup (first boot)
+    // Common setup
     // ================================================================
-    Serial.println("\n\n===========================================");
-    Serial.println("EL133UF1 13.3\" Spectra 6 E-Ink Display Demo");
-    Serial.println("===========================================\n");
 
     // Check memory availability
     Serial.println("Memory check:");
@@ -152,30 +168,23 @@ void setup() {
                   display.width(), display.height());
     Serial.println();
 
-    // Draw demo pattern
-    uint32_t drawStart = millis();
-    drawDemoPattern();
-    uint32_t drawTime = millis() - drawStart;
-    Serial.printf("Drawing took: %lu ms\n", drawTime);
-    
-    // First update - full init
-    Serial.println("\n=== First update (with init) ===");
-    display.update(false);  // false = run init sequence
+    // Do display update
+    updateCount++;
+    setUpdateCount(updateCount);
+    doDisplayUpdate(updateCount);
     
     // Enter deep sleep for 10 seconds
     Serial.println("\n=== Entering deep sleep for 10 seconds ===");
+    Serial.printf("RTC time: %lu seconds\n", sleep_get_uptime_seconds());
     Serial.println("Using RP2350 powman - TRUE deep sleep (core powers down)");
-    Serial.println("On wake, system reboots but we detect it via scratch register");
     
     Serial.flush();
     delay(100);
     
     // Prepare powman timer for deep sleep
-    Serial.println("Preparing for deep sleep...");
     sleep_run_from_lposc();
     
     // Go to deep sleep for 10 seconds
-    // On wake, the chip REBOOTS but sleep_woke_from_deep_sleep() returns true
     sleep_goto_dormant_for_ms(10000);
     
     // We should never reach here
@@ -184,51 +193,61 @@ void setup() {
 }
 
 // ================================================================
-// Called after waking from deep sleep
+// Perform a display update (called on each wake cycle)
 // ================================================================
-void doSecondUpdate() {
-    Serial.println("=== Continuing after deep sleep ===\n");
+void doDisplayUpdate(int updateNumber) {
+    Serial.printf("\n=== Display Update #%d ===\n", updateNumber);
+    
+    uint32_t uptime = sleep_get_uptime_seconds();
     
     // Reinitialize SPI
-    Serial.println("Reinitializing SPI1...");
     SPI1.setSCK(PIN_SPI_SCK);
     SPI1.setTX(PIN_SPI_MOSI);
     SPI1.begin();
     
-    // Reinitialize display
-    Serial.println("Reinitializing display...");
+    // Initialize display
     if (!display.begin(PIN_CS0, PIN_CS1, PIN_DC, PIN_RESET, PIN_BUSY)) {
-        Serial.println("ERROR: Display reinitialization failed!");
+        Serial.println("ERROR: Display initialization failed!");
         return;
     }
     
-    // Draw something different for the second update
-    Serial.println("\n=== Drawing for second update ===");
+    // Draw update info
     uint32_t drawStart = millis();
     
     display.clear(EL133UF1_WHITE);
-    display.fillRect(100, 100, 400, 300, EL133UF1_GREEN);
-    display.drawText(150, 200, "AFTER", EL133UF1_WHITE, EL133UF1_GREEN, 6);
-    display.drawText(150, 280, "SLEEP!", EL133UF1_WHITE, EL133UF1_GREEN, 6);
     
-    display.fillRect(600, 100, 400, 300, EL133UF1_BLUE);
-    display.drawText(650, 200, "DEEP", EL133UF1_WHITE, EL133UF1_BLUE, 6);
-    display.drawText(650, 280, "SLEEP", EL133UF1_WHITE, EL133UF1_BLUE, 6);
+    // Title
+    display.drawText(200, 100, "RP2350 Deep Sleep Demo", EL133UF1_BLACK, EL133UF1_WHITE, 5);
     
-    display.drawText(400, 600, "RP2350 powman demo", EL133UF1_BLACK, EL133UF1_WHITE, 4);
-    display.drawText(350, 700, "10 second deep sleep worked!", EL133UF1_RED, EL133UF1_WHITE, 3);
+    // Update number - big and colorful
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Update #%d", updateNumber);
+    
+    // Cycle through colors based on update number
+    uint8_t colors[] = {EL133UF1_RED, EL133UF1_GREEN, EL133UF1_BLUE, EL133UF1_YELLOW};
+    uint8_t color = colors[(updateNumber - 1) % 4];
+    
+    display.fillRect(200, 250, 800, 200, color);
+    display.drawText(280, 300, buf, EL133UF1_WHITE, color, 8);
+    
+    // RTC time
+    uint32_t hours = uptime / 3600;
+    uint32_t mins = (uptime % 3600) / 60;
+    uint32_t secs = uptime % 60;
+    snprintf(buf, sizeof(buf), "Uptime: %02lu:%02lu:%02lu", hours, mins, secs);
+    display.drawText(350, 550, buf, EL133UF1_BLACK, EL133UF1_WHITE, 4);
+    
+    // Info
+    display.drawText(250, 700, "10 sec deep sleep between updates", EL133UF1_BLACK, EL133UF1_WHITE, 3);
+    display.drawText(300, 800, "RTC maintained via powman timer", EL133UF1_BLACK, EL133UF1_WHITE, 3);
     
     Serial.printf("Drawing took: %lu ms\n", millis() - drawStart);
     
-    // Second update - with init since we rebooted
-    Serial.println("\n=== Second update ===");
+    // Update display
     display.update(false);
     
-    Serial.println("\n=== Demo complete! ===");
-    Serial.println("Successfully demonstrated:");
-    Serial.println("  - TRUE deep sleep (switched core powered down)");
-    Serial.println("  - Wake via powman timer alarm after 10 seconds");
-    Serial.println("  - State preserved via powman scratch register");
+    Serial.printf("Update #%d complete. Uptime: %02lu:%02lu:%02lu\n", 
+                  updateNumber, hours, mins, secs);
 }
 
 void loop() {

@@ -54,6 +54,30 @@ static void sleep_set_wake_flag(void) {
 }
 
 // ========================================================================
+// RTC / Timer functions
+// ========================================================================
+
+uint64_t sleep_get_time_ms(void) {
+    return powman_timer_get_ms();
+}
+
+void sleep_set_time_ms(uint64_t time_ms) {
+    powman_timer_set_ms(time_ms);
+}
+
+uint32_t sleep_get_uptime_seconds(void) {
+    return (uint32_t)(powman_timer_get_ms() / 1000);
+}
+
+// Initialize the powman timer if not already running
+static void ensure_timer_running(void) {
+    if (!powman_timer_is_running()) {
+        powman_timer_set_ms(0);
+        powman_timer_start();
+    }
+}
+
+// ========================================================================
 // Public API
 // ========================================================================
 

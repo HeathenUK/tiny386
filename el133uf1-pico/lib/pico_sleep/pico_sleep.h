@@ -76,6 +76,30 @@ bool sleep_woke_from_deep_sleep(void);
  */
 void sleep_clear_wake_flag(void);
 
+/**
+ * @brief Get the current RTC time in milliseconds
+ * 
+ * This timer runs continuously, even during deep sleep (using LPOSC).
+ * It starts at 0 on first boot but persists across sleep cycles.
+ * 
+ * @return Current time in milliseconds since timer was started
+ */
+uint64_t sleep_get_time_ms(void);
+
+/**
+ * @brief Set the RTC time in milliseconds
+ * 
+ * @param time_ms Time to set in milliseconds
+ */
+void sleep_set_time_ms(uint64_t time_ms);
+
+/**
+ * @brief Get uptime in seconds (convenience function)
+ * 
+ * @return Seconds since timer started
+ */
+uint32_t sleep_get_uptime_seconds(void);
+
 
 #ifdef __cplusplus
 }
