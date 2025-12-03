@@ -81,23 +81,18 @@ bool connectWiFiAndGetNTP() {
     Serial.println("\n=== Getting NTP time ===");
     NTP.begin(NTP_SERVER1, NTP_SERVER2);
     
-    // Wait for time to sync
-    int retry = 0;
-    time_t now = 0;
-    while (now < 1000000000 && retry < 20) {  // Valid time is > year 2001
-        Serial.print(".");
-        delay(500);
-        now = time(nullptr);
-        retry++;
-    }
+    // Use the built-in waitSet function with 15 second timeout
+    Serial.println("Waiting for NTP sync...");
+    bool synced = NTP.waitSet([]() { Serial.print("."); }, 15000);
     
-    if (now < 1000000000) {
+    if (!synced) {
         Serial.println("\nFailed to get NTP time!");
         WiFi.disconnect(true);
         return false;
     }
     
-    // Get time as milliseconds since epoch
+    // Get time
+    time_t now = time(nullptr);
     uint64_t now_ms = (uint64_t)now * 1000;
     
     // Set the powman timer to current time
