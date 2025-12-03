@@ -22,23 +22,40 @@ EL133UF1::EL133UF1(SPIClass* spi) :
 
 bool EL133UF1::begin(int8_t cs0Pin, int8_t cs1Pin, int8_t dcPin, 
                      int8_t resetPin, int8_t busyPin) {
+    Serial.println("EL133UF1::begin() starting...");
+    
     _cs0Pin = cs0Pin;
     _cs1Pin = cs1Pin;
     _dcPin = dcPin;
     _resetPin = resetPin;
     _busyPin = busyPin;
 
+    Serial.printf("  Pins: CS0=%d CS1=%d DC=%d RST=%d BUSY=%d\n", 
+                  _cs0Pin, _cs1Pin, _dcPin, _resetPin, _busyPin);
+
     // Allocate frame buffer (1.92 MB for 1600x1200)
+    // This REQUIRES PSRAM - regular RAM is only 512KB!
+    Serial.println("  Allocating frame buffer...");
+    
+    // arduino-pico automatically uses PSRAM for large allocations if available
+    // The malloc() will use PSRAM when the size is large enough
     _buffer = (uint8_t*)malloc(EL133UF1_WIDTH * EL133UF1_HEIGHT);
+    
     if (_buffer == nullptr) {
         Serial.println("EL133UF1: Failed to allocate frame buffer!");
+        Serial.println("  This display requires PSRAM for the 1.92MB frame buffer.");
+        Serial.println("  Make sure you're using a board with PSRAM (like Pico Plus 2 W)");
+        Serial.println("  and PSRAM is enabled in platformio.ini");
         return false;
     }
+    Serial.printf("  Frame buffer allocated at %p (%d bytes)\n", 
+                  _buffer, EL133UF1_WIDTH * EL133UF1_HEIGHT);
     
     // Initialize buffer to white
     memset(_buffer, EL133UF1_WHITE, EL133UF1_WIDTH * EL133UF1_HEIGHT);
 
     // Configure GPIO pins
+    Serial.println("  Configuring GPIO pins...");
     pinMode(_cs0Pin, OUTPUT);
     pinMode(_cs1Pin, OUTPUT);
     pinMode(_dcPin, OUTPUT);
@@ -50,25 +67,32 @@ bool EL133UF1::begin(int8_t cs0Pin, int8_t cs1Pin, int8_t dcPin,
     digitalWrite(_cs1Pin, HIGH);
     digitalWrite(_dcPin, LOW);
     digitalWrite(_resetPin, HIGH);
+    Serial.println("  GPIO configured");
 
     // Initialize SPI
-    // Note: For arduino-pico with custom pin mapping, configure SPI pins 
-    // in your setup() BEFORE calling display.begin():
-    //   SPI.setSCK(sckPin);
-    //   SPI.setTX(mosiPin);
-    // Then call display.begin() which will call _spi->begin()
+    Serial.println("  Starting SPI...");
     _spi->begin();
+    Serial.printf("  SPI started (speed=%d Hz)\n", EL133UF1_SPI_SPEED);
 
     // Perform hardware reset
+    Serial.println("  Performing hardware reset...");
     _reset();
+    Serial.println("  Reset complete");
+
+    // Check busy pin state
+    Serial.printf("  BUSY pin state after reset: %s\n", 
+                  digitalRead(_busyPin) ? "HIGH" : "LOW");
 
     // Wait for display to be ready
+    Serial.println("  Waiting for display ready (busy_wait)...");
     if (!_busyWait(1000)) {
         Serial.println("EL133UF1: Display not responding after reset");
-        return false;
+        // Continue anyway for debugging
     }
+    Serial.println("  Display ready");
 
     // Send initialization sequence
+    Serial.println("  Sending init sequence...");
     _initSequence();
 
     _initialized = true;
@@ -118,7 +142,7 @@ bool EL133UF1::_busyWait(uint32_t timeoutMs) {
 }
 
 void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, size_t len) {
-    _spi->beginTransaction(_spiSettings);
+    // Match CircuitPython exactly
     
     // Assert chip select(s) - active LOW
     if (csSel & CS0_SEL) {
@@ -129,38 +153,43 @@ void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, siz
     }
 
     // Send command (DC low = command mode)
-    // CircuitPython reference uses time.sleep(0.1) = 100ms here
+    // CircuitPython: dc.value = False; time.sleep(0.1); spi.write(bytes([cmd]))
     digitalWrite(_dcPin, LOW);
-    delay(100);  // 100ms delay for DC setup (matches working CircuitPython)
+    delay(100);  // 100ms delay - matches CircuitPython
+    
+    _spi->beginTransaction(_spiSettings);
     _spi->transfer(cmd);
+    _spi->endTransaction();
 
     // Send data if present (DC high = data mode)
+    // CircuitPython: if data: dc.value = True; spi.write(bytes(data))
     if (data != nullptr && len > 0) {
         digitalWrite(_dcPin, HIGH);
         
-        // Send data in chunks to avoid issues with large transfers
+        _spi->beginTransaction(_spiSettings);
+        // For large transfers, send in chunks
         const size_t chunkSize = 4096;
         for (size_t offset = 0; offset < len; offset += chunkSize) {
             size_t remaining = len - offset;
             size_t toSend = (remaining < chunkSize) ? remaining : chunkSize;
+            // Use transfer with nullptr for write-only
             _spi->transfer(data + offset, nullptr, toSend);
         }
+        _spi->endTransaction();
     }
 
-    // Deassert chip selects - return to HIGH (inactive)
+    // CircuitPython finally block: dc.value = False; cs0.value = True; cs1.value = True
+    digitalWrite(_dcPin, LOW);
     digitalWrite(_cs0Pin, HIGH);
     digitalWrite(_cs1Pin, HIGH);
-    digitalWrite(_dcPin, LOW);
-
-    _spi->endTransaction();
 }
 
 void EL133UF1::_initSequence() {
     // Initialization sequence from working CircuitPython reference
-    // Note: CircuitPython sends power commands to CS_BOTH (differs from Pimoroni Python)
-    // but both approaches appear to work
+    Serial.println("    _initSequence: Starting...");
     
     // ANTM - Anti-crosstalk magic (CS0 only) - must be sent first after reset
+    Serial.println("    Sending ANTM (0x74) to CS0...");
     const uint8_t antm[] = {0xC0, 0x1C, 0x1C, 0xCC, 0xCC, 0xCC, 0x15, 0x15, 0x55};
     _sendCommand(CMD_ANTM, CS0_SEL, antm, sizeof(antm));
 
@@ -231,10 +260,11 @@ void EL133UF1::_initSequence() {
     _sendCommand(CMD_BUCK_BOOST_VDDN, CS_BOTH_SEL, buck_boost, sizeof(buck_boost));
 
     // TFT_VCOM_POWER
+    Serial.println("    Sending TFT_VCOM_POWER...");
     const uint8_t vcom_power[] = {0x02};
     _sendCommand(CMD_TFT_VCOM_POWER, CS_BOTH_SEL, vcom_power, sizeof(vcom_power));
 
-    Serial.println("EL133UF1: Init sequence complete");
+    Serial.println("    _initSequence: Complete");
 }
 
 void EL133UF1::clear(uint8_t color) {

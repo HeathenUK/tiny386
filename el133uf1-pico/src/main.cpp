@@ -45,15 +45,23 @@ void setup() {
     
     // Wait for serial connection (useful for debugging)
     uint32_t startWait = millis();
-    while (!Serial && (millis() - startWait < 3000)) {
+    while (!Serial && (millis() - startWait < 5000)) {
         delay(100);
     }
     
     Serial.println("\n\n===========================================");
     Serial.println("EL133UF1 13.3\" Spectra 6 E-Ink Display Demo");
     Serial.println("===========================================\n");
+
+    // Check PSRAM availability
+    Serial.println("Checking PSRAM...");
+    size_t psramSize = rp2040.getPSRAMSize();
+    Serial.printf("  PSRAM size: %d bytes (%d MB)\n", psramSize, psramSize / (1024*1024));
+    if (psramSize == 0) {
+        Serial.println("  WARNING: No PSRAM detected! This demo requires PSRAM.");
+    }
     
-    Serial.println("Pico Plus 2 W Pin Configuration:");
+    Serial.println("\nPico Plus 2 W Pin Configuration:");
     Serial.printf("  SPI SCK:  GP%d\n", PIN_SPI_SCK);
     Serial.printf("  SPI MOSI: GP%d\n", PIN_SPI_MOSI);
     Serial.printf("  CS0:      GP%d\n", PIN_CS0);
@@ -63,10 +71,16 @@ void setup() {
     Serial.printf("  BUSY:     GP%d\n", PIN_BUSY);
     Serial.println();
 
+    // Test: Read BUSY pin state before anything
+    pinMode(PIN_BUSY, INPUT_PULLUP);
+    Serial.printf("BUSY pin initial state: %s\n", digitalRead(PIN_BUSY) ? "HIGH" : "LOW");
+
     // Configure SPI1 pins BEFORE initializing display
     // arduino-pico requires pin configuration before SPI.begin()
+    Serial.println("Configuring SPI1 pins...");
     SPI1.setSCK(PIN_SPI_SCK);
     SPI1.setTX(PIN_SPI_MOSI);
+    Serial.println("SPI1 pins configured");
 
     // Initialize the display
     Serial.println("Initializing display...");
