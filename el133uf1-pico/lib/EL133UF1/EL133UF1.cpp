@@ -264,9 +264,9 @@ void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, siz
     }
 
     // Send command (DC low = command mode)
-    // CircuitPython uses 100ms but 50ms seems to work
+    // This display needs ~90-100ms delay for DC setup
     digitalWrite(_dcPin, LOW);
-    delay(50);  // 50ms delay for DC setup
+    delay(90);  // 90ms delay for DC setup
     
     _spi->beginTransaction(_spiSettings);
     _spi->transfer(cmd);
