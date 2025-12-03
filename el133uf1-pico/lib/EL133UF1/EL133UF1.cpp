@@ -617,7 +617,7 @@ void EL133UF1::_sendBuffer() {
     Serial.printf("    Buffer alloc:   %4lu ms\n", millis() - stepStart);
 
     // Process the buffer with rotation
-    // Trying counter-clockwise rotation instead of clockwise
+    // Flip horizontally by reversing oldCol
     stepStart = millis();
     
     size_t idxA = 0;
@@ -626,7 +626,7 @@ void EL133UF1::_sendBuffer() {
     for (int newRow = 0; newRow < 1600; newRow++) {
         // First half (columns 0-599 of rotated image go to bufA)
         for (int newCol = 0; newCol < 600; newCol += 2) {
-            int oldCol = newRow;
+            int oldCol = 1599 - newRow;  // Flip horizontally
             int oldRow0 = newCol;
             int oldRow1 = newCol + 1;
             
@@ -637,7 +637,7 @@ void EL133UF1::_sendBuffer() {
         
         // Second half (columns 600-1199 of rotated image go to bufB)
         for (int newCol = 600; newCol < 1200; newCol += 2) {
-            int oldCol = newRow;
+            int oldCol = 1599 - newRow;  // Flip horizontally
             int oldRow0 = newCol;
             int oldRow1 = newCol + 1;
             
