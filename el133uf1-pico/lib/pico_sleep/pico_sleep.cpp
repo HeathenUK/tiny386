@@ -17,6 +17,7 @@
 #include "hardware/structs/rosc.h"
 #include "hardware/structs/powman.h"
 #include "hardware/regs/powman.h"
+#include "hardware/structs/systick.h"
 #include "hardware/sync.h"
 #include "pico/runtime_init.h"
 
@@ -205,6 +206,28 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
             break;
     }
 
+    // IMPORTANT: Switch powman timer to LPOSC BEFORE disabling XOSC
+    // The timer might be using XOSC and we need it for timed wakeup
+    if (dormant_source == DORMANT_SOURCE_LPOSC) {
+        // Initialize timer if not running
+        if (!powman_timer_is_running()) {
+            powman_timer_set_ms(0);
+            powman_timer_start();
+        }
+        
+        uint64_t current_ms = powman_timer_get_ms();
+        powman_timer_set_1khz_tick_source_lposc();
+        powman_timer_set_ms(current_ms);
+        
+        // Wait for switch to complete
+        while (!(powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS)) {
+            tight_loop_contents();
+        }
+    }
+
+    // Disable systick to prevent interrupts during sleep
+    systick_hw->csr &= ~1;
+
     // CLK_REF = dormant source
     clock_configure(clk_ref,
                     clk_ref_src,
@@ -237,7 +260,7 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
     pll_deinit(pll_sys);
     pll_deinit(pll_usb);
 
-    // Disable the oscillator we're not using
+    // Now safe to disable the oscillator we're not using
     if (dormant_source == DORMANT_SOURCE_XOSC) {
         rosc_disable();
     } else if (dormant_source == DORMANT_SOURCE_ROSC || dormant_source == DORMANT_SOURCE_LPOSC) {
@@ -270,57 +293,80 @@ void sleep_goto_dormant_for_ms(uint32_t delay_ms) {
         return;
     }
     
-    // Save current time and switch to LPOSC
-    uint64_t current_ms = powman_timer_get_ms();
-    powman_timer_set_1khz_tick_source_lposc();
-    powman_timer_set_ms(current_ms);
+    // Timer should already be set up by sleep_run_from_dormant_source
+    if (!(powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS)) {
+        Serial.println("  [sleep] ERROR: Timer not using LPOSC!");
+        return;
+    }
     
-    // Start the timer if not running
+    // Ensure timer is running
     if (!powman_timer_is_running()) {
+        Serial.println("  [sleep] Starting timer...");
         powman_timer_start();
     }
+    
+    uint64_t current_ms = powman_timer_get_ms();
+    Serial.printf("  [sleep] Current time: %llu ms\n", current_ms);
+    
+    // Set alarm time
+    uint64_t alarm_time = current_ms + delay_ms;
+    Serial.printf("  [sleep] Alarm set for: %llu ms (in %lu ms)\n", alarm_time, delay_ms);
     
     // Only enable powman clock during sleep
     clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_REF_POWMAN_BITS;
     clocks_hw->sleep_en1 = 0x0;
     
-    // Set alarm
-    uint64_t alarm_time = current_ms + delay_ms;
+    // Configure alarm for wakeup
     powman_enable_alarm_wakeup_at_ms(alarm_time);
     
+    Serial.printf("  [sleep] Timer reg: 0x%08lx (ALARM_ENAB=%d, PWRUP_ON_ALARM=%d)\n", 
+                  powman_hw->timer,
+                  (powman_hw->timer & POWMAN_TIMER_ALARM_ENAB_BITS) ? 1 : 0,
+                  (powman_hw->timer & POWMAN_TIMER_PWRUP_ON_ALARM_BITS) ? 1 : 0);
+    
+    Serial.println("  [sleep] Entering dormant mode NOW...");
     Serial.flush();
     
-    // Enable deep sleep
+    // Small busy wait since delay() might not work with clocks configured for dormant
+    for (volatile int i = 0; i < 100000; i++);
+    
+    // Enable deep sleep at processor level
     processor_deep_sleep();
     
-    // Go dormant
+    // Go dormant - execution stops here until wakeup
     go_dormant();
     
-    // --- Wake up here ---
+    // --- We wake up here after the alarm ---
     
     powman_disable_alarm_wakeup();
 }
 
 void sleep_power_up(void) {
-    // Re-enable ring oscillator
+    // Re-enable ring oscillator first
     rosc_enable();
     
     // Re-enable crystal oscillator
     xosc_init();
     
-    // Reset sleep enable registers
+    // Reset sleep enable registers to allow all clocks
     clocks_hw->sleep_en0 = ~0u;
     clocks_hw->sleep_en1 = ~0u;
     
-    // Restore clocks
+    // Restore all clocks (PLLs, etc.)
     clocks_init();
     
-    // Switch powman back to XOSC
+    // Re-enable systick
+    systick_hw->csr |= 1;
+    
+    // Switch powman timer back to XOSC for accuracy
     uint64_t restore_ms = powman_timer_get_ms();
     powman_timer_set_1khz_tick_source_xosc();
     powman_timer_set_ms(restore_ms);
     
-    // Reinit serial
+    // Reinitialize serial
     Serial.end();
     Serial.begin(115200);
+    
+    // Give serial time to initialize
+    for (volatile int i = 0; i < 1000000; i++);
 }

@@ -23,6 +23,13 @@
 #include "EL133UF1.h"
 #include "pico_sleep.h"
 
+// For CYW43 WiFi module control (needs to be deinitialized for deep sleep)
+#ifdef ARDUINO_RASPBERRY_PI_PICO_W
+extern "C" {
+    #include "pico/cyw43_arch.h"
+}
+#endif
+
 // Pin definitions for Pimoroni Pico Plus 2 W with Inky Impression 13.3"
 // These match the working CircuitPython reference
 #define PIN_SPI_SCK   10    // SPI1 SCK (GP10)
@@ -135,10 +142,18 @@ void setup() {
     // Enter deep sleep for 10 seconds
     Serial.println("\n=== Entering deep sleep for 10 seconds ===");
     Serial.println("Using RP2350 powman with LPOSC for lowest power consumption");
+    
+    // On Pico W boards, must deinitialize WiFi module before deep sleep
+    #ifdef CYW43_WL_GPIO_LED_PIN
+    Serial.println("Deinitializing CYW43 WiFi module...");
+    cyw43_arch_deinit();
+    #endif
+    
     Serial.flush();
     delay(100);  // Let serial output complete
     
     // Prepare for dormant mode - switch to low power oscillator
+    Serial.println("Preparing clocks for dormant mode...");
     sleep_run_from_lposc();
     
     // Go dormant for 10 seconds (10000 ms)
@@ -146,6 +161,12 @@ void setup() {
     
     // Wake up and restore clocks
     sleep_power_up();
+    
+    // Reinitialize CYW43 after wake
+    #ifdef CYW43_WL_GPIO_LED_PIN
+    Serial.println("Reinitializing CYW43...");
+    cyw43_arch_init();
+    #endif
     
     // Reinitialize SPI after clock restoration
     Serial.println("\n=== Woke up from deep sleep! ===");
