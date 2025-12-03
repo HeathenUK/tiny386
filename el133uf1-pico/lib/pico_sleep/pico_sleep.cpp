@@ -187,6 +187,9 @@ static dormant_source_t _dormant_source = DORMANT_SOURCE_LPOSC;
 void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
     _dormant_source = dormant_source;
 
+    Serial.println("  [1] Setting up dormant source...");
+    Serial.flush();
+
     uint32_t src_hz;
     uint32_t clk_ref_src;
     
@@ -207,40 +210,73 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
     }
 
     // IMPORTANT: Switch powman timer to LPOSC BEFORE disabling XOSC
-    // The timer might be using XOSC and we need it for timed wakeup
     if (dormant_source == DORMANT_SOURCE_LPOSC) {
+        Serial.printf("  [2] Timer running: %d, reg: 0x%08lx\n", 
+                      powman_timer_is_running(), powman_hw->timer);
+        Serial.flush();
+        
         // Initialize timer if not running
         if (!powman_timer_is_running()) {
+            Serial.println("  [3] Starting timer...");
+            Serial.flush();
             powman_timer_set_ms(0);
             powman_timer_start();
         }
         
+        Serial.println("  [4] Getting current time...");
+        Serial.flush();
         uint64_t current_ms = powman_timer_get_ms();
+        Serial.printf("  [5] Current time: %llu ms\n", current_ms);
+        Serial.flush();
+        
+        Serial.println("  [6] Switching to LPOSC tick source...");
+        Serial.flush();
         powman_timer_set_1khz_tick_source_lposc();
+        
+        Serial.println("  [7] Restoring time...");
+        Serial.flush();
         powman_timer_set_ms(current_ms);
         
-        // Wait for switch to complete
-        while (!(powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS)) {
-            tight_loop_contents();
+        Serial.println("  [8] Waiting for LPOSC switch...");
+        Serial.flush();
+        
+        // Wait for switch to complete with timeout
+        uint32_t timeout = 100000;
+        while (!(powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) && timeout--) {
+            // busy wait
         }
+        
+        if (timeout == 0) {
+            Serial.printf("  [!] LPOSC switch timeout! Timer reg: 0x%08lx\n", powman_hw->timer);
+            Serial.flush();
+            return;
+        }
+        Serial.println("  [9] LPOSC switch complete");
+        Serial.flush();
     }
 
-    // Disable systick to prevent interrupts during sleep
+    Serial.println("  [10] Disabling systick...");
+    Serial.flush();
     systick_hw->csr &= ~1;
 
-    // CLK_REF = dormant source
+    Serial.println("  [11] Configuring clk_ref...");
+    Serial.flush();
     clock_configure(clk_ref,
                     clk_ref_src,
                     0,
                     src_hz,
                     src_hz);
 
-    // CLK_SYS = CLK_REF
+    Serial.println("  [12] Configuring clk_sys...");
+    Serial.flush();
     clock_configure(clk_sys,
                     CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLK_REF,
                     0,
                     src_hz,
                     src_hz);
+
+    // After this point, Serial won't work reliably (clock too slow)
+    // So we stop debug output here
 
     // Stop unused clocks
     clock_stop(clk_adc);
