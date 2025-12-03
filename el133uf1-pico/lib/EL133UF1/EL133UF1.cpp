@@ -228,29 +228,33 @@ bool EL133UF1::_busyWait(uint32_t timeoutMs) {
     // From working CircuitPython reference - TWO PHASE wait:
     // 1. First wait for busy to ASSERT (go LOW) - display starts working
     // 2. Then wait for busy to DEASSERT (go HIGH) - display finished
-    //
-    // This ensures we catch the full busy cycle, not just part of it.
     
     uint32_t startTime = millis();
     
     // Phase 1: Wait for busy to go LOW (display acknowledges command)
+    // Use fast polling initially, then slow down
+    uint32_t pollDelay = 0;
     while (digitalRead(_busyPin) == HIGH) {
         if (millis() - startTime > timeoutMs) {
-            // If it never went low, the display might not be responding
-            // or the command completed very fast
             Serial.println("EL133UF1: Busy never asserted (stayed HIGH)");
             return true;  // Continue anyway - might be OK
         }
-        delay(10);
+        if (pollDelay < 100) {
+            delayMicroseconds(100);  // Fast polling initially
+            pollDelay++;
+        } else {
+            delay(1);  // Then 1ms polling
+        }
     }
     
     // Phase 2: Wait for busy to go HIGH (display finished)
+    // This can take ~30 seconds for refresh, so use longer polling
     while (digitalRead(_busyPin) == LOW) {
         if (millis() - startTime > timeoutMs) {
             Serial.println("EL133UF1: Busy timeout (stuck LOW)");
             return false;
         }
-        delay(10);
+        delay(50);  // 50ms is fine for long waits
     }
     
     return true;
@@ -268,9 +272,10 @@ void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, siz
     }
 
     // Send command (DC low = command mode)
-    // CircuitPython: dc.value = False; time.sleep(0.1); spi.write(bytes([cmd]))
+    // CircuitPython uses 100ms but that's very conservative
+    // Most e-ink displays work fine with much shorter delays
     digitalWrite(_dcPin, LOW);
-    delay(100);  // 100ms delay - matches CircuitPython
+    delayMicroseconds(10);  // 10µs should be plenty for DC setup
     
     _spi->beginTransaction(_spiSettings);
     _spi->transfer(cmd);
@@ -451,9 +456,14 @@ void EL133UF1::drawHLine(int16_t x, int16_t y, int16_t w, uint8_t color) {
     if (x + w > EL133UF1_WIDTH) { w = EL133UF1_WIDTH - x; }
     if (w <= 0) return;
     
-    // Use setPixel for compatibility with both packed and unpacked modes
-    for (int16_t i = 0; i < w; i++) {
-        setPixel(x + i, y, color);
+    if (!_packedMode && _buffer) {
+        // Fast path: direct memset for unpacked mode
+        memset(_buffer + y * EL133UF1_WIDTH + x, color & 0x07, w);
+    } else {
+        // Slow path for packed mode
+        for (int16_t i = 0; i < w; i++) {
+            setPixel(x + i, y, color);
+        }
     }
 }
 
@@ -463,9 +473,19 @@ void EL133UF1::drawVLine(int16_t x, int16_t y, int16_t h, uint8_t color) {
     if (y + h > EL133UF1_HEIGHT) { h = EL133UF1_HEIGHT - y; }
     if (h <= 0) return;
     
-    // Use setPixel for compatibility with both packed and unpacked modes
-    for (int16_t i = 0; i < h; i++) {
-        setPixel(x, y + i, color);
+    uint8_t c = color & 0x07;
+    if (!_packedMode && _buffer) {
+        // Fast path: direct buffer access for unpacked mode
+        uint8_t* ptr = _buffer + y * EL133UF1_WIDTH + x;
+        for (int16_t i = 0; i < h; i++) {
+            *ptr = c;
+            ptr += EL133UF1_WIDTH;
+        }
+    } else {
+        // Slow path for packed mode
+        for (int16_t i = 0; i < h; i++) {
+            setPixel(x, y + i, color);
+        }
     }
 }
 
@@ -484,8 +504,19 @@ void EL133UF1::fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint8_t colo
     if (y + h > EL133UF1_HEIGHT) { h = EL133UF1_HEIGHT - y; }
     if (w <= 0 || h <= 0) return;
     
-    for (int16_t i = 0; i < h; i++) {
-        drawHLine(x, y + i, w, color);
+    if (!_packedMode && _buffer) {
+        // Fast path: direct memset for each row in unpacked mode
+        uint8_t c = color & 0x07;
+        uint8_t* ptr = _buffer + y * EL133UF1_WIDTH + x;
+        for (int16_t i = 0; i < h; i++) {
+            memset(ptr, c, w);
+            ptr += EL133UF1_WIDTH;
+        }
+    } else {
+        // Slow path for packed mode
+        for (int16_t i = 0; i < h; i++) {
+            drawHLine(x, y + i, w, color);
+        }
     }
 }
 
@@ -505,17 +536,40 @@ void EL133UF1::drawChar(int16_t x, int16_t y, char c, uint8_t color, uint8_t bg,
     if (c < 32 || c > 126) c = '?';
     
     const uint8_t* charData = font8x8[c - 32];
+    uint8_t fgc = color & 0x07;
+    uint8_t bgc = bg & 0x07;
     
+    // Fast path for size=1 in unpacked mode with no clipping needed
+    if (size == 1 && !_packedMode && _buffer &&
+        x >= 0 && x + 8 <= EL133UF1_WIDTH && 
+        y >= 0 && y + 8 <= EL133UF1_HEIGHT) {
+        
+        uint8_t* ptr = _buffer + y * EL133UF1_WIDTH + x;
+        for (int8_t row = 0; row < 8; row++) {
+            uint8_t rowData = charData[row];
+            ptr[0] = (rowData & 0x80) ? fgc : bgc;
+            ptr[1] = (rowData & 0x40) ? fgc : bgc;
+            ptr[2] = (rowData & 0x20) ? fgc : bgc;
+            ptr[3] = (rowData & 0x10) ? fgc : bgc;
+            ptr[4] = (rowData & 0x08) ? fgc : bgc;
+            ptr[5] = (rowData & 0x04) ? fgc : bgc;
+            ptr[6] = (rowData & 0x02) ? fgc : bgc;
+            ptr[7] = (rowData & 0x01) ? fgc : bgc;
+            ptr += EL133UF1_WIDTH;
+        }
+        return;
+    }
+    
+    // General path for scaled text or edge cases
     for (int8_t row = 0; row < 8; row++) {
         uint8_t rowData = charData[row];
         for (int8_t col = 0; col < 8; col++) {
             bool pixel = (rowData >> (7 - col)) & 0x01;
-            uint8_t pixelColor = pixel ? color : bg;
+            uint8_t pixelColor = pixel ? fgc : bgc;
             
             if (size == 1) {
                 setPixel(x + col, y + row, pixelColor);
             } else {
-                // Scale up the pixel
                 fillRect(x + col * size, y + row * size, size, size, pixelColor);
             }
         }
@@ -580,33 +634,38 @@ void EL133UF1::_sendBuffer() {
     // After 90° clockwise rotation (rot90 with k=-1):
     // new[new_row][new_col] = old[cols - 1 - new_col][new_row]
     // where old is (1200 rows x 1600 cols), new is (1600 rows x 1200 cols)
+    //
+    // Optimized: process column by column for better cache locality
+    // oldCol = newRow, so we iterate through source columns
     
-    size_t idxA = 0;
-    size_t idxB = 0;
+    uint8_t* pA = bufA;
+    uint8_t* pB = bufB;
     
-    for (int newRow = 0; newRow < 1600; newRow++) {
-        // First half (columns 0-599 of rotated image go to bufA)
-        for (int newCol = 0; newCol < 600; newCol += 2) {
-            int oldCol0 = newRow;
-            int oldRow0 = 1199 - newCol;
-            int oldCol1 = newRow;
-            int oldRow1 = 1199 - (newCol + 1);
-            
-            uint8_t p0 = _buffer[oldRow0 * EL133UF1_WIDTH + oldCol0] & 0x07;
-            uint8_t p1 = _buffer[oldRow1 * EL133UF1_WIDTH + oldCol1] & 0x07;
-            bufA[idxA++] = (p0 << 4) | p1;
+    for (int srcCol = 0; srcCol < 1600; srcCol++) {
+        // For this source column, read pixels from bottom to top (rows 1199 down to 0)
+        // and pack them into the destination buffers
+        
+        // Buffer A: rotated columns 0-599 come from source rows 1199-600
+        const uint8_t* srcRowPtr = _buffer + 1199 * EL133UF1_WIDTH + srcCol;
+        
+        for (int i = 0; i < 300; i++) {  // 600 pixels / 2 = 300 bytes
+            uint8_t p0 = (*srcRowPtr) & 0x07;
+            srcRowPtr -= EL133UF1_WIDTH;  // Move up one row
+            uint8_t p1 = (*srcRowPtr) & 0x07;
+            srcRowPtr -= EL133UF1_WIDTH;  // Move up one row
+            *pA++ = (p0 << 4) | p1;
         }
         
-        // Second half (columns 600-1199 of rotated image go to bufB)
-        for (int newCol = 600; newCol < 1200; newCol += 2) {
-            int oldCol0 = newRow;
-            int oldRow0 = 1199 - newCol;
-            int oldCol1 = newRow;
-            int oldRow1 = 1199 - (newCol + 1);
-            
-            uint8_t p0 = _buffer[oldRow0 * EL133UF1_WIDTH + oldCol0] & 0x07;
-            uint8_t p1 = _buffer[oldRow1 * EL133UF1_WIDTH + oldCol1] & 0x07;
-            bufB[idxB++] = (p0 << 4) | p1;
+        // Buffer B: rotated columns 600-1199 come from source rows 599-0
+        // srcRowPtr is now at row 600, continue from 599
+        srcRowPtr = _buffer + 599 * EL133UF1_WIDTH + srcCol;
+        
+        for (int i = 0; i < 300; i++) {  // 600 pixels / 2 = 300 bytes
+            uint8_t p0 = (*srcRowPtr) & 0x07;
+            srcRowPtr -= EL133UF1_WIDTH;
+            uint8_t p1 = (*srcRowPtr) & 0x07;
+            srcRowPtr -= EL133UF1_WIDTH;
+            *pB++ = (p0 << 4) | p1;
         }
     }
 

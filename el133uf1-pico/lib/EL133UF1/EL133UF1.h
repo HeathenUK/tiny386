@@ -75,6 +75,19 @@
 #define EL133UF1_SPI_SPEED 40000000  // 40 MHz
 #endif
 
+// Debug output (disable for faster operation)
+#ifndef EL133UF1_DEBUG
+#define EL133UF1_DEBUG 1  // Set to 0 to disable debug output
+#endif
+
+#if EL133UF1_DEBUG
+#define EL133UF1_DBG(x) Serial.println(x)
+#define EL133UF1_DBGF(...) Serial.printf(__VA_ARGS__)
+#else
+#define EL133UF1_DBG(x)
+#define EL133UF1_DBGF(...)
+#endif
+
 // Buffer sizes
 // Unpacked: 1 byte per pixel (1600 * 1200 = 1,920,000 bytes) - requires PSRAM
 // Packed: 2 pixels per byte, split into two halves for the two controllers
