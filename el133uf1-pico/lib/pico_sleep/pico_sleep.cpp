@@ -115,15 +115,17 @@ static void powman_timer_set_1khz_tick_source_lposc(void) {
     // LPOSC frequency is ~32kHz
     uint32_t lposc_freq_hz = 32768;
     uint32_t lposc_freq_khz = lposc_freq_hz / 1000;  // 32
-    uint32_t lposc_freq_khz_frac16 = (lposc_freq_hz % 1000) * 65536 / 1000;  // 768 * 65536 / 1000
+    uint32_t lposc_freq_khz_frac16 = (lposc_freq_hz % 1000) * 65536 / 1000;
     
     powman_write(&powman_hw->lposc_freq_khz_int, lposc_freq_khz);
     powman_write(&powman_hw->lposc_freq_khz_frac, lposc_freq_khz_frac16);
     powman_set_bits(&powman_hw->timer, POWMAN_TIMER_USE_LPOSC_BITS);
     
-    if (was_running) {
-        powman_timer_start();
-        while(!(powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS));
+    // Timer must be running for the switch to complete
+    // Always start it and wait for USING_LPOSC
+    powman_timer_start();
+    while(!(powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS)) {
+        tight_loop_contents();
     }
 }
 
@@ -199,34 +201,23 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
                       powman_timer_is_running(), powman_hw->timer);
         Serial.flush();
         
-        // Initialize timer if not running
-        if (!powman_timer_is_running()) {
-            Serial.println("  [3] Starting timer...");
-            Serial.flush();
-            powman_timer_set_ms(0);
-            powman_timer_start();
-        }
-        
-        uint64_t current_ms = powman_timer_get_ms();
-        Serial.printf("  [4] Current time: %llu ms\n", current_ms);
+        Serial.println("  [3] Switching timer to LPOSC (this starts the timer)...");
         Serial.flush();
         
-        Serial.println("  [5] Switching timer to LPOSC...");
-        Serial.flush();
+        // This function now always starts the timer and waits for LPOSC switch
         powman_timer_set_1khz_tick_source_lposc();
-        powman_timer_set_ms(current_ms);
         
-        // Wait for switch to complete with timeout
-        uint32_t timeout = 100000;
-        while (!(powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) && timeout--) {
-            tight_loop_contents();
-        }
+        // Set time to 0 for a clean start
+        powman_timer_set_ms(0);
         
-        if (timeout == 0) {
-            Serial.println("  [!] LPOSC switch timeout!");
-            return;
-        }
-        Serial.println("  [6] Timer now using LPOSC");
+        Serial.printf("  [4] Timer now using LPOSC, reg=0x%08lx\n", powman_hw->timer);
+        Serial.flush();
+        
+        // Verify timer is counting
+        uint64_t t1 = powman_timer_get_ms();
+        delay(100);
+        uint64_t t2 = powman_timer_get_ms();
+        Serial.printf("  [5] Timer counting: %llu -> %llu (delta=%llu, expected ~100)\n", t1, t2, t2-t1);
         Serial.flush();
     }
     
