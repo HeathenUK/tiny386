@@ -20,17 +20,18 @@
  */
 
 #include <Arduino.h>
+#include <WiFi.h>
 #include <time.h>
 #include "EL133UF1.h"
 #include "pico_sleep.h"
 #include "hardware/structs/powman.h"
 
-// Pico SDK WiFi/network includes
-#include "pico/cyw43_arch.h"
+// Raw lwIP for NTP (WiFi handled by arduino-pico's WiFi class)
+extern "C" {
 #include "lwip/dns.h"
 #include "lwip/pbuf.h"
 #include "lwip/udp.h"
-#include "lwip/timeouts.h"
+}
 
 // WiFi credentials
 #define WIFI_SSID "JELLING"
@@ -39,7 +40,7 @@
 // NTP settings
 #define NTP_SERVER "pool.ntp.org"
 #define NTP_PORT 123
-#define NTP_DELTA 2208988800ULL  // Seconds between 1900 and 1970
+#define NTP_DELTA 2208988800UL  // Seconds between 1900 and 1970
 
 // Pin definitions for Pimoroni Pico Plus 2 W with Inky Impression 13.3"
 // These match the working CircuitPython reference
@@ -108,93 +109,88 @@ static void ntp_dns_found(const char *hostname, const ip_addr_t *ipaddr, void *a
 
 // ================================================================
 // Connect to WiFi and sync NTP time
-// (following pico-examples/pico_w/wifi/ntp_client pattern)
+// Uses arduino-pico WiFi for connection, raw lwIP for NTP
+// (NTP follows pico-examples/pico_w/wifi/ntp_client pattern)
 // ================================================================
 bool connectWiFiAndGetNTP() {
-    Serial.println("\n=== Connecting to WiFi (pico-sdk) ===");
+    Serial.println("\n=== Connecting to WiFi ===");
     Serial.printf("SSID: %s\n", WIFI_SSID);
     
-    // Initialize CYW43
-    if (cyw43_arch_init()) {
-        Serial.println("CYW43 init failed!");
+    // Use arduino-pico WiFi class for connection
+    WiFi.begin(WIFI_SSID, WIFI_PSK);
+    
+    Serial.print("Connecting");
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start < 30000)) {
+        Serial.print(".");
+        delay(500);
+    }
+    
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\nWiFi connect failed!");
         return false;
     }
     
-    cyw43_arch_enable_sta_mode();
+    Serial.println("\nWiFi connected!");
+    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
     
-    // Connect to WiFi
-    Serial.println("Connecting...");
-    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PSK, 
-                                            CYW43_AUTH_WPA2_AES_PSK, 30000)) {
-        Serial.println("WiFi connect failed!");
-        cyw43_arch_deinit();
-        return false;
-    }
-    
-    Serial.println("WiFi connected!");
-    Serial.printf("IP: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_default)));
+    // Now use raw lwIP for NTP (following pico-examples pattern)
+    Serial.println("\n=== Getting NTP time ===");
     
     // Create UDP PCB for NTP
     struct udp_pcb *ntp_pcb = udp_new_ip_type(IPADDR_TYPE_ANY);
     if (!ntp_pcb) {
         Serial.println("Failed to create UDP PCB!");
-        cyw43_arch_deinit();
+        WiFi.disconnect(true);
         return false;
     }
     udp_recv(ntp_pcb, ntp_recv_callback, NULL);
     
     // Resolve NTP server via DNS
-    Serial.println("\n=== Getting NTP time ===");
     Serial.printf("Resolving %s...\n", NTP_SERVER);
     
     dns_done = false;
     ip_addr_set_zero(&ntp_server_address);
     
-    cyw43_arch_lwip_begin();
     err_t err = dns_gethostbyname(NTP_SERVER, &ntp_server_address, ntp_dns_found, NULL);
-    cyw43_arch_lwip_end();
     
     if (err == ERR_OK) {
         // DNS result was cached
         Serial.printf("NTP server (cached): %s\n", ipaddr_ntoa(&ntp_server_address));
     } else if (err == ERR_INPROGRESS) {
         // Wait for DNS callback
-        uint32_t start = millis();
+        start = millis();
         while (!dns_done && (millis() - start < 10000)) {
-            cyw43_arch_poll();
-            sleep_ms(10);
+            delay(10);
         }
         if (!dns_done || ip_addr_isany(&ntp_server_address)) {
             Serial.println("DNS lookup failed!");
             udp_remove(ntp_pcb);
-            cyw43_arch_deinit();
+            WiFi.disconnect(true);
             return false;
         }
     } else {
         Serial.printf("DNS request failed: %d\n", err);
         udp_remove(ntp_pcb);
-        cyw43_arch_deinit();
+        WiFi.disconnect(true);
         return false;
     }
     
     // Send NTP request (following pico-examples pattern)
-    cyw43_arch_lwip_begin();
     struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, NTP_MSG_LEN, PBUF_RAM);
     uint8_t *req = (uint8_t *)p->payload;
     memset(req, 0, NTP_MSG_LEN);
     req[0] = 0x1b;  // LI=0, VN=3, Mode=3 (client)
     udp_sendto(ntp_pcb, p, &ntp_server_address, NTP_PORT);
     pbuf_free(p);
-    cyw43_arch_lwip_end();
     
     // Wait for response
     Serial.print("Waiting for NTP response");
     ntp_done = false;
-    uint32_t start = millis();
+    start = millis();
     while (!ntp_done && (millis() - start < 10000)) {
-        cyw43_arch_poll();
         Serial.print(".");
-        sleep_ms(100);
+        delay(100);
     }
     Serial.println();
     
@@ -202,7 +198,7 @@ bool connectWiFiAndGetNTP() {
     
     if (!ntp_done) {
         Serial.println("NTP timeout!");
-        cyw43_arch_deinit();
+        WiFi.disconnect(true);
         return false;
     }
     
@@ -217,9 +213,9 @@ bool connectWiFiAndGetNTP() {
     Serial.printf("Got NTP response: %s\n", buf);
     Serial.printf("Epoch: %lld\n", (long long)received_time);
     
-    // Deinit WiFi to save power
-    cyw43_arch_deinit();
-    Serial.println("WiFi deinitialized (saving power)");
+    // Disconnect WiFi to save power
+    WiFi.disconnect(true);
+    Serial.println("WiFi disconnected (saving power)");
     
     return true;
 }
