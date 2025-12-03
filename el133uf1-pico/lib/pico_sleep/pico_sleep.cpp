@@ -189,31 +189,13 @@ static dormant_source_t _dormant_source = DORMANT_SOURCE_LPOSC;
 void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
     _dormant_source = dormant_source;
 
-    Serial.println("  [1] Setting up dormant source...");
+    Serial.println("  [1] Setting up powman timer for LPOSC...");
     Serial.flush();
 
-    uint32_t src_hz;
-    uint32_t clk_ref_src;
-    
-    switch (dormant_source) {
-        case DORMANT_SOURCE_XOSC:
-            src_hz = XOSC_HZ;
-            clk_ref_src = CLOCKS_CLK_REF_CTRL_SRC_VALUE_XOSC_CLKSRC;
-            break;
-        case DORMANT_SOURCE_ROSC:
-            src_hz = 6500 * KHZ;
-            clk_ref_src = CLOCKS_CLK_REF_CTRL_SRC_VALUE_ROSC_CLKSRC_PH;
-            break;
-        case DORMANT_SOURCE_LPOSC:
-        default:
-            src_hz = 32 * KHZ;
-            clk_ref_src = CLOCKS_CLK_REF_CTRL_SRC_VALUE_LPOSC_CLKSRC;
-            break;
-    }
-
-    // IMPORTANT: Switch powman timer to LPOSC BEFORE disabling XOSC
+    // For LPOSC dormant, we just need to set up the powman timer
+    // We'll keep the main clocks running until we actually go dormant
     if (dormant_source == DORMANT_SOURCE_LPOSC) {
-        Serial.printf("  [2] Timer running: %d, reg: 0x%08lx\n", 
+        Serial.printf("  [2] Timer status: running=%d, reg=0x%08lx\n", 
                       powman_timer_is_running(), powman_hw->timer);
         Serial.flush();
         
@@ -225,85 +207,31 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
             powman_timer_start();
         }
         
-        Serial.println("  [4] Getting current time...");
-        Serial.flush();
         uint64_t current_ms = powman_timer_get_ms();
-        Serial.printf("  [5] Current time: %llu ms\n", current_ms);
+        Serial.printf("  [4] Current time: %llu ms\n", current_ms);
         Serial.flush();
         
-        Serial.println("  [6] Switching to LPOSC tick source...");
+        Serial.println("  [5] Switching timer to LPOSC...");
         Serial.flush();
         powman_timer_set_1khz_tick_source_lposc();
-        
-        Serial.println("  [7] Restoring time...");
-        Serial.flush();
         powman_timer_set_ms(current_ms);
-        
-        Serial.println("  [8] Waiting for LPOSC switch...");
-        Serial.flush();
         
         // Wait for switch to complete with timeout
         uint32_t timeout = 100000;
         while (!(powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) && timeout--) {
-            // busy wait
+            tight_loop_contents();
         }
         
         if (timeout == 0) {
-            Serial.printf("  [!] LPOSC switch timeout! Timer reg: 0x%08lx\n", powman_hw->timer);
-            Serial.flush();
+            Serial.println("  [!] LPOSC switch timeout!");
             return;
         }
-        Serial.println("  [9] LPOSC switch complete");
+        Serial.println("  [6] Timer now using LPOSC");
         Serial.flush();
     }
-
-    Serial.println("  [10] Disabling systick...");
-    Serial.flush();
-    SYSTICK_CSR &= ~1;
-
-    Serial.println("  [11] Configuring clk_ref...");
-    Serial.flush();
-    clock_configure(clk_ref,
-                    clk_ref_src,
-                    0,
-                    src_hz,
-                    src_hz);
-
-    Serial.println("  [12] Configuring clk_sys...");
-    Serial.flush();
-    clock_configure(clk_sys,
-                    CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLK_REF,
-                    0,
-                    src_hz,
-                    src_hz);
-
-    // After this point, Serial won't work reliably (clock too slow)
-    // So we stop debug output here
-
-    // Stop unused clocks
-    clock_stop(clk_adc);
-    clock_stop(clk_usb);
-#if PICO_RP2350
-    clock_stop(clk_hstx);
-#endif
-
-    // CLK_PERI = clk_sys
-    clock_configure(clk_peri,
-                    0,
-                    CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
-                    src_hz,
-                    src_hz);
-
-    // Disable PLLs
-    pll_deinit(pll_sys);
-    pll_deinit(pll_usb);
-
-    // Now safe to disable the oscillator we're not using
-    if (dormant_source == DORMANT_SOURCE_XOSC) {
-        rosc_disable();
-    } else if (dormant_source == DORMANT_SOURCE_ROSC || dormant_source == DORMANT_SOURCE_LPOSC) {
-        xosc_disable();
-    }
+    
+    // Don't switch main clocks yet - that will make everything super slow
+    // The actual clock switch happens just before going dormant
 }
 
 static void processor_deep_sleep(void) {
@@ -350,10 +278,6 @@ void sleep_goto_dormant_for_ms(uint32_t delay_ms) {
     uint64_t alarm_time = current_ms + delay_ms;
     Serial.printf("  [sleep] Alarm set for: %llu ms (in %lu ms)\n", alarm_time, delay_ms);
     
-    // Only enable powman clock during sleep
-    clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_REF_POWMAN_BITS;
-    clocks_hw->sleep_en1 = 0x0;
-    
     // Configure alarm for wakeup
     powman_enable_alarm_wakeup_at_ms(alarm_time);
     
@@ -362,11 +286,44 @@ void sleep_goto_dormant_for_ms(uint32_t delay_ms) {
                   (powman_hw->timer & POWMAN_TIMER_ALARM_ENAB_BITS) ? 1 : 0,
                   (powman_hw->timer & POWMAN_TIMER_PWRUP_ON_ALARM_BITS) ? 1 : 0);
     
-    Serial.println("  [sleep] Entering dormant mode NOW...");
+    Serial.println("  [sleep] Preparing for dormant...");
     Serial.flush();
     
-    // Small busy wait since delay() might not work with clocks configured for dormant
-    for (volatile int i = 0; i < 100000; i++);
+    // Wait for serial to finish
+    for (volatile int i = 0; i < 500000; i++);
+    
+    // Disable systick
+    SYSTICK_CSR &= ~1;
+    
+    // Only enable powman clock during sleep
+    clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_REF_POWMAN_BITS;
+    clocks_hw->sleep_en1 = 0x0;
+    
+    // Stop unused clocks
+    clock_stop(clk_adc);
+    clock_stop(clk_usb);
+#if PICO_RP2350
+    clock_stop(clk_hstx);
+#endif
+    
+    // Disable PLLs
+    pll_deinit(pll_sys);
+    pll_deinit(pll_usb);
+    
+    // Switch clocks to LPOSC (must be done quickly, no serial output after this)
+    clock_configure(clk_ref,
+                    CLOCKS_CLK_REF_CTRL_SRC_VALUE_LPOSC_CLKSRC,
+                    0, 32 * KHZ, 32 * KHZ);
+    clock_configure(clk_sys,
+                    CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLK_REF,
+                    0, 32 * KHZ, 32 * KHZ);
+    clock_configure(clk_peri,
+                    0,
+                    CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                    32 * KHZ, 32 * KHZ);
+    
+    // Disable XOSC (we're on LPOSC now)
+    xosc_disable();
     
     // Enable deep sleep at processor level
     processor_deep_sleep();
