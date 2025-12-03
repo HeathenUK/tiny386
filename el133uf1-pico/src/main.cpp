@@ -20,19 +20,26 @@
  */
 
 #include <Arduino.h>
-#include <WiFi.h>
 #include <time.h>
 #include "EL133UF1.h"
 #include "pico_sleep.h"
 #include "hardware/structs/powman.h"
 
+// Pico SDK WiFi/network includes
+#include "pico/cyw43_arch.h"
+#include "lwip/dns.h"
+#include "lwip/pbuf.h"
+#include "lwip/udp.h"
+#include "lwip/timeouts.h"
+
 // WiFi credentials
-const char* WIFI_SSID = "JELLING";
-const char* WIFI_PSK = "Crusty jugglers";
+#define WIFI_SSID "JELLING"
+#define WIFI_PSK "Crusty jugglers"
 
 // NTP settings
-const char* NTP_SERVER1 = "pool.ntp.org";
-const char* NTP_SERVER2 = "time.nist.gov";
+#define NTP_SERVER "pool.ntp.org"
+#define NTP_PORT 123
+#define NTP_DELTA 2208988800ULL  // Seconds between 1900 and 1970
 
 // Pin definitions for Pimoroni Pico Plus 2 W with Inky Impression 13.3"
 // These match the working CircuitPython reference
@@ -54,59 +61,183 @@ bool connectWiFiAndGetNTP();
 void formatTime(uint64_t time_ms, char* buf, size_t len);
 
 // ================================================================
-// Connect to WiFi and sync NTP time
+// NTP packet structure
+// ================================================================
+typedef struct {
+    uint8_t li_vn_mode;
+    uint8_t stratum;
+    uint8_t poll;
+    uint8_t precision;
+    uint32_t root_delay;
+    uint32_t root_dispersion;
+    uint32_t ref_id;
+    uint32_t ref_ts_sec;
+    uint32_t ref_ts_frac;
+    uint32_t orig_ts_sec;
+    uint32_t orig_ts_frac;
+    uint32_t rx_ts_sec;
+    uint32_t rx_ts_frac;
+    uint32_t tx_ts_sec;
+    uint32_t tx_ts_frac;
+} ntp_packet_t;
+
+static volatile bool ntp_done = false;
+static volatile time_t ntp_time = 0;
+
+// NTP response callback
+static void ntp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                               const ip_addr_t *addr, u16_t port) {
+    if (p->tot_len >= sizeof(ntp_packet_t)) {
+        ntp_packet_t packet;
+        pbuf_copy_partial(p, &packet, sizeof(packet), 0);
+        
+        // Extract transmit timestamp (seconds since 1900)
+        uint32_t tx_sec = lwip_ntohl(packet.tx_ts_sec);
+        
+        // Convert to Unix epoch (seconds since 1970)
+        ntp_time = (time_t)(tx_sec - NTP_DELTA);
+        ntp_done = true;
+    }
+    pbuf_free(p);
+}
+
+// DNS callback
+static ip_addr_t ntp_server_addr;
+static volatile bool dns_done = false;
+
+static void dns_callback(const char *name, const ip_addr_t *addr, void *arg) {
+    if (addr) {
+        ntp_server_addr = *addr;
+    }
+    dns_done = true;
+}
+
+// ================================================================
+// Connect to WiFi and sync NTP time (pico-sdk approach)
 // ================================================================
 bool connectWiFiAndGetNTP() {
-    Serial.println("\n=== Connecting to WiFi ===");
+    Serial.println("\n=== Connecting to WiFi (pico-sdk) ===");
     Serial.printf("SSID: %s\n", WIFI_SSID);
     
-    WiFi.begin(WIFI_SSID, WIFI_PSK);
-    
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
-    }
-    
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("\nWiFi connection failed!");
+    // Initialize CYW43
+    if (cyw43_arch_init()) {
+        Serial.println("CYW43 init failed!");
         return false;
     }
     
-    Serial.println("\nWiFi connected!");
-    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    cyw43_arch_enable_sta_mode();
     
-    // Configure and get NTP time using arduino-pico NTP class
+    // Connect to WiFi
+    Serial.println("Connecting...");
+    int result = cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PSK, 
+                                                      CYW43_AUTH_WPA2_AES_PSK, 15000);
+    if (result != 0) {
+        Serial.printf("WiFi connect failed: %d\n", result);
+        cyw43_arch_deinit();
+        return false;
+    }
+    
+    Serial.println("WiFi connected!");
+    Serial.printf("IP: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_default)));
+    
+    // Resolve NTP server
     Serial.println("\n=== Getting NTP time ===");
-    NTP.begin(NTP_SERVER1, NTP_SERVER2);
+    Serial.printf("Resolving %s...\n", NTP_SERVER);
     
-    // Use the built-in waitSet function with 15 second timeout
-    Serial.println("Waiting for NTP sync...");
-    bool synced = NTP.waitSet([]() { Serial.print("."); }, 15000);
+    dns_done = false;
+    ip_addr_set_zero(&ntp_server_addr);
     
-    if (!synced) {
-        Serial.println("\nFailed to get NTP time!");
-        WiFi.disconnect(true);
+    err_t err = dns_gethostbyname(NTP_SERVER, &ntp_server_addr, dns_callback, NULL);
+    if (err == ERR_INPROGRESS) {
+        // Wait for DNS
+        uint32_t start = millis();
+        while (!dns_done && (millis() - start < 5000)) {
+            cyw43_arch_poll();
+            delay(10);
+        }
+    } else if (err != ERR_OK) {
+        Serial.println("DNS lookup failed!");
+        cyw43_arch_deinit();
         return false;
     }
     
-    // Get time
-    time_t now = time(nullptr);
-    uint64_t now_ms = (uint64_t)now * 1000;
+    if (ip_addr_isany(&ntp_server_addr)) {
+        Serial.println("Could not resolve NTP server!");
+        cyw43_arch_deinit();
+        return false;
+    }
     
-    // Set the powman timer to current time
+    Serial.printf("NTP server: %s\n", ipaddr_ntoa(&ntp_server_addr));
+    
+    // Create UDP socket for NTP
+    struct udp_pcb *pcb = udp_new();
+    if (!pcb) {
+        Serial.println("Failed to create UDP PCB!");
+        cyw43_arch_deinit();
+        return false;
+    }
+    
+    udp_recv(pcb, ntp_recv_callback, NULL);
+    
+    // Create NTP request packet
+    ntp_packet_t packet;
+    memset(&packet, 0, sizeof(packet));
+    packet.li_vn_mode = (0 << 6) | (4 << 3) | 3;  // LI=0, VN=4, Mode=3 (client)
+    
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(packet), PBUF_RAM);
+    if (!p) {
+        Serial.println("Failed to allocate pbuf!");
+        udp_remove(pcb);
+        cyw43_arch_deinit();
+        return false;
+    }
+    
+    memcpy(p->payload, &packet, sizeof(packet));
+    
+    // Send NTP request
+    ntp_done = false;
+    err = udp_sendto(pcb, p, &ntp_server_addr, NTP_PORT);
+    pbuf_free(p);
+    
+    if (err != ERR_OK) {
+        Serial.printf("UDP send failed: %d\n", err);
+        udp_remove(pcb);
+        cyw43_arch_deinit();
+        return false;
+    }
+    
+    // Wait for response
+    Serial.print("Waiting for NTP response");
+    uint32_t start = millis();
+    while (!ntp_done && (millis() - start < 5000)) {
+        cyw43_arch_poll();
+        Serial.print(".");
+        delay(100);
+    }
+    Serial.println();
+    
+    udp_remove(pcb);
+    
+    if (!ntp_done) {
+        Serial.println("NTP timeout!");
+        cyw43_arch_deinit();
+        return false;
+    }
+    
+    // Got NTP time!
+    time_t received_time = ntp_time;  // Copy from volatile
+    uint64_t now_ms = (uint64_t)received_time * 1000;
     sleep_set_time_ms(now_ms);
     
-    struct tm* timeinfo = gmtime(&now);
+    struct tm* timeinfo = gmtime(&received_time);
     char buf[64];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", timeinfo);
-    Serial.printf("\nNTP time: %s\n", buf);
-    Serial.printf("Epoch ms: %llu\n", now_ms);
+    Serial.printf("NTP time: %s\n", buf);
+    Serial.printf("Epoch: %lld\n", (long long)ntp_time);
     
-    // Disconnect WiFi to save power
-    WiFi.disconnect(true);
-    Serial.println("WiFi disconnected (saving power)");
+    // Deinit WiFi to save power
+    cyw43_arch_deinit();
+    Serial.println("WiFi deinitialized (saving power)");
     
     return true;
 }
