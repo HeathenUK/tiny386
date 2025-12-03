@@ -53,12 +53,35 @@ void setup() {
     Serial.println("EL133UF1 13.3\" Spectra 6 E-Ink Display Demo");
     Serial.println("===========================================\n");
 
+    // Check memory availability
+    Serial.println("Memory check:");
+    Serial.printf("  Total heap: %d bytes\n", rp2040.getTotalHeap());
+    Serial.printf("  Free heap:  %d bytes\n", rp2040.getFreeHeap());
+    Serial.printf("  Used heap:  %d bytes\n", rp2040.getUsedHeap());
+    
     // Check PSRAM availability
-    Serial.println("Checking PSRAM...");
     size_t psramSize = rp2040.getPSRAMSize();
-    Serial.printf("  PSRAM size: %d bytes (%d MB)\n", psramSize, psramSize / (1024*1024));
-    if (psramSize == 0) {
-        Serial.println("  WARNING: No PSRAM detected! This demo requires PSRAM.");
+    Serial.printf("  PSRAM size: %d bytes", psramSize);
+    if (psramSize > 0) {
+        Serial.printf(" (%d MB)\n", psramSize / (1024*1024));
+    } else {
+        Serial.println(" (NOT DETECTED!)");
+        Serial.println("\n  WARNING: No PSRAM detected!");
+        Serial.println("  The Pico Plus 2 W should have 8MB PSRAM.");
+        Serial.println("  Make sure you're using the correct board and firmware.");
+    }
+    
+    // Test allocations of increasing size
+    Serial.println("\n  Testing allocations:");
+    size_t testSizes[] = {1024, 10*1024, 100*1024, 480*1024, 1000*1024, 2000*1024};
+    for (size_t size : testSizes) {
+        void* testAlloc = malloc(size);
+        if (testAlloc) {
+            Serial.printf("    %7d bytes: OK at %p\n", size, testAlloc);
+            free(testAlloc);
+        } else {
+            Serial.printf("    %7d bytes: FAILED\n", size);
+        }
     }
     
     Serial.println("\nPico Plus 2 W Pin Configuration:");

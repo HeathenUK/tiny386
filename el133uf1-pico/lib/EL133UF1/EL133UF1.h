@@ -75,8 +75,11 @@
 #define EL133UF1_SPI_SPEED 40000000  // 40 MHz
 #endif
 
-// Buffer size for half panel (1200 rows * 600 cols / 2 pixels per byte)
-#define HALF_BUFFER_SIZE ((1200 * 600) / 2)
+// Buffer sizes
+// Unpacked: 1 byte per pixel (1600 * 1200 = 1,920,000 bytes) - requires PSRAM
+// Packed: 2 pixels per byte, split into two halves for the two controllers
+// Each half: 1600 rows * 600 cols / 2 = 480,000 bytes
+#define PACKED_HALF_SIZE ((1600 * 600) / 2)  // 480,000 bytes per half
 
 /**
  * @class EL133UF1
@@ -217,11 +220,18 @@ public:
     /**
      * @brief Get pointer to frame buffer
      * 
-     * Buffer format: 1600x1200 pixels, 1 byte per pixel (only lower 3 bits used)
+     * If using unpacked mode: 1600x1200 pixels, 1 byte per pixel
+     * If using packed mode: Two half buffers, packed nibbles
      * 
-     * @return uint8_t* Pointer to frame buffer
+     * @return uint8_t* Pointer to frame buffer (or left half if packed)
      */
     uint8_t* getBuffer() { return _buffer; }
+    
+    /**
+     * @brief Check if using packed buffer mode
+     * @return true if using packed buffers (no PSRAM)
+     */
+    bool isPackedMode() { return _packedMode; }
 
     /**
      * @brief Set an image from a raw buffer
@@ -244,10 +254,13 @@ private:
     bool _hFlip;
     bool _vFlip;
     bool _initialized;
+    bool _packedMode;  // True if using packed buffers (no PSRAM)
     
-    // Frame buffer: 1 byte per pixel for easier manipulation
-    // Total: 1600 * 1200 = 1,920,000 bytes
-    uint8_t* _buffer;
+    // Frame buffer(s)
+    // Unpacked mode: single 1.92MB buffer (requires PSRAM)
+    // Packed mode: two 480KB buffers (works without PSRAM)
+    uint8_t* _buffer;      // Main buffer (or left half in packed mode)
+    uint8_t* _bufferRight; // Right half (only used in packed mode)
     
     /**
      * @brief Perform hardware reset

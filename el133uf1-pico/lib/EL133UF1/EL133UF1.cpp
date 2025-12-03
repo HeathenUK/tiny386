@@ -16,7 +16,9 @@ EL133UF1::EL133UF1(SPIClass* spi) :
     _hFlip(false),
     _vFlip(false),
     _initialized(false),
-    _buffer(nullptr)
+    _packedMode(false),
+    _buffer(nullptr),
+    _bufferRight(nullptr)
 {
 }
 
@@ -33,23 +35,43 @@ bool EL133UF1::begin(int8_t cs0Pin, int8_t cs1Pin, int8_t dcPin,
     Serial.printf("  Pins: CS0=%d CS1=%d DC=%d RST=%d BUSY=%d\n", 
                   _cs0Pin, _cs1Pin, _dcPin, _resetPin, _busyPin);
 
-    // Allocate frame buffer (1.92 MB for 1600x1200)
-    // This REQUIRES PSRAM - regular RAM is only 512KB!
+    // Try to allocate frame buffer
+    // First try unpacked mode (1.92MB - requires PSRAM)
+    // If that fails, fall back to packed mode (2 x 480KB)
     Serial.println("  Allocating frame buffer...");
     
-    // arduino-pico automatically uses PSRAM for large allocations if available
-    // The malloc() will use PSRAM when the size is large enough
     _buffer = (uint8_t*)malloc(EL133UF1_WIDTH * EL133UF1_HEIGHT);
     
-    if (_buffer == nullptr) {
-        Serial.println("EL133UF1: Failed to allocate frame buffer!");
-        Serial.println("  This display requires PSRAM for the 1.92MB frame buffer.");
-        Serial.println("  Make sure you're using a board with PSRAM (like Pico Plus 2 W)");
-        Serial.println("  and PSRAM is enabled in platformio.ini");
-        return false;
+    if (_buffer != nullptr) {
+        // Unpacked mode - 1 byte per pixel
+        _packedMode = false;
+        _bufferRight = nullptr;
+        Serial.printf("  Unpacked mode: %d bytes at %p\n", 
+                      EL133UF1_WIDTH * EL133UF1_HEIGHT, _buffer);
+        memset(_buffer, EL133UF1_WHITE, EL133UF1_WIDTH * EL133UF1_HEIGHT);
+    } else {
+        // Try packed mode - two smaller buffers
+        Serial.println("  Large buffer failed, trying packed mode...");
+        _buffer = (uint8_t*)malloc(PACKED_HALF_SIZE);
+        _bufferRight = (uint8_t*)malloc(PACKED_HALF_SIZE);
+        
+        if (_buffer != nullptr && _bufferRight != nullptr) {
+            _packedMode = true;
+            Serial.printf("  Packed mode: 2 x %d bytes\n", PACKED_HALF_SIZE);
+            Serial.printf("    Left:  %p\n", _buffer);
+            Serial.printf("    Right: %p\n", _bufferRight);
+            // Fill with white (0x11 = two white pixels packed)
+            memset(_buffer, 0x11, PACKED_HALF_SIZE);
+            memset(_bufferRight, 0x11, PACKED_HALF_SIZE);
+        } else {
+            // Cleanup partial allocation
+            if (_buffer) { free(_buffer); _buffer = nullptr; }
+            if (_bufferRight) { free(_bufferRight); _bufferRight = nullptr; }
+            Serial.println("EL133UF1: Failed to allocate frame buffer!");
+            Serial.println("  Need either 1.92MB (PSRAM) or 2x480KB (regular RAM)");
+            return false;
+        }
     }
-    Serial.printf("  Frame buffer allocated at %p (%d bytes)\n", 
-                  _buffer, EL133UF1_WIDTH * EL133UF1_HEIGHT);
     
     // Initialize buffer to white
     memset(_buffer, EL133UF1_WHITE, EL133UF1_WIDTH * EL133UF1_HEIGHT);
@@ -269,14 +291,58 @@ void EL133UF1::_initSequence() {
 
 void EL133UF1::clear(uint8_t color) {
     if (_buffer == nullptr) return;
-    memset(_buffer, color & 0x07, EL133UF1_WIDTH * EL133UF1_HEIGHT);
+    
+    if (_packedMode) {
+        // Packed mode: each byte has two pixels
+        uint8_t packedColor = ((color & 0x07) << 4) | (color & 0x07);
+        memset(_buffer, packedColor, PACKED_HALF_SIZE);
+        if (_bufferRight) {
+            memset(_bufferRight, packedColor, PACKED_HALF_SIZE);
+        }
+    } else {
+        // Unpacked mode: 1 byte per pixel
+        memset(_buffer, color & 0x07, EL133UF1_WIDTH * EL133UF1_HEIGHT);
+    }
 }
 
 void EL133UF1::setPixel(int16_t x, int16_t y, uint8_t color) {
     if (_buffer == nullptr) return;
     if (x < 0 || x >= EL133UF1_WIDTH || y < 0 || y >= EL133UF1_HEIGHT) return;
     
-    _buffer[y * EL133UF1_WIDTH + x] = color & 0x07;
+    if (_packedMode) {
+        // Packed mode: need to figure out which buffer and which nibble
+        // After 90° rotation: (x,y) in user coords -> (y, 1199-x) in panel coords
+        // Panel is 1600 rows x 1200 cols, split at col 600
+        int16_t panelRow = x;  // 0-1599
+        int16_t panelCol = (EL133UF1_HEIGHT - 1) - y;  // 0-1199
+        
+        uint8_t* buf;
+        int16_t bufCol;
+        if (panelCol < 600) {
+            buf = _buffer;  // Left half
+            bufCol = panelCol;
+        } else {
+            buf = _bufferRight;  // Right half
+            bufCol = panelCol - 600;
+        }
+        
+        if (buf == nullptr) return;
+        
+        // Each row is 600 cols, packed as 300 bytes
+        size_t byteIdx = panelRow * 300 + (bufCol / 2);
+        uint8_t c = color & 0x07;
+        
+        if (bufCol % 2 == 0) {
+            // High nibble
+            buf[byteIdx] = (buf[byteIdx] & 0x0F) | (c << 4);
+        } else {
+            // Low nibble
+            buf[byteIdx] = (buf[byteIdx] & 0xF0) | c;
+        }
+    } else {
+        // Unpacked mode: direct indexing
+        _buffer[y * EL133UF1_WIDTH + x] = color & 0x07;
+    }
 }
 
 uint8_t EL133UF1::getPixel(int16_t x, int16_t y) {
@@ -292,8 +358,10 @@ void EL133UF1::drawHLine(int16_t x, int16_t y, int16_t w, uint8_t color) {
     if (x + w > EL133UF1_WIDTH) { w = EL133UF1_WIDTH - x; }
     if (w <= 0) return;
     
-    uint8_t* ptr = _buffer + y * EL133UF1_WIDTH + x;
-    memset(ptr, color & 0x07, w);
+    // Use setPixel for compatibility with both packed and unpacked modes
+    for (int16_t i = 0; i < w; i++) {
+        setPixel(x + i, y, color);
+    }
 }
 
 void EL133UF1::drawVLine(int16_t x, int16_t y, int16_t h, uint8_t color) {
@@ -302,9 +370,9 @@ void EL133UF1::drawVLine(int16_t x, int16_t y, int16_t h, uint8_t color) {
     if (y + h > EL133UF1_HEIGHT) { h = EL133UF1_HEIGHT - y; }
     if (h <= 0) return;
     
-    uint8_t c = color & 0x07;
+    // Use setPixel for compatibility with both packed and unpacked modes
     for (int16_t i = 0; i < h; i++) {
-        _buffer[(y + i) * EL133UF1_WIDTH + x] = c;
+        setPixel(x, y + i, color);
     }
 }
 
@@ -346,62 +414,29 @@ bool EL133UF1::isBusy() {
 void EL133UF1::_sendBuffer() {
     if (_buffer == nullptr) return;
 
-    // Allocate temporary buffers for packed data
-    // Each half of the display: 1200 rows * 600 cols = 720000 pixels
-    // Packed as nibbles: 720000 / 2 = 360000 bytes
-    uint8_t* bufA = (uint8_t*)malloc(HALF_BUFFER_SIZE);
-    uint8_t* bufB = (uint8_t*)malloc(HALF_BUFFER_SIZE);
-    
-    if (bufA == nullptr || bufB == nullptr) {
-        Serial.println("EL133UF1: Failed to allocate send buffers");
-        if (bufA) free(bufA);
-        if (bufB) free(bufB);
+    Serial.println("EL133UF1: Preparing buffer data...");
+
+    if (_packedMode) {
+        // Packed mode: buffers are already in the correct format
+        // Just send them directly to the display
+        Serial.println("  Using packed mode - sending directly");
+        
+        _sendCommand(CMD_DTM, CS0_SEL, _buffer, PACKED_HALF_SIZE);
+        _sendCommand(CMD_DTM, CS1_SEL, _bufferRight, PACKED_HALF_SIZE);
+        
+        Serial.println("EL133UF1: Image data sent");
         return;
     }
 
-    Serial.println("EL133UF1: Preparing buffer data...");
-
-    // The Python code does:
-    // 1. Optional flips
-    // 2. Rotate 90 degrees counter-clockwise
-    // 3. Split into left (600 cols) and right (600 cols)
-    // 4. Pack nibbles
+    // Unpacked mode: need to rotate and pack the buffer
+    // Allocate temporary buffers for packed data (480000 bytes each)
+    const size_t SEND_HALF_SIZE = PACKED_HALF_SIZE;  // 480000 bytes
     
-    // After -90 degree rotation:
-    // - Original (1600 x 1200) becomes (1200 x 1600)
-    // - For each pixel at (x, y) in rotated image:
-    //   - It comes from (y, height - 1 - x) in the original
-    //   - Or equivalently, original (row, col) goes to rotated (width - 1 - col, row)
-    
-    // The display expects:
-    // - buf_a: first 600 columns of the rotated image (all 1200 rows)
-    // - buf_b: remaining 1000 columns... wait, let me re-check
-    
-    // Looking at Python: region = numpy.rot90(region, -1) rotates 90 deg clockwise
-    // Then buf_a = region[:, :600] and buf_b = region[:, 600:]
-    // Original is (1200 rows, 1600 cols), after rot90(-1) it's (1600 rows, 1200 cols)
-    // So buf_a is (1600 x 600) = 960000 pixels, buf_b is (1600 x 600) = 960000 pixels
-    // Packed: 480000 bytes each
-    
-    // Wait, that doesn't match HALF_BUFFER_SIZE. Let me recalculate.
-    // The Python code: self.buf = numpy.zeros((self.rows, self.cols), dtype=numpy.uint8)
-    // where rows = 1200, cols = 1600
-    // After rot90(-1, clockwise): shape becomes (1600, 1200)
-    // buf_a = region[:, :600] -> (1600, 600) -> 960000 pixels -> 480000 bytes packed
-    // buf_b = region[:, 600:] -> (1600, 600) -> 960000 pixels -> 480000 bytes packed
-    
-    // My HALF_BUFFER_SIZE was wrong. Let me fix it.
-    // Actually, I need to reallocate with correct size.
-    
-    free(bufA);
-    free(bufB);
-    
-    const size_t CORRECT_HALF_SIZE = (1600 * 600) / 2;  // 480000 bytes
-    bufA = (uint8_t*)malloc(CORRECT_HALF_SIZE);
-    bufB = (uint8_t*)malloc(CORRECT_HALF_SIZE);
+    uint8_t* bufA = (uint8_t*)malloc(SEND_HALF_SIZE);
+    uint8_t* bufB = (uint8_t*)malloc(SEND_HALF_SIZE);
     
     if (bufA == nullptr || bufB == nullptr) {
-        Serial.println("EL133UF1: Failed to allocate send buffers (second attempt)");
+        Serial.println("EL133UF1: Failed to allocate send buffers");
         if (bufA) free(bufA);
         if (bufB) free(bufB);
         return;
@@ -418,33 +453,10 @@ void EL133UF1::_sendBuffer() {
     for (int newRow = 0; newRow < 1600; newRow++) {
         // First half (columns 0-599 of rotated image go to bufA)
         for (int newCol = 0; newCol < 600; newCol += 2) {
-            int oldRow0, oldCol0, oldRow1, oldCol1;
-            
-            if (!_vFlip && !_hFlip) {
-                // No flips
-                oldCol0 = newRow;
-                oldRow0 = 1199 - newCol;
-                oldCol1 = newRow;
-                oldRow1 = 1199 - (newCol + 1);
-            } else if (_vFlip && !_hFlip) {
-                // Vertical flip (in original coordinates)
-                oldCol0 = 1599 - newRow;
-                oldRow0 = 1199 - newCol;
-                oldCol1 = 1599 - newRow;
-                oldRow1 = 1199 - (newCol + 1);
-            } else if (!_vFlip && _hFlip) {
-                // Horizontal flip (in original coordinates)
-                oldCol0 = newRow;
-                oldRow0 = newCol;
-                oldCol1 = newRow;
-                oldRow1 = newCol + 1;
-            } else {
-                // Both flips
-                oldCol0 = 1599 - newRow;
-                oldRow0 = newCol;
-                oldCol1 = 1599 - newRow;
-                oldRow1 = newCol + 1;
-            }
+            int oldCol0 = newRow;
+            int oldRow0 = 1199 - newCol;
+            int oldCol1 = newRow;
+            int oldRow1 = 1199 - (newCol + 1);
             
             uint8_t p0 = _buffer[oldRow0 * EL133UF1_WIDTH + oldCol0] & 0x07;
             uint8_t p1 = _buffer[oldRow1 * EL133UF1_WIDTH + oldCol1] & 0x07;
@@ -453,29 +465,10 @@ void EL133UF1::_sendBuffer() {
         
         // Second half (columns 600-1199 of rotated image go to bufB)
         for (int newCol = 600; newCol < 1200; newCol += 2) {
-            int oldRow0, oldCol0, oldRow1, oldCol1;
-            
-            if (!_vFlip && !_hFlip) {
-                oldCol0 = newRow;
-                oldRow0 = 1199 - newCol;
-                oldCol1 = newRow;
-                oldRow1 = 1199 - (newCol + 1);
-            } else if (_vFlip && !_hFlip) {
-                oldCol0 = 1599 - newRow;
-                oldRow0 = 1199 - newCol;
-                oldCol1 = 1599 - newRow;
-                oldRow1 = 1199 - (newCol + 1);
-            } else if (!_vFlip && _hFlip) {
-                oldCol0 = newRow;
-                oldRow0 = newCol;
-                oldCol1 = newRow;
-                oldRow1 = newCol + 1;
-            } else {
-                oldCol0 = 1599 - newRow;
-                oldRow0 = newCol;
-                oldCol1 = 1599 - newRow;
-                oldRow1 = newCol + 1;
-            }
+            int oldCol0 = newRow;
+            int oldRow0 = 1199 - newCol;
+            int oldCol1 = newRow;
+            int oldRow1 = 1199 - (newCol + 1);
             
             uint8_t p0 = _buffer[oldRow0 * EL133UF1_WIDTH + oldCol0] & 0x07;
             uint8_t p1 = _buffer[oldRow1 * EL133UF1_WIDTH + oldCol1] & 0x07;
@@ -486,8 +479,8 @@ void EL133UF1::_sendBuffer() {
     Serial.println("EL133UF1: Sending image data to display...");
     
     // Send data to display
-    _sendCommand(CMD_DTM, CS0_SEL, bufA, CORRECT_HALF_SIZE);
-    _sendCommand(CMD_DTM, CS1_SEL, bufB, CORRECT_HALF_SIZE);
+    _sendCommand(CMD_DTM, CS0_SEL, bufA, SEND_HALF_SIZE);
+    _sendCommand(CMD_DTM, CS1_SEL, bufB, SEND_HALF_SIZE);
 
     free(bufA);
     free(bufB);
