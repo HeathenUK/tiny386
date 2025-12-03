@@ -77,6 +77,14 @@ bool EL133UF1::begin(int8_t cs0Pin, int8_t cs1Pin, int8_t dcPin,
 }
 
 void EL133UF1::_reset() {
+    // The ESP32 reference implementation does a TRIPLE reset pulse
+    // This appears to be more reliable for this panel
+    digitalWrite(_resetPin, HIGH);
+    delay(30);
+    digitalWrite(_resetPin, LOW);
+    delay(30);
+    digitalWrite(_resetPin, HIGH);
+    delay(30);
     digitalWrite(_resetPin, LOW);
     delay(30);
     digitalWrite(_resetPin, HIGH);
@@ -86,26 +94,15 @@ void EL133UF1::_reset() {
 bool EL133UF1::_busyWait(uint32_t timeoutMs) {
     uint32_t startTime = millis();
     
-    // If busy pin is high (pulled up), the display might not be connected
-    // In that case, just wait a short time
-    if (digitalRead(_busyPin) == HIGH) {
-        // Check if it changes within a reasonable time
-        while (digitalRead(_busyPin) == HIGH) {
-            if (millis() - startTime > timeoutMs) {
-                Serial.println("EL133UF1: Busy wait timeout");
-                return false;
-            }
-            delay(10);
-        }
-    }
-    
-    // Wait for busy to go inactive (low)
+    // BUSY pin logic: LOW = busy, HIGH = idle (ready)
+    // This matches the ESP32 reference: while(!DEV_Digital_Read(EPD_BUSY_PIN))
+    // Wait while busy pin is LOW (device is busy)
     while (digitalRead(_busyPin) == LOW) {
         if (millis() - startTime > timeoutMs) {
-            Serial.println("EL133UF1: Busy wait timeout (busy stayed low)");
+            Serial.println("EL133UF1: Busy wait timeout");
             return false;
         }
-        delay(10);
+        delay(5);  // ESP32 uses 5ms polling interval
     }
     
     return true;
@@ -114,7 +111,7 @@ bool EL133UF1::_busyWait(uint32_t timeoutMs) {
 void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, size_t len) {
     _spi->beginTransaction(_spiSettings);
     
-    // Assert chip select(s)
+    // Assert chip select(s) - active LOW
     if (csSel & CS0_SEL) {
         digitalWrite(_cs0Pin, LOW);
     }
@@ -122,14 +119,15 @@ void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, siz
         digitalWrite(_cs1Pin, LOW);
     }
 
-    // Send command (DC low)
+    // Send command (DC low = command mode)
     digitalWrite(_dcPin, LOW);
-    delayMicroseconds(300);  // Small delay for DC setup
+    delayMicroseconds(10);  // Setup time for DC
     _spi->transfer(cmd);
 
-    // Send data if present (DC high)
+    // Send data if present (DC high = data mode)
     if (data != nullptr && len > 0) {
         digitalWrite(_dcPin, HIGH);
+        delayMicroseconds(10);  // Setup time for DC
         
         // Send data in chunks to avoid issues with large transfers
         const size_t chunkSize = 4096;
@@ -140,7 +138,7 @@ void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, siz
         }
     }
 
-    // Deassert chip selects
+    // Deassert chip selects - return to HIGH (inactive)
     digitalWrite(_cs0Pin, HIGH);
     digitalWrite(_cs1Pin, HIGH);
     digitalWrite(_dcPin, LOW);
@@ -149,11 +147,14 @@ void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, siz
 }
 
 void EL133UF1::_initSequence() {
-    // ANTM - Anti-crosstalk magic (CS0 only)
+    // Initialization sequence based on both Python (Pimoroni) and ESP32 references
+    // The order matches the Python implementation which is known to work
+    
+    // ANTM - Anti-crosstalk magic (CS0 only) - must be sent first after reset
     const uint8_t antm[] = {0xC0, 0x1C, 0x1C, 0xCC, 0xCC, 0xCC, 0x15, 0x15, 0x55};
     _sendCommand(CMD_ANTM, CS0_SEL, antm, sizeof(antm));
 
-    // CMD66 (both CS)
+    // CMD66 / 0xF0 (both CS)
     const uint8_t cmd66[] = {0x49, 0x55, 0x13, 0x5D, 0x05, 0x10};
     _sendCommand(CMD_CMD66, CS_BOTH_SEL, cmd66, sizeof(cmd66));
 
@@ -161,7 +162,7 @@ void EL133UF1::_initSequence() {
     const uint8_t psr[] = {0xDF, 0x69};
     _sendCommand(CMD_PSR, CS_BOTH_SEL, psr, sizeof(psr));
 
-    // PLL Control (both CS)
+    // PLL Control (both CS) - Note: ESP32 code omits this but Python has it
     const uint8_t pll[] = {0x08};
     _sendCommand(CMD_PLL, CS_BOTH_SEL, pll, sizeof(pll));
 
@@ -186,35 +187,37 @@ void EL133UF1::_initSequence() {
     _sendCommand(CMD_CCSET, CS_BOTH_SEL, ccset, sizeof(ccset));
 
     // TRES - Resolution Setting (both CS)
-    // 0x04B0 = 1200, 0x0320 = 800 (but this is per half-panel)
+    // 0x04B0 = 1200 (height), 0x0320 = 800 (half-width per controller)
     const uint8_t tres[] = {0x04, 0xB0, 0x03, 0x20};
     _sendCommand(CMD_TRES, CS_BOTH_SEL, tres, sizeof(tres));
 
-    // Power settings (CS0 only for master controller)
+    // === Power settings - CS0 (master) only ===
+    
+    // PWR - Power Setting
     const uint8_t pwr[] = {0x0F, 0x00, 0x28, 0x2C, 0x28, 0x38};
     _sendCommand(CMD_PWR, CS0_SEL, pwr, sizeof(pwr));
 
-    // EN_BUF - Enable Buffer (CS0 only)
+    // EN_BUF - Enable Buffer
     const uint8_t en_buf[] = {0x07};
     _sendCommand(CMD_EN_BUF, CS0_SEL, en_buf, sizeof(en_buf));
 
-    // BTST_P - Booster Soft Start Positive (CS0 only)
+    // BTST_P - Booster Soft Start Positive
     const uint8_t btst_p[] = {0xD8, 0x18};
     _sendCommand(CMD_BTST_P, CS0_SEL, btst_p, sizeof(btst_p));
 
-    // BOOST_VDDP_EN (CS0 only)
+    // BOOST_VDDP_EN
     const uint8_t boost_vddp[] = {0x01};
     _sendCommand(CMD_BOOST_VDDP_EN, CS0_SEL, boost_vddp, sizeof(boost_vddp));
 
-    // BTST_N - Booster Soft Start Negative (CS0 only)
+    // BTST_N - Booster Soft Start Negative
     const uint8_t btst_n[] = {0xD8, 0x18};
     _sendCommand(CMD_BTST_N, CS0_SEL, btst_n, sizeof(btst_n));
 
-    // BUCK_BOOST_VDDN (CS0 only)
+    // BUCK_BOOST_VDDN
     const uint8_t buck_boost[] = {0x01};
     _sendCommand(CMD_BUCK_BOOST_VDDN, CS0_SEL, buck_boost, sizeof(buck_boost));
 
-    // TFT_VCOM_POWER (CS0 only)
+    // TFT_VCOM_POWER
     const uint8_t vcom_power[] = {0x02};
     _sendCommand(CMD_TFT_VCOM_POWER, CS0_SEL, vcom_power, sizeof(vcom_power));
 
@@ -463,24 +466,26 @@ void EL133UF1::update() {
     // Send buffer data
     _sendBuffer();
 
-    // Power on
+    // Power on sequence (matches ESP32 reference)
+    Serial.println("EL133UF1: Power on...");
     _sendCommand(CMD_PON, CS_BOTH_SEL);
-    delay(200);
-    _busyWait(500);
+    _busyWait(1000);  // Wait for power-on to complete
+    
+    delay(30);  // Additional settle time (ESP32 uses 30ms)
 
     // Display refresh
     Serial.println("EL133UF1: Triggering refresh (this takes ~30 seconds)...");
     const uint8_t drf[] = {0x00};
     _sendCommand(CMD_DRF, CS_BOTH_SEL, drf, sizeof(drf));
     
-    // Wait for refresh to complete (can take up to 32 seconds)
-    _busyWait(35000);
+    // Wait for refresh to complete (can take up to 32 seconds for Spectra 6)
+    _busyWait(40000);
 
     // Power off
+    Serial.println("EL133UF1: Power off...");
     const uint8_t pof[] = {0x00};
     _sendCommand(CMD_POF, CS_BOTH_SEL, pof, sizeof(pof));
-    delay(200);
-    _busyWait(500);
+    _busyWait(1000);
 
     Serial.println("EL133UF1: Display update complete");
 }
