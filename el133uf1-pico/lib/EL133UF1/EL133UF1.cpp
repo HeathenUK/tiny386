@@ -538,14 +538,15 @@ void EL133UF1::drawChar(int16_t x, int16_t y, char c, uint8_t color, uint8_t bg,
         uint8_t* ptr = _buffer + y * EL133UF1_WIDTH + x;
         for (int8_t row = 0; row < 8; row++) {
             uint8_t rowData = charData[row];
-            ptr[0] = (rowData & 0x80) ? fgc : bgc;
-            ptr[1] = (rowData & 0x40) ? fgc : bgc;
-            ptr[2] = (rowData & 0x20) ? fgc : bgc;
-            ptr[3] = (rowData & 0x10) ? fgc : bgc;
-            ptr[4] = (rowData & 0x08) ? fgc : bgc;
-            ptr[5] = (rowData & 0x04) ? fgc : bgc;
-            ptr[6] = (rowData & 0x02) ? fgc : bgc;
-            ptr[7] = (rowData & 0x01) ? fgc : bgc;
+            // Flip bit order horizontally (read LSB to MSB instead of MSB to LSB)
+            ptr[0] = (rowData & 0x01) ? fgc : bgc;
+            ptr[1] = (rowData & 0x02) ? fgc : bgc;
+            ptr[2] = (rowData & 0x04) ? fgc : bgc;
+            ptr[3] = (rowData & 0x08) ? fgc : bgc;
+            ptr[4] = (rowData & 0x10) ? fgc : bgc;
+            ptr[5] = (rowData & 0x20) ? fgc : bgc;
+            ptr[6] = (rowData & 0x40) ? fgc : bgc;
+            ptr[7] = (rowData & 0x80) ? fgc : bgc;
             ptr += EL133UF1_WIDTH;
         }
         return;
@@ -555,7 +556,8 @@ void EL133UF1::drawChar(int16_t x, int16_t y, char c, uint8_t color, uint8_t bg,
     for (int8_t row = 0; row < 8; row++) {
         uint8_t rowData = charData[row];
         for (int8_t col = 0; col < 8; col++) {
-            bool pixel = (rowData >> (7 - col)) & 0x01;
+            // Flip bit order: use col instead of (7 - col)
+            bool pixel = (rowData >> col) & 0x01;
             uint8_t pixelColor = pixel ? fgc : bgc;
             
             if (size == 1) {
