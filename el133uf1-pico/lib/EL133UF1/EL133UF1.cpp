@@ -264,9 +264,9 @@ void EL133UF1::_sendCommand(uint8_t cmd, uint8_t csSel, const uint8_t* data, siz
     }
 
     // Send command (DC low = command mode)
-    // This display requires 100ms delay (from working CircuitPython reference)
+    // CircuitPython uses 100ms but 50ms seems to work
     digitalWrite(_dcPin, LOW);
-    delay(100);  // 100ms delay - required by this display
+    delay(50);  // 50ms delay for DC setup
     
     _spi->beginTransaction(_spiSettings);
     _spi->transfer(cmd);
@@ -619,33 +619,33 @@ void EL133UF1::_sendBuffer() {
     Serial.printf("    Buffer alloc:   %4lu ms\n", millis() - stepStart);
 
     // Process the buffer with rotation
-    // Flip horizontally by reversing oldCol
+    // Optimized: use pointer arithmetic and hoist calculations out of inner loop
     stepStart = millis();
     
-    size_t idxA = 0;
-    size_t idxB = 0;
+    uint8_t* pA = bufA;
+    uint8_t* pB = bufB;
     
-    for (int newRow = 0; newRow < 1600; newRow++) {
-        // First half (columns 0-599 of rotated image go to bufA)
-        for (int newCol = 0; newCol < 600; newCol += 2) {
-            int oldCol = 1599 - newRow;  // Flip horizontally
-            int oldRow0 = newCol;
-            int oldRow1 = newCol + 1;
-            
-            uint8_t p0 = _buffer[oldRow0 * EL133UF1_WIDTH + oldCol] & 0x07;
-            uint8_t p1 = _buffer[oldRow1 * EL133UF1_WIDTH + oldCol] & 0x07;
-            bufA[idxA++] = (p0 << 4) | p1;
+    // Process column by column through the source (which becomes row by row in output)
+    // For each source column (from right to left), read rows 0-1199 and pack into output
+    for (int srcCol = 1599; srcCol >= 0; srcCol--) {
+        // Pointer to start of this column in source buffer
+        const uint8_t* srcPtr = _buffer + srcCol;
+        
+        // First half: source rows 0-599 go to bufA
+        for (int i = 0; i < 300; i++) {
+            uint8_t p0 = srcPtr[0] & 0x07;
+            uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
+            *pA++ = (p0 << 4) | p1;
+            srcPtr += EL133UF1_WIDTH * 2;  // Skip 2 rows
         }
         
-        // Second half (columns 600-1199 of rotated image go to bufB)
-        for (int newCol = 600; newCol < 1200; newCol += 2) {
-            int oldCol = 1599 - newRow;  // Flip horizontally
-            int oldRow0 = newCol;
-            int oldRow1 = newCol + 1;
-            
-            uint8_t p0 = _buffer[oldRow0 * EL133UF1_WIDTH + oldCol] & 0x07;
-            uint8_t p1 = _buffer[oldRow1 * EL133UF1_WIDTH + oldCol] & 0x07;
-            bufB[idxB++] = (p0 << 4) | p1;
+        // Second half: source rows 600-1199 go to bufB
+        // srcPtr is now at row 600
+        for (int i = 0; i < 300; i++) {
+            uint8_t p0 = srcPtr[0] & 0x07;
+            uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
+            *pB++ = (p0 << 4) | p1;
+            srcPtr += EL133UF1_WIDTH * 2;  // Skip 2 rows
         }
     }
     Serial.printf("    Rotate/pack:    %4lu ms\n", millis() - stepStart);
