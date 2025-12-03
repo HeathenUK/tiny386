@@ -117,6 +117,9 @@ EL133UF1::EL133UF1(SPIClass* spi) :
     _vFlip(false),
     _initialized(false),
     _packedMode(false),
+    _preRotatedMode(false),
+    _initDone(false),
+    _asyncInProgress(false),
     _buffer(nullptr),
     _bufferRight(nullptr)
 {
@@ -300,9 +303,10 @@ void EL133UF1::_initSequence() {
 void EL133UF1::clear(uint8_t color) {
     if (_buffer == nullptr) return;
     
-    if (_packedMode) {
-        // Packed mode: each byte has two pixels
-        uint8_t packedColor = ((color & 0x07) << 4) | (color & 0x07);
+    uint8_t packedColor = ((color & 0x07) << 4) | (color & 0x07);
+    
+    if (_packedMode || _preRotatedMode) {
+        // Packed/pre-rotated: each byte has two pixels
         memset(_buffer, packedColor, PACKED_HALF_SIZE);
         if (_bufferRight) {
             memset(_bufferRight, packedColor, PACKED_HALF_SIZE);
@@ -313,38 +317,70 @@ void EL133UF1::clear(uint8_t color) {
     }
 }
 
+void EL133UF1::setPreRotatedMode(bool enable) {
+    if (enable == _preRotatedMode) return;
+    
+    _preRotatedMode = enable;
+    
+    if (enable && !_packedMode) {
+        // Switching to pre-rotated mode: reallocate buffers
+        // Free old unpacked buffer
+        if (_buffer) {
+            free(_buffer);
+            _buffer = nullptr;
+        }
+        
+        // Allocate two packed buffers (480KB each)
+        _buffer = (uint8_t*)pmalloc(PACKED_HALF_SIZE);
+        _bufferRight = (uint8_t*)pmalloc(PACKED_HALF_SIZE);
+        
+        if (_buffer && _bufferRight) {
+            // Clear to white
+            memset(_buffer, 0x11, PACKED_HALF_SIZE);
+            memset(_bufferRight, 0x11, PACKED_HALF_SIZE);
+        }
+    } else if (!enable && !_packedMode) {
+        // Switching back to unpacked mode
+        if (_buffer) free(_buffer);
+        if (_bufferRight) free(_bufferRight);
+        _bufferRight = nullptr;
+        
+        _buffer = (uint8_t*)pmalloc(EL133UF1_WIDTH * EL133UF1_HEIGHT);
+        if (_buffer) {
+            memset(_buffer, EL133UF1_WHITE, EL133UF1_WIDTH * EL133UF1_HEIGHT);
+        }
+    }
+}
+
 void EL133UF1::setPixel(int16_t x, int16_t y, uint8_t color) {
     if (_buffer == nullptr) return;
     if (x < 0 || x >= EL133UF1_WIDTH || y < 0 || y >= EL133UF1_HEIGHT) return;
     
-    if (_packedMode) {
-        // Packed mode: need to figure out which buffer and which nibble
-        // After 90° rotation: (x,y) in user coords -> (y, 1199-x) in panel coords
-        // Panel is 1600 rows x 1200 cols, split at col 600
-        int16_t panelRow = x;  // 0-1599
-        int16_t panelCol = (EL133UF1_HEIGHT - 1) - y;  // 0-1199
+    if (_packedMode || _preRotatedMode) {
+        // Pre-rotated/packed mode: write directly to panel format
+        // Transform: (x,y) -> panel row = 1599-x, panel col = y
+        // Then split at col 600
+        int16_t panelRow = 1599 - x;
+        int16_t panelCol = y;
         
         uint8_t* buf;
         int16_t bufCol;
         if (panelCol < 600) {
-            buf = _buffer;  // Left half
+            buf = _buffer;
             bufCol = panelCol;
         } else {
-            buf = _bufferRight;  // Right half
+            buf = _bufferRight;
             bufCol = panelCol - 600;
         }
         
         if (buf == nullptr) return;
         
-        // Each row is 600 cols, packed as 300 bytes
         size_t byteIdx = panelRow * 300 + (bufCol / 2);
         uint8_t c = color & 0x07;
         
         if (bufCol % 2 == 0) {
-            // High nibble
             buf[byteIdx] = (buf[byteIdx] & 0x0F) | (c << 4);
         } else {
-            // Low nibble
             buf[byteIdx] = (buf[byteIdx] & 0xF0) | c;
         }
     } else {
@@ -366,11 +402,11 @@ void EL133UF1::drawHLine(int16_t x, int16_t y, int16_t w, uint8_t color) {
     if (x + w > EL133UF1_WIDTH) { w = EL133UF1_WIDTH - x; }
     if (w <= 0) return;
     
-    if (!_packedMode && _buffer) {
+    if (!_packedMode && !_preRotatedMode && _buffer) {
         // Fast path: direct memset for unpacked mode
         memset(_buffer + y * EL133UF1_WIDTH + x, color & 0x07, w);
     } else {
-        // Slow path for packed mode
+        // Use setPixel for packed/pre-rotated modes
         for (int16_t i = 0; i < w; i++) {
             setPixel(x + i, y, color);
         }
@@ -384,7 +420,7 @@ void EL133UF1::drawVLine(int16_t x, int16_t y, int16_t h, uint8_t color) {
     if (h <= 0) return;
     
     uint8_t c = color & 0x07;
-    if (!_packedMode && _buffer) {
+    if (!_packedMode && !_preRotatedMode && _buffer) {
         // Fast path: direct buffer access for unpacked mode
         uint8_t* ptr = _buffer + y * EL133UF1_WIDTH + x;
         for (int16_t i = 0; i < h; i++) {
@@ -392,7 +428,7 @@ void EL133UF1::drawVLine(int16_t x, int16_t y, int16_t h, uint8_t color) {
             ptr += EL133UF1_WIDTH;
         }
     } else {
-        // Slow path for packed mode
+        // Use setPixel for packed/pre-rotated modes
         for (int16_t i = 0; i < h; i++) {
             setPixel(x, y + i, color);
         }
@@ -414,7 +450,7 @@ void EL133UF1::fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint8_t colo
     if (y + h > EL133UF1_HEIGHT) { h = EL133UF1_HEIGHT - y; }
     if (w <= 0 || h <= 0) return;
     
-    if (!_packedMode && _buffer) {
+    if (!_packedMode && !_preRotatedMode && _buffer) {
         // Fast path: direct memset for each row in unpacked mode
         uint8_t c = color & 0x07;
         uint8_t* ptr = _buffer + y * EL133UF1_WIDTH + x;
@@ -513,11 +549,12 @@ void EL133UF1::_sendBuffer() {
 
     uint32_t stepStart;
 
-    if (_packedMode) {
+    // Pre-rotated mode or packed mode: buffers are already in panel format
+    if (_preRotatedMode || _packedMode) {
         stepStart = millis();
         _sendCommand(CMD_DTM, CS0_SEL, _buffer, PACKED_HALF_SIZE);
         _sendCommand(CMD_DTM, CS1_SEL, _bufferRight, PACKED_HALF_SIZE);
-        Serial.printf("    SPI transmit:   %4lu ms (packed mode)\n", millis() - stepStart);
+        Serial.printf("    SPI transmit:   %4lu ms (pre-rotated)\n", millis() - stepStart);
         return;
     }
 
@@ -631,22 +668,27 @@ void EL133UF1::_sendBuffer() {
     free(bufB);
 }
 
-void EL133UF1::update() {
+void EL133UF1::update(bool skipInit) {
     if (!_initialized) {
         Serial.println("EL133UF1: Not initialized!");
         return;
     }
 
-    Serial.println("\n=== EL133UF1: Display Update Profiling ===");
+    Serial.println("\n=== EL133UF1: Display Update ===");
     uint32_t totalStart = millis();
     uint32_t stepStart;
     
-    // Run setup/init sequence
-    stepStart = millis();
-    _initSequence();
-    Serial.printf("  Init sequence:    %4lu ms\n", millis() - stepStart);
+    // Run init sequence (can skip on subsequent updates)
+    if (!skipInit || !_initDone) {
+        stepStart = millis();
+        _initSequence();
+        _initDone = true;
+        Serial.printf("  Init sequence:    %4lu ms\n", millis() - stepStart);
+    } else {
+        Serial.println("  Init sequence:    skipped");
+    }
     
-    // Send buffer data to both controllers
+    // Send buffer data
     stepStart = millis();
     _sendBuffer();
     Serial.printf("  Send buffer:      %4lu ms\n", millis() - stepStart);
@@ -657,7 +699,7 @@ void EL133UF1::update() {
     _busyWait(200);
     Serial.printf("  Power on:         %4lu ms\n", millis() - stepStart);
 
-    // Display refresh (this is the long one - panel physically updating)
+    // Display refresh
     stepStart = millis();
     const uint8_t drf[] = {0x00};
     _sendCommand(CMD_DRF, CS_BOTH_SEL, drf, sizeof(drf));
@@ -671,8 +713,58 @@ void EL133UF1::update() {
     _busyWait(200);
     Serial.printf("  Power off:        %4lu ms\n", millis() - stepStart);
 
-    uint32_t totalTime = millis() - totalStart;
-    Serial.printf("  -------------------------\n");
-    Serial.printf("  TOTAL:            %4lu ms (%.1f sec)\n", totalTime, totalTime / 1000.0);
-    Serial.println("===========================================\n");
+    Serial.printf("  TOTAL:            %4lu ms (%.1f sec)\n", 
+                  millis() - totalStart, (millis() - totalStart) / 1000.0);
+}
+
+void EL133UF1::updateAsync(bool skipInit) {
+    if (!_initialized || _asyncInProgress) return;
+
+    // Run init sequence if needed
+    if (!skipInit || !_initDone) {
+        _initSequence();
+        _initDone = true;
+    }
+    
+    // Send buffer data
+    _sendBuffer();
+
+    // Power on
+    _sendCommand(CMD_PON, CS_BOTH_SEL);
+    _busyWait(200);
+
+    // Start display refresh (non-blocking after this)
+    const uint8_t drf[] = {0x00};
+    _sendCommand(CMD_DRF, CS_BOTH_SEL, drf, sizeof(drf));
+    
+    _asyncInProgress = true;
+}
+
+bool EL133UF1::isUpdateComplete() {
+    if (!_asyncInProgress) return true;
+    
+    // Check if busy pin is HIGH (refresh complete)
+    if (digitalRead(_busyPin) == HIGH) {
+        // Power off
+        const uint8_t pof[] = {0x00};
+        _sendCommand(CMD_POF, CS_BOTH_SEL, pof, sizeof(pof));
+        _busyWait(200);
+        _asyncInProgress = false;
+        return true;
+    }
+    return false;
+}
+
+void EL133UF1::waitForUpdate() {
+    if (!_asyncInProgress) return;
+    
+    // Wait for refresh to complete
+    _busyWait(32000);
+    
+    // Power off
+    const uint8_t pof[] = {0x00};
+    _sendCommand(CMD_POF, CS_BOTH_SEL, pof, sizeof(pof));
+    _busyWait(200);
+    
+    _asyncInProgress = false;
 }

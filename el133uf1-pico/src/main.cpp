@@ -127,11 +127,29 @@ void setup() {
     uint32_t drawTime = millis() - drawStart;
     Serial.printf("Drawing took: %lu ms\n", drawTime);
     
-    // Update the display
-    Serial.println("\nUpdating display (this will take ~30 seconds)...");
-    display.update();
+    // First update - full init
+    Serial.println("\n=== First update (with init) ===");
+    display.update(false);  // false = run init sequence
+    
+    // Wait a bit
+    delay(2000);
+    
+    // Modify the display
+    Serial.println("\n=== Drawing modification ===");
+    drawStart = millis();
+    display.fillRect(700, 500, 200, 200, EL133UF1_RED);
+    display.drawText(710, 550, "2nd", EL133UF1_WHITE, EL133UF1_RED, 4);
+    Serial.printf("Modification took: %lu ms\n", millis() - drawStart);
+    
+    // Second update - skip init (faster!)
+    Serial.println("\n=== Second update (skip init - faster!) ===");
+    display.update(true);  // true = skip init sequence
     
     Serial.println("\nDemo complete!");
+    Serial.println("\nNew features available:");
+    Serial.println("  - update(true) skips init sequence (~1.5s faster)");
+    Serial.println("  - updateAsync() returns immediately, panel refreshes in background");
+    Serial.println("  - setPreRotatedMode(true) for faster updates but slower drawing");
 }
 
 void loop() {

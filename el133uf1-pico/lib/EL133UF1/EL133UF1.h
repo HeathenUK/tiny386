@@ -192,19 +192,57 @@ public:
     void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint8_t color);
 
     /**
-     * @brief Update the display with buffer contents
+     * @brief Update the display with buffer contents (blocking)
      * 
-     * This initiates a full display refresh which takes approximately 30 seconds.
-     * The function blocks until the refresh is complete.
+     * @param skipInit If true, skip init sequence on subsequent updates (~1.5s faster)
+     *                 Only use after first successful update in same session
      */
-    void update();
+    void update(bool skipInit = false);
 
     /**
-     * @brief Check if display is busy
+     * @brief Start async display update (non-blocking)
      * 
-     * @return true if display is busy with a refresh
+     * Returns immediately after sending data. Panel refreshes in background.
+     * Use isUpdateComplete() to check status or waitForUpdate() to block.
+     * 
+     * @param skipInit If true, skip init sequence
+     */
+    void updateAsync(bool skipInit = false);
+
+    /**
+     * @brief Check if async update is complete
+     * @return true if panel refresh is finished
+     */
+    bool isUpdateComplete();
+
+    /**
+     * @brief Wait for async update to complete (blocking)
+     */
+    void waitForUpdate();
+
+    /**
+     * @brief Check if display is busy with a refresh
+     * @return true if display is busy
      */
     bool isBusy();
+
+    /**
+     * @brief Enable/disable pre-rotated buffer mode
+     * 
+     * When enabled, pixels are stored in panel-native format:
+     * - Drawing is ~3x slower (more complex coordinate math)
+     * - Update is ~300ms faster (no rotation needed)
+     * 
+     * Call before begin() or after clear() when changing modes.
+     * 
+     * @param enable True to enable pre-rotated mode
+     */
+    void setPreRotatedMode(bool enable);
+
+    /**
+     * @brief Check if using pre-rotated buffer mode
+     */
+    bool isPreRotatedMode() const { return _preRotatedMode; }
 
     /**
      * @brief Get display width
@@ -291,13 +329,16 @@ private:
     bool _hFlip;
     bool _vFlip;
     bool _initialized;
-    bool _packedMode;  // True if using packed buffers (no PSRAM)
+    bool _packedMode;       // True if using packed buffers (no PSRAM)
+    bool _preRotatedMode;   // True if buffer stores pre-rotated data
+    bool _initDone;         // True if init sequence has run at least once
+    bool _asyncInProgress;  // True if async update is running
     
     // Frame buffer(s)
     // Unpacked mode: single 1.92MB buffer (requires PSRAM)
     // Packed mode: two 480KB buffers (works without PSRAM)
-    uint8_t* _buffer;      // Main buffer (or left half in packed mode)
-    uint8_t* _bufferRight; // Right half (only used in packed mode)
+    uint8_t* _buffer;       // Main buffer (or left half in packed mode)
+    uint8_t* _bufferRight;  // Right half (only used in packed mode)
     
     /**
      * @brief Perform hardware reset
