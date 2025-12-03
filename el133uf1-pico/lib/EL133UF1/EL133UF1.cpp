@@ -590,29 +590,12 @@ bool EL133UF1::isBusy() {
     return digitalRead(_busyPin) == LOW;
 }
 
-// Helper to rotate one half of the buffer
-static void rotateHalf(const uint8_t* src, uint8_t* dest, int startRow, int endRow) {
-    uint8_t* p = dest;
-    for (int srcCol = 1599; srcCol >= 0; srcCol--) {
-        const uint8_t* srcPtr = src + startRow * EL133UF1_WIDTH + srcCol;
-        int numPairs = (endRow - startRow) / 2;
-        
-        for (int i = 0; i < numPairs; i++) {
-            uint8_t p0 = srcPtr[0] & 0x07;
-            uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
-            *p++ = (p0 << 4) | p1;
-            srcPtr += EL133UF1_WIDTH * 2;
-        }
-    }
-}
-
 void EL133UF1::_sendBuffer() {
     if (_buffer == nullptr) return;
 
-    uint32_t stepStart, totalStart = millis();
+    uint32_t stepStart;
 
     if (_packedMode) {
-        // Packed mode: buffers are already in the correct format
         stepStart = millis();
         _sendCommand(CMD_DTM, CS0_SEL, _buffer, PACKED_HALF_SIZE);
         _sendCommand(CMD_DTM, CS1_SEL, _bufferRight, PACKED_HALF_SIZE);
@@ -620,8 +603,8 @@ void EL133UF1::_sendBuffer() {
         return;
     }
 
-    // Unpacked mode: need to rotate and pack the buffer
-    const size_t SEND_HALF_SIZE = PACKED_HALF_SIZE;  // 480000 bytes
+    // Unpacked mode: rotate and pack the buffer
+    const size_t SEND_HALF_SIZE = PACKED_HALF_SIZE;
     
     stepStart = millis();
     uint8_t* bufA = (uint8_t*)pmalloc(SEND_HALF_SIZE);
@@ -635,77 +618,44 @@ void EL133UF1::_sendBuffer() {
     }
     Serial.printf("    Buffer alloc:   %4lu ms\n", millis() - stepStart);
 
-    // OPTIMIZED: Overlap rotation with SPI transmission
-    // 1. Rotate bufA
-    // 2. Start SPI transfer of bufA, while simultaneously rotating bufB
-    // 3. Finish with SPI transfer of bufB
-    
-    uint32_t rotateTimeA, rotateTimeB, spiTimeA, spiTimeB;
-    
-    // Step 1: Rotate bufA (source rows 0-599)
-    stepStart = millis();
-    rotateHalf(_buffer, bufA, 0, 600);
-    rotateTimeA = millis() - stepStart;
-    
-    // Step 2: Start sending bufA command header, then send data while rotating bufB
-    // First, send the command byte for CS0
-    digitalWrite(_cs0Pin, LOW);
-    digitalWrite(_dcPin, LOW);
-    delay(90);
-    _spi->beginTransaction(_spiSettings);
-    _spi->transfer(CMD_DTM);
-    _spi->endTransaction();
-    digitalWrite(_dcPin, HIGH);
-    
-    // Now we need to send data, but let's rotate bufB in parallel using chunked transfers
+    // Rotate and pack
     stepStart = millis();
     
-    // Rotate bufB while sending bufA in chunks
-    const size_t CHUNK_SIZE = 4096;
-    size_t bufA_sent = 0;
+    uint8_t* pA = bufA;
     uint8_t* pB = bufB;
-    int srcColB = 1599;
     
-    _spi->beginTransaction(_spiSettings);
-    
-    // Interleave: send chunk of bufA, rotate chunk of bufB
-    while (bufA_sent < SEND_HALF_SIZE || srcColB >= 0) {
-        // Send a chunk of bufA if there's more to send
-        if (bufA_sent < SEND_HALF_SIZE) {
-            size_t toSend = min(CHUNK_SIZE, SEND_HALF_SIZE - bufA_sent);
-            _spi->transfer(bufA + bufA_sent, nullptr, toSend);
-            bufA_sent += toSend;
+    for (int srcCol = 1599; srcCol >= 0; srcCol--) {
+        const uint8_t* srcPtr = _buffer + srcCol;
+        
+        // BufA: source rows 0-599
+        for (int i = 0; i < 300; i++) {
+            uint8_t p0 = srcPtr[0] & 0x07;
+            uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
+            *pA++ = (p0 << 4) | p1;
+            srcPtr += EL133UF1_WIDTH * 2;
         }
         
-        // Rotate some of bufB if there's more to rotate
-        // Process ~8 columns per iteration to balance with SPI chunk time
-        for (int col = 0; col < 8 && srcColB >= 0; col++, srcColB--) {
-            const uint8_t* srcPtr = _buffer + 600 * EL133UF1_WIDTH + srcColB;
-            for (int i = 0; i < 300; i++) {
-                uint8_t p0 = srcPtr[0] & 0x07;
-                uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
-                *pB++ = (p0 << 4) | p1;
-                srcPtr += EL133UF1_WIDTH * 2;
-            }
+        // BufB: source rows 600-1199 (srcPtr is now at row 600)
+        for (int i = 0; i < 300; i++) {
+            uint8_t p0 = srcPtr[0] & 0x07;
+            uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
+            *pB++ = (p0 << 4) | p1;
+            srcPtr += EL133UF1_WIDTH * 2;
         }
     }
+    Serial.printf("    Rotate/pack:    %4lu ms\n", millis() - stepStart);
+
+    // Send to display
+    stepStart = millis();
+    _sendCommand(CMD_DTM, CS0_SEL, bufA, SEND_HALF_SIZE);
+    uint32_t spiTimeA = millis() - stepStart;
     
-    _spi->endTransaction();
-    digitalWrite(_cs0Pin, HIGH);
-    
-    spiTimeA = millis() - stepStart;
-    rotateTimeB = spiTimeA;  // Rotation happened during this time
-    
-    // Step 3: Send bufB
     stepStart = millis();
     _sendCommand(CMD_DTM, CS1_SEL, bufB, SEND_HALF_SIZE);
-    spiTimeB = millis() - stepStart;
+    uint32_t spiTimeB = millis() - stepStart;
     
-    uint32_t totalTime = millis() - totalStart;
-    Serial.printf("    Rotate A:       %4lu ms\n", rotateTimeA);
-    Serial.printf("    SPI A + Rot B:  %4lu ms (overlapped)\n", spiTimeA);
-    Serial.printf("    SPI B:          %4lu ms\n", spiTimeB);
-    Serial.printf("    Total:          %4lu ms\n", totalTime);
+    Serial.printf("    SPI transmit:   %4lu ms (CS0: %lu, CS1: %lu)\n", 
+                  spiTimeA + spiTimeB, spiTimeA, spiTimeB);
 
     free(bufA);
     free(bufB);
