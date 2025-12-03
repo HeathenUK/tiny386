@@ -77,27 +77,21 @@ bool connectWiFiAndGetNTP() {
     Serial.println("\nWiFi connected!");
     Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
     
-    // Configure NTP using arduino-pico's configTime()
-    // This uses lwIP SNTP internally
+    // Use arduino-pico's NTP class (like the example)
     Serial.println("\n=== Getting NTP time ===");
-    Serial.printf("NTP servers: %s, %s\n", NTP_SERVER1, NTP_SERVER2);
+    NTP.begin(NTP_SERVER1, NTP_SERVER2);
     
-    // configTime(gmtOffset_sec, daylightOffset_sec, server1, server2)
-    // Using 0,0 for UTC
-    configTime(0, 0, NTP_SERVER1, NTP_SERVER2);
-    
-    // Wait for time to be set
-    Serial.print("Waiting for NTP sync");
+    Serial.print("Waiting for NTP time sync: ");
+    time_t now = time(nullptr);
     start = millis();
-    time_t now = 0;
-    while (now < 1000000000 && (millis() - start < 15000)) {
-        Serial.print(".");
+    while (now < 8 * 3600 * 2 && (millis() - start < 30000)) {
         delay(500);
-        time(&now);
+        Serial.print(".");
+        now = time(nullptr);
     }
     Serial.println();
     
-    if (now < 1000000000) {
+    if (now < 8 * 3600 * 2) {
         Serial.println("NTP sync failed!");
         WiFi.disconnect(true);
         return false;
@@ -107,10 +101,10 @@ bool connectWiFiAndGetNTP() {
     uint64_t now_ms = (uint64_t)now * 1000;
     sleep_set_time_ms(now_ms);
     
-    struct tm* timeinfo = gmtime(&now);
-    char buf[64];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", timeinfo);
-    Serial.printf("NTP time: %s\n", buf);
+    struct tm timeinfo;
+    gmtime_r(&now, &timeinfo);
+    Serial.print("Current time: ");
+    Serial.println(asctime(&timeinfo));
     Serial.printf("Epoch: %lld\n", (long long)now);
     
     // Disconnect WiFi to save power
