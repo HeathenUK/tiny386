@@ -17,9 +17,11 @@
 #include "hardware/structs/rosc.h"
 #include "hardware/structs/powman.h"
 #include "hardware/regs/powman.h"
-#include "hardware/structs/systick.h"
 #include "hardware/sync.h"
 #include "pico/runtime_init.h"
+
+// Systick register (avoid including full header that might conflict)
+#define SYSTICK_CSR (*(volatile uint32_t*)0xE000E010)
 
 // For ARM deep sleep
 #ifndef __riscv
@@ -257,7 +259,7 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
 
     Serial.println("  [10] Disabling systick...");
     Serial.flush();
-    systick_hw->csr &= ~1;
+    SYSTICK_CSR &= ~1;
 
     Serial.println("  [11] Configuring clk_ref...");
     Serial.flush();
@@ -392,7 +394,7 @@ void sleep_power_up(void) {
     clocks_init();
     
     // Re-enable systick
-    systick_hw->csr |= 1;
+    SYSTICK_CSR |= 1;
     
     // Switch powman timer back to XOSC for accuracy
     uint64_t restore_ms = powman_timer_get_ms();
