@@ -63,6 +63,14 @@ void setup() {
     Serial.printf("  PSRAM size: %d bytes", psramSize);
     if (psramSize > 0) {
         Serial.printf(" (%d MB)\n", psramSize / (1024*1024));
+        // Show PSRAM clock speed
+        uint32_t sysClk = rp2040.f_cpu();
+        Serial.printf("  System clock: %lu MHz\n", sysClk / 1000000);
+        #ifdef RP2350_PSRAM_MAX_SCK_HZ
+        Serial.printf("  PSRAM max: %d MHz (divisor ~%lu)\n", 
+                      RP2350_PSRAM_MAX_SCK_HZ / 1000000,
+                      (sysClk + RP2350_PSRAM_MAX_SCK_HZ - 1) / RP2350_PSRAM_MAX_SCK_HZ);
+        #endif
     } else {
         Serial.println(" (NOT DETECTED!)");
         Serial.println("\n  WARNING: No PSRAM detected!");
