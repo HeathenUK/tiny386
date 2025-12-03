@@ -590,10 +590,31 @@ bool EL133UF1::isBusy() {
     return digitalRead(_busyPin) == LOW;
 }
 
+// Core 1 parameters for parallel rotation
+static const uint8_t* _core1Src;
+static uint8_t* _core1Dest;
+static volatile bool _core1Done;
+
+static void core1_rotate_bufB() {
+    uint8_t* pB = _core1Dest;
+    const uint8_t* src = _core1Src;
+    
+    for (int srcCol = 1599; srcCol >= 0; srcCol--) {
+        const uint8_t* srcPtr = src + 600 * EL133UF1_WIDTH + srcCol;
+        for (int i = 0; i < 300; i++) {
+            uint8_t p0 = srcPtr[0] & 0x07;
+            uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
+            *pB++ = (p0 << 4) | p1;
+            srcPtr += EL133UF1_WIDTH * 2;
+        }
+    }
+    _core1Done = true;
+}
+
 void EL133UF1::_sendBuffer() {
     if (_buffer == nullptr) return;
 
-    uint32_t stepStart;
+    uint32_t stepStart, phaseStart;
 
     if (_packedMode) {
         stepStart = millis();
@@ -603,7 +624,6 @@ void EL133UF1::_sendBuffer() {
         return;
     }
 
-    // Unpacked mode: rotate and pack the buffer
     const size_t SEND_HALF_SIZE = PACKED_HALF_SIZE;
     
     stepStart = millis();
@@ -618,44 +638,56 @@ void EL133UF1::_sendBuffer() {
     }
     Serial.printf("    Buffer alloc:   %4lu ms\n", millis() - stepStart);
 
-    // Rotate and pack
+    // OPTIMIZED PIPELINE:
+    // 1. Launch Core 1 to rotate bufB
+    // 2. Core 0 rotates bufA
+    // 3. As soon as bufA done, start SPI transfer (while Core 1 may still work on bufB)
+    // 4. Wait for Core 1, then SPI bufB
+    
+    phaseStart = millis();
+    
+    // Launch Core 1 for bufB rotation
+    _core1Src = _buffer;
+    _core1Dest = bufB;
+    _core1Done = false;
+    multicore_launch_core1(core1_rotate_bufB);
+    
+    // Core 0 rotates bufA
     stepStart = millis();
-    
     uint8_t* pA = bufA;
-    uint8_t* pB = bufB;
-    
     for (int srcCol = 1599; srcCol >= 0; srcCol--) {
         const uint8_t* srcPtr = _buffer + srcCol;
-        
-        // BufA: source rows 0-599
         for (int i = 0; i < 300; i++) {
             uint8_t p0 = srcPtr[0] & 0x07;
             uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
             *pA++ = (p0 << 4) | p1;
             srcPtr += EL133UF1_WIDTH * 2;
         }
-        
-        // BufB: source rows 600-1199 (srcPtr is now at row 600)
-        for (int i = 0; i < 300; i++) {
-            uint8_t p0 = srcPtr[0] & 0x07;
-            uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
-            *pB++ = (p0 << 4) | p1;
-            srcPtr += EL133UF1_WIDTH * 2;
-        }
     }
-    Serial.printf("    Rotate/pack:    %4lu ms\n", millis() - stepStart);
-
-    // Send to display
+    uint32_t rotateA = millis() - stepStart;
+    
+    // BufA is ready - start SPI immediately (Core 1 may still be working)
     stepStart = millis();
     _sendCommand(CMD_DTM, CS0_SEL, bufA, SEND_HALF_SIZE);
-    uint32_t spiTimeA = millis() - stepStart;
+    uint32_t spiA = millis() - stepStart;
     
+    // Now wait for Core 1 to finish bufB (it probably finished during SPI A)
+    while (!_core1Done) {
+        tight_loop_contents();
+    }
+    multicore_reset_core1();
+    
+    // Send bufB
     stepStart = millis();
     _sendCommand(CMD_DTM, CS1_SEL, bufB, SEND_HALF_SIZE);
-    uint32_t spiTimeB = millis() - stepStart;
+    uint32_t spiB = millis() - stepStart;
     
-    Serial.printf("    SPI transmit:   %4lu ms (CS0: %lu, CS1: %lu)\n", 
-                  spiTimeA + spiTimeB, spiTimeA, spiTimeB);
+    uint32_t totalPhase = millis() - phaseStart;
+    
+    Serial.printf("    Rotate A:       %4lu ms\n", rotateA);
+    Serial.printf("    SPI A:          %4lu ms (Core1 rotates B in parallel)\n", spiA);
+    Serial.printf("    SPI B:          %4lu ms\n", spiB);
+    Serial.printf("    Pipeline total: %4lu ms\n", totalPhase);
 
     free(bufA);
     free(bufB);
