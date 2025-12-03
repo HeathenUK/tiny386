@@ -76,23 +76,42 @@ bool connectWiFiAndGetNTP() {
     
     Serial.println("\nWiFi connected!");
     Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
+    Serial.printf("DNS: %s\n", WiFi.dnsIP().toString().c_str());
+    
+    // Small delay to let network stack stabilize
+    delay(1000);
     
     // Use arduino-pico's NTP class (like the example)
     Serial.println("\n=== Getting NTP time ===");
+    Serial.printf("Servers: %s, %s\n", NTP_SERVER1, NTP_SERVER2);
+    
     NTP.begin(NTP_SERVER1, NTP_SERVER2);
     
     Serial.print("Waiting for NTP time sync: ");
     time_t now = time(nullptr);
+    Serial.printf("(initial=%lld) ", (long long)now);
     start = millis();
+    int dots = 0;
     while (now < 8 * 3600 * 2 && (millis() - start < 30000)) {
-        delay(500);
-        Serial.print(".");
-        now = time(nullptr);
+        delay(100);  // Shorter delay for more responsive network processing
+        dots++;
+        if (dots % 10 == 0) {
+            Serial.print(".");
+        }
+        if (dots % 50 == 0) {
+            now = time(nullptr);
+            Serial.printf("[%lld]", (long long)now);
+        } else {
+            now = time(nullptr);
+        }
     }
     Serial.println();
     
+    Serial.printf("Final time: %lld (threshold: %d)\n", (long long)now, 8 * 3600 * 2);
+    
     if (now < 8 * 3600 * 2) {
-        Serial.println("NTP sync failed!");
+        Serial.println("NTP sync failed - time not set!");
         WiFi.disconnect(true);
         return false;
     }
