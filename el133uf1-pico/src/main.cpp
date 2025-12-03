@@ -77,10 +77,16 @@ bool connectWiFiAndGetNTP() {
     Serial.println("\nWiFi connected!");
     Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
     Serial.printf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
-    Serial.printf("DNS: %s\n", WiFi.dnsIP().toString().c_str());
+    Serial.printf("DNS (DHCP): %s\n", WiFi.dnsIP().toString().c_str());
+    
+    // Override DNS with Cloudflare (1.1.1.1) and Google (8.8.8.8)
+    IPAddress cloudflare(1, 1, 1, 1);
+    IPAddress google(8, 8, 8, 8);
+    WiFi.setDNS(cloudflare, google);
+    Serial.printf("DNS (override): %s, %s\n", cloudflare.toString().c_str(), google.toString().c_str());
     
     // Small delay to let network stack stabilize
-    delay(1000);
+    delay(500);
     
     // Use arduino-pico's NTP class
     Serial.println("\n=== Getting NTP time ===");
