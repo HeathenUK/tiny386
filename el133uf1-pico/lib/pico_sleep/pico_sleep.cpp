@@ -94,20 +94,22 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
     }
 }
 
-static void processor_deep_sleep(void) {
-#ifdef __riscv
-    asm volatile("wfi");
-#else
+static void go_dormant(void) {
+#ifndef __riscv
+    // ARM Cortex-M33: Set SLEEPDEEP bit for deep sleep
     scb_hw->scr |= ARM_CPU_PREFIXED(SCR_SLEEPDEEP_BITS);
 #endif
-}
 
-static void go_dormant(void) {
+    // Put the oscillator into dormant mode
+    // This blocks until woken by an interrupt (like the powman alarm)
     if (_dormant_source == DORMANT_SOURCE_XOSC) {
         xosc_dormant();
     } else {
+        // For LPOSC, we put ROSC dormant but LPOSC keeps running for the timer
         rosc_set_dormant();
     }
+    
+    // If we get here, we've been woken up
 }
 
 void sleep_goto_dormant_for_ms(uint32_t delay_ms) {
@@ -133,13 +135,14 @@ void sleep_goto_dormant_for_ms(uint32_t delay_ms) {
     powman_enable_alarm_wakeup_at_ms(alarm_time);
     
     Serial.printf("  [sleep] Timer reg: 0x%08lx\n", powman_hw->timer);
-    Serial.println("  [sleep] Going dormant NOW...");
+    Serial.printf("  [sleep] INTE reg: 0x%08lx\n", powman_hw->inte);
+    Serial.println("  [sleep] Entering low power sleep...");
     Serial.flush();
     
     // Wait for serial
     for (volatile int i = 0; i < 500000; i++);
     
-    // Disable systick
+    // Disable systick to prevent tick interrupts
     SYSTICK_CSR &= ~1;
     
     // Only enable powman clock during sleep
@@ -157,21 +160,25 @@ void sleep_goto_dormant_for_ms(uint32_t delay_ms) {
     pll_deinit(pll_sys);
     pll_deinit(pll_usb);
     
-    // Switch to LPOSC
+    // Switch to LPOSC (32kHz) - system runs very slow but uses less power
     clock_configure(clk_ref, CLOCKS_CLK_REF_CTRL_SRC_VALUE_LPOSC_CLKSRC, 0, 32*KHZ, 32*KHZ);
     clock_configure(clk_sys, CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLK_REF, 0, 32*KHZ, 32*KHZ);
     clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS, 32*KHZ, 32*KHZ);
     
-    // Disable XOSC
+    // Disable XOSC to save power
     xosc_disable();
     
-    // Enable deep sleep
-    processor_deep_sleep();
+    // Set SLEEPDEEP for ARM
+#ifndef __riscv
+    scb_hw->scr |= ARM_CPU_PREFIXED(SCR_SLEEPDEEP_BITS);
+#endif
     
-    // Go dormant
-    go_dormant();
+    // Wait for interrupt (powman alarm) - this is where the CPU sleeps
+    // The CPU will halt here until the powman alarm fires
+    __wfi();
     
-    // --- Wake up here ---
+    // --- We wake up here when the alarm fires ---
+    
     powman_disable_alarm_wakeup();
 }
 
