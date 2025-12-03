@@ -622,9 +622,8 @@ void EL133UF1::_sendBuffer() {
     Serial.printf("  Send buffers: bufA=%p, bufB=%p\n", bufA, bufB);
 
     // Process the buffer with rotation
-    // After 90° clockwise rotation (rot90 with k=-1):
-    // new[new_row][new_col] = old[cols - 1 - new_col][new_row]
-    // where old is (1200 rows x 1600 cols), new is (1600 rows x 1200 cols)
+    // 90° clockwise rotation with horizontal flip correction
+    // Maps buffer (1600w x 1200h) to panel (1600 rows x 1200 cols, split into two 600-col halves)
     
     size_t idxA = 0;
     size_t idxB = 0;
@@ -632,7 +631,8 @@ void EL133UF1::_sendBuffer() {
     for (int newRow = 0; newRow < 1600; newRow++) {
         // First half (columns 0-599 of rotated image go to bufA)
         for (int newCol = 0; newCol < 600; newCol += 2) {
-            int oldCol = newRow;
+            // Flip horizontally by using (1599 - newRow) instead of newRow
+            int oldCol = 1599 - newRow;
             int oldRow0 = 1199 - newCol;
             int oldRow1 = 1199 - (newCol + 1);
             
@@ -643,7 +643,7 @@ void EL133UF1::_sendBuffer() {
         
         // Second half (columns 600-1199 of rotated image go to bufB)
         for (int newCol = 600; newCol < 1200; newCol += 2) {
-            int oldCol = newRow;
+            int oldCol = 1599 - newRow;
             int oldRow0 = 1199 - newCol;
             int oldRow1 = 1199 - (newCol + 1);
             
