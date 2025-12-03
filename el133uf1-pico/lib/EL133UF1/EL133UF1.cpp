@@ -423,17 +423,20 @@ void EL133UF1::_sendBuffer() {
 
     // Unpacked mode: need to rotate and pack the buffer
     // Allocate temporary buffers for packed data (480000 bytes each)
+    // Must use pmalloc since these are too large for regular RAM
     const size_t SEND_HALF_SIZE = PACKED_HALF_SIZE;  // 480000 bytes
     
-    uint8_t* bufA = (uint8_t*)malloc(SEND_HALF_SIZE);
-    uint8_t* bufB = (uint8_t*)malloc(SEND_HALF_SIZE);
+    uint8_t* bufA = (uint8_t*)pmalloc(SEND_HALF_SIZE);
+    uint8_t* bufB = (uint8_t*)pmalloc(SEND_HALF_SIZE);
     
     if (bufA == nullptr || bufB == nullptr) {
-        Serial.println("EL133UF1: Failed to allocate send buffers");
+        Serial.println("EL133UF1: Failed to allocate send buffers in PSRAM");
         if (bufA) free(bufA);
         if (bufB) free(bufB);
         return;
     }
+    
+    Serial.printf("  Send buffers: bufA=%p, bufB=%p\n", bufA, bufB);
 
     // Process the buffer with rotation
     // After 90° clockwise rotation (rot90 with k=-1):
