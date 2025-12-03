@@ -57,9 +57,8 @@ void setup() {
     Serial.println("Memory check:");
     Serial.printf("  Total heap: %d bytes\n", rp2040.getTotalHeap());
     Serial.printf("  Free heap:  %d bytes\n", rp2040.getFreeHeap());
-    Serial.printf("  Used heap:  %d bytes\n", rp2040.getUsedHeap());
     
-    // Check PSRAM availability
+    // Check PSRAM availability (critical for this display!)
     size_t psramSize = rp2040.getPSRAMSize();
     Serial.printf("  PSRAM size: %d bytes", psramSize);
     if (psramSize > 0) {
@@ -67,21 +66,16 @@ void setup() {
     } else {
         Serial.println(" (NOT DETECTED!)");
         Serial.println("\n  WARNING: No PSRAM detected!");
-        Serial.println("  The Pico Plus 2 W should have 8MB PSRAM.");
-        Serial.println("  Make sure you're using the correct board and firmware.");
+        Serial.println("  This display requires ~2MB PSRAM for the frame buffer.");
     }
     
-    // Test allocations of increasing size
-    Serial.println("\n  Testing allocations:");
-    size_t testSizes[] = {1024, 10*1024, 100*1024, 480*1024, 1000*1024, 2000*1024};
-    for (size_t size : testSizes) {
-        void* testAlloc = malloc(size);
-        if (testAlloc) {
-            Serial.printf("    %7d bytes: OK at %p\n", size, testAlloc);
-            free(testAlloc);
-        } else {
-            Serial.printf("    %7d bytes: FAILED\n", size);
-        }
+    // Quick test of pmalloc
+    void* testPsram = pmalloc(1024);
+    if (testPsram) {
+        Serial.printf("  pmalloc test: OK at %p\n", testPsram);
+        free(testPsram);
+    } else {
+        Serial.println("  pmalloc test: FAILED - PSRAM not working!");
     }
     
     Serial.println("\nPico Plus 2 W Pin Configuration:");

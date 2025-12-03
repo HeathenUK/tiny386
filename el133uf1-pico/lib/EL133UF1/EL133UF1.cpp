@@ -35,13 +35,20 @@ bool EL133UF1::begin(int8_t cs0Pin, int8_t cs1Pin, int8_t dcPin,
     Serial.printf("  Pins: CS0=%d CS1=%d DC=%d RST=%d BUSY=%d\n", 
                   _cs0Pin, _cs1Pin, _dcPin, _resetPin, _busyPin);
 
-    // Use the static PSRAM buffer
-    extern uint8_t psramFrameBuffer[];
-    _buffer = psramFrameBuffer;
+    // Allocate frame buffer using pmalloc (PSRAM malloc)
+    Serial.println("  Allocating frame buffer in PSRAM...");
+    
+    _buffer = (uint8_t*)pmalloc(EL133UF1_WIDTH * EL133UF1_HEIGHT);
     _packedMode = false;
     _bufferRight = nullptr;
     
-    Serial.printf("  Using PSRAM buffer at %p (%d bytes)\n", 
+    if (_buffer == nullptr) {
+        Serial.println("EL133UF1: pmalloc failed!");
+        Serial.println("  Make sure PSRAM is available on this board.");
+        return false;
+    }
+    
+    Serial.printf("  PSRAM buffer allocated at %p (%d bytes)\n", 
                   _buffer, EL133UF1_WIDTH * EL133UF1_HEIGHT);
     
     // Verify we can write to it
@@ -49,9 +56,11 @@ bool EL133UF1::begin(int8_t cs0Pin, int8_t cs1Pin, int8_t dcPin,
     _buffer[1] = 0x55;
     if (_buffer[0] != 0xAA || _buffer[1] != 0x55) {
         Serial.println("EL133UF1: PSRAM buffer verification failed!");
+        free(_buffer);
         _buffer = nullptr;
         return false;
     }
+    Serial.println("  PSRAM buffer verified OK");
     
     // Clear to white
     memset(_buffer, EL133UF1_WHITE, EL133UF1_WIDTH * EL133UF1_HEIGHT);
