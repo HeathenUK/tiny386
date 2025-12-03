@@ -4,6 +4,7 @@
  */
 
 #include "EL133UF1.h"
+#include <pico/multicore.h>
 
 // Simple 8x8 bitmap font (ASCII 32-127)
 // Each character is 8 bytes, each byte is one row (MSB = leftmost pixel)
@@ -589,6 +590,30 @@ bool EL133UF1::isBusy() {
     return digitalRead(_busyPin) == LOW;
 }
 
+// Dual-core rotation parameters
+static const uint8_t* _core1SrcBuffer;
+static uint8_t* _core1DestBuffer;
+static volatile bool _core1Done;
+
+// Core 1 worker function for parallel buffer processing
+static void core1_rotate_bufB() {
+    uint8_t* pB = _core1DestBuffer;
+    
+    // Process bufB: source rows 600-1199
+    for (int srcCol = 1599; srcCol >= 0; srcCol--) {
+        const uint8_t* srcPtr = _core1SrcBuffer + 600 * EL133UF1_WIDTH + srcCol;
+        
+        for (int i = 0; i < 300; i++) {
+            uint8_t p0 = srcPtr[0] & 0x07;
+            uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
+            *pB++ = (p0 << 4) | p1;
+            srcPtr += EL133UF1_WIDTH * 2;
+        }
+    }
+    
+    _core1Done = true;
+}
+
 void EL133UF1::_sendBuffer() {
     if (_buffer == nullptr) return;
 
@@ -618,37 +643,38 @@ void EL133UF1::_sendBuffer() {
     }
     Serial.printf("    Buffer alloc:   %4lu ms\n", millis() - stepStart);
 
-    // Process the buffer with rotation
-    // Optimized: use pointer arithmetic and hoist calculations out of inner loop
+    // Process the buffer with rotation using DUAL CORES
     stepStart = millis();
     
-    uint8_t* pA = bufA;
-    uint8_t* pB = bufB;
+    // Setup and launch core 1 to process bufB
+    _core1SrcBuffer = _buffer;
+    _core1DestBuffer = bufB;
+    _core1Done = false;
     
-    // Process column by column through the source (which becomes row by row in output)
-    // For each source column (from right to left), read rows 0-1199 and pack into output
+    rp2040.idleOtherCore();
+    rp2040.resumeOtherCore();
+    multicore_launch_core1(core1_rotate_bufB);
+    
+    // Core 0 processes bufA: source rows 0-599
+    uint8_t* pA = bufA;
     for (int srcCol = 1599; srcCol >= 0; srcCol--) {
-        // Pointer to start of this column in source buffer
         const uint8_t* srcPtr = _buffer + srcCol;
         
-        // First half: source rows 0-599 go to bufA
         for (int i = 0; i < 300; i++) {
             uint8_t p0 = srcPtr[0] & 0x07;
             uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
             *pA++ = (p0 << 4) | p1;
-            srcPtr += EL133UF1_WIDTH * 2;  // Skip 2 rows
-        }
-        
-        // Second half: source rows 600-1199 go to bufB
-        // srcPtr is now at row 600
-        for (int i = 0; i < 300; i++) {
-            uint8_t p0 = srcPtr[0] & 0x07;
-            uint8_t p1 = srcPtr[EL133UF1_WIDTH] & 0x07;
-            *pB++ = (p0 << 4) | p1;
-            srcPtr += EL133UF1_WIDTH * 2;  // Skip 2 rows
+            srcPtr += EL133UF1_WIDTH * 2;
         }
     }
-    Serial.printf("    Rotate/pack:    %4lu ms\n", millis() - stepStart);
+    
+    // Wait for core 1 to finish
+    while (!_core1Done) {
+        tight_loop_contents();
+    }
+    multicore_reset_core1();
+    
+    Serial.printf("    Rotate/pack:    %4lu ms (dual-core)\n", millis() - stepStart);
 
     // Send data to display
     stepStart = millis();
