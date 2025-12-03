@@ -59,11 +59,32 @@ void sleep_goto_dormant_for_ms(uint32_t delay_ms);
 /**
  * @brief Restore clocks and peripherals after waking from dormant mode
  * 
- * This must be called after waking from dormant mode to restore
- * normal system clock operation. It re-enables PLLs, restores
- * clock sources, and reinitializes UART.
+ * Note: For true deep sleep, this is handled automatically by the
+ * wake handler. This function is kept for compatibility.
  */
 void sleep_power_up(void);
+
+/**
+ * @brief Check if we just woke from deep sleep
+ * 
+ * @return true if we woke from deep sleep, false otherwise
+ */
+bool sleep_woke_from_deep_sleep(void);
+
+/**
+ * @brief Clear the wake-from-deep-sleep flag
+ */
+void sleep_clear_wake_flag(void);
+
+/**
+ * @brief Set callback function to run after waking from deep sleep
+ * 
+ * This callback will be called after the system reinitializes on wake.
+ * Use this to continue your application after deep sleep.
+ * 
+ * @param callback Function to call on wake (or NULL to disable)
+ */
+void sleep_set_wake_callback(void (*callback)(void));
 
 #ifdef __cplusplus
 }

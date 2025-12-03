@@ -1,6 +1,10 @@
 /*
  * Deep Sleep functionality for RP2350
  * Uses the official Pico SDK powman functions
+ * 
+ * This implements TRUE deep sleep where the switched core is powered down.
+ * When waking up, execution restarts from a boot vector (like a warm reset)
+ * but RAM is preserved.
  */
 
 #include "pico_sleep.h"
@@ -12,7 +16,7 @@
 #include "hardware/clocks.h"
 #include "hardware/xosc.h"
 #include "hardware/structs/rosc.h"
-#include "hardware/powman.h"  // Official SDK powman header
+#include "hardware/powman.h"
 #include "hardware/sync.h"
 #include "pico/runtime_init.h"
 
@@ -21,184 +25,174 @@
 #include "hardware/structs/scb.h"
 #endif
 
+// Magic number for powman boot vector
+#define POWMAN_BOOT_MAGIC_NUM 0x706d6e61  // "pmna" in ASCII
+
 // Systick register
 #define SYSTICK_CSR (*(volatile uint32_t*)0xE000E010)
 
 // ========================================================================
-// ROSC functions (from pico-extras, not in main SDK)
+// Sleep state - preserved across deep sleep (in RAM)
 // ========================================================================
 
-static inline void rosc_write(io_rw_32 *addr, uint32_t value) {
-    hw_clear_bits(&rosc_hw->status, ROSC_STATUS_BADWRITE_BITS);
-    *addr = value;
-}
-
-static void rosc_disable(void) {
-    uint32_t tmp = rosc_hw->ctrl;
-    tmp &= (~ROSC_CTRL_ENABLE_BITS);
-    tmp |= (ROSC_CTRL_ENABLE_VALUE_DISABLE << ROSC_CTRL_ENABLE_LSB);
-    rosc_write(&rosc_hw->ctrl, tmp);
-    while(rosc_hw->status & ROSC_STATUS_STABLE_BITS);
-}
-
-static void rosc_set_dormant(void) {
-    rosc_write(&rosc_hw->dormant, ROSC_DORMANT_VALUE_DORMANT);
-    while(!(rosc_hw->status & ROSC_STATUS_STABLE_BITS));
-}
-
-static void rosc_enable(void) {
-    rosc_write(&rosc_hw->ctrl, ROSC_CTRL_ENABLE_BITS);
-    while (!(rosc_hw->status & ROSC_STATUS_STABLE_BITS));
-}
-
-// ========================================================================
-// Sleep implementation
-// ========================================================================
-
+static volatile bool _woke_from_deep_sleep = false;
 static dormant_source_t _dormant_source = DORMANT_SOURCE_LPOSC;
+
+// ========================================================================
+// Wake-up callback - user provides this
+// ========================================================================
+static void (*_wake_callback)(void) = nullptr;
+
+void sleep_set_wake_callback(void (*callback)(void)) {
+    _wake_callback = callback;
+}
+
+// ========================================================================
+// Wake-up handler - called when we wake from deep sleep
+// This runs instead of main() after deep sleep
+// ========================================================================
+
+void __not_in_flash_func(deep_sleep_wake_handler)() {
+    // Reinitialize the C runtime (but preserve RAM)
+    runtime_init();
+    
+    // Mark that we woke from deep sleep
+    _woke_from_deep_sleep = true;
+    
+    // Re-enable clocks
+    clocks_hw->sleep_en0 = ~0u;
+    clocks_hw->sleep_en1 = ~0u;
+    clocks_init();
+    
+    // Re-enable systick
+    SYSTICK_CSR |= 1;
+    
+    // Switch powman timer back to XOSC
+    powman_timer_set_1khz_tick_source_xosc();
+    
+    // Reinitialize serial
+    Serial.begin(115200);
+    delay(100);
+    
+    Serial.println("\n\n========================================");
+    Serial.println("*** WOKE FROM DEEP SLEEP! ***");
+    Serial.println("========================================\n");
+    
+    // Call user's wake callback if set
+    if (_wake_callback) {
+        _wake_callback();
+    }
+    
+    // Enter infinite loop (user callback should handle everything)
+    while(1) {
+        delay(1000);
+    }
+}
+
+// ========================================================================
+// Public API
+// ========================================================================
+
+bool sleep_woke_from_deep_sleep(void) {
+    return _woke_from_deep_sleep;
+}
+
+void sleep_clear_wake_flag(void) {
+    _woke_from_deep_sleep = false;
+}
 
 void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
     _dormant_source = dormant_source;
 
-    Serial.println("  [1] Setting up powman timer for LPOSC...");
+    Serial.println("  [1] Setting up powman timer...");
     Serial.flush();
 
     if (dormant_source == DORMANT_SOURCE_LPOSC) {
-        Serial.printf("  [2] Timer running: %d\n", powman_timer_is_running() ? 1 : 0);
-        Serial.flush();
-        
         // Start timer if not running
         if (!powman_timer_is_running()) {
-            Serial.println("  [3] Starting and configuring timer...");
+            Serial.println("  [2] Starting timer...");
             Serial.flush();
             powman_timer_set_ms(0);
             powman_timer_start();
         }
         
-        Serial.println("  [4] Switching to LPOSC tick source...");
+        Serial.println("  [3] Switching to LPOSC...");
         Serial.flush();
         
-        // Use official SDK function to switch to LPOSC
+        // Switch to LPOSC (keeps running during deep sleep)
         powman_timer_set_1khz_tick_source_lposc();
         
-        Serial.printf("  [5] Timer now using LPOSC: %d\n", 
+        Serial.printf("  [4] Timer using LPOSC: %d\n", 
                       (powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) ? 1 : 0);
-        Serial.flush();
         
         // Verify timer is counting
         uint64_t t1 = powman_timer_get_ms();
         delay(100);
         uint64_t t2 = powman_timer_get_ms();
-        Serial.printf("  [6] Timer test: %llu -> %llu (delta=%llu)\n", t1, t2, t2-t1);
+        Serial.printf("  [5] Timer test: %llu -> %llu (delta=%llu)\n", t1, t2, t2-t1);
         Serial.flush();
     }
 }
 
-static void go_dormant(void) {
-#ifndef __riscv
-    // ARM Cortex-M33: Set SLEEPDEEP bit for deep sleep
-    scb_hw->scr |= ARM_CPU_PREFIXED(SCR_SLEEPDEEP_BITS);
-#endif
-
-    // Put the oscillator into dormant mode
-    // This blocks until woken by an interrupt (like the powman alarm)
-    if (_dormant_source == DORMANT_SOURCE_XOSC) {
-        xosc_dormant();
-    } else {
-        // For LPOSC, we put ROSC dormant but LPOSC keeps running for the timer
-        rosc_set_dormant();
-    }
-    
-    // If we get here, we've been woken up
-}
-
 void sleep_goto_dormant_for_ms(uint32_t delay_ms) {
-    if (_dormant_source != DORMANT_SOURCE_LPOSC) {
-        Serial.println("Warning: Timed dormant requires LPOSC source!");
-        return;
-    }
-    
     if (!(powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS)) {
-        Serial.println("  [sleep] ERROR: Timer not using LPOSC!");
+        Serial.println("  ERROR: Timer not using LPOSC!");
         return;
     }
     
-    uint64_t current_ms = powman_timer_get_ms();
-    uint64_t alarm_time = current_ms + delay_ms;
+    uint64_t alarm_time = powman_timer_get_ms() + delay_ms;
+    Serial.printf("  [sleep] Alarm at: %llu ms (in %lu ms)\n", alarm_time, delay_ms);
     
-    Serial.printf("  [sleep] Current: %llu ms, Alarm: %llu ms\n", current_ms, alarm_time);
-    Serial.flush();
-    
-    // Use official SDK function to set up alarm wakeup
-    Serial.println("  [sleep] Setting alarm wakeup...");
-    Serial.flush();
+    // Set up alarm wakeup
     powman_enable_alarm_wakeup_at_ms(alarm_time);
     
-    Serial.printf("  [sleep] Timer reg: 0x%08lx\n", powman_hw->timer);
-    Serial.printf("  [sleep] INTE reg: 0x%08lx\n", powman_hw->inte);
-    Serial.println("  [sleep] Entering low power sleep...");
+    // Set up boot vector for wake-up
+    // When we wake, execution will jump to deep_sleep_wake_handler
+    uintptr_t boot_addr = (uintptr_t)deep_sleep_wake_handler;
+#ifndef __riscv
+    boot_addr |= 1;  // OR with 1 for ARM thumb mode
+#endif
+    
+    uintptr_t stack_pointer;
+    asm volatile("mov %0, sp" : "=r" (stack_pointer));
+    
+    // Write boot vector to powman registers
+    powman_hw->boot[0] = POWMAN_BOOT_MAGIC_NUM;
+    powman_hw->boot[1] = (~POWMAN_BOOT_MAGIC_NUM + 1) ^ boot_addr;  // -magic ^ addr
+    powman_hw->boot[2] = stack_pointer;
+    powman_hw->boot[3] = boot_addr;
+    
+    Serial.printf("  [sleep] Boot vector: 0x%08lx, SP: 0x%08lx\n", boot_addr, stack_pointer);
+    
+    // Configure power states:
+    // Sleep state: SW core OFF, keep XIP cache + SRAM (0x07)
+    // Wake state: Everything ON (0x0f)
+    powman_power_state sleep_state = 0x07;  // XIP, SRAM0, SRAM1 (no SW core)
+    powman_power_state wake_state = 0x0f;   // All on
+    
+    bool valid = powman_configure_wakeup_state(sleep_state, wake_state);
+    if (!valid) {
+        Serial.println("  ERROR: Invalid wakeup state configuration!");
+        return;
+    }
+    
+    Serial.println("  [sleep] Entering DEEP SLEEP (core powered down)...");
     Serial.flush();
     
-    // Wait for serial
-    for (volatile int i = 0; i < 500000; i++);
+    // Wait for serial to complete
+    delay(100);
     
-    // Disable systick to prevent tick interrupts
-    SYSTICK_CSR &= ~1;
-    
-    // Only enable powman clock during sleep
-    clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_REF_POWMAN_BITS;
-    clocks_hw->sleep_en1 = 0x0;
-    
-    // Stop unused clocks
-    clock_stop(clk_adc);
-    clock_stop(clk_usb);
-#if PICO_RP2350
-    clock_stop(clk_hstx);
-#endif
-    
-    // Disable PLLs
-    pll_deinit(pll_sys);
-    pll_deinit(pll_usb);
-    
-    // Switch to LPOSC (32kHz) - system runs very slow but uses less power
-    clock_configure(clk_ref, CLOCKS_CLK_REF_CTRL_SRC_VALUE_LPOSC_CLKSRC, 0, 32*KHZ, 32*KHZ);
-    clock_configure(clk_sys, CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLK_REF, 0, 32*KHZ, 32*KHZ);
-    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS, 32*KHZ, 32*KHZ);
-    
-    // Disable XOSC to save power
-    xosc_disable();
-    
-    // Set SLEEPDEEP for ARM
-#ifndef __riscv
-    scb_hw->scr |= ARM_CPU_PREFIXED(SCR_SLEEPDEEP_BITS);
-#endif
-    
-    // Wait for interrupt (powman alarm) - this is where the CPU sleeps
-    // The CPU will halt here until the powman alarm fires
+    // Power down the switched core - THIS IS THE DEEP SLEEP
+    // Execution will NOT continue past this point
+    // When alarm fires, we'll wake at deep_sleep_wake_handler()
+    powman_set_power_state(sleep_state);
     __wfi();
     
-    // --- We wake up here when the alarm fires ---
-    
-    powman_disable_alarm_wakeup();
+    // We should never reach here - wake goes to boot vector
+    Serial.println("  ERROR: Should not reach here!");
 }
 
 void sleep_power_up(void) {
-    rosc_enable();
-    xosc_init();
-    
-    clocks_hw->sleep_en0 = ~0u;
-    clocks_hw->sleep_en1 = ~0u;
-    
-    clocks_init();
-    
-    SYSTICK_CSR |= 1;
-    
-    // Switch powman back to XOSC
-    uint64_t restore_ms = powman_timer_get_ms();
-    powman_timer_set_1khz_tick_source_xosc();
-    powman_timer_set_ms(restore_ms);
-    
-    Serial.end();
-    Serial.begin(115200);
-    for (volatile int i = 0; i < 1000000; i++);
+    // This is now handled by deep_sleep_wake_handler
+    // Called automatically on wake
 }

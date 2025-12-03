@@ -44,8 +44,50 @@ extern "C" {
 // (SPI1 is the correct bus for GP10/GP11 on Pico)
 EL133UF1 display(&SPI1);
 
-// Forward declaration
+// Forward declarations
 void drawDemoPattern();
+void onWakeFromSleep();
+
+// ========================================================================
+// Wake callback - runs after deep sleep wake
+// ========================================================================
+void onWakeFromSleep() {
+    Serial.println("=== Continuing after deep sleep ===\n");
+    
+    // Reinitialize SPI
+    Serial.println("Reinitializing SPI1...");
+    SPI1.setSCK(PIN_SPI_SCK);
+    SPI1.setTX(PIN_SPI_MOSI);
+    SPI1.begin();
+    
+    // Reinitialize display (just GPIO, not full init)
+    Serial.println("Reinitializing display GPIO...");
+    pinMode(PIN_CS0, OUTPUT);
+    pinMode(PIN_CS1, OUTPUT);
+    pinMode(PIN_DC, OUTPUT);
+    pinMode(PIN_RESET, OUTPUT);
+    pinMode(PIN_BUSY, INPUT_PULLUP);
+    digitalWrite(PIN_CS0, HIGH);
+    digitalWrite(PIN_CS1, HIGH);
+    
+    // Modify the display buffer (it should still be in PSRAM!)
+    Serial.println("\n=== Drawing modification ===");
+    uint32_t drawStart = millis();
+    display.fillRect(700, 500, 200, 200, EL133UF1_RED);
+    display.drawText(710, 550, "WAKE!", EL133UF1_WHITE, EL133UF1_RED, 4);
+    Serial.printf("Modification took: %lu ms\n", millis() - drawStart);
+    
+    // Second update - skip init since display is still powered
+    Serial.println("\n=== Second update (after deep sleep) ===");
+    display.update(true);  // true = skip init
+    
+    Serial.println("\n=== Demo complete! ===");
+    Serial.println("Successfully demonstrated:");
+    Serial.println("  - TRUE deep sleep (switched core powered down)");
+    Serial.println("  - Wake via powman timer alarm");
+    Serial.println("  - RAM preserved across sleep");
+    Serial.println("  - Display update after wake");
+}
 
 void setup() {
     // Initialize serial for debugging
@@ -141,40 +183,27 @@ void setup() {
     
     // Enter deep sleep for 10 seconds
     Serial.println("\n=== Entering deep sleep for 10 seconds ===");
-    Serial.println("Using RP2350 powman with LPOSC for lowest power consumption");
-    
-    // On Pico W boards, must deinitialize WiFi module before deep sleep
-    #ifdef CYW43_WL_GPIO_LED_PIN
-    Serial.println("Deinitializing CYW43 WiFi module...");
-    cyw43_arch_deinit();
-    #endif
+    Serial.println("Using RP2350 powman - TRUE deep sleep (core powers down)");
+    Serial.println("NOTE: On wake, code restarts from boot vector");
     
     Serial.flush();
-    delay(100);  // Let serial output complete
+    delay(100);
     
-    // Prepare for dormant mode - switch to low power oscillator
-    Serial.println("Preparing clocks for dormant mode...");
+    // Set up wake callback - this runs when we wake from deep sleep
+    sleep_set_wake_callback(onWakeFromSleep);
+    
+    // Prepare powman timer for deep sleep
+    Serial.println("Preparing for deep sleep...");
     sleep_run_from_lposc();
     
-    // Go dormant for 10 seconds (10000 ms)
+    // Go to deep sleep for 10 seconds
+    // WARNING: Execution does NOT continue past this point!
+    // On wake, the boot vector runs (which calls onWakeFromSleep)
     sleep_goto_dormant_for_ms(10000);
     
-    // Wake up and restore clocks
-    sleep_power_up();
-    
-    // Reinitialize CYW43 after wake
-    #ifdef CYW43_WL_GPIO_LED_PIN
-    Serial.println("Reinitializing CYW43...");
-    cyw43_arch_init();
-    #endif
-    
-    // Reinitialize SPI after clock restoration
-    Serial.println("\n=== Woke up from deep sleep! ===");
-    Serial.println("Reinitializing SPI...");
-    SPI1.end();
-    SPI1.setSCK(PIN_SPI_SCK);
-    SPI1.setTX(PIN_SPI_MOSI);
-    SPI1.begin();
+    // We should never reach here - execution restarts from boot vector on wake
+    Serial.println("ERROR: Should not reach here after deep sleep!");
+    while(1) delay(1000);
     
     // Modify the display
     Serial.println("\n=== Drawing modification ===");
