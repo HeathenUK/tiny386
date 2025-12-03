@@ -35,43 +35,27 @@ bool EL133UF1::begin(int8_t cs0Pin, int8_t cs1Pin, int8_t dcPin,
     Serial.printf("  Pins: CS0=%d CS1=%d DC=%d RST=%d BUSY=%d\n", 
                   _cs0Pin, _cs1Pin, _dcPin, _resetPin, _busyPin);
 
-    // Try to allocate frame buffer
-    // First try unpacked mode (1.92MB - requires PSRAM)
-    // If that fails, fall back to packed mode (2 x 480KB)
-    Serial.println("  Allocating frame buffer...");
+    // Use the static PSRAM buffer
+    extern uint8_t psramFrameBuffer[];
+    _buffer = psramFrameBuffer;
+    _packedMode = false;
+    _bufferRight = nullptr;
     
-    _buffer = (uint8_t*)malloc(EL133UF1_WIDTH * EL133UF1_HEIGHT);
+    Serial.printf("  Using PSRAM buffer at %p (%d bytes)\n", 
+                  _buffer, EL133UF1_WIDTH * EL133UF1_HEIGHT);
     
-    if (_buffer != nullptr) {
-        // Unpacked mode - 1 byte per pixel
-        _packedMode = false;
-        _bufferRight = nullptr;
-        Serial.printf("  Unpacked mode: %d bytes at %p\n", 
-                      EL133UF1_WIDTH * EL133UF1_HEIGHT, _buffer);
-        memset(_buffer, EL133UF1_WHITE, EL133UF1_WIDTH * EL133UF1_HEIGHT);
-    } else {
-        // Try packed mode - two smaller buffers
-        Serial.println("  Large buffer failed, trying packed mode...");
-        _buffer = (uint8_t*)malloc(PACKED_HALF_SIZE);
-        _bufferRight = (uint8_t*)malloc(PACKED_HALF_SIZE);
-        
-        if (_buffer != nullptr && _bufferRight != nullptr) {
-            _packedMode = true;
-            Serial.printf("  Packed mode: 2 x %d bytes\n", PACKED_HALF_SIZE);
-            Serial.printf("    Left:  %p\n", _buffer);
-            Serial.printf("    Right: %p\n", _bufferRight);
-            // Fill with white (0x11 = two white pixels packed)
-            memset(_buffer, 0x11, PACKED_HALF_SIZE);
-            memset(_bufferRight, 0x11, PACKED_HALF_SIZE);
-        } else {
-            // Cleanup partial allocation
-            if (_buffer) { free(_buffer); _buffer = nullptr; }
-            if (_bufferRight) { free(_bufferRight); _bufferRight = nullptr; }
-            Serial.println("EL133UF1: Failed to allocate frame buffer!");
-            Serial.println("  Need either 1.92MB (PSRAM) or 2x480KB (regular RAM)");
-            return false;
-        }
+    // Verify we can write to it
+    _buffer[0] = 0xAA;
+    _buffer[1] = 0x55;
+    if (_buffer[0] != 0xAA || _buffer[1] != 0x55) {
+        Serial.println("EL133UF1: PSRAM buffer verification failed!");
+        _buffer = nullptr;
+        return false;
     }
+    
+    // Clear to white
+    memset(_buffer, EL133UF1_WHITE, EL133UF1_WIDTH * EL133UF1_HEIGHT);
+    Serial.println("  Buffer cleared to white");
     
     // Initialize buffer to white
     memset(_buffer, EL133UF1_WHITE, EL133UF1_WIDTH * EL133UF1_HEIGHT);
