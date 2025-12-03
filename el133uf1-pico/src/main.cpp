@@ -21,6 +21,7 @@
 
 #include <Arduino.h>
 #include "EL133UF1.h"
+#include "pico_sleep.h"
 
 // Pin definitions for Pimoroni Pico Plus 2 W with Inky Impression 13.3"
 // These match the working CircuitPython reference
@@ -131,8 +132,28 @@ void setup() {
     Serial.println("\n=== First update (with init) ===");
     display.update(false);  // false = run init sequence
     
-    // Wait a bit
-    delay(2000);
+    // Enter deep sleep for 10 seconds
+    Serial.println("\n=== Entering deep sleep for 10 seconds ===");
+    Serial.println("Using RP2350 powman with LPOSC for lowest power consumption");
+    Serial.flush();
+    delay(100);  // Let serial output complete
+    
+    // Prepare for dormant mode - switch to low power oscillator
+    sleep_run_from_lposc();
+    
+    // Go dormant for 10 seconds (10000 ms)
+    sleep_goto_dormant_for_ms(10000);
+    
+    // Wake up and restore clocks
+    sleep_power_up();
+    
+    // Reinitialize SPI after clock restoration
+    Serial.println("\n=== Woke up from deep sleep! ===");
+    Serial.println("Reinitializing SPI...");
+    SPI1.end();
+    SPI1.setSCK(PIN_SPI_SCK);
+    SPI1.setTX(PIN_SPI_MOSI);
+    SPI1.begin();
     
     // Modify the display
     Serial.println("\n=== Drawing modification ===");
@@ -146,7 +167,8 @@ void setup() {
     display.update(true);  // true = skip init sequence
     
     Serial.println("\nDemo complete!");
-    Serial.println("\nNew features available:");
+    Serial.println("\nFeatures demonstrated:");
+    Serial.println("  - Deep sleep using RP2350 powman + LPOSC (10 sec between updates)");
     Serial.println("  - update(true) skips init sequence (~1.5s faster)");
     Serial.println("  - updateAsync() returns immediately, panel refreshes in background");
     Serial.println("  - setPreRotatedMode(true) for faster updates but slower drawing");
