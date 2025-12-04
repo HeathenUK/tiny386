@@ -357,16 +357,23 @@ void doDisplayUpdate(int updateNumber) {
     ttf.begin(&display);
     ttf.loadFont(opensans_ttf, opensans_ttf_len);
     
-    // Draw update info
+    // Draw update info with performance profiling
     uint32_t drawStart = millis();
+    uint32_t t0, t1;
+    uint32_t ttfTotal = 0, bitmapTotal = 0;
     
+    t0 = millis();
     display.clear(EL133UF1_WHITE);
+    Serial.printf("  clear:          %lu ms\n", millis() - t0);
     
-    // Title - using TTF font
+    // Title - using TTF font (64px, 23 chars)
+    t0 = millis();
     ttf.drawTextCentered(0, 60, display.width(), "RP2350 Deep Sleep Clock", 64.0, EL133UF1_BLACK);
+    t1 = millis() - t0;
+    ttfTotal += t1;
+    Serial.printf("  TTF title 64px: %lu ms\n", t1);
     
     // Current time - big display
-    // Extract just the time portion
     time_t time_sec = (time_t)(now_ms / 1000);
     struct tm* tm = gmtime(&time_sec);
     char timeBuf[16];
@@ -376,29 +383,67 @@ void doDisplayUpdate(int updateNumber) {
     uint8_t colors[] = {EL133UF1_RED, EL133UF1_GREEN, EL133UF1_BLUE, EL133UF1_YELLOW};
     uint8_t color = colors[(updateNumber - 1) % 4];
     
+    t0 = millis();
     display.fillRect(150, 200, 900, 200, color);
-    // Time display - large TTF
-    ttf.drawTextCentered(150, 230, 900, timeBuf, 140.0, EL133UF1_WHITE);
+    Serial.printf("  fillRect:       %lu ms\n", millis() - t0);
     
-    // Date - TTF
+    // Time display - large TTF (140px, 8 chars)
+    t0 = millis();
+    ttf.drawTextCentered(150, 230, 900, timeBuf, 140.0, EL133UF1_WHITE);
+    t1 = millis() - t0;
+    ttfTotal += t1;
+    Serial.printf("  TTF time 140px: %lu ms\n", t1);
+    
+    // Date - TTF (42px, ~20 chars)
     char dateBuf[32];
     strftime(dateBuf, sizeof(dateBuf), "%A, %d %B %Y", tm);
+    t0 = millis();
     ttf.drawTextCentered(0, 450, display.width(), dateBuf, 42.0, EL133UF1_BLACK);
+    t1 = millis() - t0;
+    ttfTotal += t1;
+    Serial.printf("  TTF date 42px:  %lu ms\n", t1);
     
-    // Update count - TTF
+    // Update count - TTF (56px, ~10 chars)
     char buf[32];
     snprintf(buf, sizeof(buf), "Update #%d", updateNumber);
+    t0 = millis();
     ttf.drawTextCentered(0, 530, display.width(), buf, 56.0, EL133UF1_BLACK);
+    t1 = millis() - t0;
+    ttfTotal += t1;
+    Serial.printf("  TTF count 56px: %lu ms\n", t1);
     
-    // Info - TTF
+    // Info line 1 - TTF (28px, 48 chars)
+    t0 = millis();
     ttf.drawTextCentered(0, 650, display.width(), "NTP synced on boot, time maintained during sleep", 28.0, EL133UF1_BLACK);
+    t1 = millis() - t0;
+    ttfTotal += t1;
+    Serial.printf("  TTF info1 28px: %lu ms\n", t1);
+    
+    // Info line 2 - TTF (28px, 38 chars)
+    t0 = millis();
     ttf.drawTextCentered(0, 700, display.width(), "Next update in 10 seconds (deep sleep)", 28.0, EL133UF1_BLACK);
+    t1 = millis() - t0;
+    ttfTotal += t1;
+    Serial.printf("  TTF info2 28px: %lu ms\n", t1);
     
-    // Show font comparison
+    // Bitmap font comparison (size 2 = 16px, 24 chars)
+    t0 = millis();
     display.drawText(50, 800, "Bitmap font (8x8 scaled)", EL133UF1_BLACK, EL133UF1_WHITE, 2);
-    ttf.drawText(50, 850, "TrueType font (Open Sans)", 24.0, EL133UF1_BLACK);
+    t1 = millis() - t0;
+    bitmapTotal += t1;
+    Serial.printf("  Bitmap 16px:    %lu ms\n", t1);
     
-    Serial.printf("Drawing took: %lu ms\n", millis() - drawStart);
+    // TTF comparison (24px, 25 chars)
+    t0 = millis();
+    ttf.drawText(50, 850, "TrueType font (Open Sans)", 24.0, EL133UF1_BLACK);
+    t1 = millis() - t0;
+    ttfTotal += t1;
+    Serial.printf("  TTF 24px:       %lu ms\n", t1);
+    
+    Serial.printf("--- Drawing summary ---\n");
+    Serial.printf("  TTF total:      %lu ms\n", ttfTotal);
+    Serial.printf("  Bitmap total:   %lu ms\n", bitmapTotal);
+    Serial.printf("  All drawing:    %lu ms\n", millis() - drawStart);
     
     // Update display
     display.update(false);
