@@ -191,9 +191,40 @@ void doDisplayUpdate(int updateNumber);  // Forward declaration
 // Track how many updates we've done (stored in scratch register 1)
 #define UPDATE_COUNT_REG 1
 
-// NTP resync interval - LPOSC drifts ~1-5%, so resync periodically
-// Every 10 updates at 10s sleep = ~100s between syncs
-#define NTP_RESYNC_INTERVAL  10  // Resync every N updates
+// Drift compensation (stored in scratch register 2)
+// Stored as: (drift_ppm + 500000) to handle negative values
+// e.g., -5% drift = -50000 ppm, stored as 450000
+#define DRIFT_PPM_REG 2
+#define DRIFT_PPM_OFFSET 500000  // Offset to handle negative values
+
+// NTP resync interval - LPOSC can drift >5%, resync frequently
+#define NTP_RESYNC_INTERVAL  5  // Resync every N updates (reduced from 10)
+
+// Get/set drift compensation in PPM (parts per million)
+// Negative = LPOSC running slow, Positive = LPOSC running fast
+int32_t getDriftPPM() {
+    uint32_t stored = powman_hw->scratch[DRIFT_PPM_REG];
+    if (stored == 0) return 0;  // Not calibrated
+    return (int32_t)(stored - DRIFT_PPM_OFFSET);
+}
+
+void setDriftPPM(int32_t ppm) {
+    powman_hw->scratch[DRIFT_PPM_REG] = (uint32_t)(ppm + DRIFT_PPM_OFFSET);
+}
+
+// Apply drift compensation to a time value
+uint64_t compensateForDrift(uint64_t raw_time_ms, uint64_t reference_time_ms) {
+    int32_t ppm = getDriftPPM();
+    if (ppm == 0) return raw_time_ms;  // No compensation
+    
+    // Calculate elapsed time since reference
+    int64_t elapsed = (int64_t)(raw_time_ms - reference_time_ms);
+    
+    // Apply correction: corrected = raw + (elapsed * ppm / 1000000)
+    int64_t correction = (elapsed * ppm) / 1000000;
+    
+    return (uint64_t)((int64_t)raw_time_ms + correction);
+}
 
 int getUpdateCount() {
     return (int)powman_hw->scratch[UPDATE_COUNT_REG];
@@ -249,11 +280,45 @@ void setup() {
     // Sync NTP if needed (cold boot or periodic resync)
     if (needsNtpSync) {
         uint64_t oldTime = sleep_get_time_ms();
+        uint32_t syncStartMs = millis();
+        
         if (connectWiFiAndGetNTP()) {
             uint64_t newTime = sleep_get_time_ms();
-            int64_t drift = (int64_t)(newTime - oldTime);
-            if (oldTime > 0) {
-                Serial.printf(">>> Time correction: %+lld ms <<<\n", drift);
+            uint32_t syncDurationMs = millis() - syncStartMs;
+            
+            // The sync itself takes time, so account for that
+            // oldTime was captured before sync, newTime is "now" after sync
+            // The drift is: (newTime - oldTime) - syncDuration
+            // because oldTime should have advanced by syncDuration if LPOSC was perfect
+            
+            if (oldTime > 1700000000000ULL) {  // Valid old time (after Sept 2023)
+                int64_t expectedAdvance = syncDurationMs;  // How much time should have passed
+                int64_t actualAdvance = (int64_t)(newTime - oldTime);
+                int64_t driftMs = actualAdvance - expectedAdvance;
+                
+                // But we also need to know how long since LAST NTP sync to calculate rate
+                // For now, just report the correction
+                Serial.printf(">>> Time correction: %+lld ms <<<\n", -driftMs);
+                Serial.printf(">>> (LPOSC was %s by %lld ms during ~%lu ms awake) <<<\n",
+                              driftMs > 0 ? "fast" : "slow", 
+                              driftMs > 0 ? driftMs : -driftMs,
+                              syncDurationMs);
+                
+                // Calculate drift in PPM based on time since last sync
+                // We track total elapsed LPOSC time vs real time
+                // For simplicity, assume updates happen every ~10s + refresh time (~30s)
+                // So between syncs at interval 5: ~5 * 40s = 200s of real time
+                // The drift observed is relative to that period
+                
+                // Store approximate drift rate if significant
+                if (abs(driftMs) > 100) {  // More than 100ms drift is significant
+                    // Rough estimate: assume 3 minutes between syncs
+                    int64_t estimatedIntervalMs = 180000;  // 3 minutes
+                    int32_t driftPPM = (int32_t)((driftMs * 1000000LL) / estimatedIntervalMs);
+                    setDriftPPM(-driftPPM);  // Negative because we correct in opposite direction
+                    Serial.printf(">>> Estimated drift rate: %+ld ppm (%+.2f%%) <<<\n", 
+                                  (long)driftPPM, driftPPM / 10000.0);
+                }
             }
         } else {
             Serial.println("WARNING: NTP sync failed, using existing time");
