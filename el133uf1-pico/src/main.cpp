@@ -60,41 +60,6 @@ bool connectWiFiAndGetNTP();
 void formatTime(uint64_t time_ms, char* buf, size_t len);
 
 // ================================================================
-// Try to get NTP time from a specific server pair
-// ================================================================
-bool tryNTPSync(IPAddress server1, IPAddress server2, int timeoutSec) {
-    Serial.printf("  Trying NTP servers: %s, %s\n", 
-                  server1.toString().c_str(), server2.toString().c_str());
-    
-    NTP.begin(server1, server2);
-    delay(500);  // Let SNTP initialize
-    
-    time_t now = time(nullptr);
-    int elapsed = 0;
-    
-    while (now < 1700000000 && elapsed < timeoutSec) {
-        for (int i = 0; i < 10; i++) {
-            delay(100);
-            yield();
-        }
-        elapsed++;
-        now = time(nullptr);
-        
-        if (elapsed % 3 == 0) {
-            Serial.printf("[%ds] ", elapsed);
-        } else {
-            Serial.print(".");
-        }
-        
-        // Early exit if we got a valid time
-        if (now >= 1700000000) break;
-    }
-    Serial.println();
-    
-    return (now >= 1700000000);
-}
-
-// ================================================================
 // Connect to WiFi and sync NTP time (arduino-pico native)
 // ================================================================
 bool connectWiFiAndGetNTP() {
@@ -117,82 +82,68 @@ bool connectWiFiAndGetNTP() {
     
     Serial.println("\nWiFi connected!");
     Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
-    Serial.printf("DNS (DHCP): %s\n", WiFi.dnsIP().toString().c_str());
     
     // Override DNS with Cloudflare and Google
-    IPAddress cloudflare(1, 1, 1, 1);
-    IPAddress google(8, 8, 8, 8);
-    WiFi.setDNS(cloudflare, google);
-    Serial.printf("DNS (override): %s, %s\n", cloudflare.toString().c_str(), google.toString().c_str());
+    WiFi.setDNS(IPAddress(1, 1, 1, 1), IPAddress(8, 8, 8, 8));
+    delay(500);
     
-    delay(500);  // Let network stack stabilize
+    Serial.println("\n=== Getting NTP time ===");
     
-    Serial.println("\n=== Getting NTP time (with retries) ===");
+    // Use Google NTP (very reliable) with pool.ntp.org as backup
+    IPAddress ntpServer1(216, 239, 35, 0);   // time.google.com
+    IPAddress ntpServer2(216, 239, 35, 4);   // time2.google.com
     
-    // Define multiple NTP server options to try
-    struct NTPServer {
-        IPAddress ip1;
-        IPAddress ip2;
-        const char* name;
-    } servers[] = {
-        // Google NTP (very reliable)
-        { IPAddress(216, 239, 35, 0), IPAddress(216, 239, 35, 4), "Google" },
-        // Cloudflare NTP
-        { IPAddress(162, 159, 200, 1), IPAddress(162, 159, 200, 123), "Cloudflare" },
-        // NIST
-        { IPAddress(129, 6, 15, 28), IPAddress(129, 6, 15, 29), "NIST" },
-        // pool.ntp.org (try DNS resolution)
-        { IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), "pool.ntp.org" },
-    };
-    
-    // Try DNS resolution for pool.ntp.org
-    IPAddress poolServer1, poolServer2;
-    if (WiFi.hostByName("pool.ntp.org", poolServer1)) {
-        servers[3].ip1 = poolServer1;
-        Serial.printf("DNS pool.ntp.org -> %s\n", poolServer1.toString().c_str());
-    }
-    if (WiFi.hostByName("time.google.com", poolServer2)) {
-        servers[3].ip2 = poolServer2;
+    // Try DNS for pool.ntp.org as alternative
+    IPAddress poolServer;
+    if (WiFi.hostByName("pool.ntp.org", poolServer)) {
+        ntpServer2 = poolServer;
+        Serial.printf("Using: time.google.com + pool.ntp.org (%s)\n", poolServer.toString().c_str());
+    } else {
+        Serial.println("Using: time.google.com (primary + backup)");
     }
     
-    // Try each server set with increasing timeouts
-    bool success = false;
-    for (int attempt = 0; attempt < 3 && !success; attempt++) {
-        Serial.printf("\n--- NTP Attempt %d/3 ---\n", attempt + 1);
-        
-        for (int i = 0; i < 4 && !success; i++) {
-            if (servers[i].ip1 == IPAddress(0, 0, 0, 0)) continue;  // Skip if no IP
-            
-            Serial.printf("Trying %s...\n", servers[i].name);
-            int timeout = 10 + (attempt * 5);  // 10s, 15s, 20s
-            
-            if (tryNTPSync(servers[i].ip1, servers[i].ip2, timeout)) {
-                success = true;
-                Serial.printf("SUCCESS with %s!\n", servers[i].name);
-                break;
-            }
-            Serial.printf("Failed with %s, trying next...\n", servers[i].name);
-        }
-        
-        if (!success && attempt < 2) {
-            Serial.println("Waiting 2 seconds before retry...");
-            delay(2000);
-        }
-    }
+    NTP.begin(ntpServer1, ntpServer2);
+    Serial.println("NTP initialized, waiting for sync...");
+    delay(1000);
     
+    // Wait for valid time - up to 90 seconds total with periodic status
     time_t now = time(nullptr);
-    Serial.printf("\nFinal time: %lld\n", (long long)now);
+    int totalWait = 0;
+    const int maxWait = 90;  // 90 seconds max
     
-    if (!success) {
-        Serial.println("NTP sync FAILED after all retries!");
-        Serial.println("Possible causes:");
-        Serial.println("  - Firewall blocking UDP port 123");
-        Serial.println("  - All NTP servers unreachable");
-        Serial.println("  - Network issues");
+    Serial.print("Syncing: ");
+    while (now < 1700000000 && totalWait < maxWait) {
+        // Process network for 1 second
+        for (int i = 0; i < 10; i++) {
+            delay(100);
+            yield();
+        }
+        totalWait++;
+        now = time(nullptr);
+        
+        // Show progress every 5 seconds
+        if (totalWait % 5 == 0) {
+            Serial.printf("[%ds", totalWait);
+            if (now > 0) Serial.printf(":%lld", (long long)now);
+            Serial.print("] ");
+        } else {
+            Serial.print(".");
+        }
+        
+        // Success! Exit early
+        if (now >= 1700000000) {
+            Serial.println(" OK!");
+            break;
+        }
+    }
+    
+    if (now < 1700000000) {
+        Serial.println("\nNTP sync FAILED!");
         WiFi.disconnect(true);
         return false;
     }
+    
+    Serial.printf("NTP sync successful after %d seconds\n", totalWait);
     
     // Got NTP time!
     uint64_t now_ms = (uint64_t)now * 1000;
