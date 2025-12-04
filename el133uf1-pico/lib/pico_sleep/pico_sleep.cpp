@@ -62,6 +62,10 @@ uint64_t sleep_get_time_ms(void) {
 }
 
 void sleep_set_time_ms(uint64_t time_ms) {
+    // Ensure timer is running before setting time
+    if (!powman_timer_is_running()) {
+        powman_timer_start();
+    }
     powman_timer_set_ms(time_ms);
 }
 
@@ -108,7 +112,7 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
         if (!timer_running) {
             Serial.println("  [3] Starting timer...");
             Serial.flush();
-            powman_timer_set_ms(0);
+            // NOTE: Don't reset to 0 - time may have been set by NTP already
             powman_timer_start();
         }
         
