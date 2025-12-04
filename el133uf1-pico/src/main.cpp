@@ -23,6 +23,8 @@
 #include <WiFi.h>
 #include <time.h>
 #include "EL133UF1.h"
+#include "EL133UF1_TTF.h"
+#include "fonts/opensans.h"
 #include "pico_sleep.h"
 #include "hardware/structs/powman.h"
 
@@ -47,6 +49,9 @@ const char* NTP_SERVER2_NAME = "pool.ntp.org";
 // Create display instance using SPI1
 // (SPI1 is the correct bus for GP10/GP11 on Pico)
 EL133UF1 display(&SPI1);
+
+// TTF font renderer
+EL133UF1_TTF ttf;
 
 // Forward declarations
 void drawDemoPattern();
@@ -290,6 +295,14 @@ void setup() {
     
     Serial.printf("Display initialized: %dx%d pixels\n", 
                   display.width(), display.height());
+    
+    // Initialize TTF font renderer
+    ttf.begin(&display);
+    if (ttf.loadFont(opensans_ttf, opensans_ttf_len)) {
+        Serial.println("TTF font loaded successfully");
+    } else {
+        Serial.println("WARNING: TTF font failed to load");
+    }
     Serial.println();
 
     // Do display update
@@ -340,13 +353,17 @@ void doDisplayUpdate(int updateNumber) {
         return;
     }
     
+    // Reinitialize TTF (display was reinitialized)
+    ttf.begin(&display);
+    ttf.loadFont(opensans_ttf, opensans_ttf_len);
+    
     // Draw update info
     uint32_t drawStart = millis();
     
     display.clear(EL133UF1_WHITE);
     
-    // Title
-    display.drawText(250, 80, "RP2350 Deep Sleep Clock", EL133UF1_BLACK, EL133UF1_WHITE, 4);
+    // Title - using TTF font
+    ttf.drawTextCentered(0, 60, display.width(), "RP2350 Deep Sleep Clock", 64.0, EL133UF1_BLACK);
     
     // Current time - big display
     // Extract just the time portion
@@ -360,21 +377,26 @@ void doDisplayUpdate(int updateNumber) {
     uint8_t color = colors[(updateNumber - 1) % 4];
     
     display.fillRect(150, 200, 900, 200, color);
-    display.drawText(200, 250, timeBuf, EL133UF1_WHITE, color, 10);
+    // Time display - large TTF
+    ttf.drawTextCentered(150, 230, 900, timeBuf, 140.0, EL133UF1_WHITE);
     
-    // Date
+    // Date - TTF
     char dateBuf[32];
     strftime(dateBuf, sizeof(dateBuf), "%A, %d %B %Y", tm);
-    display.drawText(300, 450, dateBuf, EL133UF1_BLACK, EL133UF1_WHITE, 3);
+    ttf.drawTextCentered(0, 450, display.width(), dateBuf, 42.0, EL133UF1_BLACK);
     
-    // Update count
+    // Update count - TTF
     char buf[32];
     snprintf(buf, sizeof(buf), "Update #%d", updateNumber);
-    display.drawText(550, 550, buf, EL133UF1_BLACK, EL133UF1_WHITE, 4);
+    ttf.drawTextCentered(0, 530, display.width(), buf, 56.0, EL133UF1_BLACK);
     
-    // Info
-    display.drawText(200, 700, "NTP synced on boot, time maintained during sleep", EL133UF1_BLACK, EL133UF1_WHITE, 2);
-    display.drawText(250, 780, "Next update in 10 seconds (deep sleep)", EL133UF1_BLACK, EL133UF1_WHITE, 2);
+    // Info - TTF
+    ttf.drawTextCentered(0, 650, display.width(), "NTP synced on boot, time maintained during sleep", 28.0, EL133UF1_BLACK);
+    ttf.drawTextCentered(0, 700, display.width(), "Next update in 10 seconds (deep sleep)", 28.0, EL133UF1_BLACK);
+    
+    // Show font comparison
+    display.drawText(50, 800, "Bitmap font (8x8 scaled)", EL133UF1_BLACK, EL133UF1_WHITE, 2);
+    ttf.drawText(50, 850, "TrueType font (Open Sans)", 24.0, EL133UF1_BLACK);
     
     Serial.printf("Drawing took: %lu ms\n", millis() - drawStart);
     
