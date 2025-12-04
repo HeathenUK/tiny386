@@ -1,0 +1,8 @@
+{
+    "name": "pico_sleep",
+    "version": "1.0.0",
+    "description": "Deep sleep functionality for RP2350 using powman",
+    "keywords": "sleep, dormant, powman, rp2350, low-power",
+    "frameworks": "arduino",
+    "platforms": "raspberrypi"
+}
