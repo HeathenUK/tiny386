@@ -575,11 +575,26 @@ void EL133UF1::_sendBuffer() {
     // SRAM-accelerated rotation
     // Strategy: Copy horizontal strips to SRAM, then read columns from fast SRAM
     // Strip size: 1600 cols × STRIP_ROWS rows = STRIP_ROWS * 1600 bytes
+    // Note: SRAM heap may be limited when PSRAM is enabled, try progressively smaller sizes
     
-    const int STRIP_ROWS = 100;  // 160KB per strip - fits comfortably in SRAM
+    // Debug: show available heap
+    Serial.printf("    Free heap:      %lu KB\n", rp2040.getFreeHeap() / 1024);
+    
+    uint8_t* sramStrip = nullptr;
+    int STRIP_ROWS = 0;
+    
+    // Try decreasing buffer sizes until one succeeds
+    static const int stripSizes[] = {100, 50, 25, 10};  // 160KB, 80KB, 40KB, 16KB
+    for (int i = 0; i < 4 && sramStrip == nullptr; i++) {
+        STRIP_ROWS = stripSizes[i];
+        size_t trySize = EL133UF1_WIDTH * STRIP_ROWS;
+        sramStrip = (uint8_t*)malloc(trySize);
+        if (sramStrip) {
+            Serial.printf("    SRAM strip:     %d rows (%lu KB) - allocated\n", STRIP_ROWS, trySize / 1024);
+        }
+    }
+    
     const size_t STRIP_SIZE = EL133UF1_WIDTH * STRIP_ROWS;
-    
-    uint8_t* sramStrip = (uint8_t*)malloc(STRIP_SIZE);  // Regular malloc uses SRAM
     if (sramStrip == nullptr) {
         Serial.println("EL133UF1: Failed to allocate SRAM strip buffer, falling back");
         // Fallback to direct PSRAM access
