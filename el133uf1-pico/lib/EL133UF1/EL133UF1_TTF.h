@@ -79,6 +79,30 @@ public:
      * @brief Check if a font is loaded
      */
     bool fontLoaded() { return _fontLoaded; }
+    
+    /**
+     * @brief Draw text centered within a given width
+     * @param x X coordinate of left edge
+     * @param y Y coordinate (top of text)
+     * @param width Width to center within
+     * @param text Text string
+     * @param fontSize Font size in pixels
+     * @param color Text color
+     */
+    void drawTextCentered(int16_t x, int16_t y, int16_t width, 
+                          const char* text, float fontSize, uint8_t color);
+    
+    /**
+     * @brief Draw text right-aligned within a given width
+     * @param x X coordinate of left edge
+     * @param y Y coordinate (top of text)
+     * @param width Width to align within
+     * @param text Text string
+     * @param fontSize Font size in pixels
+     * @param color Text color
+     */
+    void drawTextRight(int16_t x, int16_t y, int16_t width,
+                       const char* text, float fontSize, uint8_t color);
 
 private:
     EL133UF1* _display;
