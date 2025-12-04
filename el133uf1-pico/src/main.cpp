@@ -191,54 +191,9 @@ void doDisplayUpdate(int updateNumber);  // Forward declaration
 // Track how many updates we've done (stored in scratch register 1)
 #define UPDATE_COUNT_REG 1
 
-// Drift compensation (stored in scratch register 2)
-// Stored as: (drift_ppm + 500000) to handle negative values
-// e.g., -5% drift = -50000 ppm, stored as 450000
-#define DRIFT_PPM_REG 2
-#define DRIFT_PPM_OFFSET 500000  // Offset to handle negative values
-
-// NTP resync interval - resync every update for drift testing
-#define NTP_RESYNC_INTERVAL  1  // Resync EVERY update for drift measurement
-
-// Sleep duration for testing LPOSC drift
-// Use 30 seconds for quick testing, 300000 (5 min) for real drift measurement
-#define SLEEP_DURATION_MS  30000  // 30 seconds for testing (change to 300000 for 5 min)
-
-// Get/set drift compensation in PPM (parts per million)
-// Negative = LPOSC running slow, Positive = LPOSC running fast
-int32_t getDriftPPM() {
-    uint32_t stored = powman_hw->scratch[DRIFT_PPM_REG];
-    if (stored == 0) return 0;  // Not calibrated
-    return (int32_t)(stored - DRIFT_PPM_OFFSET);
-}
-
-void setDriftPPM(int32_t ppm) {
-    powman_hw->scratch[DRIFT_PPM_REG] = (uint32_t)(ppm + DRIFT_PPM_OFFSET);
-}
-
-// Global drift measurement results (for display)
-struct DriftMeasurement {
-    bool valid;
-    int64_t driftMs;           // Positive = fast, Negative = slow
-    float driftPercent;
-    float driftPerHour;        // Seconds per hour
-    char lposcTimeStr[24];
-    char ntpTimeStr[24];
-} g_drift = {false, 0, 0, 0, "", ""};
-
-// Apply drift compensation to a time value
-uint64_t compensateForDrift(uint64_t raw_time_ms, uint64_t reference_time_ms) {
-    int32_t ppm = getDriftPPM();
-    if (ppm == 0) return raw_time_ms;  // No compensation
-    
-    // Calculate elapsed time since reference
-    int64_t elapsed = (int64_t)(raw_time_ms - reference_time_ms);
-    
-    // Apply correction: corrected = raw + (elapsed * ppm / 1000000)
-    int64_t correction = (elapsed * ppm) / 1000000;
-    
-    return (uint64_t)((int64_t)raw_time_ms + correction);
-}
+// NTP resync interval - LPOSC drifts ~1-5%, so resync periodically
+// Every 10 updates at 10s sleep = ~100s between syncs
+#define NTP_RESYNC_INTERVAL  10  // Resync every N updates
 
 int getUpdateCount() {
     return (int)powman_hw->scratch[UPDATE_COUNT_REG];
@@ -266,32 +221,25 @@ void setup() {
     // Check if we woke from deep sleep
     // ================================================================
     bool needsNtpSync = false;
-    uint64_t lposcTime = sleep_get_time_ms();  // Get LPOSC-based time immediately
     
     if (sleep_woke_from_deep_sleep()) {
         Serial.println("\n\n========================================");
         Serial.printf("*** WOKE FROM DEEP SLEEP! (update #%d) ***\n", updateCount + 1);
+        Serial.printf("*** RTC uptime: %lu seconds ***\n", uptime);
         Serial.println("========================================\n");
-        
-        // Show what time LPOSC thinks it is (before any NTP correction)
-        char lposcTimeStr[32];
-        time_t lposcSec = (time_t)(lposcTime / 1000);
-        struct tm* lposcTm = gmtime(&lposcSec);
-        strftime(lposcTimeStr, sizeof(lposcTimeStr), "%Y-%m-%d %H:%M:%S", lposcTm);
-        Serial.printf(">>> LPOSC time (uncorrected): %s UTC <<<\n", lposcTimeStr);
-        Serial.printf(">>> LPOSC epoch: %llu ms <<<\n", lposcTime);
         
         // Clear the wake flag
         sleep_clear_wake_flag();
         
-        // Always resync NTP for drift testing
-        Serial.println(">>> NTP sync to measure drift <<<");
-        needsNtpSync = true;
+        // Check if we need to resync NTP (LPOSC drifts over time)
+        if ((updateCount + 1) % NTP_RESYNC_INTERVAL == 0) {
+            Serial.println(">>> Periodic NTP resync to correct LPOSC drift <<<");
+            needsNtpSync = true;
+        }
     } else {
         // First boot
         Serial.println("\n\n===========================================");
         Serial.println("EL133UF1 13.3\" Spectra 6 E-Ink Display Demo");
-        Serial.println("    LPOSC DRIFT TEST - 5 minute sleep");
         Serial.println("===========================================\n");
         
         needsNtpSync = true;
@@ -300,69 +248,18 @@ void setup() {
     
     // Sync NTP if needed (cold boot or periodic resync)
     if (needsNtpSync) {
-        // lposcTime was captured at the very start of wake
-        uint32_t syncStartMs = millis();
-        
+        uint64_t oldTime = sleep_get_time_ms();
         if (connectWiFiAndGetNTP()) {
-            uint64_t ntpTime = sleep_get_time_ms();  // This is now the NTP-corrected time
-            uint32_t syncDurationMs = millis() - syncStartMs;
-            
-            // Show NTP time
-            char ntpTimeStr[32];
-            time_t ntpSec = (time_t)(ntpTime / 1000);
-            struct tm* ntpTm = gmtime(&ntpSec);
-            strftime(ntpTimeStr, sizeof(ntpTimeStr), "%Y-%m-%d %H:%M:%S", ntpTm);
-            Serial.printf(">>> NTP time (corrected):     %s UTC <<<\n", ntpTimeStr);
-            Serial.printf(">>> NTP epoch: %llu ms <<<\n", ntpTime);
-            
-            // Calculate drift (only valid if we had a previous time)
-            if (lposcTime > 1700000000000ULL) {  // Valid LPOSC time (after Sept 2023)
-                // The LPOSC time was captured before NTP sync
-                // The NTP sync took syncDurationMs of real time
-                // So NTP time should be = lposcTime + syncDurationMs (if LPOSC was perfect)
-                // Drift = lposcTime - (ntpTime - syncDurationMs)
-                //       = lposcTime - ntpTime + syncDurationMs
-                
-                int64_t expectedLposcTime = (int64_t)ntpTime - syncDurationMs;
-                int64_t driftMs = (int64_t)lposcTime - expectedLposcTime;
-                
-                // Calculate drift percentage over 5 minute sleep
-                float driftPercent = (float)driftMs / (float)SLEEP_DURATION_MS * 100.0f;
-                
-                // Extrapolate to 1 hour
-                float driftPerHour = driftMs * (3600000.0f / SLEEP_DURATION_MS);
-                
-                // Store for display
-                g_drift.valid = true;
-                g_drift.driftMs = driftMs;
-                g_drift.driftPercent = driftPercent;
-                g_drift.driftPerHour = driftPerHour / 1000.0f;  // Convert to seconds
-                
-                // Format time strings for display
-                time_t lposcSec = (time_t)(lposcTime / 1000);
-                struct tm* lposcTm = gmtime(&lposcSec);
-                strftime(g_drift.lposcTimeStr, sizeof(g_drift.lposcTimeStr), "%H:%M:%S", lposcTm);
-                
-                time_t expectedSec = (time_t)(expectedLposcTime / 1000);
-                struct tm* expectedTm = gmtime(&expectedSec);
-                strftime(g_drift.ntpTimeStr, sizeof(g_drift.ntpTimeStr), "%H:%M:%S", expectedTm);
-                
-                Serial.println("\n========== DRIFT MEASUREMENT ==========");
-                Serial.printf("  LPOSC thought it was: %llu ms\n", lposcTime);
-                Serial.printf("  It should have been:  %lld ms\n", expectedLposcTime);
-                Serial.printf("  NTP sync took:        %lu ms\n", syncDurationMs);
-                Serial.println("  ----------------------------------------");
-                Serial.printf("  DRIFT: %+lld ms (%s)\n", driftMs, 
-                              driftMs > 0 ? "LPOSC fast" : "LPOSC slow");
-                Serial.printf("  Over %d sec sleep: %.2f%% drift\n", 
-                              SLEEP_DURATION_MS / 1000, driftPercent);
-                Serial.printf("  Extrapolated: %.1f sec/hour drift\n", driftPerHour / 1000.0f);
-                Serial.println("========================================\n");
-            } else {
-                g_drift.valid = false;  // Cold boot, no drift to measure
+            uint64_t newTime = sleep_get_time_ms();
+            int64_t drift = (int64_t)(newTime - oldTime);
+            if (oldTime > 0) {
+                Serial.printf(">>> Time correction: %+lld ms <<<\n", drift);
             }
         } else {
-            Serial.println("WARNING: NTP sync failed, using LPOSC time");
+            Serial.println("WARNING: NTP sync failed, using existing time");
+            if (sleep_get_time_ms() == 0) {
+                sleep_set_time_ms(0);  // No time available
+            }
         }
     }
     
@@ -451,31 +348,9 @@ void setup() {
     setUpdateCount(updateCount);
     doDisplayUpdate(updateCount);
     
-    // Enter deep sleep for drift testing
-    Serial.println("\n============================================");
-    Serial.printf("=== Entering deep sleep for %d seconds ===\n", SLEEP_DURATION_MS / 1000);
-    Serial.println("============================================");
-    
-    // Get current time and calculate expected wake time
-    uint64_t sleepStartMs = sleep_get_time_ms();
-    uint64_t expectedWakeMs = sleepStartMs + SLEEP_DURATION_MS;
-    
-    // Format times
-    char sleepTimeStr[32], wakeTimeStr[32];
-    time_t sleepSec = (time_t)(sleepStartMs / 1000);
-    time_t wakeSec = (time_t)(expectedWakeMs / 1000);
-    struct tm* sleepTm = gmtime(&sleepSec);
-    strftime(sleepTimeStr, sizeof(sleepTimeStr), "%H:%M:%S", sleepTm);
-    struct tm* wakeTm = gmtime(&wakeSec);
-    strftime(wakeTimeStr, sizeof(wakeTimeStr), "%H:%M:%S", wakeTm);
-    
-    Serial.printf("  Sleep start:    %s UTC (epoch: %llu ms)\n", sleepTimeStr, sleepStartMs);
-    Serial.printf("  Expected wake:  %s UTC (epoch: %llu ms)\n", wakeTimeStr, expectedWakeMs);
-    Serial.printf("  Sleep duration: %d ms (%d min %d sec)\n", 
-                  SLEEP_DURATION_MS, 
-                  SLEEP_DURATION_MS / 60000, 
-                  (SLEEP_DURATION_MS % 60000) / 1000);
-    Serial.println("--------------------------------------------");
+    // Enter deep sleep for 10 seconds
+    Serial.println("\n=== Entering deep sleep for 10 seconds ===");
+    Serial.printf("RTC time: %lu seconds\n", sleep_get_uptime_seconds());
     Serial.println("Using RP2350 powman - TRUE deep sleep (core powers down)");
     
     Serial.flush();
@@ -484,8 +359,8 @@ void setup() {
     // Prepare powman timer for deep sleep
     sleep_run_from_lposc();
     
-    // Go to deep sleep
-    sleep_goto_dormant_for_ms(SLEEP_DURATION_MS);
+    // Go to deep sleep for 10 seconds
+    sleep_goto_dormant_for_ms(10000);
     
     // We should never reach here
     Serial.println("ERROR: Should not reach here after deep sleep!");
@@ -584,61 +459,41 @@ void doDisplayUpdate(int updateNumber) {
     Serial.printf("  TTF date 42px:  %lu ms\n", t1);
     
     // Update count - TTF (56px, ~10 chars)
-    char buf[64];
+    char buf[32];
     snprintf(buf, sizeof(buf), "Update #%d", updateNumber);
     t0 = millis();
-    ttf.drawTextCentered(0, 520, display.width(), buf, 48.0, EL133UF1_BLACK);
+    ttf.drawTextCentered(0, 530, display.width(), buf, 56.0, EL133UF1_BLACK);
     t1 = millis() - t0;
     ttfTotal += t1;
-    Serial.printf("  TTF count 48px: %lu ms\n", t1);
+    Serial.printf("  TTF count 56px: %lu ms\n", t1);
     
-    // Drift measurement section
+    // Info line 1 - TTF (28px, 48 chars)
     t0 = millis();
-    if (g_drift.valid) {
-        // Draw drift measurement box
-        display.fillRect(100, 600, 1000, 280, EL133UF1_BLACK);
-        display.fillRect(105, 605, 990, 270, EL133UF1_WHITE);
-        
-        ttf.drawTextCentered(100, 620, 1000, "LPOSC DRIFT MEASUREMENT", 36.0, EL133UF1_BLACK);
-        
-        // LPOSC time vs NTP time
-        snprintf(buf, sizeof(buf), "LPOSC said: %s    Actual: %s", 
-                 g_drift.lposcTimeStr, g_drift.ntpTimeStr);
-        ttf.drawTextCentered(100, 680, 1000, buf, 32.0, EL133UF1_BLACK);
-        
-        // Drift amount
-        snprintf(buf, sizeof(buf), "Drift: %+lld ms (%s)", 
-                 (long long)g_drift.driftMs,
-                 g_drift.driftMs > 0 ? "LPOSC fast" : "LPOSC slow");
-        ttf.drawTextCentered(100, 730, 1000, buf, 36.0, 
-                            g_drift.driftMs > 0 ? EL133UF1_BLUE : EL133UF1_RED);
-        
-        // Drift percentage and extrapolation
-        snprintf(buf, sizeof(buf), "%.2f%% over %d min  |  %.1f sec/hour", 
-                 g_drift.driftPercent, SLEEP_DURATION_MS / 60000, g_drift.driftPerHour);
-        ttf.drawTextCentered(100, 790, 1000, buf, 28.0, EL133UF1_BLACK);
-        
-        // Sleep duration info
-        snprintf(buf, sizeof(buf), "Sleep duration: %d minutes", SLEEP_DURATION_MS / 60000);
-        ttf.drawTextCentered(100, 840, 1000, buf, 24.0, EL133UF1_BLACK);
-    } else {
-        // Cold boot - no drift data yet
-        display.fillRect(100, 620, 1000, 200, EL133UF1_YELLOW);
-        ttf.drawTextCentered(100, 680, 1000, "LPOSC DRIFT TEST", 48.0, EL133UF1_BLACK);
-        snprintf(buf, sizeof(buf), "Sleeping for %d minutes...", SLEEP_DURATION_MS / 60000);
-        ttf.drawTextCentered(100, 750, 1000, buf, 32.0, EL133UF1_BLACK);
-    }
+    ttf.drawTextCentered(0, 650, display.width(), "NTP synced on boot, time maintained during sleep", 28.0, EL133UF1_BLACK);
     t1 = millis() - t0;
     ttfTotal += t1;
-    Serial.printf("  Drift display:  %lu ms\n", t1);
+    Serial.printf("  TTF info1 28px: %lu ms\n", t1);
     
-    // Next update info
+    // Info line 2 - TTF (28px, 38 chars)
     t0 = millis();
-    snprintf(buf, sizeof(buf), "Next update in %d minutes", SLEEP_DURATION_MS / 60000);
-    ttf.drawTextCentered(0, 920, display.width(), buf, 28.0, EL133UF1_BLACK);
+    ttf.drawTextCentered(0, 700, display.width(), "Next update in 10 seconds (deep sleep)", 28.0, EL133UF1_BLACK);
     t1 = millis() - t0;
     ttfTotal += t1;
-    Serial.printf("  TTF next:       %lu ms\n", t1);
+    Serial.printf("  TTF info2 28px: %lu ms\n", t1);
+    
+    // Bitmap font comparison (size 2 = 16px, 24 chars)
+    t0 = millis();
+    display.drawText(50, 800, "Bitmap font (8x8 scaled)", EL133UF1_BLACK, EL133UF1_WHITE, 2);
+    t1 = millis() - t0;
+    bitmapTotal += t1;
+    Serial.printf("  Bitmap 16px:    %lu ms\n", t1);
+    
+    // TTF comparison (24px, 25 chars)
+    t0 = millis();
+    ttf.drawText(50, 850, "TrueType font (Open Sans)", 24.0, EL133UF1_BLACK);
+    t1 = millis() - t0;
+    ttfTotal += t1;
+    Serial.printf("  TTF 24px:       %lu ms\n", t1);
     
     Serial.printf("--- Drawing summary ---\n");
     Serial.printf("  TTF total:      %lu ms\n", ttfTotal);
