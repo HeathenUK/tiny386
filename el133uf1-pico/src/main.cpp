@@ -145,9 +145,10 @@ bool connectWiFiAndGetNTP() {
     
     Serial.printf("NTP sync successful after %d seconds\n", totalWait);
     
-    // Got NTP time!
+    // Got NTP time - calibrate drift and set time
     uint64_t now_ms = (uint64_t)now * 1000;
-    sleep_set_time_ms(now_ms);
+    sleep_calibrate_drift(now_ms);  // This also sets the time and updates drift correction
+    Serial.printf("Drift correction: %d ppm\n", sleep_get_drift_ppm());
     
     struct tm timeinfo;
     gmtime_r(&now, &timeinfo);
@@ -364,10 +365,11 @@ void setup() {
 void doDisplayUpdate(int updateNumber) {
     Serial.printf("\n=== Display Update #%d ===\n", updateNumber);
     
-    // Get current time from powman timer (persists across sleep!)
-    uint64_t now_ms = sleep_get_time_ms();
+    // Get current time with drift correction applied
+    uint64_t now_ms = sleep_get_corrected_time_ms();
     char timeStr[32];
     formatTime(now_ms, timeStr, sizeof(timeStr));
+    Serial.printf("Drift correction: %d ppm\n", sleep_get_drift_ppm());
     Serial.printf("Current time: %s\n", timeStr);
     
     // Predict what time it will be when the display finishes refreshing
@@ -491,8 +493,8 @@ void doDisplayUpdate(int updateNumber) {
     display.update(!isColdBoot);  // skipInit=true for warm updates
     uint32_t actualRefreshMs = millis() - refreshStart;
     
-    // Get actual time now for comparison
-    uint64_t actual_now_ms = sleep_get_time_ms();
+    // Get actual time now for comparison (with drift correction)
+    uint64_t actual_now_ms = sleep_get_corrected_time_ms();
     char actualTimeStr[32];
     formatTime(actual_now_ms, actualTimeStr, sizeof(actualTimeStr));
     

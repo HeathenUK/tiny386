@@ -100,6 +100,42 @@ void sleep_set_time_ms(uint64_t time_ms);
  */
 uint32_t sleep_get_uptime_seconds(void);
 
+/**
+ * @brief Get drift-compensated time in milliseconds
+ * 
+ * Applies the stored drift correction factor to improve accuracy.
+ * Use this instead of sleep_get_time_ms() for best accuracy.
+ * 
+ * @return Corrected time in milliseconds
+ */
+uint64_t sleep_get_corrected_time_ms(void);
+
+/**
+ * @brief Update drift calibration based on NTP sync
+ * 
+ * Call this when you have accurate NTP time to improve future accuracy.
+ * Compares elapsed LPOSC time vs actual elapsed time to calculate drift.
+ * 
+ * @param accurate_time_ms The accurate (NTP) time in milliseconds
+ */
+void sleep_calibrate_drift(uint64_t accurate_time_ms);
+
+/**
+ * @brief Get the current drift correction in parts-per-million
+ * 
+ * Positive means LPOSC runs slow, negative means LPOSC runs fast.
+ * 
+ * @return Drift in PPM
+ */
+int32_t sleep_get_drift_ppm(void);
+
+/**
+ * @brief Set a known drift correction in parts-per-million
+ * 
+ * @param drift_ppm Drift correction value
+ */
+void sleep_set_drift_ppm(int32_t drift_ppm);
+
 
 #ifdef __cplusplus
 }

@@ -38,6 +38,14 @@
 #define SLEEP_SCRATCH_MAGIC    0xDEE95EE7  // Magic value to detect wake
 #define SLEEP_SCRATCH_REG      0           // Which scratch register to use
 
+// Drift calibration scratch registers
+#define DRIFT_PPM_REG          2           // Drift in parts-per-million (int32_t)
+#define LAST_SYNC_LPOSC_HI_REG 3           // LPOSC time at last sync (high 32 bits)
+#define LAST_SYNC_LPOSC_LO_REG 4           // LPOSC time at last sync (low 32 bits)
+#define LAST_SYNC_NTP_HI_REG   5           // NTP time at last sync (high 32 bits)
+#define LAST_SYNC_NTP_LO_REG   6           // NTP time at last sync (low 32 bits)
+#define DRIFT_VALID_MAGIC      0xCA1B0000  // Magic + flags in high bits of DRIFT_PPM_REG
+
 static dormant_source_t _dormant_source = DORMANT_SOURCE_LPOSC;
 
 // Check if we woke from deep sleep by looking at scratch register
@@ -179,4 +187,109 @@ void sleep_goto_dormant_for_ms(uint32_t delay_ms) {
 void sleep_power_up(void) {
     // Not needed for deep sleep - system reboots on wake
     // Use sleep_woke_from_deep_sleep() to detect wake state
+}
+
+// ========================================================================
+// Drift compensation functions
+// ========================================================================
+
+int32_t sleep_get_drift_ppm(void) {
+    uint32_t val = powman_hw->scratch[DRIFT_PPM_REG];
+    // Check if drift has been calibrated (magic in high bits)
+    if ((val & 0xFFFF0000) != DRIFT_VALID_MAGIC) {
+        return 0;  // Not calibrated yet
+    }
+    // Drift is stored in low 16 bits as signed value
+    int16_t drift = (int16_t)(val & 0xFFFF);
+    return (int32_t)drift * 100;  // Stored as drift/100 to fit in 16 bits
+}
+
+void sleep_set_drift_ppm(int32_t drift_ppm) {
+    // Clamp to ±3,276,700 ppm (±327%) - should be way more than needed
+    if (drift_ppm > 3276700) drift_ppm = 3276700;
+    if (drift_ppm < -3276700) drift_ppm = -3276700;
+    // Store as drift/100 in low 16 bits, magic in high bits
+    int16_t stored = (int16_t)(drift_ppm / 100);
+    powman_hw->scratch[DRIFT_PPM_REG] = DRIFT_VALID_MAGIC | (uint16_t)stored;
+}
+
+static void store_sync_point(uint64_t lposc_ms, uint64_t ntp_ms) {
+    powman_hw->scratch[LAST_SYNC_LPOSC_HI_REG] = (uint32_t)(lposc_ms >> 32);
+    powman_hw->scratch[LAST_SYNC_LPOSC_LO_REG] = (uint32_t)(lposc_ms & 0xFFFFFFFF);
+    powman_hw->scratch[LAST_SYNC_NTP_HI_REG] = (uint32_t)(ntp_ms >> 32);
+    powman_hw->scratch[LAST_SYNC_NTP_LO_REG] = (uint32_t)(ntp_ms & 0xFFFFFFFF);
+}
+
+static bool get_sync_point(uint64_t* lposc_ms, uint64_t* ntp_ms) {
+    // Check if we have valid calibration data
+    if ((powman_hw->scratch[DRIFT_PPM_REG] & 0xFFFF0000) != DRIFT_VALID_MAGIC) {
+        return false;
+    }
+    *lposc_ms = ((uint64_t)powman_hw->scratch[LAST_SYNC_LPOSC_HI_REG] << 32) |
+                 powman_hw->scratch[LAST_SYNC_LPOSC_LO_REG];
+    *ntp_ms = ((uint64_t)powman_hw->scratch[LAST_SYNC_NTP_HI_REG] << 32) |
+               powman_hw->scratch[LAST_SYNC_NTP_LO_REG];
+    return (*lposc_ms > 0 && *ntp_ms > 1700000000000ULL);  // Sanity check
+}
+
+void sleep_calibrate_drift(uint64_t accurate_time_ms) {
+    uint64_t current_lposc = powman_timer_get_ms();
+    
+    uint64_t last_lposc, last_ntp;
+    if (get_sync_point(&last_lposc, &last_ntp)) {
+        // Calculate elapsed time on both clocks
+        int64_t lposc_elapsed = (int64_t)(current_lposc - last_lposc);
+        int64_t ntp_elapsed = (int64_t)(accurate_time_ms - last_ntp);
+        
+        // Only calibrate if we have meaningful elapsed time (>10 seconds)
+        if (lposc_elapsed > 10000 && ntp_elapsed > 10000) {
+            // drift_ppm = (ntp_elapsed - lposc_elapsed) / lposc_elapsed * 1000000
+            // Positive = LPOSC runs slow, negative = LPOSC runs fast
+            int64_t drift_ppm = ((ntp_elapsed - lposc_elapsed) * 1000000LL) / lposc_elapsed;
+            
+            // Get existing drift and apply exponential smoothing (75% old, 25% new)
+            int32_t old_drift = sleep_get_drift_ppm();
+            int32_t new_drift;
+            if (old_drift == 0) {
+                new_drift = (int32_t)drift_ppm;  // First calibration
+            } else {
+                new_drift = (old_drift * 3 + (int32_t)drift_ppm) / 4;  // Smoothed
+            }
+            
+            Serial.printf("  Drift calibration: LPOSC=%lldms, NTP=%lldms, measured=%lldppm, smoothed=%dppm\n",
+                          lposc_elapsed, ntp_elapsed, drift_ppm, new_drift);
+            
+            sleep_set_drift_ppm(new_drift);
+        }
+    }
+    
+    // Store this sync point for next calibration
+    store_sync_point(current_lposc, accurate_time_ms);
+    
+    // Also update the raw timer to match NTP (for sleep_get_time_ms)
+    powman_timer_set_ms(accurate_time_ms);
+}
+
+uint64_t sleep_get_corrected_time_ms(void) {
+    uint64_t current_lposc = powman_timer_get_ms();
+    
+    uint64_t last_lposc, last_ntp;
+    if (!get_sync_point(&last_lposc, &last_ntp)) {
+        // No calibration data, return raw time
+        return current_lposc;
+    }
+    
+    int32_t drift_ppm = sleep_get_drift_ppm();
+    if (drift_ppm == 0) {
+        return current_lposc;
+    }
+    
+    // Calculate corrected time from last sync point
+    int64_t lposc_elapsed = (int64_t)(current_lposc - last_lposc);
+    
+    // Apply drift correction: corrected = elapsed * (1 + drift_ppm/1000000)
+    int64_t correction = (lposc_elapsed * drift_ppm) / 1000000LL;
+    uint64_t corrected_time = last_ntp + lposc_elapsed + correction;
+    
+    return corrected_time;
 }
