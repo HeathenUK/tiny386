@@ -332,6 +332,10 @@ void setup() {
 // ================================================================
 // Perform a display update (called on each wake cycle)
 // ================================================================
+// Expected time for display refresh (measured empirically)
+// Adjust this based on your observed refresh times
+#define DISPLAY_REFRESH_MS 28000  // ~28 seconds typical for full refresh
+
 void doDisplayUpdate(int updateNumber) {
     Serial.printf("\n=== Display Update #%d ===\n", updateNumber);
     
@@ -339,8 +343,15 @@ void doDisplayUpdate(int updateNumber) {
     uint64_t now_ms = sleep_get_time_ms();
     char timeStr[32];
     formatTime(now_ms, timeStr, sizeof(timeStr));
-    
     Serial.printf("Current time: %s\n", timeStr);
+    
+    // Predict what time it will be when the display finishes refreshing
+    // This accounts for: drawing time (~1s) + SPI transfer (~0.5s) + panel refresh (~27s)
+    uint64_t display_time_ms = now_ms + DISPLAY_REFRESH_MS;
+    char displayTimeStr[32];
+    formatTime(display_time_ms, displayTimeStr, sizeof(displayTimeStr));
+    Serial.printf("Display will show: %s (compensating +%d sec)\n", 
+                  displayTimeStr, DISPLAY_REFRESH_MS / 1000);
     
     // Reinitialize SPI
     SPI1.setSCK(PIN_SPI_SCK);
@@ -373,8 +384,8 @@ void doDisplayUpdate(int updateNumber) {
     ttfTotal += t1;
     Serial.printf("  TTF title 64px: %lu ms\n", t1);
     
-    // Current time - big display
-    time_t time_sec = (time_t)(now_ms / 1000);
+    // Display the PREDICTED time (what it will be when refresh completes)
+    time_t time_sec = (time_t)(display_time_ms / 1000);
     struct tm* tm = gmtime(&time_sec);
     char timeBuf[16];
     strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", tm);
@@ -445,10 +456,25 @@ void doDisplayUpdate(int updateNumber) {
     Serial.printf("  Bitmap total:   %lu ms\n", bitmapTotal);
     Serial.printf("  All drawing:    %lu ms\n", millis() - drawStart);
     
-    // Update display
+    // Update display and measure actual refresh time
+    uint32_t refreshStart = millis();
     display.update(false);
+    uint32_t actualRefreshMs = millis() - refreshStart;
     
-    Serial.printf("Update #%d complete. Time: %s\n", updateNumber, timeStr);
+    // Get actual time now for comparison
+    uint64_t actual_now_ms = sleep_get_time_ms();
+    char actualTimeStr[32];
+    formatTime(actual_now_ms, actualTimeStr, sizeof(actualTimeStr));
+    
+    Serial.printf("Update #%d complete.\n", updateNumber);
+    Serial.printf("  Displayed time: %s\n", displayTimeStr);
+    Serial.printf("  Actual time:    %s\n", actualTimeStr);
+    Serial.printf("  Refresh took:   %lu ms (predicted %d ms)\n", 
+                  actualRefreshMs, DISPLAY_REFRESH_MS);
+    
+    int32_t errorMs = (int32_t)(actual_now_ms - display_time_ms);
+    Serial.printf("  Time error:     %+ld ms (%s)\n", errorMs,
+                  abs(errorMs) < 2000 ? "good" : "adjust DISPLAY_REFRESH_MS");
 }
 
 void loop() {
