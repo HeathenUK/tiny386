@@ -62,11 +62,8 @@ uint64_t sleep_get_time_ms(void) {
 }
 
 void sleep_set_time_ms(uint64_t time_ms) {
-    // Ensure timer is running first
-    if (!powman_timer_is_running()) {
-        powman_timer_start();
-    }
-    // Now set the time value
+    // Just set the value - timer will be started by sleep_run_from_lposc()
+    // The value persists even if timer isn't running yet
     powman_timer_set_ms(time_ms);
 }
 
@@ -111,19 +108,22 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
         
         // First time setup - need to start timer (but preserve any existing time value!)
         if (!timer_running) {
-            // Check if we already have a valid time (set by NTP)
+            // Check if we already have a valid time (set by NTP before timer was started)
             uint64_t existingTime = powman_timer_get_ms();
-            Serial.printf("  [3] Starting timer (existing value: %llu ms)...\n", existingTime);
+            Serial.printf("  [3] Timer not running. Existing value: %llu ms\n", existingTime);
             Serial.flush();
             
-            // Only reset to 0 if no valid time was set
-            if (existingTime < 1700000000000ULL) {  // Before Sept 2023 = invalid
+            // Start timer first
+            powman_timer_start();
+            
+            // If a valid NTP time was set, restore it (starting might have reset it)
+            if (existingTime >= 1700000000000ULL) {  // After Sept 2023 = valid
+                Serial.println("      Restoring NTP time after start");
+                powman_timer_set_ms(existingTime);
+            } else {
                 Serial.println("      No valid time, starting from 0");
                 powman_timer_set_ms(0);
-            } else {
-                Serial.println("      Preserving NTP time");
             }
-            powman_timer_start();
         }
         
         Serial.println("  [4] Switching to LPOSC...");

@@ -201,7 +201,8 @@ void doDisplayUpdate(int updateNumber);  // Forward declaration
 #define NTP_RESYNC_INTERVAL  1  // Resync EVERY update for drift measurement
 
 // Sleep duration for testing LPOSC drift
-#define SLEEP_DURATION_MS  300000  // 5 minutes (300 seconds)
+// Use 30 seconds for quick testing, 300000 (5 min) for real drift measurement
+#define SLEEP_DURATION_MS  30000  // 30 seconds for testing (change to 300000 for 5 min)
 
 // Get/set drift compensation in PPM (parts per million)
 // Negative = LPOSC running slow, Positive = LPOSC running fast
