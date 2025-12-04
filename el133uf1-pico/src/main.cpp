@@ -191,6 +191,10 @@ void doDisplayUpdate(int updateNumber);  // Forward declaration
 // Track how many updates we've done (stored in scratch register 1)
 #define UPDATE_COUNT_REG 1
 
+// NTP resync interval - LPOSC drifts ~1-5%, so resync periodically
+// Every 10 updates at 10s sleep = ~100s between syncs
+#define NTP_RESYNC_INTERVAL  10  // Resync every N updates
+
 int getUpdateCount() {
     return (int)powman_hw->scratch[UPDATE_COUNT_REG];
 }
@@ -216,6 +220,8 @@ void setup() {
     // ================================================================
     // Check if we woke from deep sleep
     // ================================================================
+    bool needsNtpSync = false;
+    
     if (sleep_woke_from_deep_sleep()) {
         Serial.println("\n\n========================================");
         Serial.printf("*** WOKE FROM DEEP SLEEP! (update #%d) ***\n", updateCount + 1);
@@ -224,19 +230,37 @@ void setup() {
         
         // Clear the wake flag
         sleep_clear_wake_flag();
+        
+        // Check if we need to resync NTP (LPOSC drifts over time)
+        if ((updateCount + 1) % NTP_RESYNC_INTERVAL == 0) {
+            Serial.println(">>> Periodic NTP resync to correct LPOSC drift <<<");
+            needsNtpSync = true;
+        }
     } else {
         // First boot
         Serial.println("\n\n===========================================");
         Serial.println("EL133UF1 13.3\" Spectra 6 E-Ink Display Demo");
         Serial.println("===========================================\n");
         
-        // Connect to WiFi and get NTP time
-        if (!connectWiFiAndGetNTP()) {
-            Serial.println("WARNING: Using local time (starting from 0)");
-            sleep_set_time_ms(0);
-        }
-        
+        needsNtpSync = true;
         setUpdateCount(0);
+    }
+    
+    // Sync NTP if needed (cold boot or periodic resync)
+    if (needsNtpSync) {
+        uint64_t oldTime = sleep_get_time_ms();
+        if (connectWiFiAndGetNTP()) {
+            uint64_t newTime = sleep_get_time_ms();
+            int64_t drift = (int64_t)(newTime - oldTime);
+            if (oldTime > 0) {
+                Serial.printf(">>> Time correction: %+lld ms <<<\n", drift);
+            }
+        } else {
+            Serial.println("WARNING: NTP sync failed, using existing time");
+            if (sleep_get_time_ms() == 0) {
+                sleep_set_time_ms(0);  // No time available
+            }
+        }
     }
     
     // ================================================================
