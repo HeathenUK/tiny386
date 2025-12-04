@@ -32,9 +32,10 @@
 const char* WIFI_SSID = "JELLING";
 const char* WIFI_PSK = "Crusty jugglers";
 
-// NTP servers (hostnames for display, IPs for actual use)
-const char* NTP_SERVER1_NAME = "time.nist.gov";
-const char* NTP_SERVER2_NAME = "pool.ntp.org";
+// NTP servers - use pool.ntp.org which is more reliable than NIST
+// NIST servers often rate-limit and can be slow
+const char* NTP_SERVER1_NAME = "pool.ntp.org";
+const char* NTP_SERVER2_NAME = "time.google.com";
 
 // Pin definitions for Pimoroni Pico Plus 2 W with Inky Impression 13.3"
 // These match the working CircuitPython reference
@@ -106,42 +107,55 @@ bool connectWiFiAndGetNTP() {
     Serial.printf("DNS %s: %s -> %s\n", NTP_SERVER2_NAME, dns2 ? "OK" : "FAIL",
                   dns2 ? ntpServer2.toString().c_str() : "N/A");
     
-    // If DNS failed, use hardcoded IPs
+    // If DNS failed, use hardcoded IPs (Google's NTP servers are very reliable)
     if (!dns1) {
-        ntpServer1 = IPAddress(129, 6, 15, 28);  // time-a-g.nist.gov
+        ntpServer1 = IPAddress(216, 239, 35, 0);  // time.google.com
         Serial.printf("Using fallback IP: %s\n", ntpServer1.toString().c_str());
     }
     if (!dns2) {
-        ntpServer2 = IPAddress(129, 6, 15, 29);  // time-b-g.nist.gov
+        ntpServer2 = IPAddress(216, 239, 35, 4);  // time2.google.com
     }
     
-    // Use IPAddress overload to ensure sntp_init() is called
+    // Initialize NTP - use IPAddress overload to ensure sntp_init() is called
     NTP.begin(ntpServer1, ntpServer2);
     
-    Serial.print("Waiting for NTP time sync: ");
+    // Give SNTP time to initialize and send first request
+    Serial.println("NTP initialized, waiting for response...");
+    delay(1000);
+    
+    // Wait for valid time with better feedback
+    Serial.print("Syncing: ");
     time_t now = time(nullptr);
-    Serial.printf("(initial=%lld) ", (long long)now);
     start = millis();
-    int dots = 0;
-    while (now < 8 * 3600 * 2 && (millis() - start < 30000)) {
-        delay(100);  // Shorter delay for more responsive network processing
-        dots++;
-        if (dots % 10 == 0) {
-            Serial.print(".");
+    int attempts = 0;
+    const int maxAttempts = 60;  // 60 seconds max
+    
+    while (now < 1700000000 && attempts < maxAttempts) {  // Valid if > Sept 2023
+        // Let network stack process - yield() is important for lwIP
+        for (int i = 0; i < 10; i++) {
+            delay(100);
+            yield();  // Allow background network processing
         }
-        if (dots % 50 == 0) {
-            now = time(nullptr);
-            Serial.printf("[%lld]", (long long)now);
+        attempts++;
+        now = time(nullptr);
+        
+        if (attempts % 5 == 0) {
+            Serial.printf("[%ds: %lld] ", attempts, (long long)now);
         } else {
-            now = time(nullptr);
+            Serial.print(".");
         }
     }
     Serial.println();
     
-    Serial.printf("Final time: %lld (threshold: %d)\n", (long long)now, 8 * 3600 * 2);
+    Serial.printf("Final time: %lld (valid threshold: 1700000000)\n", (long long)now);
+    Serial.printf("NTP attempts: %d seconds\n", attempts);
     
-    if (now < 8 * 3600 * 2) {
+    if (now < 1700000000) {  // Sept 2023
         Serial.println("NTP sync failed - time not set!");
+        Serial.println("Possible causes:");
+        Serial.println("  - Firewall blocking UDP port 123");
+        Serial.println("  - NTP servers unreachable");
+        Serial.println("  - Network issues");
         WiFi.disconnect(true);
         return false;
     }
