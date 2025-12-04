@@ -333,8 +333,10 @@ void setup() {
 // Perform a display update (called on each wake cycle)
 // ================================================================
 // Expected time for display refresh (measured empirically)
-// Adjust this based on your observed refresh times
-#define DISPLAY_REFRESH_MS 28000  // ~28 seconds typical for full refresh
+// Cold boot (with init):  ~23 seconds (init 1.7s + rotate 1s + SPI 0.5s + refresh 19.5s + overhead 0.3s)
+// Warm update (skipInit): ~21 seconds (no init sequence)
+#define DISPLAY_REFRESH_COLD_MS  23000  // First update after power-on
+#define DISPLAY_REFRESH_WARM_MS  21300  // Subsequent updates (skipInit=true)
 
 void doDisplayUpdate(int updateNumber) {
     Serial.printf("\n=== Display Update #%d ===\n", updateNumber);
@@ -346,12 +348,16 @@ void doDisplayUpdate(int updateNumber) {
     Serial.printf("Current time: %s\n", timeStr);
     
     // Predict what time it will be when the display finishes refreshing
-    // This accounts for: drawing time (~1s) + SPI transfer (~0.5s) + panel refresh (~27s)
-    uint64_t display_time_ms = now_ms + DISPLAY_REFRESH_MS;
+    // First update needs init sequence (~1.7s extra), subsequent updates can skip it
+    bool isColdBoot = (updateNumber == 1);
+    uint32_t expectedRefreshMs = isColdBoot ? DISPLAY_REFRESH_COLD_MS : DISPLAY_REFRESH_WARM_MS;
+    
+    uint64_t display_time_ms = now_ms + expectedRefreshMs;
     char displayTimeStr[32];
     formatTime(display_time_ms, displayTimeStr, sizeof(displayTimeStr));
-    Serial.printf("Display will show: %s (compensating +%d sec)\n", 
-                  displayTimeStr, DISPLAY_REFRESH_MS / 1000);
+    Serial.printf("Display will show: %s (compensating +%lu ms, %s)\n", 
+                  displayTimeStr, expectedRefreshMs, 
+                  isColdBoot ? "cold boot" : "warm update");
     
     // Reinitialize SPI
     SPI1.setSCK(PIN_SPI_SCK);
@@ -457,8 +463,9 @@ void doDisplayUpdate(int updateNumber) {
     Serial.printf("  All drawing:    %lu ms\n", millis() - drawStart);
     
     // Update display and measure actual refresh time
+    // Skip init sequence on warm updates (saves ~1.7 seconds)
     uint32_t refreshStart = millis();
-    display.update(false);
+    display.update(!isColdBoot);  // skipInit=true for warm updates
     uint32_t actualRefreshMs = millis() - refreshStart;
     
     // Get actual time now for comparison
@@ -469,8 +476,8 @@ void doDisplayUpdate(int updateNumber) {
     Serial.printf("Update #%d complete.\n", updateNumber);
     Serial.printf("  Displayed time: %s\n", displayTimeStr);
     Serial.printf("  Actual time:    %s\n", actualTimeStr);
-    Serial.printf("  Refresh took:   %lu ms (predicted %d ms)\n", 
-                  actualRefreshMs, DISPLAY_REFRESH_MS);
+    Serial.printf("  Refresh took:   %lu ms (predicted %lu ms)\n", 
+                  actualRefreshMs, expectedRefreshMs);
     
     int32_t errorMs = (int32_t)(actual_now_ms - display_time_ms);
     Serial.printf("  Time error:     %+ld ms (%s)\n", errorMs,
