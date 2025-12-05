@@ -320,28 +320,133 @@ void EL133UF1_TTF::drawTextRight(int16_t x, int16_t y, int16_t width,
 // Outlined Text
 // ============================================================================
 
-void EL133UF1_TTF::drawTextOutlined(int16_t x, int16_t y, const char* text, 
-                                     float fontSize, uint8_t color, 
-                                     uint8_t outlineColor, int outlineWidth) {
-    // Draw outline by rendering text at offsets around the center position
-    // For width=1: 8 positions (N, NE, E, SE, S, SW, W, NW)
-    // For width=2+: concentric rings
+// Render a single glyph with outline (optimized single-pass)
+void EL133UF1_TTF::renderGlyphOutlined(int codepoint, int16_t x, int16_t baseline,
+                                        float scale, uint8_t color, uint8_t outlineColor,
+                                        int outlineWidth) {
+    stbtt_fontinfo* info = (stbtt_fontinfo*)_fontInfo;
     
-    for (int w = outlineWidth; w >= 1; w--) {
-        // Draw at 8 compass positions for each ring
-        for (int dy = -w; dy <= w; dy++) {
-            for (int dx = -w; dx <= w; dx++) {
-                // Skip center and inner positions (already covered by smaller rings)
-                if (dx == 0 && dy == 0) continue;
-                if (abs(dx) < w && abs(dy) < w) continue;
-                
-                drawText(x + dx, y + dy, text, fontSize, outlineColor);
+    // Get glyph bounding box
+    int x0, y0, x1, y1;
+    stbtt_GetCodepointBitmapBox(info, codepoint, scale, scale, &x0, &y0, &x1, &y1);
+    
+    int glyphWidth = x1 - x0;
+    int glyphHeight = y1 - y0;
+    
+    if (glyphWidth <= 0 || glyphHeight <= 0) return;
+    
+    // Expanded buffer size to accommodate outline
+    int pad = outlineWidth;
+    int bufWidth = glyphWidth + pad * 2;
+    int bufHeight = glyphHeight + pad * 2;
+    size_t bufSize = bufWidth * bufHeight;
+    
+    uint8_t* glyphBuf = (uint8_t*)malloc(bufSize);
+    if (!glyphBuf) return;
+    
+    memset(glyphBuf, 0, bufSize);
+    
+    // Render glyph centered in padded buffer
+    stbtt_MakeCodepointBitmap(info, glyphBuf + pad * bufWidth + pad,
+                               glyphWidth, glyphHeight, bufWidth, scale, scale, codepoint);
+    
+    // Screen position (adjusted for padding)
+    int16_t screenX = x + x0 - pad;
+    int16_t screenY = baseline + y0 - pad;
+    
+    // Single pass: for each pixel, check if it's glyph, outline, or skip
+    for (int py = 0; py < bufHeight; py++) {
+        int16_t drawY = screenY + py;
+        if (drawY < 0 || drawY >= _display->height()) continue;
+        
+        for (int px = 0; px < bufWidth; px++) {
+            int16_t drawX = screenX + px;
+            if (drawX < 0 || drawX >= _display->width()) continue;
+            
+            uint8_t alpha = glyphBuf[py * bufWidth + px];
+            
+            // Is this a glyph pixel?
+            if (alpha > 127) {
+                _display->setPixel(drawX, drawY, color);
+                continue;
+            }
+            
+            // Check if any neighbor within outlineWidth is a glyph pixel (dilation)
+            bool isOutline = false;
+            for (int oy = -outlineWidth; oy <= outlineWidth && !isOutline; oy++) {
+                for (int ox = -outlineWidth; ox <= outlineWidth && !isOutline; ox++) {
+                    if (ox == 0 && oy == 0) continue;
+                    int nx = px + ox;
+                    int ny = py + oy;
+                    if (nx >= 0 && nx < bufWidth && ny >= 0 && ny < bufHeight) {
+                        if (glyphBuf[ny * bufWidth + nx] > 127) {
+                            isOutline = true;
+                        }
+                    }
+                }
+            }
+            
+            if (isOutline) {
+                _display->setPixel(drawX, drawY, outlineColor);
             }
         }
     }
     
-    // Draw main text on top
-    drawText(x, y, text, fontSize, color);
+    free(glyphBuf);
+}
+
+void EL133UF1_TTF::drawTextOutlined(int16_t x, int16_t y, const char* text, 
+                                     float fontSize, uint8_t color, 
+                                     uint8_t outlineColor, int outlineWidth) {
+    if (!_fontLoaded || _fontInfo == nullptr || _display == nullptr || text == nullptr) return;
+    
+    stbtt_fontinfo* info = (stbtt_fontinfo*)_fontInfo;
+    float scale = stbtt_ScaleForPixelHeight(info, fontSize);
+    
+    // Get font metrics for baseline
+    int ascent, descent, lineGap;
+    stbtt_GetFontVMetrics(info, &ascent, &descent, &lineGap);
+    int baseline = y + (int)(ascent * scale);
+    
+    int xPos = x;
+    int prevCodepoint = 0;
+    const char* p = text;
+    
+    while (*p) {
+        // Decode UTF-8 (same as drawText)
+        int codepoint = (uint8_t)*p++;
+        if (codepoint >= 0xC0 && codepoint < 0xE0 && *p) {
+            codepoint = ((codepoint & 0x1F) << 6) | (*p++ & 0x3F);
+        } else if (codepoint >= 0xE0 && codepoint < 0xF0 && *p && *(p+1)) {
+            codepoint = ((codepoint & 0x0F) << 12) | 
+                       ((*p++ & 0x3F) << 6) | 
+                       (*p++ & 0x3F);
+        }
+        
+        // Handle newlines
+        if (codepoint == '\n') {
+            xPos = x;
+            baseline += (int)((ascent - descent + lineGap) * scale);
+            prevCodepoint = 0;
+            continue;
+        }
+        
+        // Apply kerning
+        if (prevCodepoint) {
+            int kern = stbtt_GetCodepointKernAdvance(info, prevCodepoint, codepoint);
+            xPos += (int)(kern * scale);
+        }
+        
+        // Render glyph with outline
+        renderGlyphOutlined(codepoint, xPos, baseline, scale, color, outlineColor, outlineWidth);
+        
+        // Advance cursor
+        int advance, lsb;
+        stbtt_GetCodepointHMetrics(info, codepoint, &advance, &lsb);
+        xPos += (int)(advance * scale);
+        
+        prevCodepoint = codepoint;
+    }
 }
 
 void EL133UF1_TTF::drawTextOutlinedCentered(int16_t x, int16_t y, int16_t width,

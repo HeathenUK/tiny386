@@ -134,6 +134,11 @@ private:
     bool _fontLoaded;
     void* _fontInfo;  // Opaque pointer to stbtt_fontinfo
     
+    // Render a single glyph with outline (optimized)
+    void renderGlyphOutlined(int codepoint, int16_t x, int16_t baseline,
+                             float scale, uint8_t color, uint8_t outlineColor,
+                             int outlineWidth);
+    
     // Render a single glyph and draw to display
     void renderGlyph(int codepoint, int16_t x, int16_t y, float scale, 
                      uint8_t color, uint8_t bgColor);
