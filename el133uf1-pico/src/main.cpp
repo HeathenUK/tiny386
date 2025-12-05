@@ -408,12 +408,9 @@ void doDisplayUpdate(int updateNumber) {
     display.clear(EL133UF1_WHITE);
     Serial.printf("  clear:          %lu ms\n", millis() - t0);
     
-    // Title - using TTF font (64px, 23 chars)
-    t0 = millis();
-    ttf.drawTextCentered(0, 60, display.width(), "RP2350 Deep Sleep Clock", 64.0, EL133UF1_BLACK);
-    t1 = millis() - t0;
-    ttfTotal += t1;
-    Serial.printf("  TTF title 64px: %lu ms\n", t1);
+    // ================================================================
+    // MAIN TIME DISPLAY - centered with outline for readability
+    // ================================================================
     
     // Display the PREDICTED time (what it will be when refresh completes)
     time_t time_sec = (time_t)(display_time_ms / 1000);
@@ -421,66 +418,151 @@ void doDisplayUpdate(int updateNumber) {
     char timeBuf[16];
     strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", tm);
     
-    // Cycle through colors based on update number
+    // Cycle through background colors based on update number
     uint8_t colors[] = {EL133UF1_RED, EL133UF1_GREEN, EL133UF1_BLUE, EL133UF1_YELLOW};
-    uint8_t color = colors[(updateNumber - 1) % 4];
+    uint8_t bgColor = colors[(updateNumber - 1) % 4];
     
+    // Large colored banner for time
     t0 = millis();
-    display.fillRect(150, 200, 900, 200, color);
+    display.fillRect(0, 80, display.width(), 220, bgColor);
     Serial.printf("  fillRect:       %lu ms\n", millis() - t0);
     
-    // Time display - large TTF (140px, 8 chars)
+    // Time - large outlined text, centered on anchor point
+    // Using anchor at center of banner (800, 190)
     t0 = millis();
-    ttf.drawTextCentered(150, 230, 900, timeBuf, 140.0, EL133UF1_WHITE);
+    ttf.drawTextAlignedOutlined(display.width() / 2, 190, timeBuf, 160.0,
+                                 EL133UF1_WHITE, EL133UF1_BLACK,
+                                 ALIGN_CENTER, ALIGN_MIDDLE, 2);
     t1 = millis() - t0;
     ttfTotal += t1;
-    Serial.printf("  TTF time 140px: %lu ms\n", t1);
+    Serial.printf("  TTF time 160px: %lu ms\n", t1);
     
-    // Date - TTF (42px, ~20 chars)
+    // Date - centered below banner
     char dateBuf[32];
     strftime(dateBuf, sizeof(dateBuf), "%A, %d %B %Y", tm);
     t0 = millis();
-    ttf.drawTextCentered(0, 450, display.width(), dateBuf, 42.0, EL133UF1_BLACK);
+    ttf.drawTextAligned(display.width() / 2, 340, dateBuf, 48.0, EL133UF1_BLACK,
+                        ALIGN_CENTER, ALIGN_TOP);
     t1 = millis() - t0;
     ttfTotal += t1;
-    Serial.printf("  TTF date 42px:  %lu ms\n", t1);
+    Serial.printf("  TTF date 48px:  %lu ms\n", t1);
     
-    // Update count - TTF (56px, ~10 chars)
-    char buf[32];
+    // Update count
+    char buf[64];
     snprintf(buf, sizeof(buf), "Update #%d", updateNumber);
     t0 = millis();
-    ttf.drawTextCentered(0, 530, display.width(), buf, 56.0, EL133UF1_BLACK);
+    ttf.drawTextAligned(display.width() / 2, 410, buf, 36.0, EL133UF1_BLACK,
+                        ALIGN_CENTER, ALIGN_TOP);
     t1 = millis() - t0;
     ttfTotal += t1;
-    Serial.printf("  TTF count 56px: %lu ms\n", t1);
+    Serial.printf("  TTF count 36px: %lu ms\n", t1);
     
-    // Info line 1 - TTF (28px, 48 chars)
+    // ================================================================
+    // ALIGNMENT DEMO - show anchor points and alignment modes
+    // ================================================================
+    
+    int16_t demoY = 500;
+    int16_t anchorX = display.width() / 2;  // Center of screen
+    
+    // Draw vertical anchor line
+    display.drawVLine(anchorX, demoY, 180, EL133UF1_BLACK);
+    
+    // Draw horizontal baseline indicators
+    int16_t baselineY = demoY + 90;
+    display.drawHLine(anchorX - 300, baselineY, 600, EL133UF1_BLACK);
+    
+    // Small marker at anchor point
+    display.fillRect(anchorX - 3, baselineY - 3, 6, 6, EL133UF1_RED);
+    
+    // Left-aligned text (anchor on left edge, baseline)
     t0 = millis();
-    ttf.drawTextCentered(0, 650, display.width(), "NTP synced on boot, time maintained during sleep", 28.0, EL133UF1_BLACK);
+    ttf.drawTextAligned(anchorX - 280, baselineY, "Left", 32.0, EL133UF1_BLACK,
+                        ALIGN_LEFT, ALIGN_BASELINE);
     t1 = millis() - t0;
     ttfTotal += t1;
-    Serial.printf("  TTF info1 28px: %lu ms\n", t1);
     
-    // Info line 2 - TTF (28px, 38 chars)
+    // Center-aligned text (anchor at center, baseline)
     t0 = millis();
-    ttf.drawTextCentered(0, 700, display.width(), "Next update in 10 seconds (deep sleep)", 28.0, EL133UF1_BLACK);
+    ttf.drawTextAligned(anchorX, baselineY, "Center", 32.0, EL133UF1_RED,
+                        ALIGN_CENTER, ALIGN_BASELINE);
     t1 = millis() - t0;
     ttfTotal += t1;
-    Serial.printf("  TTF info2 28px: %lu ms\n", t1);
     
-    // Bitmap font comparison (size 2 = 16px, 24 chars)
+    // Right-aligned text (anchor on right edge, baseline)
     t0 = millis();
-    display.drawText(50, 800, "Bitmap font (8x8 scaled)", EL133UF1_BLACK, EL133UF1_WHITE, 2);
-    t1 = millis() - t0;
-    bitmapTotal += t1;
-    Serial.printf("  Bitmap 16px:    %lu ms\n", t1);
-    
-    // TTF comparison (24px, 25 chars)
-    t0 = millis();
-    ttf.drawText(50, 850, "TrueType font (Open Sans)", 24.0, EL133UF1_BLACK);
+    ttf.drawTextAligned(anchorX + 280, baselineY, "Right", 32.0, EL133UF1_BLACK,
+                        ALIGN_RIGHT, ALIGN_BASELINE);
     t1 = millis() - t0;
     ttfTotal += t1;
-    Serial.printf("  TTF 24px:       %lu ms\n", t1);
+    Serial.printf("  Alignment demo: %lu ms\n", t1 * 3);
+    
+    // ================================================================
+    // VERTICAL ALIGNMENT DEMO - showing descenders
+    // ================================================================
+    
+    int16_t vdemoX = 200;
+    int16_t vdemoY = 750;
+    
+    // Draw anchor line
+    display.drawHLine(vdemoX, vdemoY, 500, EL133UF1_RED);
+    display.fillRect(vdemoX - 3, vdemoY - 3, 6, 6, EL133UF1_RED);
+    
+    // Demonstrate baseline alignment with descenders (g, y, p)
+    t0 = millis();
+    ttf.drawTextAligned(vdemoX, vdemoY, "gyp Baseline", 36.0, EL133UF1_BLACK,
+                        ALIGN_LEFT, ALIGN_BASELINE);
+    t1 = millis() - t0;
+    ttfTotal += t1;
+    
+    // Show different vertical alignments side by side
+    int16_t vX2 = 900;
+    display.drawHLine(vX2, vdemoY, 400, EL133UF1_BLUE);
+    
+    ttf.drawTextAligned(vX2, vdemoY, "Top", 28.0, EL133UF1_BLUE,
+                        ALIGN_LEFT, ALIGN_TOP);
+    ttf.drawTextAligned(vX2 + 100, vdemoY, "Mid", 28.0, EL133UF1_GREEN,
+                        ALIGN_LEFT, ALIGN_MIDDLE);
+    ttf.drawTextAligned(vX2 + 200, vdemoY, "Base", 28.0, EL133UF1_RED,
+                        ALIGN_LEFT, ALIGN_BASELINE);
+    ttf.drawTextAligned(vX2 + 320, vdemoY, "Bot", 28.0, EL133UF1_BLACK,
+                        ALIGN_LEFT, ALIGN_BOTTOM);
+    Serial.printf("  V-align demo:   %lu ms\n", millis() - t0);
+    
+    // ================================================================
+    // OUTLINED TEXT DEMO
+    // ================================================================
+    
+    // Gradient background for outline demo
+    for (int i = 0; i < 6; i++) {
+        display.fillRect(0, 850 + i * 25, display.width(), 25, i);
+    }
+    
+    t0 = millis();
+    ttf.drawTextAlignedOutlined(display.width() / 2, 925, "Outlined Text on Any Background", 40.0,
+                                 EL133UF1_WHITE, EL133UF1_BLACK,
+                                 ALIGN_CENTER, ALIGN_MIDDLE, 1);
+    t1 = millis() - t0;
+    ttfTotal += t1;
+    Serial.printf("  Outlined demo:  %lu ms\n", t1);
+    
+    // ================================================================
+    // INFO FOOTER
+    // ================================================================
+    
+    // Drift info at bottom
+    int32_t driftPpm = sleep_get_drift_ppm();
+    snprintf(buf, sizeof(buf), "LPOSC drift: %+ld ppm | Next update: 10s", (long)driftPpm);
+    t0 = millis();
+    ttf.drawTextAligned(display.width() / 2, 1050, buf, 24.0, EL133UF1_BLACK,
+                        ALIGN_CENTER, ALIGN_TOP);
+    ttfTotal += millis() - t0;
+    
+    ttf.drawTextAligned(display.width() / 2, 1090, "NTP synced on boot, time maintained during deep sleep", 
+                        22.0, EL133UF1_BLACK, ALIGN_CENTER, ALIGN_TOP);
+    
+    // Version/tech info - right aligned at bottom
+    ttf.drawTextAligned(display.width() - 20, 1150, "RP2350 + EL133UF1 + Open Sans TTF", 
+                        18.0, EL133UF1_BLACK, ALIGN_RIGHT, ALIGN_BOTTOM);
     
     Serial.printf("--- Drawing summary ---\n");
     Serial.printf("  TTF total:      %lu ms\n", ttfTotal);
