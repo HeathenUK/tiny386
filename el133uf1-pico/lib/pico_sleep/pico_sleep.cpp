@@ -93,6 +93,79 @@ static void ensure_timer_running(void) {
 // Public API
 // ========================================================================
 
+// Scratch register for storing calibrated LPOSC frequency
+#define LPOSC_FREQ_REG  7
+
+// Get stored LPOSC frequency, or 0 if not calibrated
+static uint32_t get_calibrated_lposc_hz(void) {
+    uint32_t val = powman_hw->scratch[LPOSC_FREQ_REG];
+    // Check for reasonable range (25kHz - 45kHz)
+    if (val >= 25000 && val <= 45000) {
+        return val;
+    }
+    return 0;  // Not calibrated or invalid
+}
+
+// Store calibrated LPOSC frequency
+static void set_calibrated_lposc_hz(uint32_t freq_hz) {
+    powman_hw->scratch[LPOSC_FREQ_REG] = freq_hz;
+}
+
+// Measure actual LPOSC frequency by comparing to XOSC
+// This should only be called when XOSC is running (before deep sleep)
+static uint32_t measure_lposc_frequency(void) {
+    // Use rosc_hw->count to count LPOSC cycles
+    // Actually, we'll use a simpler approach: 
+    // Set timer to LPOSC, wait 100ms via delay() (XOSC-based), measure timer ticks
+    
+    Serial.println("  Calibrating LPOSC frequency...");
+    
+    // Make sure timer is running on LPOSC
+    bool was_running = powman_timer_is_running();
+    if (!was_running) {
+        powman_timer_set_ms(0);
+        powman_timer_start();
+    }
+    
+    // Switch to LPOSC with assumed 32768 Hz initially
+    powman_timer_set_1khz_tick_source_lposc_with_hz(32768);
+    
+    // Wait for timer to stabilize
+    delay(10);
+    
+    // Measure: use XOSC-based delay() as reference, count LPOSC timer ticks
+    uint64_t t1 = powman_timer_get_ms();
+    uint32_t start_us = micros();  // micros() uses XOSC
+    
+    delay(500);  // Wait 500ms (XOSC-accurate)
+    
+    uint64_t t2 = powman_timer_get_ms();
+    uint32_t elapsed_us = micros() - start_us;
+    
+    // Calculate actual LPOSC frequency
+    // If LPOSC were exactly 32768 Hz, we'd see 500 timer ticks
+    // actual_freq = assumed_freq * (actual_ticks / expected_ticks)
+    // But we need to account for the assumed frequency
+    
+    int64_t lposc_ticks = (int64_t)(t2 - t1);
+    float elapsed_sec = elapsed_us / 1000000.0f;
+    
+    // The timer gives 1 tick per ms when calibrated correctly
+    // So lposc_ticks should equal elapsed_ms if calibrated
+    // actual_lposc_hz = 32768 * (lposc_ticks / elapsed_ms) 
+    
+    float expected_ticks = elapsed_sec * 1000.0f;  // Expected ms
+    float ratio = lposc_ticks / expected_ticks;
+    uint32_t actual_freq = (uint32_t)(32768.0f * ratio);
+    
+    Serial.printf("  Measured: %lld ticks in %.1f ms (ratio=%.4f)\n", 
+                  lposc_ticks, elapsed_sec * 1000.0f, ratio);
+    Serial.printf("  LPOSC actual frequency: %lu Hz (nominal 32768 Hz)\n", actual_freq);
+    Serial.printf("  Deviation: %+.2f%%\n", (ratio - 1.0f) * 100.0f);
+    
+    return actual_freq;
+}
+
 void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
     _dormant_source = dormant_source;
 
@@ -113,6 +186,10 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
         if (timer_running && using_lposc) {
             // Already set up from previous cycle - don't touch it!
             Serial.println("  [3] Timer already on LPOSC, preserving");
+            uint32_t cal_freq = get_calibrated_lposc_hz();
+            if (cal_freq > 0) {
+                Serial.printf("  [4] Using calibrated freq: %lu Hz\n", cal_freq);
+            }
             Serial.flush();
             return;
         }
@@ -124,21 +201,33 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
             powman_timer_start();
         }
         
+        // Check if we have a stored LPOSC calibration
+        uint32_t lposc_freq = get_calibrated_lposc_hz();
+        
+        if (lposc_freq == 0) {
+            // No calibration - measure LPOSC frequency now (while XOSC is running)
+            lposc_freq = measure_lposc_frequency();
+            set_calibrated_lposc_hz(lposc_freq);
+            Serial.printf("  [4] Stored calibration: %lu Hz\n", lposc_freq);
+        } else {
+            Serial.printf("  [4] Using stored calibration: %lu Hz\n", lposc_freq);
+        }
+        
         // Check time before switching source
         uint64_t time_pre_switch = powman_timer_get_ms();
-        Serial.printf("  [4] Time before LPOSC switch: %llu ms\n", time_pre_switch);
+        Serial.printf("  [5] Time before LPOSC switch: %llu ms\n", time_pre_switch);
         Serial.flush();
         
-        // Switch to LPOSC - this is where time might be lost!
-        powman_timer_set_1khz_tick_source_lposc();
+        // Switch to LPOSC with CALIBRATED frequency
+        powman_timer_set_1khz_tick_source_lposc_with_hz(lposc_freq);
         
         // Check time immediately after switch
         uint64_t time_post_switch = powman_timer_get_ms();
         int64_t switch_delta = (int64_t)time_post_switch - (int64_t)time_pre_switch;
         
-        Serial.printf("  [5] Time after LPOSC switch: %llu ms (delta: %+lld ms)\n", 
+        Serial.printf("  [6] Time after LPOSC switch: %llu ms (delta: %+lld ms)\n", 
                       time_post_switch, switch_delta);
-        Serial.printf("  [6] Timer now: running=%d, LPOSC=%d\n",
+        Serial.printf("  [7] Timer now: running=%d, LPOSC=%d\n",
                       powman_timer_is_running(),
                       (powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) ? 1 : 0);
         
@@ -146,7 +235,7 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
         uint64_t t1 = powman_timer_get_ms();
         delay(100);
         uint64_t t2 = powman_timer_get_ms();
-        Serial.printf("  [7] 100ms test: %llu -> %llu (delta=%llu, expected ~100)\n", t1, t2, t2-t1);
+        Serial.printf("  [8] 100ms test: %llu -> %llu (delta=%llu, expected ~100)\n", t1, t2, t2-t1);
         Serial.flush();
         
         // Warn if significant time was lost during switch
