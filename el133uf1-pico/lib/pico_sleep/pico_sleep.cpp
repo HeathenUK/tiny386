@@ -66,7 +66,14 @@ static void sleep_set_wake_flag(void) {
 // ========================================================================
 
 uint64_t sleep_get_time_ms(void) {
+    // If timer isn't running, it will return 0
+    // This is expected on first boot before NTP sync
     return powman_timer_get_ms();
+}
+
+// Check if the powman timer has a valid time set (not just 0)
+bool sleep_has_valid_time(void) {
+    return powman_timer_is_running() && powman_timer_get_ms() > 1700000000000ULL;
 }
 
 void sleep_set_time_ms(uint64_t time_ms) {
@@ -349,6 +356,12 @@ static bool get_sync_point(uint64_t* lposc_ms, uint64_t* ntp_ms) {
 }
 
 void sleep_calibrate_drift(uint64_t accurate_time_ms) {
+    // Ensure timer is running before we try to read/write it
+    if (!powman_timer_is_running()) {
+        Serial.println("  Starting powman timer...");
+        powman_timer_start();
+    }
+    
     uint64_t current_lposc = powman_timer_get_ms();
     
     uint64_t last_lposc, last_ntp;
@@ -382,8 +395,11 @@ void sleep_calibrate_drift(uint64_t accurate_time_ms) {
     // Store this sync point for next calibration
     store_sync_point(current_lposc, accurate_time_ms);
     
-    // Also update the raw timer to match NTP (for sleep_get_time_ms)
+    // Set the timer to the accurate NTP time
     powman_timer_set_ms(accurate_time_ms);
+    
+    Serial.printf("  Timer set to: %llu ms (epoch %llu)\n", 
+                  accurate_time_ms, accurate_time_ms / 1000);
 }
 
 uint64_t sleep_get_corrected_time_ms(void) {
