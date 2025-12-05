@@ -317,6 +317,119 @@ void EL133UF1_TTF::drawTextRight(int16_t x, int16_t y, int16_t width,
 }
 
 // ============================================================================
+// Anchor-Based Alignment
+// ============================================================================
+
+int16_t EL133UF1_TTF::getTextHeight(float fontSize) {
+    if (!_fontLoaded || _fontInfo == nullptr) return 0;
+    
+    stbtt_fontinfo* info = (stbtt_fontinfo*)_fontInfo;
+    float scale = stbtt_ScaleForPixelHeight(info, fontSize);
+    
+    int ascent, descent, lineGap;
+    stbtt_GetFontVMetrics(info, &ascent, &descent, &lineGap);
+    
+    // descent is negative, so we subtract it (adding its absolute value)
+    return (int16_t)((ascent - descent) * scale);
+}
+
+void EL133UF1_TTF::drawTextAligned(int16_t x, int16_t y, const char* text, float fontSize,
+                                    uint8_t color, TextAlignH alignH, TextAlignV alignV,
+                                    uint8_t bgColor) {
+    if (!_fontLoaded || _fontInfo == nullptr || _display == nullptr || text == nullptr) return;
+    
+    stbtt_fontinfo* info = (stbtt_fontinfo*)_fontInfo;
+    float scale = stbtt_ScaleForPixelHeight(info, fontSize);
+    
+    // Get font metrics
+    int ascent, descent, lineGap;
+    stbtt_GetFontVMetrics(info, &ascent, &descent, &lineGap);
+    int16_t ascentPx = (int16_t)(ascent * scale);
+    int16_t descentPx = (int16_t)(descent * scale);  // negative value
+    int16_t totalHeight = ascentPx - descentPx;
+    
+    // Calculate horizontal offset based on alignment
+    int16_t drawX = x;
+    if (alignH != ALIGN_LEFT) {
+        int16_t textWidth = getTextWidth(text, fontSize);
+        if (alignH == ALIGN_CENTER) {
+            drawX = x - textWidth / 2;
+        } else if (alignH == ALIGN_RIGHT) {
+            drawX = x - textWidth;
+        }
+    }
+    
+    // Calculate vertical offset based on alignment
+    // Note: drawText expects y to be TOP of text, so we adjust accordingly
+    int16_t drawY = y;
+    switch (alignV) {
+        case ALIGN_TOP:
+            // y is already top, no adjustment needed
+            break;
+        case ALIGN_BASELINE:
+            // y is baseline, top is baseline minus ascent
+            drawY = y - ascentPx;
+            break;
+        case ALIGN_BOTTOM:
+            // y is bottom (descender line), top is y minus total height
+            drawY = y - totalHeight;
+            break;
+        case ALIGN_MIDDLE:
+            // y is vertical center, top is y minus half the height
+            drawY = y - totalHeight / 2;
+            break;
+    }
+    
+    drawText(drawX, drawY, text, fontSize, color, bgColor);
+}
+
+void EL133UF1_TTF::drawTextAlignedOutlined(int16_t x, int16_t y, const char* text, float fontSize,
+                                            uint8_t color, uint8_t outlineColor,
+                                            TextAlignH alignH, TextAlignV alignV,
+                                            int outlineWidth, bool exactOutline) {
+    if (!_fontLoaded || _fontInfo == nullptr || _display == nullptr || text == nullptr) return;
+    
+    stbtt_fontinfo* info = (stbtt_fontinfo*)_fontInfo;
+    float scale = stbtt_ScaleForPixelHeight(info, fontSize);
+    
+    // Get font metrics
+    int ascent, descent, lineGap;
+    stbtt_GetFontVMetrics(info, &ascent, &descent, &lineGap);
+    int16_t ascentPx = (int16_t)(ascent * scale);
+    int16_t descentPx = (int16_t)(descent * scale);
+    int16_t totalHeight = ascentPx - descentPx;
+    
+    // Calculate horizontal offset
+    int16_t drawX = x;
+    if (alignH != ALIGN_LEFT) {
+        int16_t textWidth = getTextWidth(text, fontSize);
+        if (alignH == ALIGN_CENTER) {
+            drawX = x - textWidth / 2;
+        } else if (alignH == ALIGN_RIGHT) {
+            drawX = x - textWidth;
+        }
+    }
+    
+    // Calculate vertical offset
+    int16_t drawY = y;
+    switch (alignV) {
+        case ALIGN_TOP:
+            break;
+        case ALIGN_BASELINE:
+            drawY = y - ascentPx;
+            break;
+        case ALIGN_BOTTOM:
+            drawY = y - totalHeight;
+            break;
+        case ALIGN_MIDDLE:
+            drawY = y - totalHeight / 2;
+            break;
+    }
+    
+    drawTextOutlined(drawX, drawY, text, fontSize, color, outlineColor, outlineWidth, exactOutline);
+}
+
+// ============================================================================
 // Outlined Text
 // ============================================================================
 

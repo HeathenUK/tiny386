@@ -26,6 +26,25 @@
 // Forward declaration
 class EL133UF1;
 
+/**
+ * @brief Horizontal text alignment (anchor point)
+ */
+enum TextAlignH : uint8_t {
+    ALIGN_LEFT   = 0,  // x is left edge of text
+    ALIGN_CENTER = 1,  // x is horizontal center of text
+    ALIGN_RIGHT  = 2   // x is right edge of text
+};
+
+/**
+ * @brief Vertical text alignment (anchor point)
+ */
+enum TextAlignV : uint8_t {
+    ALIGN_TOP      = 0,  // y is top of text (ascender line)
+    ALIGN_BASELINE = 1,  // y is baseline (where most letters sit)
+    ALIGN_BOTTOM   = 2,  // y is bottom of text (descender line)
+    ALIGN_MIDDLE   = 3   // y is vertical center of text
+};
+
 class EL133UF1_TTF {
 public:
     EL133UF1_TTF();
@@ -103,6 +122,49 @@ public:
      */
     void drawTextRight(int16_t x, int16_t y, int16_t width,
                        const char* text, float fontSize, uint8_t color);
+
+    /**
+     * @brief Draw text with precise anchor-based alignment
+     * 
+     * The anchor point (x, y) can be positioned at any combination of
+     * horizontal (left/center/right) and vertical (top/baseline/bottom/middle)
+     * alignment points on the text.
+     * 
+     * Example: To center text at screen position (400, 300):
+     *   drawTextAligned(400, 300, "Hello", 48, color, ALIGN_CENTER, ALIGN_MIDDLE);
+     * 
+     * Example: To place text with baseline at y=500, right-aligned to x=800:
+     *   drawTextAligned(800, 500, "Hello", 48, color, ALIGN_RIGHT, ALIGN_BASELINE);
+     * 
+     * @param x X coordinate of anchor point
+     * @param y Y coordinate of anchor point
+     * @param text Text string
+     * @param fontSize Font size in pixels
+     * @param color Text color
+     * @param alignH Horizontal alignment (ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT)
+     * @param alignV Vertical alignment (ALIGN_TOP, ALIGN_BASELINE, ALIGN_BOTTOM, ALIGN_MIDDLE)
+     * @param bgColor Background color (0xFF for transparent, default)
+     */
+    void drawTextAligned(int16_t x, int16_t y, const char* text, float fontSize,
+                         uint8_t color, TextAlignH alignH, TextAlignV alignV,
+                         uint8_t bgColor = 0xFF);
+
+    /**
+     * @brief Draw outlined text with precise anchor-based alignment
+     * 
+     * Same as drawTextAligned but with outline.
+     */
+    void drawTextAlignedOutlined(int16_t x, int16_t y, const char* text, float fontSize,
+                                  uint8_t color, uint8_t outlineColor,
+                                  TextAlignH alignH, TextAlignV alignV,
+                                  int outlineWidth = 1, bool exactOutline = false);
+
+    /**
+     * @brief Get text height including ascenders and descenders
+     * @param fontSize Font size in pixels
+     * @return Total height in pixels (ascent + |descent|)
+     */
+    int16_t getTextHeight(float fontSize);
 
     /**
      * @brief Draw text with an outline (stroke) around it
