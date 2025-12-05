@@ -206,15 +206,17 @@ void setup() {
     // Initialize serial for debugging
     Serial.begin(115200);
     
-    // Wait for serial connection (shorter timeout)
+    // Wait for serial connection (longer timeout for reliability)
     uint32_t startWait = millis();
-    while (!Serial && (millis() - startWait < 1000)) {
-        delay(50);
+    while (!Serial && (millis() - startWait < 3000)) {
+        delay(100);
     }
+    delay(500);  // Extra delay for serial to stabilize
     
     // Immediate sign of life
     Serial.println("\n\n>>> BOOT <<<");
     Serial.flush();
+    delay(100);
     
     // ================================================================
     // EARLY BOOT TIMER DIAGNOSTICS

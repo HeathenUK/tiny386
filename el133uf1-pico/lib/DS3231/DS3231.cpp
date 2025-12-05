@@ -16,23 +16,34 @@ bool DS3231::begin(TwoWire* wire, int sda, int scl) {
     _present = false;
     _address = 0;
     
+    Serial.printf("DS3231: Initializing I2C (SDA=%d, SCL=%d)...\n", sda, scl);
+    Serial.flush();
+    
     // Initialize I2C with custom pins if specified
     if (sda >= 0 && scl >= 0) {
         _wire->setSDA(sda);
         _wire->setSCL(scl);
     }
+    
     _wire->begin();
     _wire->setClock(100000);  // 100kHz for reliability
     
-    Serial.println("DS3231: Scanning I2C bus...");
+    Serial.println("DS3231: I2C initialized, scanning...");
+    Serial.flush();
     
     // Scan for DS3231 at known addresses
     uint8_t addresses[] = { DS3231_ADDR_PRIMARY, 0x69, 0x6F };  // Common RTC addresses
     
     for (uint8_t i = 0; i < sizeof(addresses); i++) {
         uint8_t addr = addresses[i];
+        Serial.printf("DS3231: Checking 0x%02X... ", addr);
+        Serial.flush();
+        
         _wire->beginTransmission(addr);
         uint8_t error = _wire->endTransmission();
+        
+        Serial.printf("result=%d\n", error);
+        Serial.flush();
         
         if (error == 0) {
             Serial.printf("DS3231: Found device at 0x%02X\n", addr);
