@@ -26,6 +26,8 @@
 #include "EL133UF1_TTF.h"
 #include "fonts/opensans.h"
 #include "pico_sleep.h"
+#include "DS3231.h"
+#include "AT24C32.h"
 #include "hardware/structs/powman.h"
 #include "hardware/powman.h"
 
@@ -169,6 +171,12 @@ bool connectWiFiAndGetNTP() {
     Serial.printf("Epoch: %lld\n", (long long)now);
     Serial.flush();
     
+    // Save NTP sync time to EEPROM
+    if (eeprom.isPresent()) {
+        eeprom.setLastNtpSync((uint32_t)now);
+        Serial.println("NTP sync time saved to EEPROM");
+    }
+    
     // Disconnect WiFi to save power
     WiFi.disconnect(true);
     Serial.println("WiFi disconnected (saving power)");
@@ -257,15 +265,31 @@ void setup() {
         char timeBuf[32];
         formatTime(rtcTime, timeBuf, sizeof(timeBuf));
         Serial.printf("  RTC time: %s\n", timeBuf);
+        Serial.printf("  Temperature: %.1f°C\n", rtc.getTemperature());
+        
+        // Initialize EEPROM (on same I2C bus)
+        if (eeprom.begin(&Wire1, 0x57)) {
+            eeprom.printStatus();
+            
+            // Log temperature
+            eeprom.logTemperature(rtc.getTemperature());
+        }
     } else {
         Serial.println("No DS3231 found - using LPOSC (less accurate)");
     }
     Serial.println("===============================\n");
     Serial.flush();
     
-    // Get current update count and RTC time
+    // Get current update count (from powman scratch for this session)
     int updateCount = sleep_woke_from_deep_sleep() ? getUpdateCount() : 0;
     uint32_t uptime = sleep_get_uptime_seconds();
+    
+    // Increment persistent boot count in EEPROM (survives power loss)
+    uint32_t totalBoots = 0;
+    if (eeprom.isPresent()) {
+        eeprom.incrementBootCount();
+        totalBoots = eeprom.getBootCount();
+    }
     
     // ================================================================
     // Check if we woke from deep sleep
@@ -275,9 +299,14 @@ void setup() {
     if (sleep_woke_from_deep_sleep()) {
         Serial.println("\n\n========================================");
         Serial.printf("*** WOKE FROM DEEP SLEEP! (update #%d) ***\n", updateCount + 1);
+        if (eeprom.isPresent()) {
+            Serial.printf("*** Total boots (EEPROM): %lu ***\n", totalBoots);
+        }
         Serial.printf("*** RTC uptime: %lu seconds ***\n", uptime);
         if (hasRTC) {
             Serial.println("*** Wake source: DS3231 RTC alarm ***");
+            // Clear the DS3231 alarm flag
+            rtc.clearAlarm1();
         } else {
             Serial.println("*** Wake source: LPOSC timer ***");
         }
