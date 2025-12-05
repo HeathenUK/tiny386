@@ -236,11 +236,19 @@ void setup() {
     Serial.printf("  powman_hw->timer raw: 0x%08lx\n", (unsigned long)powman_hw->timer);
     Serial.println("==============================");
     Serial.flush();
+    delay(100);
     
     // ================================================================
     // Initialize DS3231 RTC if present
     // ================================================================
     Serial.println("\n=== Checking for DS3231 RTC ===");
+    Serial.printf("  I2C pins: SDA=%d, SCL=%d, INT=%d\n", PIN_RTC_SDA, PIN_RTC_SCL, PIN_RTC_INT);
+    Serial.flush();
+    delay(100);
+    
+    Serial.println("  Calling sleep_init_rtc...");
+    Serial.flush();
+    
     bool hasRTC = sleep_init_rtc(PIN_RTC_SDA, PIN_RTC_SCL, PIN_RTC_INT);
     if (hasRTC) {
         Serial.println("DS3231 RTC found - using for timekeeping");

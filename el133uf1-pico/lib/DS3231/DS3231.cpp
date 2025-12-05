@@ -27,55 +27,50 @@ bool DS3231::begin(TwoWire* wire, int sda, int scl) {
     
     _wire->begin();
     _wire->setClock(100000);  // 100kHz for reliability
+    _wire->setTimeout(1000);  // 1 second timeout
     
     Serial.println("DS3231: I2C initialized, scanning...");
     Serial.flush();
     
-    // Scan for DS3231 at known addresses
-    uint8_t addresses[] = { DS3231_ADDR_PRIMARY, 0x69, 0x6F };  // Common RTC addresses
+    // Only check the primary DS3231 address (0x68)
+    uint8_t addr = DS3231_ADDR_PRIMARY;
+    Serial.printf("DS3231: Checking 0x%02X... ", addr);
+    Serial.flush();
     
-    for (uint8_t i = 0; i < sizeof(addresses); i++) {
-        uint8_t addr = addresses[i];
-        Serial.printf("DS3231: Checking 0x%02X... ", addr);
-        Serial.flush();
+    _wire->beginTransmission(addr);
+    uint8_t error = _wire->endTransmission();
+    
+    Serial.printf("result=%d\n", error);
+    Serial.flush();
+    
+    if (error == 0) {
+        Serial.printf("DS3231: Found device at 0x%02X\n", addr);
         
-        _wire->beginTransmission(addr);
-        uint8_t error = _wire->endTransmission();
+        // Verify it's a DS3231 by reading control/status registers
+        _address = addr;
+        uint8_t ctrl = readRegister(DS3231_REG_CONTROL);
+        uint8_t status = readRegister(DS3231_REG_STATUS);
         
-        Serial.printf("result=%d\n", error);
-        Serial.flush();
+        Serial.printf("DS3231: Control=0x%02X, Status=0x%02X\n", ctrl, status);
         
-        if (error == 0) {
-            Serial.printf("DS3231: Found device at 0x%02X\n", addr);
+        // DS3231 should have reasonable values in these registers
+        // The OSF bit might be set on first power-up
+        if (status != 0xFF && ctrl != 0xFF) {
+            _present = true;
+            Serial.printf("DS3231: Confirmed at 0x%02X\n", addr);
             
-            // Verify it's a DS3231 by reading control/status registers
-            _address = addr;
-            uint8_t ctrl = readRegister(DS3231_REG_CONTROL);
-            uint8_t status = readRegister(DS3231_REG_STATUS);
-            
-            Serial.printf("DS3231: Control=0x%02X, Status=0x%02X\n", ctrl, status);
-            
-            // DS3231 should have reasonable values in these registers
-            // The OSF bit might be set on first power-up
-            if (status != 0xFF && ctrl != 0xFF) {
-                _present = true;
-                Serial.printf("DS3231: Confirmed at 0x%02X\n", addr);
-                
-                // Clear OSF flag if set (indicates oscillator was stopped)
-                if (status & DS3231_STAT_OSF) {
-                    Serial.println("DS3231: Oscillator was stopped, clearing flag");
-                    writeRegister(DS3231_REG_STATUS, status & ~DS3231_STAT_OSF);
-                }
-                
-                // Configure for alarm interrupt (not square wave)
-                // INTCN=1, disable both alarms initially
-                writeRegister(DS3231_REG_CONTROL, DS3231_CTRL_INTCN);
-                
-                // Enable 32kHz output
-                enable32kHz(true);
-                
-                break;
+            // Clear OSF flag if set (indicates oscillator was stopped)
+            if (status & DS3231_STAT_OSF) {
+                Serial.println("DS3231: Oscillator was stopped, clearing flag");
+                writeRegister(DS3231_REG_STATUS, status & ~DS3231_STAT_OSF);
             }
+            
+            // Configure for alarm interrupt (not square wave)
+            // INTCN=1, disable both alarms initially
+            writeRegister(DS3231_REG_CONTROL, DS3231_CTRL_INTCN);
+            
+            // Enable 32kHz output
+            enable32kHz(true);
         }
     }
     

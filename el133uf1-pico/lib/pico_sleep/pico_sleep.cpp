@@ -67,8 +67,21 @@ bool sleep_init_rtc(int sda_pin, int scl_pin, int int_pin) {
     Serial.printf("sleep_init_rtc: SDA=%d, SCL=%d, INT=%d\n", sda_pin, scl_pin, int_pin);
     Serial.flush();
     
+    // Determine which I2C bus to use based on pins
+    // GPIO 0,1 = I2C0, GPIO 2,3 = I2C1, GPIO 4,5 = I2C0, GPIO 6,7 = I2C1, etc.
+    // General rule: (pin / 2) % 2 == 0 -> I2C0, else I2C1
+    TwoWire* wire = &Wire;  // Default I2C0
+    if (sda_pin == 2 || sda_pin == 6 || sda_pin == 10 || sda_pin == 14 || 
+        sda_pin == 18 || sda_pin == 22 || sda_pin == 26) {
+        wire = &Wire1;  // I2C1
+        Serial.println("  Using Wire1 (I2C1)");
+    } else {
+        Serial.println("  Using Wire (I2C0)");
+    }
+    Serial.flush();
+    
     // Initialize DS3231
-    _rtc_present = rtc.begin(&Wire, sda_pin, scl_pin);
+    _rtc_present = rtc.begin(wire, sda_pin, scl_pin);
     _rtc_int_pin = int_pin;
     
     if (_rtc_present) {
