@@ -176,7 +176,12 @@ time_t DS3231::getTime() {
 }
 
 uint64_t DS3231::getTimeMs() {
-    return (uint64_t)getTime() * 1000;
+    time_t t = getTime();
+    // If time is before 2000 (invalid/unset RTC), return 0
+    if (t < 946684800) {  // 2000-01-01 00:00:00
+        return 0;
+    }
+    return (uint64_t)t * 1000;
 }
 
 void DS3231::setAlarm1(uint32_t delayMs) {

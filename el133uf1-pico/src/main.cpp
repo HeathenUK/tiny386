@@ -301,9 +301,18 @@ void setup() {
         Serial.println("===========================================\n");
         
         // Check if DS3231 already has valid time (battery-backed)
-        if (hasRTC && sleep_get_time_ms() > 1700000000000ULL) {
-            Serial.println("DS3231 already has valid time from battery backup");
-            needsNtpSync = false;  // Can skip NTP sync, RTC has time
+        // Note: RTC time before 1970 returns garbage when cast to uint64_t
+        // So we check the raw time_t value from the RTC
+        if (hasRTC) {
+            time_t rtcTimeSec = (time_t)(sleep_get_time_ms() / 1000);
+            // Valid if between 2020 and 2100
+            if (rtcTimeSec > 1577836800 && rtcTimeSec < 4102444800) {
+                Serial.println("DS3231 already has valid time from battery backup");
+                needsNtpSync = false;
+            } else {
+                Serial.println("DS3231 time is invalid, need NTP sync");
+                needsNtpSync = true;
+            }
         } else {
             needsNtpSync = true;
         }
