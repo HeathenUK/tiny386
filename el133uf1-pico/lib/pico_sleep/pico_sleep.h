@@ -136,6 +136,23 @@ int32_t sleep_get_drift_ppm(void);
  */
 void sleep_set_drift_ppm(int32_t drift_ppm);
 
+/**
+ * @brief Get the calibrated LPOSC frequency in Hz
+ * 
+ * Returns the measured LPOSC frequency stored during calibration.
+ * Nominal is 32768 Hz, but actual can vary significantly.
+ * 
+ * @return Calibrated frequency in Hz, or 0 if not calibrated
+ */
+uint32_t sleep_get_lposc_freq_hz(void);
+
+/**
+ * @brief Get LPOSC deviation from nominal in percent * 100
+ * 
+ * @return Deviation (e.g., 500 = +5.00%, -300 = -3.00%)
+ */
+int32_t sleep_get_lposc_deviation_centipercent(void);
+
 
 #ifdef __cplusplus
 }

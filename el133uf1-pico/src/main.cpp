@@ -568,16 +568,32 @@ void doDisplayUpdate(int updateNumber) {
     // INFO FOOTER
     // ================================================================
     
-    // Drift info at bottom
+    // LPOSC calibration and drift info at bottom
+    uint32_t lposcFreq = sleep_get_lposc_freq_hz();
+    int32_t lposcDev = sleep_get_lposc_deviation_centipercent();
     int32_t driftPpm = sleep_get_drift_ppm();
-    snprintf(buf, sizeof(buf), "LPOSC drift: %+ld ppm | Next update: 10s", (long)driftPpm);
+    
+    // Line 1: LPOSC calibration
+    if (lposcFreq > 0) {
+        snprintf(buf, sizeof(buf), "LPOSC: %lu Hz (%+ld.%02ld%% from 32768)", 
+                 lposcFreq, lposcDev / 100, abs(lposcDev) % 100);
+    } else {
+        snprintf(buf, sizeof(buf), "LPOSC: not calibrated");
+    }
     t0 = millis();
-    ttf.drawTextAligned(display.width() / 2, 1050, buf, 24.0, EL133UF1_BLACK,
+    ttf.drawTextAligned(display.width() / 2, 1020, buf, 22.0, EL133UF1_BLACK,
                         ALIGN_CENTER, ALIGN_TOP);
     ttfTotal += millis() - t0;
     
+    // Line 2: Drift correction status
+    snprintf(buf, sizeof(buf), "Drift correction: %+ld ppm | Sleep: 10s | Update #%d", 
+             (long)driftPpm, updateNumber);
+    ttf.drawTextAligned(display.width() / 2, 1055, buf, 22.0, EL133UF1_BLACK,
+                        ALIGN_CENTER, ALIGN_TOP);
+
+    // Line 3: Status
     ttf.drawTextAligned(display.width() / 2, 1090, "NTP synced on boot, time maintained during deep sleep", 
-                        22.0, EL133UF1_BLACK, ALIGN_CENTER, ALIGN_TOP);
+                        20.0, EL133UF1_BLACK, ALIGN_CENTER, ALIGN_TOP);
     
     // Version/tech info - right aligned at bottom
     ttf.drawTextAligned(display.width() - 20, 1150, "RP2350 + EL133UF1 + Open Sans TTF", 

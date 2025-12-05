@@ -106,6 +106,19 @@ static uint32_t get_calibrated_lposc_hz(void) {
     return 0;  // Not calibrated or invalid
 }
 
+// Public API to get calibrated frequency
+uint32_t sleep_get_lposc_freq_hz(void) {
+    return get_calibrated_lposc_hz();
+}
+
+// Get deviation from nominal 32768 Hz in centipercent (percent * 100)
+int32_t sleep_get_lposc_deviation_centipercent(void) {
+    uint32_t freq = get_calibrated_lposc_hz();
+    if (freq == 0) return 0;
+    // deviation = (freq - 32768) / 32768 * 10000
+    return (int32_t)(((int64_t)freq - 32768) * 10000 / 32768);
+}
+
 // Store calibrated LPOSC frequency
 static void set_calibrated_lposc_hz(uint32_t freq_hz) {
     powman_hw->scratch[LPOSC_FREQ_REG] = freq_hz;
