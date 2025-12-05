@@ -27,6 +27,7 @@
 #include "fonts/opensans.h"
 #include "pico_sleep.h"
 #include "hardware/structs/powman.h"
+#include "hardware/powman.h"
 
 // WiFi credentials
 const char* WIFI_SSID = "JELLING";
@@ -198,6 +199,24 @@ void setup() {
     while (!Serial && (millis() - startWait < 2000)) {
         delay(100);
     }
+    
+    // ================================================================
+    // EARLY BOOT TIMER DIAGNOSTICS
+    // Capture timer state before anything else touches it
+    // ================================================================
+    uint64_t boot_timer_value = powman_timer_get_ms();
+    bool boot_timer_running = powman_timer_is_running();
+    bool boot_using_lposc = (powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) != 0;
+    bool boot_using_xosc = (powman_hw->timer & POWMAN_TIMER_USING_XOSC_BITS) != 0;
+    uint32_t boot_millis = millis();  // Arduino millis() for comparison
+    
+    Serial.println("\n=== EARLY BOOT TIMER STATE ===");
+    Serial.printf("  powman timer: %llu ms\n", boot_timer_value);
+    Serial.printf("  timer running: %d\n", boot_timer_running);
+    Serial.printf("  using LPOSC: %d, using XOSC: %d\n", boot_using_lposc, boot_using_xosc);
+    Serial.printf("  Arduino millis(): %lu\n", boot_millis);
+    Serial.printf("  powman_hw->timer raw: 0x%08lx\n", (unsigned long)powman_hw->timer);
+    Serial.println("==============================\n");
     
     // Get current update count and RTC time
     int updateCount = sleep_woke_from_deep_sleep() ? getUpdateCount() : 0;

@@ -100,45 +100,59 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
     Serial.flush();
 
     if (dormant_source == DORMANT_SOURCE_LPOSC) {
-        // Check if timer is already running on LPOSC (from previous sleep cycle)
+        // Check current timer state
         bool timer_running = powman_timer_is_running();
         bool using_lposc = (powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) != 0;
+        bool using_xosc = (powman_hw->timer & POWMAN_TIMER_USING_XOSC_BITS) != 0;
+        uint64_t time_before = powman_timer_get_ms();
         
-        Serial.printf("  [2] Timer running: %d, using LPOSC: %d\n", timer_running, using_lposc);
+        Serial.printf("  [2] Timer state: running=%d, LPOSC=%d, XOSC=%d, time=%llu ms\n", 
+                      timer_running, using_lposc, using_xosc, time_before);
         Serial.flush();
         
         if (timer_running && using_lposc) {
             // Already set up from previous cycle - don't touch it!
-            Serial.println("  [3] Timer already configured, preserving time");
-            uint64_t current = powman_timer_get_ms();
-            Serial.printf("  [4] Current time: %llu ms\n", current);
+            Serial.println("  [3] Timer already on LPOSC, preserving");
             Serial.flush();
             return;
         }
         
         // First time setup - need to configure timer
         if (!timer_running) {
-            Serial.println("  [3] Starting timer...");
+            Serial.println("  [3] Timer not running, starting...");
             Serial.flush();
-            // NOTE: Don't reset to 0 - time may have been set by NTP already
             powman_timer_start();
         }
         
-        Serial.println("  [4] Switching to LPOSC...");
+        // Check time before switching source
+        uint64_t time_pre_switch = powman_timer_get_ms();
+        Serial.printf("  [4] Time before LPOSC switch: %llu ms\n", time_pre_switch);
         Serial.flush();
         
-        // Switch to LPOSC (keeps running during deep sleep)
+        // Switch to LPOSC - this is where time might be lost!
         powman_timer_set_1khz_tick_source_lposc();
         
-        Serial.printf("  [5] Timer using LPOSC: %d\n", 
+        // Check time immediately after switch
+        uint64_t time_post_switch = powman_timer_get_ms();
+        int64_t switch_delta = (int64_t)time_post_switch - (int64_t)time_pre_switch;
+        
+        Serial.printf("  [5] Time after LPOSC switch: %llu ms (delta: %+lld ms)\n", 
+                      time_post_switch, switch_delta);
+        Serial.printf("  [6] Timer now: running=%d, LPOSC=%d\n",
+                      powman_timer_is_running(),
                       (powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) ? 1 : 0);
         
-        // Verify timer is counting
+        // Verify timer is counting correctly
         uint64_t t1 = powman_timer_get_ms();
         delay(100);
         uint64_t t2 = powman_timer_get_ms();
-        Serial.printf("  [6] Timer test: %llu -> %llu (delta=%llu)\n", t1, t2, t2-t1);
+        Serial.printf("  [7] 100ms test: %llu -> %llu (delta=%llu, expected ~100)\n", t1, t2, t2-t1);
         Serial.flush();
+        
+        // Warn if significant time was lost during switch
+        if (switch_delta < -100 || switch_delta > 100) {
+            Serial.printf("  WARNING: %+lld ms jump during clock switch!\n", switch_delta);
+        }
     }
 }
 
