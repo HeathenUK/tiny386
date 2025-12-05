@@ -362,19 +362,34 @@ void sleep_calibrate_drift(uint64_t accurate_time_ms) {
         powman_timer_start();
     }
     
-    uint64_t current_lposc = powman_timer_get_ms();
+    // Read the CURRENT timer value (before we overwrite it with NTP time)
+    // This represents: last_sync_ntp_time + LPOSC_elapsed_with_drift
+    uint64_t current_timer = powman_timer_get_ms();
     
-    uint64_t last_lposc, last_ntp;
-    if (get_sync_point(&last_lposc, &last_ntp)) {
-        // Calculate elapsed time on both clocks
-        int64_t lposc_elapsed = (int64_t)(current_lposc - last_lposc);
-        int64_t ntp_elapsed = (int64_t)(accurate_time_ms - last_ntp);
+    Serial.printf("  Current timer value: %llu ms\n", current_timer);
+    
+    uint64_t last_sync_timer, last_sync_ntp;
+    if (get_sync_point(&last_sync_timer, &last_sync_ntp)) {
+        // last_sync_timer = the NTP time we SET the timer to at last sync
+        // current_timer = last_sync_timer + LPOSC_elapsed (with drift)
+        // So: lposc_elapsed = current_timer - last_sync_timer
+        int64_t lposc_elapsed = (int64_t)(current_timer - last_sync_timer);
+        
+        // NTP elapsed = actual wall clock time since last sync
+        int64_t ntp_elapsed = (int64_t)(accurate_time_ms - last_sync_ntp);
+        
+        Serial.printf("  Last sync: timer=%llu, ntp=%llu\n", last_sync_timer, last_sync_ntp);
+        Serial.printf("  Elapsed: LPOSC=%lld ms, NTP=%lld ms\n", lposc_elapsed, ntp_elapsed);
         
         // Only calibrate if we have meaningful elapsed time (>10 seconds)
-        if (lposc_elapsed > 10000 && ntp_elapsed > 10000) {
-            // drift_ppm = (ntp_elapsed - lposc_elapsed) / lposc_elapsed * 1000000
-            // Positive = LPOSC runs slow, negative = LPOSC runs fast
-            int64_t drift_ppm = ((ntp_elapsed - lposc_elapsed) * 1000000LL) / lposc_elapsed;
+        // and the values make sense (not from a stale sync point)
+        if (lposc_elapsed > 10000 && ntp_elapsed > 10000 && 
+            lposc_elapsed < 86400000LL && ntp_elapsed < 86400000LL) {  // Max 24 hours
+            
+            // drift_ppm = (lposc_elapsed - ntp_elapsed) / ntp_elapsed * 1000000
+            // Positive = LPOSC runs fast (timer gained time)
+            // Negative = LPOSC runs slow (timer lost time)
+            int64_t drift_ppm = ((lposc_elapsed - ntp_elapsed) * 1000000LL) / ntp_elapsed;
             
             // Get existing drift and apply exponential smoothing (75% old, 25% new)
             int32_t old_drift = sleep_get_drift_ppm();
@@ -385,43 +400,57 @@ void sleep_calibrate_drift(uint64_t accurate_time_ms) {
                 new_drift = (old_drift * 3 + (int32_t)drift_ppm) / 4;  // Smoothed
             }
             
-            Serial.printf("  Drift calibration: LPOSC=%lldms, NTP=%lldms, measured=%lldppm, smoothed=%dppm\n",
-                          lposc_elapsed, ntp_elapsed, drift_ppm, new_drift);
+            Serial.printf("  Drift: measured=%lld ppm, old=%d ppm, new=%d ppm\n",
+                          drift_ppm, old_drift, new_drift);
             
             sleep_set_drift_ppm(new_drift);
+        } else {
+            Serial.printf("  Skipping drift calc: values out of range\n");
         }
+    } else {
+        Serial.println("  No previous sync point - first calibration");
     }
-    
-    // Store this sync point for next calibration
-    store_sync_point(current_lposc, accurate_time_ms);
     
     // Set the timer to the accurate NTP time
     powman_timer_set_ms(accurate_time_ms);
+    
+    // Store sync point AFTER setting timer
+    // Both values are now the same (timer == NTP at sync moment)
+    store_sync_point(accurate_time_ms, accurate_time_ms);
     
     Serial.printf("  Timer set to: %llu ms (epoch %llu)\n", 
                   accurate_time_ms, accurate_time_ms / 1000);
 }
 
 uint64_t sleep_get_corrected_time_ms(void) {
-    uint64_t current_lposc = powman_timer_get_ms();
+    uint64_t current_timer = powman_timer_get_ms();
     
-    uint64_t last_lposc, last_ntp;
-    if (!get_sync_point(&last_lposc, &last_ntp)) {
-        // No calibration data, return raw time
-        return current_lposc;
-    }
-    
+    // Get drift correction factor
     int32_t drift_ppm = sleep_get_drift_ppm();
+    
+    // If no drift correction, just return raw timer value
+    // (timer is already set to NTP time at last sync)
     if (drift_ppm == 0) {
-        return current_lposc;
+        return current_timer;
     }
     
-    // Calculate corrected time from last sync point
-    int64_t lposc_elapsed = (int64_t)(current_lposc - last_lposc);
+    uint64_t last_sync_timer, last_sync_ntp;
+    if (!get_sync_point(&last_sync_timer, &last_sync_ntp)) {
+        // No sync point, return raw time
+        return current_timer;
+    }
     
-    // Apply drift correction: corrected = elapsed * (1 + drift_ppm/1000000)
+    // Calculate elapsed time since last sync (as measured by LPOSC)
+    int64_t lposc_elapsed = (int64_t)(current_timer - last_sync_timer);
+    
+    // Apply drift correction to the elapsed time
+    // If drift_ppm > 0, LPOSC runs fast, so we need to SUBTRACT time
+    // If drift_ppm < 0, LPOSC runs slow, so we need to ADD time
     int64_t correction = (lposc_elapsed * drift_ppm) / 1000000LL;
-    uint64_t corrected_time = last_ntp + lposc_elapsed + correction;
+    
+    // Corrected time = sync NTP time + elapsed - drift correction
+    // (subtract because drift_ppm represents how much EXTRA time LPOSC counted)
+    uint64_t corrected_time = last_sync_ntp + lposc_elapsed - correction;
     
     return corrected_time;
 }
