@@ -1,0 +1,8 @@
+{
+    "name": "DS3231",
+    "version": "1.0.0",
+    "description": "DS3231 RTC driver with deep sleep wake support",
+    "keywords": ["rtc", "ds3231", "i2c", "deep sleep"],
+    "frameworks": "arduino",
+    "platforms": "*"
+}
