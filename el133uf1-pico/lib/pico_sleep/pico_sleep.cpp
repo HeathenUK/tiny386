@@ -133,56 +133,65 @@ static void set_calibrated_lposc_hz(uint32_t freq_hz) {
 
 // Measure actual LPOSC frequency by comparing to XOSC
 // This should only be called when XOSC is running (before deep sleep)
+// NOTE: Does NOT touch the main timer - uses a separate measurement approach
 static uint32_t measure_lposc_frequency(void) {
-    // Use rosc_hw->count to count LPOSC cycles
-    // Actually, we'll use a simpler approach: 
-    // Set timer to LPOSC, wait 100ms via delay() (XOSC-based), measure timer ticks
+    Serial.println("  [LPOSC] Calibrating frequency...");
+    Serial.flush();
     
-    Serial.println("  Calibrating LPOSC frequency...");
+    // We'll measure by temporarily switching the timer to LPOSC,
+    // counting ticks over 500ms, then switching back.
+    // We need to save and restore the timer value.
     
-    // Make sure timer is running on LPOSC
-    bool was_running = powman_timer_is_running();
-    if (!was_running) {
-        powman_timer_set_ms(0);
+    uint64_t saved_time = powman_timer_get_ms();
+    Serial.printf("  [LPOSC] Current timer: %llu ms\n", saved_time);
+    Serial.flush();
+    
+    // Switch to LPOSC with assumed 32768 Hz
+    // The SDK function will stop/restart the timer
+    powman_timer_set_1khz_tick_source_lposc_with_hz(32768);
+    delay(20);  // Let it stabilize
+    
+    // Ensure running
+    if (!powman_timer_is_running()) {
         powman_timer_start();
+        delay(5);
     }
     
-    // Switch to LPOSC with assumed 32768 Hz initially
-    powman_timer_set_1khz_tick_source_lposc_with_hz(32768);
+    Serial.println("  [LPOSC] Measuring for 500ms...");
+    Serial.flush();
     
-    // Wait for timer to stabilize
-    delay(10);
-    
-    // Measure: use XOSC-based delay() as reference, count LPOSC timer ticks
+    // Measure LPOSC ticks over 500ms (using XOSC-based delay/micros)
     uint64_t t1 = powman_timer_get_ms();
-    uint32_t start_us = micros();  // micros() uses XOSC
+    uint32_t start_us = micros();
     
-    delay(500);  // Wait 500ms (XOSC-accurate)
+    delay(500);
     
     uint64_t t2 = powman_timer_get_ms();
     uint32_t elapsed_us = micros() - start_us;
     
-    // Calculate actual LPOSC frequency
-    // If LPOSC were exactly 32768 Hz, we'd see 500 timer ticks
-    // actual_freq = assumed_freq * (actual_ticks / expected_ticks)
-    // But we need to account for the assumed frequency
-    
     int64_t lposc_ticks = (int64_t)(t2 - t1);
     float elapsed_sec = elapsed_us / 1000000.0f;
+    float expected_ticks = elapsed_sec * 1000.0f;
     
-    // The timer gives 1 tick per ms when calibrated correctly
-    // So lposc_ticks should equal elapsed_ms if calibrated
-    // actual_lposc_hz = 32768 * (lposc_ticks / elapsed_ms) 
+    // Calculate result
+    uint32_t actual_freq = 32768;
+    if (lposc_ticks > 0 && expected_ticks > 0) {
+        float ratio = lposc_ticks / expected_ticks;
+        actual_freq = (uint32_t)(32768.0f * ratio);
+        
+        if (actual_freq < 27000 || actual_freq > 38000) {
+            Serial.printf("  [LPOSC] WARNING: Unusual freq %lu Hz, using nominal\n", actual_freq);
+            actual_freq = 32768;
+        } else {
+            Serial.printf("  [LPOSC] Result: %lu Hz (%.2f%% from nominal)\n", 
+                          actual_freq, (ratio - 1.0f) * 100.0f);
+        }
+    } else {
+        Serial.println("  [LPOSC] ERROR: Invalid measurement, using nominal");
+    }
+    Serial.flush();
     
-    float expected_ticks = elapsed_sec * 1000.0f;  // Expected ms
-    float ratio = lposc_ticks / expected_ticks;
-    uint32_t actual_freq = (uint32_t)(32768.0f * ratio);
-    
-    Serial.printf("  Measured: %lld ticks in %.1f ms (ratio=%.4f)\n", 
-                  lposc_ticks, elapsed_sec * 1000.0f, ratio);
-    Serial.printf("  LPOSC actual frequency: %lu Hz (nominal 32768 Hz)\n", actual_freq);
-    Serial.printf("  Deviation: %+.2f%%\n", (ratio - 1.0f) * 100.0f);
-    
+    // Return the frequency - caller will reconfigure with this value and restore time
     return actual_freq;
 }
 
@@ -214,12 +223,13 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
             return;
         }
         
-        // First time setup - need to configure timer
-        if (!timer_running) {
-            Serial.println("  [3] Timer not running, starting...");
-            Serial.flush();
-            powman_timer_start();
-        }
+        // SAVE the current timer value - we need to preserve it through LPOSC setup
+        uint64_t saved_time = time_before;
+        Serial.printf("  [3] Saving timer value: %llu ms\n", saved_time);
+        Serial.flush();
+        
+        // Track if we did calibration measurement (takes ~600ms)
+        bool did_measurement = false;
         
         // Check if we have a stored LPOSC calibration
         uint32_t lposc_freq = get_calibrated_lposc_hz();
@@ -228,26 +238,44 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
             // No calibration - measure LPOSC frequency now (while XOSC is running)
             lposc_freq = measure_lposc_frequency();
             set_calibrated_lposc_hz(lposc_freq);
-            Serial.printf("  [4] Stored calibration: %lu Hz\n", lposc_freq);
+            Serial.printf("  [4] Stored new calibration: %lu Hz\n", lposc_freq);
+            did_measurement = true;
         } else {
             Serial.printf("  [4] Using stored calibration: %lu Hz\n", lposc_freq);
         }
-        
-        // Check time before switching source
-        uint64_t time_pre_switch = powman_timer_get_ms();
-        Serial.printf("  [5] Time before LPOSC switch: %llu ms\n", time_pre_switch);
         Serial.flush();
         
         // Switch to LPOSC with CALIBRATED frequency
+        Serial.println("  [5] Configuring LPOSC with calibrated frequency...");
+        Serial.flush();
         powman_timer_set_1khz_tick_source_lposc_with_hz(lposc_freq);
+        delay(10);
         
-        // Check time immediately after switch
-        uint64_t time_post_switch = powman_timer_get_ms();
-        int64_t switch_delta = (int64_t)time_post_switch - (int64_t)time_pre_switch;
+        // Ensure timer is running
+        if (!powman_timer_is_running()) {
+            Serial.println("  [5b] Timer stopped, starting...");
+            powman_timer_start();
+            delay(5);
+        }
         
-        Serial.printf("  [6] Time after LPOSC switch: %llu ms (delta: %+lld ms)\n", 
-                      time_post_switch, switch_delta);
-        Serial.printf("  [7] Timer now: running=%d, LPOSC=%d\n",
+        // RESTORE the saved timer value, accounting for elapsed overhead
+        // Measurement takes ~600ms, just switching takes ~50ms
+        uint64_t elapsed_overhead = did_measurement ? 650 : 50;
+        uint64_t restored_time = saved_time + elapsed_overhead;
+        
+        Serial.printf("  [6] Restoring timer: %llu + %llu = %llu ms\n", 
+                      saved_time, elapsed_overhead, restored_time);
+        Serial.flush();
+        
+        powman_timer_stop();
+        delay(1);
+        powman_timer_set_ms(restored_time);
+        powman_timer_start();
+        delay(1);
+        
+        uint64_t verify_time = powman_timer_get_ms();
+        Serial.printf("  [7] Timer now: %llu ms (running=%d, LPOSC=%d)\n",
+                      verify_time,
                       powman_timer_is_running(),
                       (powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) ? 1 : 0);
         
@@ -257,11 +285,6 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
         uint64_t t2 = powman_timer_get_ms();
         Serial.printf("  [8] 100ms test: %llu -> %llu (delta=%llu, expected ~100)\n", t1, t2, t2-t1);
         Serial.flush();
-        
-        // Warn if significant time was lost during switch
-        if (switch_delta < -100 || switch_delta > 100) {
-            Serial.printf("  WARNING: %+lld ms jump during clock switch!\n", switch_delta);
-        }
     }
 }
 
@@ -344,82 +367,100 @@ static void store_sync_point(uint64_t lposc_ms, uint64_t ntp_ms) {
 }
 
 static bool get_sync_point(uint64_t* lposc_ms, uint64_t* ntp_ms) {
-    // Check if we have valid calibration data
-    if ((powman_hw->scratch[DRIFT_PPM_REG] & 0xFFFF0000) != DRIFT_VALID_MAGIC) {
+    // Check if we have valid calibration data (magic number in drift register)
+    uint32_t drift_reg = powman_hw->scratch[DRIFT_PPM_REG];
+    if ((drift_reg & 0xFFFF0000) != DRIFT_VALID_MAGIC) {
         return false;
     }
+    
     *lposc_ms = ((uint64_t)powman_hw->scratch[LAST_SYNC_LPOSC_HI_REG] << 32) |
                  powman_hw->scratch[LAST_SYNC_LPOSC_LO_REG];
     *ntp_ms = ((uint64_t)powman_hw->scratch[LAST_SYNC_NTP_HI_REG] << 32) |
                powman_hw->scratch[LAST_SYNC_NTP_LO_REG];
-    return (*lposc_ms > 0 && *ntp_ms > 1700000000000ULL);  // Sanity check
+    
+    // Sanity checks:
+    // - NTP time should be after 2023 (1700000000000 ms)
+    // - NTP time should be before 2100 (4102444800000 ms)
+    // - LPOSC and NTP should be reasonably close (within 24 hours = 86400000 ms)
+    if (*ntp_ms < 1700000000000ULL || *ntp_ms > 4102444800000ULL) {
+        return false;  // Invalid NTP time
+    }
+    if (*lposc_ms < 1700000000000ULL || *lposc_ms > 4102444800000ULL) {
+        return false;  // Invalid LPOSC time  
+    }
+    
+    return true;
 }
 
 void sleep_calibrate_drift(uint64_t accurate_time_ms) {
+    Serial.println("  [calibrate] Starting...");
+    Serial.flush();
+    
     // Ensure timer is running before we try to read/write it
-    if (!powman_timer_is_running()) {
-        Serial.println("  Starting powman timer...");
+    bool was_running = powman_timer_is_running();
+    if (!was_running) {
+        Serial.println("  [calibrate] Timer not running, starting...");
+        Serial.flush();
         powman_timer_start();
+        delay(10);  // Give timer time to stabilize
     }
     
     // Read the CURRENT timer value (before we overwrite it with NTP time)
-    // This represents: last_sync_ntp_time + LPOSC_elapsed_with_drift
     uint64_t current_timer = powman_timer_get_ms();
-    
-    Serial.printf("  Current timer value: %llu ms\n", current_timer);
+    Serial.printf("  [calibrate] Current timer: %llu ms (was_running=%d)\n", 
+                  current_timer, was_running);
+    Serial.flush();
     
     uint64_t last_sync_timer, last_sync_ntp;
     if (get_sync_point(&last_sync_timer, &last_sync_ntp)) {
-        // last_sync_timer = the NTP time we SET the timer to at last sync
-        // current_timer = last_sync_timer + LPOSC_elapsed (with drift)
-        // So: lposc_elapsed = current_timer - last_sync_timer
         int64_t lposc_elapsed = (int64_t)(current_timer - last_sync_timer);
-        
-        // NTP elapsed = actual wall clock time since last sync
         int64_t ntp_elapsed = (int64_t)(accurate_time_ms - last_sync_ntp);
         
-        Serial.printf("  Last sync: timer=%llu, ntp=%llu\n", last_sync_timer, last_sync_ntp);
-        Serial.printf("  Elapsed: LPOSC=%lld ms, NTP=%lld ms\n", lposc_elapsed, ntp_elapsed);
+        Serial.printf("  [calibrate] Last sync: timer=%llu, ntp=%llu\n", 
+                      last_sync_timer, last_sync_ntp);
+        Serial.printf("  [calibrate] Elapsed: LPOSC=%lld ms, NTP=%lld ms\n", 
+                      lposc_elapsed, ntp_elapsed);
+        Serial.flush();
         
-        // Only calibrate if we have meaningful elapsed time (>10 seconds)
-        // and the values make sense (not from a stale sync point)
+        // Only calibrate if values make sense
         if (lposc_elapsed > 10000 && ntp_elapsed > 10000 && 
-            lposc_elapsed < 86400000LL && ntp_elapsed < 86400000LL) {  // Max 24 hours
+            lposc_elapsed < 86400000LL && ntp_elapsed < 86400000LL) {
             
-            // drift_ppm = (lposc_elapsed - ntp_elapsed) / ntp_elapsed * 1000000
-            // Positive = LPOSC runs fast (timer gained time)
-            // Negative = LPOSC runs slow (timer lost time)
             int64_t drift_ppm = ((lposc_elapsed - ntp_elapsed) * 1000000LL) / ntp_elapsed;
-            
-            // Get existing drift and apply exponential smoothing (75% old, 25% new)
             int32_t old_drift = sleep_get_drift_ppm();
-            int32_t new_drift;
-            if (old_drift == 0) {
-                new_drift = (int32_t)drift_ppm;  // First calibration
-            } else {
-                new_drift = (old_drift * 3 + (int32_t)drift_ppm) / 4;  // Smoothed
-            }
+            int32_t new_drift = (old_drift == 0) ? (int32_t)drift_ppm 
+                                                  : (old_drift * 3 + (int32_t)drift_ppm) / 4;
             
-            Serial.printf("  Drift: measured=%lld ppm, old=%d ppm, new=%d ppm\n",
-                          drift_ppm, old_drift, new_drift);
-            
+            Serial.printf("  [calibrate] Drift: %lld ppm (smoothed: %d)\n", drift_ppm, new_drift);
             sleep_set_drift_ppm(new_drift);
         } else {
-            Serial.printf("  Skipping drift calc: values out of range\n");
+            Serial.println("  [calibrate] Skipping - values out of range");
         }
     } else {
-        Serial.println("  No previous sync point - first calibration");
+        Serial.println("  [calibrate] First sync - no previous data");
     }
+    Serial.flush();
     
-    // Set the timer to the accurate NTP time
+    // Set the timer - use explicit stop/set/start sequence for reliability
+    Serial.println("  [calibrate] Setting timer...");
+    Serial.flush();
+    
+    if (powman_timer_is_running()) {
+        powman_timer_stop();
+        delay(1);
+    }
     powman_timer_set_ms(accurate_time_ms);
+    powman_timer_start();
+    delay(1);
     
     // Store sync point AFTER setting timer
-    // Both values are now the same (timer == NTP at sync moment)
     store_sync_point(accurate_time_ms, accurate_time_ms);
     
-    Serial.printf("  Timer set to: %llu ms (epoch %llu)\n", 
-                  accurate_time_ms, accurate_time_ms / 1000);
+    // Verify
+    uint64_t verify = powman_timer_get_ms();
+    Serial.printf("  [calibrate] Timer set to: %llu ms (verify: %llu)\n", 
+                  accurate_time_ms, verify);
+    Serial.flush();
 }
 
 uint64_t sleep_get_corrected_time_ms(void) {

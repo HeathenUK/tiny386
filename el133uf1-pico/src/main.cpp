@@ -145,17 +145,24 @@ bool connectWiFiAndGetNTP() {
     }
     
     Serial.printf("NTP sync successful after %d seconds\n", totalWait);
+    Serial.flush();
     
     // Got NTP time - calibrate drift and set time
+    Serial.println("Calling sleep_calibrate_drift...");
+    Serial.flush();
+    
     uint64_t now_ms = (uint64_t)now * 1000;
-    sleep_calibrate_drift(now_ms);  // This also sets the time and updates drift correction
+    sleep_calibrate_drift(now_ms);
+    
     Serial.printf("Drift correction: %d ppm\n", sleep_get_drift_ppm());
+    Serial.flush();
     
     struct tm timeinfo;
     gmtime_r(&now, &timeinfo);
     Serial.print("Current time: ");
     Serial.println(asctime(&timeinfo));
     Serial.printf("Epoch: %lld\n", (long long)now);
+    Serial.flush();
     
     // Disconnect WiFi to save power
     WiFi.disconnect(true);
@@ -194,11 +201,15 @@ void setup() {
     // Initialize serial for debugging
     Serial.begin(115200);
     
-    // Wait for serial connection
+    // Wait for serial connection (shorter timeout)
     uint32_t startWait = millis();
-    while (!Serial && (millis() - startWait < 2000)) {
-        delay(100);
+    while (!Serial && (millis() - startWait < 1000)) {
+        delay(50);
     }
+    
+    // Immediate sign of life
+    Serial.println("\n\n>>> BOOT <<<");
+    Serial.flush();
     
     // ================================================================
     // EARLY BOOT TIMER DIAGNOSTICS
@@ -208,15 +219,16 @@ void setup() {
     bool boot_timer_running = powman_timer_is_running();
     bool boot_using_lposc = (powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS) != 0;
     bool boot_using_xosc = (powman_hw->timer & POWMAN_TIMER_USING_XOSC_BITS) != 0;
-    uint32_t boot_millis = millis();  // Arduino millis() for comparison
+    uint32_t boot_millis = millis();
     
-    Serial.println("\n=== EARLY BOOT TIMER STATE ===");
+    Serial.println("=== EARLY BOOT TIMER STATE ===");
     Serial.printf("  powman timer: %llu ms\n", boot_timer_value);
     Serial.printf("  timer running: %d\n", boot_timer_running);
     Serial.printf("  using LPOSC: %d, using XOSC: %d\n", boot_using_lposc, boot_using_xosc);
     Serial.printf("  Arduino millis(): %lu\n", boot_millis);
     Serial.printf("  powman_hw->timer raw: 0x%08lx\n", (unsigned long)powman_hw->timer);
-    Serial.println("==============================\n");
+    Serial.println("==============================");
+    Serial.flush();
     
     // Get current update count and RTC time
     int updateCount = sleep_woke_from_deep_sleep() ? getUpdateCount() : 0;
