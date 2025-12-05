@@ -479,11 +479,12 @@ void setup() {
 // ================================================================
 // Perform a display update (called on each wake cycle)
 // ================================================================
-// Expected time for display refresh (measured empirically)
-// Cold boot (with init):  ~23 seconds (init 1.7s + rotate 1s + SPI 0.5s + refresh 19.5s + overhead 0.3s)
-// Warm update (skipInit): ~21 seconds (no init sequence)
-#define DISPLAY_REFRESH_COLD_MS  23000  // First update after power-on
-#define DISPLAY_REFRESH_WARM_MS  21300  // Subsequent updates (skipInit=true)
+// Expected time for FULL display update cycle (from reading time to display complete)
+// This includes: drawing (~0.5s) + rotate/pack (~0.7s) + SPI (~0.5s) + panel refresh (~20-32s)
+// Cold boot (with init):  ~35 seconds (init 1.5s + panel refresh is slower first time)
+// Warm update (skipInit): ~26 seconds (no init, faster refresh)
+#define DISPLAY_REFRESH_COLD_MS  35000  // First update after power-on
+#define DISPLAY_REFRESH_WARM_MS  26000  // Subsequent updates (skipInit=true)
 
 void doDisplayUpdate(int updateNumber) {
     Serial.printf("\n=== Display Update #%d ===\n", updateNumber);
