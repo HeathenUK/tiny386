@@ -4,6 +4,8 @@
  */
 
 #include "EL133UF1.h"
+#include "hardware/dma.h"
+#include "hardware/sync.h"
 
 // Simple 8x8 bitmap font (ASCII 32-127)
 // Each character is 8 bytes, each byte is one row (MSB = leftmost pixel)
@@ -545,23 +547,56 @@ bool EL133UF1::isBusy() {
 }
 
 // ============================================================================
-// Optimized buffer rotation with SIMD-style packing
+// Optimized buffer rotation with SIMD-style packing and DMA
 // ============================================================================
 
-// Pack 4 pixels into 2 bytes using 32-bit word operations
-// Input: 4 consecutive pixels from sramCol at stride EL133UF1_WIDTH
-// Output: 2 packed bytes (high nibble | low nibble for each pair)
-static inline void packPixels4_SIMD(const uint8_t* src, size_t stride, uint8_t* dst) {
-    // Load 4 pixels (at column positions r, r+1, r+2, r+3)
-    uint32_t p0 = src[0] & 0x07;
-    uint32_t p1 = src[stride] & 0x07;
-    uint32_t p2 = src[stride * 2] & 0x07;
-    uint32_t p3 = src[stride * 3] & 0x07;
+// DMA channel for async memory transfers (-1 = not initialized)
+static int _dmaChannel = -1;
+
+// Initialize DMA channel for memory transfers
+static void initDMA() {
+    if (_dmaChannel < 0) {
+        _dmaChannel = dma_claim_unused_channel(false);
+        if (_dmaChannel >= 0) {
+            Serial.printf("    DMA channel:    %d claimed\n", _dmaChannel);
+        }
+    }
+}
+
+// Start async DMA memcpy (returns immediately)
+static void dmaMemcpyStart(void* dst, const void* src, size_t size) {
+    if (_dmaChannel < 0) {
+        // Fallback to regular memcpy
+        memcpy(dst, src, size);
+        return;
+    }
     
-    // Pack into 2 bytes: (p0<<4|p1), (p2<<4|p3)
-    // Use 16-bit write for better bus efficiency
-    uint16_t packed = ((p0 << 4) | p1) | (((p2 << 4) | p3) << 8);
-    *((uint16_t*)dst) = packed;
+    dma_channel_config c = dma_channel_get_default_config(_dmaChannel);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_32);  // 32-bit transfers
+    channel_config_set_read_increment(&c, true);
+    channel_config_set_write_increment(&c, true);
+    
+    dma_channel_configure(
+        _dmaChannel,
+        &c,
+        dst,           // Write address
+        src,           // Read address
+        size / 4,      // Transfer count (32-bit words)
+        true           // Start immediately
+    );
+}
+
+// Wait for DMA to complete
+static void dmaMemcpyWait() {
+    if (_dmaChannel >= 0) {
+        dma_channel_wait_for_finish_blocking(_dmaChannel);
+    }
+}
+
+// Synchronous DMA memcpy
+static void dmaMemcpy(void* dst, const void* src, size_t size) {
+    dmaMemcpyStart(dst, src, size);
+    dmaMemcpyWait();
 }
 
 // Process 8 pixels into 4 bytes using 32-bit operations
@@ -584,6 +619,29 @@ static inline void packPixels8_SIMD(const uint8_t* src, size_t stride, uint8_t* 
                      (((p4 << 4) | p5) << 16) |
                      (((p6 << 4) | p7) << 24);
     *((uint32_t*)dst) = packed;
+}
+
+// Process a strip from SRAM to output buffer (PSRAM)
+static void processStrip(const uint8_t* sramStrip, uint8_t* outBuf, 
+                         int stripStart, int stripH, int outRowOffset) {
+    for (int srcCol = 1599; srcCol >= 0; srcCol--) {
+        int outRow = 1599 - srcCol;
+        uint8_t* outPtr = outBuf + outRow * 300 + (stripStart / 2) - outRowOffset;
+        const uint8_t* sramCol = sramStrip + srcCol;
+        
+        // Process 8 rows at a time with SIMD
+        int r = 0;
+        for (; r + 8 <= stripH; r += 8) {
+            packPixels8_SIMD(sramCol + r * EL133UF1_WIDTH, EL133UF1_WIDTH, outPtr);
+            outPtr += 4;
+        }
+        // Handle remaining rows
+        for (; r + 2 <= stripH; r += 2) {
+            uint8_t p0 = sramCol[r * EL133UF1_WIDTH] & 0x07;
+            uint8_t p1 = sramCol[(r + 1) * EL133UF1_WIDTH] & 0x07;
+            *outPtr++ = (p0 << 4) | p1;
+        }
+    }
 }
 
 void EL133UF1::_sendBuffer() {
@@ -614,28 +672,52 @@ void EL133UF1::_sendBuffer() {
     }
     Serial.printf("    Buffer alloc:   %4lu ms\n", millis() - stepStart);
 
+    // Initialize DMA for async memory transfers
+    initDMA();
+    
     // Debug: show available heap
     Serial.printf("    Free heap:      %lu KB\n", rp2040.getFreeHeap() / 1024);
     
-    // SRAM-accelerated rotation with SIMD packing
-    // Strategy: Copy horizontal strips to SRAM, then process with word-aligned operations
-    uint8_t* sramStrip = nullptr;
-    int STRIP_ROWS = 0;
+    // SRAM-accelerated rotation with SIMD packing and DMA
+    // Strategy: Double-buffered strips with DMA prefetch
+    //   - DMA fetches next strip while CPU processes current strip
+    //   - Overlaps memory latency with computation
     
-    // Try decreasing buffer sizes until one succeeds
-    // Prefer multiples of 8 for SIMD alignment
-    static const int stripSizes[] = {104, 56, 24, 8};  // ~166KB, ~90KB, ~38KB, ~13KB
-    for (int i = 0; i < 4 && sramStrip == nullptr; i++) {
+    int STRIP_ROWS = 0;
+    uint8_t* sramStrip[2] = {nullptr, nullptr};  // Double buffer
+    
+    // Try to allocate two strip buffers for double-buffering
+    static const int stripSizes[] = {56, 24, 8};  // ~90KB, ~38KB, ~13KB each
+    for (int i = 0; i < 3 && sramStrip[0] == nullptr; i++) {
         STRIP_ROWS = stripSizes[i];
         size_t trySize = EL133UF1_WIDTH * STRIP_ROWS;
-        sramStrip = (uint8_t*)malloc(trySize);
-        if (sramStrip) {
-            Serial.printf("    SRAM strip:     %d rows (%lu KB) - SIMD aligned\n", 
+        sramStrip[0] = (uint8_t*)malloc(trySize);
+        sramStrip[1] = (uint8_t*)malloc(trySize);
+        if (sramStrip[0] && sramStrip[1]) {
+            Serial.printf("    SRAM strips:    2x %d rows (%lu KB) - DMA double-buffer\n", 
                          STRIP_ROWS, trySize / 1024);
+        } else {
+            // Fall back to single buffer
+            if (sramStrip[0]) { free(sramStrip[0]); sramStrip[0] = nullptr; }
+            if (sramStrip[1]) { free(sramStrip[1]); sramStrip[1] = nullptr; }
         }
     }
     
-    if (sramStrip == nullptr) {
+    // If double-buffer failed, try single buffer
+    if (sramStrip[0] == nullptr) {
+        static const int singleSizes[] = {104, 56, 24, 8};
+        for (int i = 0; i < 4 && sramStrip[0] == nullptr; i++) {
+            STRIP_ROWS = singleSizes[i];
+            size_t trySize = EL133UF1_WIDTH * STRIP_ROWS;
+            sramStrip[0] = (uint8_t*)malloc(trySize);
+            if (sramStrip[0]) {
+                Serial.printf("    SRAM strip:     %d rows (%lu KB) - single buffer\n", 
+                             STRIP_ROWS, trySize / 1024);
+            }
+        }
+    }
+    
+    if (sramStrip[0] == nullptr) {
         Serial.println("EL133UF1: Failed to allocate SRAM strip buffer, falling back");
         // Fallback: Direct PSRAM access with basic SIMD
         stepStart = millis();
@@ -661,66 +743,89 @@ void EL133UF1::_sendBuffer() {
             }
         }
         Serial.printf("    Rotate/pack:    %4lu ms (SIMD fallback)\n", millis() - stepStart);
+    } else if (sramStrip[1] != nullptr) {
+        // Double-buffered DMA mode: prefetch next strip while processing current
+        stepStart = millis();
+        int currentBuf = 0;
+        
+        // ===== Process bufA (source rows 0-599) =====
+        // Prime the pipeline: start first DMA transfer
+        dmaMemcpyStart(sramStrip[0], _buffer, STRIP_ROWS * EL133UF1_WIDTH);
+        
+        for (int stripStart = 0; stripStart < 600; stripStart += STRIP_ROWS) {
+            int stripH = min(STRIP_ROWS, 600 - stripStart);
+            int nextStrip = stripStart + STRIP_ROWS;
+            
+            // Wait for current strip's DMA to complete
+            dmaMemcpyWait();
+            
+            // Start DMA for next strip (overlaps with processing)
+            if (nextStrip < 600) {
+                int nextBuf = 1 - currentBuf;
+                dmaMemcpyStart(sramStrip[nextBuf], 
+                              _buffer + nextStrip * EL133UF1_WIDTH, 
+                              min(STRIP_ROWS, 600 - nextStrip) * EL133UF1_WIDTH);
+            }
+            
+            // Process current strip (CPU works while DMA runs)
+            processStrip(sramStrip[currentBuf], bufA, stripStart, stripH, 0);
+            
+            currentBuf = 1 - currentBuf;
+        }
+        
+        // ===== Process bufB (source rows 600-1199) =====
+        currentBuf = 0;
+        dmaMemcpyStart(sramStrip[0], _buffer + 600 * EL133UF1_WIDTH, STRIP_ROWS * EL133UF1_WIDTH);
+        
+        for (int stripStart = 600; stripStart < 1200; stripStart += STRIP_ROWS) {
+            int stripH = min(STRIP_ROWS, 1200 - stripStart);
+            int nextStrip = stripStart + STRIP_ROWS;
+            
+            dmaMemcpyWait();
+            
+            if (nextStrip < 1200) {
+                int nextBuf = 1 - currentBuf;
+                dmaMemcpyStart(sramStrip[nextBuf],
+                              _buffer + nextStrip * EL133UF1_WIDTH,
+                              min(STRIP_ROWS, 1200 - nextStrip) * EL133UF1_WIDTH);
+            }
+            
+            // Process with offset for bufB (strips start at row 600)
+            processStrip(sramStrip[currentBuf], bufB, stripStart, stripH, 300);
+            
+            currentBuf = 1 - currentBuf;
+        }
+        
+        free(sramStrip[0]);
+        free(sramStrip[1]);
+        Serial.printf("    Rotate/pack:    %4lu ms (DMA+SIMD)\n", millis() - stepStart);
     } else {
+        // Single buffer mode with DMA
         stepStart = millis();
         
         // Process bufA (source rows 0-599) in strips
         for (int stripStart = 0; stripStart < 600; stripStart += STRIP_ROWS) {
-            int stripEnd = min(stripStart + STRIP_ROWS, 600);
-            int stripH = stripEnd - stripStart;
+            int stripH = min(STRIP_ROWS, 600 - stripStart);
             
-            // Copy strip from PSRAM to SRAM (sequential read - fast burst mode)
-            memcpy(sramStrip, _buffer + stripStart * EL133UF1_WIDTH, stripH * EL133UF1_WIDTH);
+            // DMA copy (synchronous since single buffer)
+            dmaMemcpy(sramStrip[0], _buffer + stripStart * EL133UF1_WIDTH, 
+                     stripH * EL133UF1_WIDTH);
             
-            // Process this strip with SIMD packing
-            for (int srcCol = 1599; srcCol >= 0; srcCol--) {
-                int outRow = 1599 - srcCol;
-                uint8_t* outPtr = bufA + outRow * 300 + (stripStart / 2);
-                const uint8_t* sramCol = sramStrip + srcCol;
-                
-                // Process 8 rows at a time with SIMD
-                int r = 0;
-                for (; r + 8 <= stripH; r += 8) {
-                    packPixels8_SIMD(sramCol + r * EL133UF1_WIDTH, EL133UF1_WIDTH, outPtr);
-                    outPtr += 4;
-                }
-                // Handle remaining rows (if strip height not multiple of 8)
-                for (; r + 2 <= stripH; r += 2) {
-                    uint8_t p0 = sramCol[r * EL133UF1_WIDTH] & 0x07;
-                    uint8_t p1 = sramCol[(r + 1) * EL133UF1_WIDTH] & 0x07;
-                    *outPtr++ = (p0 << 4) | p1;
-                }
-            }
+            processStrip(sramStrip[0], bufA, stripStart, stripH, 0);
         }
         
         // Process bufB (source rows 600-1199) in strips
         for (int stripStart = 600; stripStart < 1200; stripStart += STRIP_ROWS) {
-            int stripEnd = min(stripStart + STRIP_ROWS, 1200);
-            int stripH = stripEnd - stripStart;
+            int stripH = min(STRIP_ROWS, 1200 - stripStart);
             
-            memcpy(sramStrip, _buffer + stripStart * EL133UF1_WIDTH, stripH * EL133UF1_WIDTH);
+            dmaMemcpy(sramStrip[0], _buffer + stripStart * EL133UF1_WIDTH,
+                     stripH * EL133UF1_WIDTH);
             
-            for (int srcCol = 1599; srcCol >= 0; srcCol--) {
-                int outRow = 1599 - srcCol;
-                int outColStart = stripStart - 600;
-                uint8_t* outPtr = bufB + outRow * 300 + (outColStart / 2);
-                const uint8_t* sramCol = sramStrip + srcCol;
-                
-                int r = 0;
-                for (; r + 8 <= stripH; r += 8) {
-                    packPixels8_SIMD(sramCol + r * EL133UF1_WIDTH, EL133UF1_WIDTH, outPtr);
-                    outPtr += 4;
-                }
-                for (; r + 2 <= stripH; r += 2) {
-                    uint8_t p0 = sramCol[r * EL133UF1_WIDTH] & 0x07;
-                    uint8_t p1 = sramCol[(r + 1) * EL133UF1_WIDTH] & 0x07;
-                    *outPtr++ = (p0 << 4) | p1;
-                }
-            }
+            processStrip(sramStrip[0], bufB, stripStart, stripH, 300);
         }
         
-        free(sramStrip);
-        Serial.printf("    Rotate/pack:    %4lu ms (SRAM+SIMD)\n", millis() - stepStart);
+        free(sramStrip[0]);
+        Serial.printf("    Rotate/pack:    %4lu ms (DMA+SIMD single)\n", millis() - stepStart);
     }
 
     // SPI transmission - already uses DMA internally via Arduino-Pico
