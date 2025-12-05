@@ -397,9 +397,26 @@ void EL133UF1_TTF::renderGlyphOutlined(int codepoint, int16_t x, int16_t baselin
 
 void EL133UF1_TTF::drawTextOutlined(int16_t x, int16_t y, const char* text, 
                                      float fontSize, uint8_t color, 
-                                     uint8_t outlineColor, int outlineWidth) {
+                                     uint8_t outlineColor, int outlineWidth,
+                                     bool exactOutline) {
     if (!_fontLoaded || _fontInfo == nullptr || _display == nullptr || text == nullptr) return;
     
+    // Exact mode: render text multiple times at offsets (slower but pixel-perfect)
+    if (exactOutline) {
+        for (int w = outlineWidth; w >= 1; w--) {
+            for (int dy = -w; dy <= w; dy++) {
+                for (int dx = -w; dx <= w; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    if (abs(dx) < w && abs(dy) < w) continue;
+                    drawText(x + dx, y + dy, text, fontSize, outlineColor);
+                }
+            }
+        }
+        drawText(x, y, text, fontSize, color);
+        return;
+    }
+    
+    // Fast mode: single render with dilation
     stbtt_fontinfo* info = (stbtt_fontinfo*)_fontInfo;
     float scale = stbtt_ScaleForPixelHeight(info, fontSize);
     
@@ -452,8 +469,8 @@ void EL133UF1_TTF::drawTextOutlined(int16_t x, int16_t y, const char* text,
 void EL133UF1_TTF::drawTextOutlinedCentered(int16_t x, int16_t y, int16_t width,
                                              const char* text, float fontSize,
                                              uint8_t color, uint8_t outlineColor, 
-                                             int outlineWidth) {
+                                             int outlineWidth, bool exactOutline) {
     int16_t textWidth = getTextWidth(text, fontSize);
     int16_t offsetX = (width - textWidth) / 2;
-    drawTextOutlined(x + offsetX, y, text, fontSize, color, outlineColor, outlineWidth);
+    drawTextOutlined(x + offsetX, y, text, fontSize, color, outlineColor, outlineWidth, exactOutline);
 }
