@@ -48,10 +48,10 @@ const char* NTP_SERVER2_NAME = "time.google.com";
 #define PIN_RESET     27    // Reset (GP27)
 #define PIN_BUSY      17    // Busy (GP17)
 
-// DS3231 RTC pins (I2C0)
-#define PIN_RTC_SDA    2    // I2C0 SDA (GP2)
-#define PIN_RTC_SCL    3    // I2C0 SCL (GP3)
-#define PIN_RTC_INT   -1    // DS3231 INT/SQW pin for wake (set to GPIO if connected, -1 if not)
+// DS3231 RTC pins (I2C1)
+#define PIN_RTC_SDA    2    // I2C1 SDA (GP2)
+#define PIN_RTC_SCL    3    // I2C1 SCL (GP3)
+#define PIN_RTC_INT   18    // DS3231 INT/SQW pin for wake (GP18)
 
 // Create display instance using SPI1
 // (SPI1 is the correct bus for GP10/GP11 on Pico)
