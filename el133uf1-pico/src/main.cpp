@@ -742,8 +742,9 @@ void doDisplayUpdate(int updateNumber) {
                   actualRefreshMs, expectedRefreshMs);
     
     int32_t errorMs = (int32_t)(actual_now_ms - display_time_ms);
-    Serial.printf("  Time error:     %+ld ms (%s)\n", errorMs,
-                  abs(errorMs) < 2000 ? "good" : "adjust DISPLAY_REFRESH_MS");
+    const char* accuracy = (abs(errorMs) < 2000) ? "excellent" : 
+                           (abs(errorMs) < 5000) ? "good" : "acceptable";
+    Serial.printf("  Display vs actual: %+ld ms (%s)\n", errorMs, accuracy);
 }
 
 void loop() {
