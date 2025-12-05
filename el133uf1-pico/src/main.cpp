@@ -418,6 +418,10 @@ void doDisplayUpdate(int updateNumber) {
     ttf.begin(&display);
     ttf.loadFont(opensans_ttf, opensans_ttf_len);
     
+    // Enable glyph cache for time display (160px digits)
+    // This pre-renders 0-9, colon, space - used repeatedly
+    ttf.enableGlyphCache(160.0, "0123456789: ");
+    
     // Draw update info with performance profiling
     uint32_t drawStart = millis();
     uint32_t t0, t1;

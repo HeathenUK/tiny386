@@ -192,12 +192,55 @@ public:
                                    uint8_t color, uint8_t outlineColor, 
                                    int outlineWidth = 1, bool exactOutline = false);
 
+    /**
+     * @brief Enable glyph caching for faster repeated rendering
+     * 
+     * Caches rendered glyphs for characters that are used frequently
+     * (digits 0-9, punctuation, etc). Significantly speeds up clock displays.
+     * 
+     * @param fontSize Font size to cache (only one size cached at a time)
+     * @param characters String of characters to cache (e.g., "0123456789:")
+     * @return true if cache was created successfully
+     */
+    bool enableGlyphCache(float fontSize, const char* characters = "0123456789:.-/ ");
+
+    /**
+     * @brief Clear the glyph cache
+     */
+    void clearGlyphCache();
+
+    /**
+     * @brief Check if glyph cache is active
+     */
+    bool isCacheEnabled() { return _cacheEnabled; }
+
 private:
     EL133UF1* _display;
     const uint8_t* _fontData;
     size_t _fontDataSize;
     bool _fontLoaded;
     void* _fontInfo;  // Opaque pointer to stbtt_fontinfo
+    
+    // Glyph cache for fast rendering
+    struct CachedGlyph {
+        int codepoint;
+        int16_t width, height;
+        int16_t xOffset, yOffset;  // Offset from baseline
+        int16_t advance;
+        uint8_t* bitmap;  // Pre-rendered bitmap (1-bit or 8-bit alpha)
+    };
+    static const int MAX_CACHED_GLYPHS = 32;
+    CachedGlyph _glyphCache[MAX_CACHED_GLYPHS];
+    int _cachedGlyphCount;
+    float _cacheScale;
+    float _cacheFontSize;
+    bool _cacheEnabled;
+    
+    // Find cached glyph or return nullptr
+    CachedGlyph* findCachedGlyph(int codepoint);
+    
+    // Render glyph from cache
+    void renderCachedGlyph(CachedGlyph* glyph, int16_t x, int16_t baseline, uint8_t color);
     
     // Render a single glyph with outline (optimized)
     void renderGlyphOutlined(int codepoint, int16_t x, int16_t baseline,

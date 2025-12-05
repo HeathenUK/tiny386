@@ -24,18 +24,159 @@
 // ============================================================================
 
 EL133UF1_TTF::EL133UF1_TTF() : 
-    _display(nullptr), 
-    _fontData(nullptr), 
-    _fontDataSize(0), 
+    _display(nullptr),
+    _fontData(nullptr),
+    _fontDataSize(0),
     _fontLoaded(false), 
-    _fontInfo(nullptr) 
+    _fontInfo(nullptr),
+    _cachedGlyphCount(0),
+    _cacheScale(0),
+    _cacheFontSize(0),
+    _cacheEnabled(false)
 {
+    memset(_glyphCache, 0, sizeof(_glyphCache));
 }
 
 EL133UF1_TTF::~EL133UF1_TTF() {
+    clearGlyphCache();
     if (_fontInfo) {
         free(_fontInfo);
         _fontInfo = nullptr;
+    }
+}
+
+// ============================================================================
+// Glyph Caching for Fast Rendering
+// ============================================================================
+
+void EL133UF1_TTF::clearGlyphCache() {
+    for (int i = 0; i < _cachedGlyphCount; i++) {
+        if (_glyphCache[i].bitmap) {
+            free(_glyphCache[i].bitmap);
+            _glyphCache[i].bitmap = nullptr;
+        }
+    }
+    _cachedGlyphCount = 0;
+    _cacheEnabled = false;
+}
+
+bool EL133UF1_TTF::enableGlyphCache(float fontSize, const char* characters) {
+    if (!_fontLoaded || _fontInfo == nullptr) return false;
+    
+    // Clear any existing cache
+    clearGlyphCache();
+    
+    stbtt_fontinfo* info = (stbtt_fontinfo*)_fontInfo;
+    float scale = stbtt_ScaleForPixelHeight(info, fontSize);
+    _cacheScale = scale;
+    _cacheFontSize = fontSize;
+    
+    Serial.printf("TTF: Caching glyphs for size %.0f: ", fontSize);
+    
+    const char* p = characters;
+    while (*p && _cachedGlyphCount < MAX_CACHED_GLYPHS) {
+        // Decode UTF-8
+        int codepoint = (uint8_t)*p++;
+        if (codepoint >= 0xC0 && codepoint < 0xE0 && *p) {
+            codepoint = ((codepoint & 0x1F) << 6) | (*p++ & 0x3F);
+        }
+        
+        // Check if already cached
+        bool found = false;
+        for (int i = 0; i < _cachedGlyphCount; i++) {
+            if (_glyphCache[i].codepoint == codepoint) {
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+        
+        // Get glyph metrics
+        int x0, y0, x1, y1;
+        stbtt_GetCodepointBitmapBox(info, codepoint, scale, scale, &x0, &y0, &x1, &y1);
+        
+        int width = x1 - x0;
+        int height = y1 - y0;
+        
+        if (width <= 0 || height <= 0) {
+            // Space or non-printable - still cache metrics
+            int advance, lsb;
+            stbtt_GetCodepointHMetrics(info, codepoint, &advance, &lsb);
+            
+            CachedGlyph* g = &_glyphCache[_cachedGlyphCount++];
+            g->codepoint = codepoint;
+            g->width = 0;
+            g->height = 0;
+            g->xOffset = 0;
+            g->yOffset = 0;
+            g->advance = (int16_t)(advance * scale);
+            g->bitmap = nullptr;
+            continue;
+        }
+        
+        // Allocate bitmap
+        size_t bitmapSize = width * height;
+        uint8_t* bitmap = (uint8_t*)malloc(bitmapSize);
+        if (!bitmap) {
+            Serial.println("\nTTF: Cache allocation failed");
+            break;
+        }
+        
+        // Render glyph
+        stbtt_MakeCodepointBitmap(info, bitmap, width, height, width, scale, scale, codepoint);
+        
+        // Get advance
+        int advance, lsb;
+        stbtt_GetCodepointHMetrics(info, codepoint, &advance, &lsb);
+        
+        // Store in cache
+        CachedGlyph* g = &_glyphCache[_cachedGlyphCount++];
+        g->codepoint = codepoint;
+        g->width = width;
+        g->height = height;
+        g->xOffset = x0;
+        g->yOffset = y0;
+        g->advance = (int16_t)(advance * scale);
+        g->bitmap = bitmap;
+        
+        Serial.printf("%c", codepoint < 128 ? (char)codepoint : '?');
+    }
+    
+    _cacheEnabled = true;
+    Serial.printf(" (%d glyphs cached)\n", _cachedGlyphCount);
+    return true;
+}
+
+EL133UF1_TTF::CachedGlyph* EL133UF1_TTF::findCachedGlyph(int codepoint) {
+    if (!_cacheEnabled) return nullptr;
+    for (int i = 0; i < _cachedGlyphCount; i++) {
+        if (_glyphCache[i].codepoint == codepoint) {
+            return &_glyphCache[i];
+        }
+    }
+    return nullptr;
+}
+
+void EL133UF1_TTF::renderCachedGlyph(CachedGlyph* glyph, int16_t x, int16_t baseline, uint8_t color) {
+    if (!glyph || !glyph->bitmap) return;
+    
+    int16_t screenX = x + glyph->xOffset;
+    int16_t screenY = baseline + glyph->yOffset;
+    
+    // Fast path: direct pixel writes with threshold
+    for (int py = 0; py < glyph->height; py++) {
+        int16_t drawY = screenY + py;
+        if (drawY < 0 || drawY >= _display->height()) continue;
+        
+        const uint8_t* row = glyph->bitmap + py * glyph->width;
+        for (int px = 0; px < glyph->width; px++) {
+            int16_t drawX = screenX + px;
+            if (drawX < 0 || drawX >= _display->width()) continue;
+            
+            if (row[px] > 127) {
+                _display->setPixel(drawX, drawY, color);
+            }
+        }
     }
 }
 
@@ -246,6 +387,9 @@ void EL133UF1_TTF::drawText(int16_t x, int16_t y, const char* text, float fontSi
     stbtt_fontinfo* info = (stbtt_fontinfo*)_fontInfo;
     float scale = stbtt_ScaleForPixelHeight(info, fontSize);
     
+    // Check if we can use the cache (size must match)
+    bool useCache = _cacheEnabled && (fontSize == _cacheFontSize);
+    
     // Get font metrics for baseline positioning
     int ascent, descent, lineGap;
     stbtt_GetFontVMetrics(info, &ascent, &descent, &lineGap);
@@ -286,13 +430,21 @@ void EL133UF1_TTF::drawText(int16_t x, int16_t y, const char* text, float fontSi
             xPos += (int)(kern * scale);
         }
         
-        // Render the glyph
-        renderGlyph(codepoint, xPos, baseline, scale, color, bgColor);
-        
-        // Advance cursor
-        int advance, lsb;
-        stbtt_GetCodepointHMetrics(info, codepoint, &advance, &lsb);
-        xPos += (int)(advance * scale);
+        // Try to use cached glyph first
+        CachedGlyph* cached = useCache ? findCachedGlyph(codepoint) : nullptr;
+        if (cached) {
+            // Fast path: use pre-rendered glyph
+            renderCachedGlyph(cached, xPos, baseline, color);
+            xPos += cached->advance;
+        } else {
+            // Slow path: render glyph on-the-fly
+            renderGlyph(codepoint, xPos, baseline, scale, color, bgColor);
+            
+            // Advance cursor
+            int advance, lsb;
+            stbtt_GetCodepointHMetrics(info, codepoint, &advance, &lsb);
+            xPos += (int)(advance * scale);
+        }
         
         prevCodepoint = codepoint;
     }
