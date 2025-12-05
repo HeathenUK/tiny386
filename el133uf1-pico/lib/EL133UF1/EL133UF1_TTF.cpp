@@ -315,3 +315,40 @@ void EL133UF1_TTF::drawTextRight(int16_t x, int16_t y, int16_t width,
     int16_t offsetX = width - textWidth;
     drawText(x + offsetX, y, text, fontSize, color);
 }
+
+// ============================================================================
+// Outlined Text
+// ============================================================================
+
+void EL133UF1_TTF::drawTextOutlined(int16_t x, int16_t y, const char* text, 
+                                     float fontSize, uint8_t color, 
+                                     uint8_t outlineColor, int outlineWidth) {
+    // Draw outline by rendering text at offsets around the center position
+    // For width=1: 8 positions (N, NE, E, SE, S, SW, W, NW)
+    // For width=2+: concentric rings
+    
+    for (int w = outlineWidth; w >= 1; w--) {
+        // Draw at 8 compass positions for each ring
+        for (int dy = -w; dy <= w; dy++) {
+            for (int dx = -w; dx <= w; dx++) {
+                // Skip center and inner positions (already covered by smaller rings)
+                if (dx == 0 && dy == 0) continue;
+                if (abs(dx) < w && abs(dy) < w) continue;
+                
+                drawText(x + dx, y + dy, text, fontSize, outlineColor);
+            }
+        }
+    }
+    
+    // Draw main text on top
+    drawText(x, y, text, fontSize, color);
+}
+
+void EL133UF1_TTF::drawTextOutlinedCentered(int16_t x, int16_t y, int16_t width,
+                                             const char* text, float fontSize,
+                                             uint8_t color, uint8_t outlineColor, 
+                                             int outlineWidth) {
+    int16_t textWidth = getTextWidth(text, fontSize);
+    int16_t offsetX = (width - textWidth) / 2;
+    drawTextOutlined(x + offsetX, y, text, fontSize, color, outlineColor, outlineWidth);
+}

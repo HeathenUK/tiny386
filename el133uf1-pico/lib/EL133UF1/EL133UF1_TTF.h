@@ -104,6 +104,29 @@ public:
     void drawTextRight(int16_t x, int16_t y, int16_t width,
                        const char* text, float fontSize, uint8_t color);
 
+    /**
+     * @brief Draw text with an outline (stroke) around it
+     * 
+     * Useful for making text readable on any background.
+     * 
+     * @param x X coordinate
+     * @param y Y coordinate (top of text)
+     * @param text Text string
+     * @param fontSize Font size in pixels
+     * @param color Text fill color
+     * @param outlineColor Outline/stroke color
+     * @param outlineWidth Outline thickness (1-3 recommended)
+     */
+    void drawTextOutlined(int16_t x, int16_t y, const char* text, float fontSize,
+                          uint8_t color, uint8_t outlineColor, int outlineWidth = 1);
+
+    /**
+     * @brief Draw centered text with outline
+     */
+    void drawTextOutlinedCentered(int16_t x, int16_t y, int16_t width,
+                                   const char* text, float fontSize,
+                                   uint8_t color, uint8_t outlineColor, int outlineWidth = 1);
+
 private:
     EL133UF1* _display;
     const uint8_t* _fontData;
