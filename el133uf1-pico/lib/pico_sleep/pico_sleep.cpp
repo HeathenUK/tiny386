@@ -5,9 +5,12 @@
  * This implements TRUE deep sleep where the switched core is powered down.
  * When waking up, execution restarts from a boot vector (like a warm reset)
  * but RAM is preserved.
+ * 
+ * Supports optional DS3231 external RTC for more accurate timekeeping.
  */
 
 #include "pico_sleep.h"
+#include "DS3231.h"
 
 #include <Arduino.h>
 
@@ -18,6 +21,7 @@
 #include "hardware/structs/rosc.h"
 #include "hardware/powman.h"
 #include "hardware/sync.h"
+#include "hardware/gpio.h"
 #include "pico/runtime_init.h"
 
 // For ARM deep sleep
@@ -30,6 +34,13 @@
 
 // Systick register
 #define SYSTICK_CSR (*(volatile uint32_t*)0xE000E010)
+
+// ========================================================================
+// DS3231 RTC state
+// ========================================================================
+
+static bool _rtc_present = false;
+static int _rtc_int_pin = -1;
 
 // ========================================================================
 // Sleep state - use powman scratch registers (preserved across reset!)
@@ -47,6 +58,51 @@
 #define DRIFT_VALID_MAGIC      0xCA1B0000  // Magic + flags in high bits of DRIFT_PPM_REG
 
 static dormant_source_t _dormant_source = DORMANT_SOURCE_LPOSC;
+
+// ========================================================================
+// DS3231 RTC functions
+// ========================================================================
+
+bool sleep_init_rtc(int sda_pin, int scl_pin, int int_pin) {
+    Serial.printf("sleep_init_rtc: SDA=%d, SCL=%d, INT=%d\n", sda_pin, scl_pin, int_pin);
+    Serial.flush();
+    
+    // Initialize DS3231
+    _rtc_present = rtc.begin(&Wire, sda_pin, scl_pin);
+    _rtc_int_pin = int_pin;
+    
+    if (_rtc_present) {
+        Serial.println("DS3231 RTC detected - will use for timekeeping");
+        rtc.printStatus();
+        
+        // Configure INT pin if specified
+        if (int_pin >= 0) {
+            pinMode(int_pin, INPUT_PULLUP);
+            Serial.printf("RTC INT pin %d configured as input with pullup\n", int_pin);
+            
+            // Clear any pending alarm
+            rtc.clearAlarm1();
+        }
+        
+        // If RTC time is invalid (before 2020), it needs to be set
+        time_t rtcTime = rtc.getTime();
+        if (rtcTime < 1577836800) {  // Before 2020-01-01
+            Serial.println("WARNING: RTC time is invalid (before 2020), needs NTP sync");
+        }
+    } else {
+        Serial.println("DS3231 RTC not found - falling back to LPOSC");
+    }
+    
+    return _rtc_present;
+}
+
+bool sleep_has_rtc(void) {
+    return _rtc_present;
+}
+
+int sleep_get_rtc_int_pin(void) {
+    return _rtc_int_pin;
+}
 
 // Check if we woke from deep sleep by looking at scratch register
 bool sleep_woke_from_deep_sleep(void) {
@@ -66,8 +122,11 @@ static void sleep_set_wake_flag(void) {
 // ========================================================================
 
 uint64_t sleep_get_time_ms(void) {
-    // If timer isn't running, it will return 0
-    // This is expected on first boot before NTP sync
+    // Use DS3231 if available (more accurate)
+    if (_rtc_present) {
+        return rtc.getTimeMs();
+    }
+    // Fall back to powman timer
     return powman_timer_get_ms();
 }
 
@@ -77,7 +136,13 @@ bool sleep_has_valid_time(void) {
 }
 
 void sleep_set_time_ms(uint64_t time_ms) {
-    // Ensure timer is running before setting time
+    // Set time on DS3231 if available
+    if (_rtc_present) {
+        rtc.setTimeMs(time_ms);
+        Serial.printf("DS3231: Time set to %llu ms\n", time_ms);
+    }
+    
+    // Also set powman timer (for backup/comparison)
     if (!powman_timer_is_running()) {
         powman_timer_start();
     }
@@ -289,25 +354,75 @@ void sleep_run_from_dormant_source(dormant_source_t dormant_source) {
 }
 
 void sleep_goto_dormant_for_ms(uint32_t delay_ms) {
-    if (!(powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS)) {
-        Serial.println("  ERROR: Timer not using LPOSC!");
-        return;
-    }
-    
-    uint64_t alarm_time = powman_timer_get_ms() + delay_ms;
-    Serial.printf("  [sleep] Alarm at: %llu ms (in %lu ms)\n", alarm_time, delay_ms);
-    
     // Set flag so we know we're waking from sleep (survives reset!)
     sleep_set_wake_flag();
-    
-    // Set up alarm wakeup
-    powman_enable_alarm_wakeup_at_ms(alarm_time);
     
     // Configure power states:
     // Sleep state: SW core OFF, keep XIP cache + SRAM (0x07)
     // Wake state: Everything ON (0x0f)
     powman_power_state sleep_state = 0x07;  // XIP, SRAM0, SRAM1 (no SW core)
     powman_power_state wake_state = 0x0f;   // All on
+    
+    // ========================================================================
+    // DS3231 RTC Wake (preferred - more accurate)
+    // ========================================================================
+    if (_rtc_present && _rtc_int_pin >= 0) {
+        Serial.println("  [sleep] Using DS3231 RTC for wake");
+        Serial.flush();
+        
+        // Set alarm on DS3231
+        rtc.setAlarm1(delay_ms);
+        
+        // Configure GPIO wake on the INT pin (active low when alarm triggers)
+        // The DS3231 INT pin goes LOW when alarm fires and stays low until cleared
+        Serial.printf("  [sleep] Configuring GPIO%d for wake (low level)\n", _rtc_int_pin);
+        Serial.flush();
+        
+        // Enable GPIO wake in powman
+        // powman_enable_gpio_wakeup(slot, gpio, edge, high)
+        // slot: 0-3 (which GPIO wake source to use)
+        // gpio: the GPIO pin number
+        // edge: true = edge triggered, false = level triggered
+        // high: true = high/rising, false = low/falling
+        // DS3231 INT is active-low and stays low, so use level-triggered low
+        powman_enable_gpio_wakeup(0, _rtc_int_pin, false, false);  // Slot 0, level-triggered, low
+        
+        bool valid = powman_configure_wakeup_state(sleep_state, wake_state);
+        if (!valid) {
+            Serial.println("  ERROR: Invalid wakeup state configuration!");
+            sleep_clear_wake_flag();
+            return;
+        }
+        
+        Serial.printf("  [sleep] Entering DEEP SLEEP for %lu ms (DS3231 alarm)...\n", delay_ms);
+        Serial.println("  [sleep] Will reboot on wake - check sleep_woke_from_deep_sleep()");
+        Serial.flush();
+        delay(100);
+        
+        // Power down the switched core
+        powman_set_power_state(sleep_state);
+        __wfi();
+        
+        // We should never reach here
+        Serial.println("  ERROR: Should not reach here!");
+        return;
+    }
+    
+    // ========================================================================
+    // LPOSC Timer Wake (fallback)
+    // ========================================================================
+    if (!(powman_hw->timer & POWMAN_TIMER_USING_LPOSC_BITS)) {
+        Serial.println("  ERROR: Timer not using LPOSC and no RTC available!");
+        sleep_clear_wake_flag();
+        return;
+    }
+    
+    uint64_t alarm_time = powman_timer_get_ms() + delay_ms;
+    Serial.printf("  [sleep] Using LPOSC timer, alarm at: %llu ms (in %lu ms)\n", alarm_time, delay_ms);
+    Serial.flush();
+    
+    // Set up alarm wakeup
+    powman_enable_alarm_wakeup_at_ms(alarm_time);
     
     bool valid = powman_configure_wakeup_state(sleep_state, wake_state);
     if (!valid) {
@@ -322,7 +437,6 @@ void sleep_goto_dormant_for_ms(uint32_t delay_ms) {
     delay(100);
     
     // Power down the switched core - THIS IS THE DEEP SLEEP
-    // On wake, the chip will REBOOT but the scratch register preserves our flag
     powman_set_power_state(sleep_state);
     __wfi();
     
@@ -396,13 +510,39 @@ void sleep_calibrate_drift(uint64_t accurate_time_ms) {
     Serial.println("  [calibrate] Starting...");
     Serial.flush();
     
+    // ========================================================================
+    // DS3231 RTC - just set time, no drift calibration needed
+    // ========================================================================
+    if (_rtc_present) {
+        Serial.println("  [calibrate] Using DS3231 RTC (crystal accurate, no drift cal needed)");
+        rtc.setTimeMs(accurate_time_ms);
+        
+        // Also keep powman timer in sync for backup
+        if (!powman_timer_is_running()) {
+            powman_timer_start();
+            delay(1);
+        }
+        powman_timer_set_ms(accurate_time_ms);
+        
+        // Store sync point for reference
+        store_sync_point(accurate_time_ms, accurate_time_ms);
+        
+        Serial.printf("  [calibrate] DS3231 and powman set to: %llu ms\n", accurate_time_ms);
+        Serial.flush();
+        return;
+    }
+    
+    // ========================================================================
+    // LPOSC fallback - needs drift calibration
+    // ========================================================================
+    
     // Ensure timer is running before we try to read/write it
     bool was_running = powman_timer_is_running();
     if (!was_running) {
         Serial.println("  [calibrate] Timer not running, starting...");
         Serial.flush();
         powman_timer_start();
-        delay(10);  // Give timer time to stabilize
+        delay(10);
     }
     
     // Read the CURRENT timer value (before we overwrite it with NTP time)
@@ -464,13 +604,15 @@ void sleep_calibrate_drift(uint64_t accurate_time_ms) {
 }
 
 uint64_t sleep_get_corrected_time_ms(void) {
+    // DS3231 is crystal-accurate, no drift correction needed
+    if (_rtc_present) {
+        return rtc.getTimeMs();
+    }
+    
+    // LPOSC fallback - apply drift correction
     uint64_t current_timer = powman_timer_get_ms();
     
-    // Get drift correction factor
     int32_t drift_ppm = sleep_get_drift_ppm();
-    
-    // If no drift correction, just return raw timer value
-    // (timer is already set to NTP time at last sync)
     if (drift_ppm == 0) {
         return current_timer;
     }

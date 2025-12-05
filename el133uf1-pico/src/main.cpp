@@ -48,6 +48,11 @@ const char* NTP_SERVER2_NAME = "time.google.com";
 #define PIN_RESET     27    // Reset (GP27)
 #define PIN_BUSY      17    // Busy (GP17)
 
+// DS3231 RTC pins (I2C0)
+#define PIN_RTC_SDA    2    // I2C0 SDA (GP2)
+#define PIN_RTC_SCL    3    // I2C0 SCL (GP3)
+#define PIN_RTC_INT   -1    // DS3231 INT/SQW pin for wake (set to GPIO if connected, -1 if not)
+
 // Create display instance using SPI1
 // (SPI1 is the correct bus for GP10/GP11 on Pico)
 EL133UF1 display(&SPI1);
@@ -230,6 +235,24 @@ void setup() {
     Serial.println("==============================");
     Serial.flush();
     
+    // ================================================================
+    // Initialize DS3231 RTC if present
+    // ================================================================
+    Serial.println("\n=== Checking for DS3231 RTC ===");
+    bool hasRTC = sleep_init_rtc(PIN_RTC_SDA, PIN_RTC_SCL, PIN_RTC_INT);
+    if (hasRTC) {
+        Serial.println("DS3231 RTC found - using for timekeeping");
+        // Read current RTC time
+        uint64_t rtcTime = sleep_get_time_ms();
+        char timeBuf[32];
+        formatTime(rtcTime, timeBuf, sizeof(timeBuf));
+        Serial.printf("  RTC time: %s\n", timeBuf);
+    } else {
+        Serial.println("No DS3231 found - using LPOSC (less accurate)");
+    }
+    Serial.println("===============================\n");
+    Serial.flush();
+    
     // Get current update count and RTC time
     int updateCount = sleep_woke_from_deep_sleep() ? getUpdateCount() : 0;
     uint32_t uptime = sleep_get_uptime_seconds();
@@ -243,14 +266,22 @@ void setup() {
         Serial.println("\n\n========================================");
         Serial.printf("*** WOKE FROM DEEP SLEEP! (update #%d) ***\n", updateCount + 1);
         Serial.printf("*** RTC uptime: %lu seconds ***\n", uptime);
+        if (hasRTC) {
+            Serial.println("*** Wake source: DS3231 RTC alarm ***");
+        } else {
+            Serial.println("*** Wake source: LPOSC timer ***");
+        }
         Serial.println("========================================\n");
         
         // Clear the wake flag
         sleep_clear_wake_flag();
         
-        // Check if we need to resync NTP (LPOSC drifts over time)
-        if ((updateCount + 1) % NTP_RESYNC_INTERVAL == 0) {
-            Serial.println(">>> Periodic NTP resync to correct LPOSC drift <<<");
+        // With DS3231: NTP resync much less often (crystal accurate ~2ppm)
+        // Without: Resync every NTP_RESYNC_INTERVAL updates (LPOSC drifts ~1-5%)
+        int resyncInterval = hasRTC ? 100 : NTP_RESYNC_INTERVAL;  // 100 = ~1000 seconds
+        
+        if ((updateCount + 1) % resyncInterval == 0) {
+            Serial.println(">>> Periodic NTP resync <<<");
             needsNtpSync = true;
         }
     } else {
@@ -259,7 +290,13 @@ void setup() {
         Serial.println("EL133UF1 13.3\" Spectra 6 E-Ink Display Demo");
         Serial.println("===========================================\n");
         
-        needsNtpSync = true;
+        // Check if DS3231 already has valid time (battery-backed)
+        if (hasRTC && sleep_get_time_ms() > 1700000000000ULL) {
+            Serial.println("DS3231 already has valid time from battery backup");
+            needsNtpSync = false;  // Can skip NTP sync, RTC has time
+        } else {
+            needsNtpSync = true;
+        }
         setUpdateCount(0);
     }
     
@@ -269,13 +306,13 @@ void setup() {
         if (connectWiFiAndGetNTP()) {
             uint64_t newTime = sleep_get_time_ms();
             int64_t drift = (int64_t)(newTime - oldTime);
-            if (oldTime > 0) {
+            if (oldTime > 1700000000000ULL) {
                 Serial.printf(">>> Time correction: %+lld ms <<<\n", drift);
             }
         } else {
             Serial.println("WARNING: NTP sync failed, using existing time");
-            if (sleep_get_time_ms() == 0) {
-                sleep_set_time_ms(0);  // No time available
+            if (sleep_get_time_ms() < 1700000000000ULL) {
+                Serial.println("ERROR: No valid time available!");
             }
         }
     }
@@ -373,8 +410,15 @@ void setup() {
     Serial.flush();
     delay(100);
     
-    // Prepare powman timer for deep sleep
-    sleep_run_from_lposc();
+    // Prepare for deep sleep
+    if (sleep_has_rtc()) {
+        // DS3231 handles wake via alarm - no LPOSC setup needed
+        Serial.println("Using DS3231 RTC for wake timing");
+    } else {
+        // LPOSC fallback - need to configure powman timer
+        Serial.println("Using LPOSC for wake timing (preparing timer...)");
+        sleep_run_from_lposc();
+    }
     
     // Go to deep sleep for 10 seconds
     sleep_goto_dormant_for_ms(10000);
@@ -584,31 +628,43 @@ void doDisplayUpdate(int updateNumber) {
     // INFO FOOTER
     // ================================================================
     
-    // LPOSC calibration and drift info at bottom
-    uint32_t lposcFreq = sleep_get_lposc_freq_hz();
-    int32_t lposcDev = sleep_get_lposc_deviation_centipercent();
-    int32_t driftPpm = sleep_get_drift_ppm();
-    
-    // Line 1: LPOSC calibration
-    if (lposcFreq > 0) {
-        snprintf(buf, sizeof(buf), "LPOSC: %lu Hz (%+ld.%02ld%% from 32768)", 
-                 lposcFreq, lposcDev / 100, abs(lposcDev) % 100);
-    } else {
-        snprintf(buf, sizeof(buf), "LPOSC: not calibrated");
-    }
     t0 = millis();
+    
+    // Line 1: Time source info
+    if (sleep_has_rtc()) {
+        // DS3231 RTC present
+        snprintf(buf, sizeof(buf), "DS3231 RTC: crystal accurate (~2ppm), battery-backed");
+    } else {
+        // LPOSC fallback
+        uint32_t lposcFreq = sleep_get_lposc_freq_hz();
+        int32_t lposcDev = sleep_get_lposc_deviation_centipercent();
+        if (lposcFreq > 0) {
+            snprintf(buf, sizeof(buf), "LPOSC: %lu Hz (%+ld.%02ld%% from 32768)", 
+                     lposcFreq, lposcDev / 100, abs(lposcDev) % 100);
+        } else {
+            snprintf(buf, sizeof(buf), "LPOSC: not calibrated");
+        }
+    }
     ttf.drawTextAligned(display.width() / 2, 1020, buf, 22.0, EL133UF1_BLACK,
                         ALIGN_CENTER, ALIGN_TOP);
-    ttfTotal += millis() - t0;
     
-    // Line 2: Drift correction status
-    snprintf(buf, sizeof(buf), "Drift correction: %+ld ppm | Sleep: 10s | Update #%d", 
-             (long)driftPpm, updateNumber);
+    // Line 2: Status
+    if (sleep_has_rtc()) {
+        snprintf(buf, sizeof(buf), "Wake: DS3231 alarm | Sleep: 10s | Update #%d", updateNumber);
+    } else {
+        int32_t driftPpm = sleep_get_drift_ppm();
+        snprintf(buf, sizeof(buf), "Drift: %+ld ppm | Sleep: 10s | Update #%d", 
+                 (long)driftPpm, updateNumber);
+    }
     ttf.drawTextAligned(display.width() / 2, 1055, buf, 22.0, EL133UF1_BLACK,
                         ALIGN_CENTER, ALIGN_TOP);
+    ttfTotal += millis() - t0;
 
     // Line 3: Status
-    ttf.drawTextAligned(display.width() / 2, 1090, "NTP synced on boot, time maintained during deep sleep", 
+    const char* statusMsg = sleep_has_rtc() 
+        ? "DS3231 RTC maintains time during deep sleep"
+        : "NTP synced on boot, time maintained during deep sleep";
+    ttf.drawTextAligned(display.width() / 2, 1090, statusMsg, 
                         20.0, EL133UF1_BLACK, ALIGN_CENTER, ALIGN_TOP);
     
     // Version/tech info - right aligned at bottom
