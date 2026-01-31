@@ -32,8 +32,8 @@ hda = /sdcard/disk.img
 fill_cmos = 1
 
 [display]
-; Tanmatsu display is 800x480
-; VGA output will be scaled/centered as needed
+; VGA emulator output resolution
+; Will be scaled to fit 480x800 portrait display with PPA hardware rotation
 width = 720
 height = 480
 

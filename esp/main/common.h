@@ -22,4 +22,9 @@ struct Globals {
 extern EventGroupHandle_t global_event_group;
 extern struct Globals globals;
 
+#ifdef USE_LCD_BSP
+// Set VGA dimensions for PPA scaling calculation
+void lcd_set_vga_dimensions(int width, int height);
+#endif
+
 #endif /* COMMON_H */

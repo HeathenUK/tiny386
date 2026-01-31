@@ -11,9 +11,10 @@
 #define BPP 16
 #define FULL_UPDATE
 #define USE_LCD_BSP
+// Display logical dimensions (VGA emulator output size)
+// lcd_bsp.c uses smaller internal dimensions (640x480) for PPA-friendly scaling
 #define LCD_WIDTH 800
 #define LCD_HEIGHT 480
-// Note: BSP handles rotation internally (480x800 physical -> 800x480 logical)
 
 // SD card pins (same as JC4880P433)
 #define SD_CLK 43

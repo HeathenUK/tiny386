@@ -34,17 +34,18 @@ void (*_Atomic esp32_send_packet)(uint8_t *buf, int size) = NULL;
 // PPA client handle for rotation
 static ppa_client_handle_t ppa_srm_handle = NULL;
 
-// Framebuffer dimensions
-// VGA emulator outputs 720x480 with stride matching width
-#define VGA_WIDTH  720   // Actual VGA output width
-#define VGA_HEIGHT 480   // VGA output height
-#define FB_STRIDE  720   // Buffer stride = width (VGA sets stride to width)
-#define DISPLAY_WIDTH  480  // Portrait width (physical display)
-#define DISPLAY_HEIGHT 800  // Portrait height
+// Physical display dimensions (portrait orientation)
+#define DISPLAY_WIDTH  480
+#define DISPLAY_HEIGHT 800
 
-// Scaling: 720x480 rotated to 480x720, scaled to 480x800
-// Scale factor: 800/720 = 1.111 (vertical stretch after rotation)
-#define SCALE_ENABLE 1
+// Maximum VGA framebuffer - allocate large enough for any reasonable mode
+// Actual VGA resolution comes from ini config and may be smaller
+#define VGA_MAX_WIDTH  800
+#define VGA_MAX_HEIGHT 600
+
+// Actual VGA dimensions - set from globals after PC init
+static int vga_width = 720;   // Default, updated at runtime
+static int vga_height = 480;
 
 void pc_vga_step(void *o);
 
@@ -94,13 +95,39 @@ static void IRAM_ATTR rotate_and_blit(uint16_t *fb, uint16_t *fb_rotated)
 		return;
 	}
 
+	// Calculate scale factors to fit display while respecting PPA's 1/16 precision
+	// After 270° rotation: out_w = scale_y * in_h, out_h = scale_x * in_w
+	// We need: out_w <= DISPLAY_WIDTH (480), out_h <= DISPLAY_HEIGHT (800)
+	float ideal_scale_x = (float)DISPLAY_HEIGHT / vga_width;   // For height after rotation
+	float ideal_scale_y = (float)DISPLAY_WIDTH / vga_height;   // For width after rotation
+
+	// Use the smaller scale to maintain aspect ratio
+	float ideal_scale = (ideal_scale_x < ideal_scale_y) ? ideal_scale_x : ideal_scale_y;
+
+	// Round DOWN to 1/16 precision (PPA truncates, not rounds)
+	int scale_16 = (int)(ideal_scale * 16.0f);
+	if (scale_16 < 1) scale_16 = 1;  // Minimum scale
+	float scale = scale_16 / 16.0f;
+
+	// Calculate actual output dimensions after PPA's truncation
+	int out_w = (int)(scale * vga_height);  // Width after rotation
+	int out_h = (int)(scale * vga_width);   // Height after rotation
+
+	// Center on display
+	int offset_x = (DISPLAY_WIDTH - out_w) / 2;
+	int offset_y = (DISPLAY_HEIGHT - out_h) / 2;
+	if (offset_x < 0) offset_x = 0;
+	if (offset_y < 0) offset_y = 0;
+
 	// Debug: print buffer info once
 	if (blit_debug_count == 0) {
-		float scale_x = 800.0f / 720.0f;
-		ESP_LOGI(TAG, "PPA blit: fb=%p (ext=%d) fb_rot=%p (ext=%d) scale_x=%.6f",
+		ESP_LOGI(TAG, "PPA blit: fb=%p (ext=%d) fb_rot=%p (ext=%d)",
 		         fb, esp_ptr_external_ram(fb),
-		         fb_rotated, esp_ptr_external_ram(fb_rotated),
-		         scale_x);
+		         fb_rotated, esp_ptr_external_ram(fb_rotated));
+		ESP_LOGI(TAG, "VGA: %dx%d, ideal_scale=%.4f, actual_scale=%.4f (%d/16)",
+		         vga_width, vga_height, ideal_scale, scale, scale_16);
+		ESP_LOGI(TAG, "Output: %dx%d at offset (%d,%d) on %dx%d display",
+		         out_w, out_h, offset_x, offset_y, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 		blit_debug_count++;
 	}
 
@@ -108,10 +135,10 @@ static void IRAM_ATTR rotate_and_blit(uint16_t *fb, uint16_t *fb_rotated)
 	if (!use_software_rotation && ppa_srm_handle) {
 		ppa_srm_oper_config_t srm_config = {
 			.in.buffer = fb,
-			.in.pic_w = VGA_WIDTH,
-			.in.pic_h = VGA_HEIGHT,
-			.in.block_w = VGA_WIDTH,
-			.in.block_h = VGA_HEIGHT,
+			.in.pic_w = vga_width,
+			.in.pic_h = vga_height,
+			.in.block_w = vga_width,
+			.in.block_h = vga_height,
 			.in.block_offset_x = 0,
 			.in.block_offset_y = 0,
 			.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
@@ -119,17 +146,12 @@ static void IRAM_ATTR rotate_and_blit(uint16_t *fb, uint16_t *fb_rotated)
 			.out.buffer_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t),
 			.out.pic_w = DISPLAY_WIDTH,
 			.out.pic_h = DISPLAY_HEIGHT,
-			.out.block_offset_x = 0,
-			.out.block_offset_y = 0,
+			.out.block_offset_x = offset_x,
+			.out.block_offset_y = offset_y,
 			.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
 			.rotation_angle = PPA_SRM_ROTATION_ANGLE_270,
-			// Scale 720x480 -> 800x480 before rotation, then rotate to 480x800
-			// For 270° rotation: out_w = scale_y * in_h, out_h = scale_x * in_w
-			// We want 480x800 output from 720x480 input:
-			//   out_w = scale_y * 480 = 480, so scale_y = 1.0
-			//   out_h = scale_x * 720 = 800, so scale_x = 800/720 = 1.111
-			.scale_x = 800.0f / 720.0f,
-			.scale_y = 1.0f,
+			.scale_x = scale,
+			.scale_y = scale,
 			.rgb_swap = 0,
 			.byte_swap = 0,
 			.mode = PPA_TRANS_MODE_BLOCKING,
@@ -146,11 +168,18 @@ static void IRAM_ATTR rotate_and_blit(uint16_t *fb, uint16_t *fb_rotated)
 		use_software_rotation = true;
 	}
 
-	// Software rotation fallback
-	// VGA outputs 720x480 with stride 800, rotate to 480x720 portrait
-	// Display is 480x800, so image will be centered with black bars
-	software_rotate_90cw_stride(fb, fb_rotated, VGA_WIDTH, VGA_HEIGHT, FB_STRIDE);
-	bsp_display_blit(0, 0, DISPLAY_WIDTH, VGA_WIDTH, fb_rotated);
+	// Software rotation fallback (no scaling, just rotation)
+	software_rotate_90cw_stride(fb, fb_rotated, vga_width, vga_height, vga_width);
+	// After rotation: width=vga_height, height=vga_width
+	bsp_display_blit(0, 0, vga_height, vga_width, fb_rotated);
+}
+
+// Set VGA dimensions - called after PC config is loaded
+void lcd_set_vga_dimensions(int width, int height)
+{
+	vga_width = width;
+	vga_height = height;
+	ESP_LOGI(TAG, "VGA dimensions set to %dx%d", width, height);
 }
 
 // This function is called by the VGA emulator but we do full-frame updates instead
@@ -180,9 +209,9 @@ void vga_task(void *arg)
 	         (int)heap_info.largest_free_block);
 
 	// 1. Allocate framebuffers BEFORE BSP init (while PSRAM region tracking is correct)
-	// Main VGA framebuffer (720x480 RGB565)
-	size_t fb_size = VGA_WIDTH * VGA_HEIGHT * sizeof(uint16_t);
-	ESP_LOGI(TAG, "Allocating VGA framebuffer: %d bytes", (int)fb_size);
+	// Main VGA framebuffer - allocate max size to handle any VGA mode
+	size_t fb_size = VGA_MAX_WIDTH * VGA_MAX_HEIGHT * sizeof(uint16_t);
+	ESP_LOGI(TAG, "Allocating VGA framebuffer: %d bytes (max %dx%d)", (int)fb_size, VGA_MAX_WIDTH, VGA_MAX_HEIGHT);
 
 	uint16_t *fb = heap_caps_aligned_alloc(64, fb_size,
 	                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);

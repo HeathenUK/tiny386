@@ -146,6 +146,11 @@ static int pc_main(const char *file)
 		return err;
 	}
 
+#ifdef USE_LCD_BSP
+	// Tell LCD backend the actual VGA dimensions for PPA scaling
+	lcd_set_vga_dimensions(conf.width, conf.height);
+#endif
+
 	Console *console = console_init(conf.width, conf.height);
 	PC *pc = pc_new(redraw, stub, console, console->fb, &conf);
 	console->pc = pc;
