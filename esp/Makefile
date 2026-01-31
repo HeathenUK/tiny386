@@ -89,8 +89,13 @@ fmopl:
 
 .PHONY: patch_idf
 patch_idf:
-	@echo "Patching ESP-IDF..."
-	cd "$(IDF_PATH)" && patch -p1 < ../esp-idf.patch
+	@if [ ! -f "$(IDF_PATH)/.patched" ]; then \
+		echo "Patching ESP-IDF..."; \
+		cd "$(IDF_PATH)" && patch -p1 -N --no-backup-if-mismatch < ../esp-idf.patch > /dev/null 2>&1 || true; \
+		touch "$(IDF_PATH)/.patched"; \
+	else \
+		echo "ESP-IDF already patched, skipping..."; \
+	fi
 
 .PHONY: patch_bsp
 patch_bsp:
@@ -105,6 +110,7 @@ patch_bsp:
 removesdk:
 	rm -rf "$(IDF_PATH)"
 	rm -rf "$(IDF_TOOLS_PATH)"
+	rm -f "$(IDF_PATH)/.patched"
 
 .PHONY: refreshsdk
 refreshsdk: removesdk sdk
@@ -138,7 +144,7 @@ checkbuildenv:
 # Building
 
 .PHONY: build
-build: checkbuildenv submodules patch_bsp
+build: checkbuildenv submodules patch_idf patch_bsp
 	export IDF_TOOLS_PATH="$(IDF_TOOLS_PATH)" && \
 	source "$(IDF_PATH)/export.sh" >/dev/null && \
 	idf.py -B $(BUILD) build -DDEVICE=$(DEVICE)
