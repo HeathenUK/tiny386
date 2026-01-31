@@ -31,7 +31,9 @@
 //#include "cutils.h"
 #include "ide.h"
 
-//#define DEBUG_IDE
+#ifdef TANMATSU_BUILD
+#define DEBUG_IDE
+#endif
 //#define DEBUG_IDE_ATAPI
 
 /* Bits of HD_STATUS */
@@ -434,9 +436,11 @@ static void ide_identify(IDEState *s)
     padstr((char *)(tab + 27), "TINY386 HARDDISK", 40);
     stw(tab + 47, 0x8000 | MAX_MULT_SECTORS);
     stw(tab + 48, 1); /* dword I/O */
-    stw(tab + 49, 1 << 9); /* LBA supported, no DMA */
+    stw(tab + 49, (1 << 9) | (1 << 8)); /* LBA supported, DMA supported */
     stw(tab + 51, 0x200); /* PIO transfer cycle */
     stw(tab + 52, 0x200); /* DMA transfer cycle */
+    stw(tab + 63, 0x07);  /* Multiword DMA modes 0-2 supported */
+    stw(tab + 88, 0x3f);  /* Ultra DMA modes 0-5 supported */
     stw(tab + 54, s->cylinders);
     stw(tab + 55, s->heads);
     stw(tab + 56, s->sectors);
@@ -707,7 +711,7 @@ static void ide_identify_cb(IDEState *s)
 static void ide_exec_cmd(IDEState *s, int val)
 {
 #if defined(DEBUG_IDE)
-    printf("ide: exec_cmd=0x%02x\n", val);
+    printf("ide: exec_cmd=0x%02x\n", (unsigned)val);
 #endif
     switch(val) {
     case WIN_IDENTIFY:
@@ -767,6 +771,25 @@ static void ide_exec_cmd(IDEState *s, int val)
         ide_set_sector(s, s->nb_sectors - 1);
         s->status = READY_STAT;
         ide_set_irq(s);
+        break;
+    case WIN_READDMA:
+    case WIN_READDMA_ONCE:
+        // DMA read - for now, treat same as multi-sector PIO read
+        // This gives us the speed benefit without full DMA controller emulation
+        s->req_nb_sectors = s->nsector ? s->nsector : 256;
+#ifdef DEBUG_IDE
+        printf("DMA read: sector=%d count=%d\n", (int)ide_get_sector(s), s->req_nb_sectors);
+#endif
+        ide_sector_read(s);
+        break;
+    case WIN_WRITEDMA:
+    case WIN_WRITEDMA_ONCE:
+        // DMA write - for now, treat same as multi-sector PIO write
+        s->req_nb_sectors = s->nsector ? s->nsector : 256;
+#ifdef DEBUG_IDE
+        printf("DMA write: sector=%d count=%d\n", (int)ide_get_sector(s), s->req_nb_sectors);
+#endif
+        ide_sector_write(s);
         break;
     default:
         ide_abort_command(s);
@@ -914,7 +937,14 @@ static int cdrom_read_toc_raw(int nb_sectors, uint8_t *buf, int msf, int session
 /* XXX: DVDs that could fit on a CD will be reported as a CD */
 static inline int media_present(IDEState *s)
 {
-    return (s->nb_sectors > 0);
+    return (s->bs != NULL && s->nb_sectors > 0);
+}
+
+/* Safe sector count that returns 0 if no media */
+static inline uint64_t cd_get_sector_count(IDEState *s)
+{
+    if (!s->bs) return 0;
+    return s->bs->get_sector_count(s->bs);
 }
 
 static inline int media_is_dvd(IDEState *s)
@@ -987,6 +1017,8 @@ static int cd_read_sector(BlockDevice *bs, int lba, uint8_t *buf,
                            int sector_size)
 {
     int ret;
+
+    if (!bs) return -1;  // No disc inserted
 
     switch(sector_size) {
     case 2048:
@@ -1323,7 +1355,7 @@ static void ide_atapi_cmd(IDEState *s)
             unsigned int lba;
             uint64_t total_sectors;
 
-            total_sectors = s->bs->get_sector_count(s->bs);
+            total_sectors = cd_get_sector_count(s);
             total_sectors >>= 2;
             if (total_sectors == 0) {
                 ide_atapi_cmd_error(s, SENSE_NOT_READY,
@@ -1362,7 +1394,7 @@ static void ide_atapi_cmd(IDEState *s)
             int format, msf, start_track, len;
             uint64_t total_sectors;
 
-            total_sectors = s->bs->get_sector_count(s->bs);
+            total_sectors = cd_get_sector_count(s);
             total_sectors >>= 2;
             if (total_sectors == 0) {
                 ide_atapi_cmd_error(s, SENSE_NOT_READY,
@@ -1406,7 +1438,7 @@ static void ide_atapi_cmd(IDEState *s)
         {
             uint64_t total_sectors;
 
-            total_sectors = s->bs->get_sector_count(s->bs);
+            total_sectors = cd_get_sector_count(s);
             total_sectors >>= 2;
             if (total_sectors == 0) {
                 ide_atapi_cmd_error(s, SENSE_NOT_READY,
@@ -1491,7 +1523,7 @@ static void ide_atapi_cmd(IDEState *s)
 static void idecd_exec_cmd(IDEState *s, int val)
 {
 #if defined(DEBUG_IDE)
-    printf("idecd: exec_cmd=0x%02x\n", val);
+    printf("idecd: exec_cmd=0x%02x\n", (unsigned)val);
 #endif
     switch(val) {
     case WIN_DEVICE_RESET:
@@ -1530,7 +1562,7 @@ void ide_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     IDEState *s = s1->cur_drive;
     
 #ifdef DEBUG_IDE
-    printf("ide: write addr=0x%02x val=0x%02x\n", addr, val);
+    printf("ide: write addr=0x%02x val=0x%02x\n", (unsigned)addr, (unsigned)val);
 #endif
     switch(addr) {
     case 0:
@@ -1619,7 +1651,7 @@ uint32_t ide_ioport_read(void *opaque, uint32_t addr)
         }
     }
 #ifdef DEBUG_IDE
-    printf("ide: read addr=0x%02x val=0x%02x\n", addr, ret);
+    printf("ide: read addr=0x%02x val=0x%02x\n", (unsigned)addr, (unsigned)ret);
 #endif
     return ret;
 }
@@ -1648,7 +1680,7 @@ void ide_cmd_write(void *opaque, uint32_t val)
     int i;
     
 #ifdef DEBUG_IDE
-    printf("ide: cmd write=0x%02x\n", val);
+    printf("ide: cmd write=0x%02x\n", (unsigned)val);
 #endif
     if (!(s1->cmd & IDE_CMD_RESET) && (val & IDE_CMD_RESET)) {
         /* low to high */
@@ -1910,6 +1942,16 @@ typedef struct BlockDeviceFile {
     int64_t nb_sectors;
     BlockDeviceModeEnum mode;
     uint8_t **sector_table;
+#ifdef TANMATSU_BUILD
+    char path[256];  // Store filename for OSD display
+#endif
+#ifdef BUILD_ESP32
+    /* Read-ahead cache for faster sequential access */
+    uint8_t *cache_buf;        /* Cache buffer in PSRAM */
+    int64_t cache_start;       /* First sector in cache */
+    int cache_count;           /* Number of valid sectors in cache */
+#define DISK_CACHE_SECTORS 64  /* Cache 64 sectors = 32KB per disk */
+#endif
 } BlockDeviceFile;
 
 static int64_t bf_get_sector_count(BlockDevice *bs)
@@ -1958,8 +2000,43 @@ static int bf_read_async(BlockDevice *bs,
             buf += SECTOR_SIZE;
         }
     } else {
-        fseeko(bf->f, bf->start_offset + sector_num * SECTOR_SIZE, SEEK_SET);
-        fread(buf, 1, n * SECTOR_SIZE, bf->f);
+#ifdef BUILD_ESP32
+        /* Use read-ahead cache for faster sequential access */
+        if (bf->cache_buf) {
+            while (n > 0) {
+                /* Check if sector is in cache */
+                if (sector_num >= bf->cache_start &&
+                    sector_num < bf->cache_start + bf->cache_count) {
+                    /* Cache hit - copy from cache */
+                    int cache_offset = (sector_num - bf->cache_start) * SECTOR_SIZE;
+                    memcpy(buf, bf->cache_buf + cache_offset, SECTOR_SIZE);
+                    sector_num++;
+                    buf += SECTOR_SIZE;
+                    n--;
+                } else {
+                    /* Cache miss - read ahead into cache */
+                    int64_t read_start = sector_num;
+                    int read_count = DISK_CACHE_SECTORS;
+                    /* Don't read past end of disk */
+                    if (read_start + read_count > bf->nb_sectors)
+                        read_count = bf->nb_sectors - read_start;
+                    if (read_count > 0) {
+                        fseeko(bf->f, bf->start_offset + read_start * SECTOR_SIZE, SEEK_SET);
+                        fread(bf->cache_buf, 1, read_count * SECTOR_SIZE, bf->f);
+                        bf->cache_start = read_start;
+                        bf->cache_count = read_count;
+                    } else {
+                        /* Past end of disk */
+                        break;
+                    }
+                }
+            }
+        } else
+#endif
+        {
+            fseeko(bf->f, bf->start_offset + sector_num * SECTOR_SIZE, SEEK_SET);
+            fread(buf, 1, n * SECTOR_SIZE, bf->f);
+        }
     }
     /* synchronous read */
     return 0;
@@ -1971,6 +2048,13 @@ static int bf_write_async(BlockDevice *bs,
 {
     BlockDeviceFile *bf = bs->opaque;
     int ret;
+
+#ifdef BUILD_ESP32
+    /* Invalidate cache on write - simple approach, just clear it */
+    if (bf->cache_buf) {
+        bf->cache_count = 0;
+    }
+#endif
 
     switch(bf->mode) {
     case BF_MODE_RO:
@@ -2043,6 +2127,10 @@ static BlockDevice *block_device_init(const char *filename,
     bf->nb_sectors = file_size / 512;
     bf->f = f;
     bf->start_offset = start_offset;
+#ifdef TANMATSU_BUILD
+    strncpy(bf->path, filename, sizeof(bf->path) - 1);
+    bf->path[sizeof(bf->path) - 1] = '\0';
+#endif
 
     if (mode == BF_MODE_SNAPSHOT) {
         bf->sector_table = pcmalloc(sizeof(bf->sector_table[0]) *
@@ -2050,6 +2138,12 @@ static BlockDevice *block_device_init(const char *filename,
         memset(bf->sector_table, 0,
                sizeof(bf->sector_table[0]) * bf->nb_sectors);
     }
+#ifdef BUILD_ESP32
+    /* Allocate read-ahead cache buffer */
+    bf->cache_buf = pcmalloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
+    bf->cache_start = -1;
+    bf->cache_count = 0;
+#endif
     
     bs->opaque = bf;
     bs->get_sector_count = bf_get_sector_count;
@@ -2071,6 +2165,94 @@ static BlockDevice *block_device_init(const char *filename,
 
 #ifdef BUILD_ESP32
 #include "sdmmc_cmd.h"
+
+// === Sector Cache and Prefetch for ESP32 ===
+// Cache recently read sectors to avoid repeated SD card access
+// Prefetch ahead when sequential reads are detected
+
+#define CACHE_SIZE 128          // Number of sectors to cache (64KB)
+#define PREFETCH_SIZE 16        // Sectors to prefetch on sequential read
+#define CACHE_LINE_SECTORS 8    // Read this many sectors at once
+
+typedef struct {
+    uint64_t sector_num;        // Sector number (-1 = invalid)
+    uint8_t data[512];          // Sector data
+    uint8_t valid;              // Entry is valid
+    uint32_t access_count;      // LRU counter
+} CacheEntry;
+
+typedef struct {
+    CacheEntry entries[CACHE_SIZE];
+    uint32_t access_counter;    // Global access counter for LRU
+    uint64_t last_sector;       // Last sector read (for sequential detection)
+    uint32_t hits;              // Cache hit counter
+    uint32_t misses;            // Cache miss counter
+} SectorCache;
+
+static SectorCache *sector_cache = NULL;
+
+static void cache_init(void)
+{
+    if (sector_cache) return;
+    sector_cache = pcmalloc(sizeof(SectorCache));
+    memset(sector_cache, 0, sizeof(SectorCache));
+    for (int i = 0; i < CACHE_SIZE; i++) {
+        sector_cache->entries[i].sector_num = (uint64_t)-1;
+        sector_cache->entries[i].valid = 0;
+    }
+    sector_cache->last_sector = (uint64_t)-1;
+#ifdef DEBUG_IDE
+    printf("IDE cache initialized: %d sectors (%d KB)\n", CACHE_SIZE, CACHE_SIZE / 2);
+#endif
+}
+
+static int cache_find(uint64_t sector_num)
+{
+    for (int i = 0; i < CACHE_SIZE; i++) {
+        if (sector_cache->entries[i].valid &&
+            sector_cache->entries[i].sector_num == sector_num) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int cache_find_lru(void)
+{
+    int lru_idx = 0;
+    uint32_t lru_count = sector_cache->entries[0].access_count;
+    for (int i = 1; i < CACHE_SIZE; i++) {
+        if (!sector_cache->entries[i].valid) {
+            return i;  // Use empty slot first
+        }
+        if (sector_cache->entries[i].access_count < lru_count) {
+            lru_count = sector_cache->entries[i].access_count;
+            lru_idx = i;
+        }
+    }
+    return lru_idx;
+}
+
+static void cache_store(uint64_t sector_num, const uint8_t *data)
+{
+    int idx = cache_find(sector_num);
+    if (idx < 0) {
+        idx = cache_find_lru();
+    }
+    sector_cache->entries[idx].sector_num = sector_num;
+    memcpy(sector_cache->entries[idx].data, data, 512);
+    sector_cache->entries[idx].valid = 1;
+    sector_cache->entries[idx].access_count = ++sector_cache->access_counter;
+}
+
+static void cache_invalidate(uint64_t sector_num)
+{
+    int idx = cache_find(sector_num);
+    if (idx >= 0) {
+        sector_cache->entries[idx].valid = 0;
+    }
+}
+
 typedef struct BlockDeviceESPSD {
     sdmmc_card_t *card;
     int64_t start_sector;
@@ -2092,11 +2274,108 @@ static int espsd_read_async(BlockDevice *bs,
     BlockDeviceESPSD *bf = bs->opaque;
     if (!bf->card)
         return -1;
+
+    // Initialize cache on first use
+    if (!sector_cache) {
+        cache_init();
+    }
+
     esp_err_t ret;
-    ret = sdmmc_read_sectors(bf->card, buf, bf->start_sector + sector_num, n);
-    if (ret != 0)
-        return -1;
-    /* synchronous read */
+    int sectors_from_cache = 0;
+    int sectors_read = 0;
+
+    // Check cache for each requested sector
+    for (int i = 0; i < n; i++) {
+        uint64_t sect = sector_num + i;
+        int cache_idx = cache_find(sect);
+        if (cache_idx >= 0) {
+            // Cache hit
+            memcpy(buf + i * 512, sector_cache->entries[cache_idx].data, 512);
+            sector_cache->entries[cache_idx].access_count = ++sector_cache->access_counter;
+            sectors_from_cache++;
+        } else {
+            // Cache miss - need to read from SD
+            // Read multiple sectors at once for efficiency
+            int read_start = i;
+            int read_count = 0;
+
+            // Find contiguous cache misses
+            while (i < n && cache_find(sector_num + i) < 0) {
+                read_count++;
+                i++;
+            }
+            i--;  // Back up since loop will increment
+
+            // Prefetch: if sequential read detected, read extra sectors
+            int prefetch = 0;
+            if (sector_cache->last_sector != (uint64_t)-1 &&
+                sector_num == sector_cache->last_sector + 1) {
+                prefetch = PREFETCH_SIZE;
+                // Don't prefetch beyond disk
+                if (sector_num + read_count + prefetch > (uint64_t)bf->nb_sectors) {
+                    prefetch = bf->nb_sectors - sector_num - read_count;
+                    if (prefetch < 0) prefetch = 0;
+                }
+            }
+
+            // Allocate temp buffer if prefetching
+            int total_read = read_count + prefetch;
+            uint8_t *read_buf;
+            uint8_t *temp_buf = NULL;
+
+            if (prefetch > 0) {
+                temp_buf = malloc(total_read * 512);
+                if (temp_buf) {
+                    read_buf = temp_buf;
+                } else {
+                    // Fallback to no prefetch
+                    total_read = read_count;
+                    read_buf = buf + read_start * 512;
+                }
+            } else {
+                read_buf = buf + read_start * 512;
+            }
+
+            // Read from SD card
+            ret = sdmmc_read_sectors(bf->card, read_buf,
+                                      bf->start_sector + sector_num + read_start,
+                                      total_read);
+            if (ret != 0) {
+                if (temp_buf) free(temp_buf);
+                return -1;
+            }
+
+            // Copy requested sectors to output buffer
+            if (temp_buf) {
+                memcpy(buf + read_start * 512, temp_buf, read_count * 512);
+            }
+
+            // Store all read sectors in cache
+            for (int j = 0; j < total_read; j++) {
+                cache_store(sector_num + read_start + j, read_buf + j * 512);
+            }
+
+            if (temp_buf) free(temp_buf);
+            sectors_read += read_count;
+        }
+    }
+
+    // Update last sector for sequential detection
+    sector_cache->last_sector = sector_num + n - 1;
+
+    // Update stats
+    sector_cache->hits += sectors_from_cache;
+    sector_cache->misses += sectors_read;
+
+#ifdef DEBUG_IDE
+    static int log_count = 0;
+    if (++log_count % 100 == 0) {
+        printf("IDE cache: hits=%lu misses=%lu ratio=%.1f%%\n",
+               (unsigned long)sector_cache->hits, (unsigned long)sector_cache->misses,
+               sector_cache->hits * 100.0 / (sector_cache->hits + sector_cache->misses + 1));
+    }
+#endif
+
     return 0;
 }
 
@@ -2107,6 +2386,14 @@ static int espsd_write_async(BlockDevice *bs,
     BlockDeviceESPSD *bf = bs->opaque;
     if (!bf->card)
         return -1;
+
+    // Invalidate cache entries for written sectors
+    if (sector_cache) {
+        for (int i = 0; i < n; i++) {
+            cache_invalidate(sector_num + i);
+        }
+    }
+
     esp_err_t ret;
     ret = sdmmc_write_sectors(bf->card, buf, bf->start_sector + sector_num, n);
     if (ret != 0)
@@ -2180,10 +2467,12 @@ int ide_attach(IDEIFState *s, int drive, const char *filename)
 int ide_attach_cd(IDEIFState *s, int drive, const char *filename)
 {
     assert(MAX_MULT_SECTORS >= 4);
-    BlockDevice *bs = block_device_init(filename, BF_MODE_RO);
-    if (!bs) {
-        return -1;
+    BlockDevice *bs = NULL;
+    if (filename && filename[0]) {
+        bs = block_device_init(filename, BF_MODE_RO);
     }
+    // Always create the CD-ROM drive, even without a disc
+    // This allows hot-mounting CDs at runtime via OSD
     s->drives[drive] = ide_cddrive_init(s, bs);
     return 0;
 }
@@ -2219,13 +2508,23 @@ static void block_device_reinit(BlockDevice *bs, const char *filename)
         fclose(bf->f);
     bf->f = f;
     bf->start_offset = 0;
+#ifdef TANMATSU_BUILD
+    strncpy(bf->path, filename, sizeof(bf->path) - 1);
+    bf->path[sizeof(bf->path) - 1] = '\0';
+#endif
 }
 
 void ide_change_cd(IDEIFState *sif, int drive, const char *filename)
 {
     IDEState *s = sif->drives[drive];
     if (s && s->drive_kind == IDE_CD) {
-        block_device_reinit(s->bs, filename);
+        if (s->bs) {
+            // Existing disc - reinitialize with new image
+            block_device_reinit(s->bs, filename);
+        } else {
+            // No disc was mounted - create new BlockDevice
+            s->bs = block_device_init(filename, BF_MODE_RO);
+        }
         s->sense_key = SENSE_UNIT_ATTENTION;
         s->asc = ASC_MEDIUM_MAY_HAVE_CHANGED;
         s->cdrom_changed = 1;
@@ -2233,11 +2532,26 @@ void ide_change_cd(IDEIFState *sif, int drive, const char *filename)
     }
 }
 
+#ifdef TANMATSU_BUILD
+const char *ide_get_cd_path(IDEIFState *sif, int drive)
+{
+    if (!sif || drive < 0 || drive > 1)
+        return NULL;
+    IDEState *s = sif->drives[drive];
+    if (!s || s->drive_kind != IDE_CD || !s->bs)
+        return NULL;
+    if (s->bs->get_sector_count != bf_get_sector_count)
+        return NULL;
+    BlockDeviceFile *bf = s->bs->opaque;
+    return bf->path;
+}
+#endif
+
 PCIDevice *piix3_ide_init(PCIBus *pci_bus, int devfn)
 {
     PCIDevice *d;
     d = pci_register_device(pci_bus, "PIIX3 IDE", devfn, 0x8086, 0x7010, 0x00, 0x0101);
-    pci_device_set_config8(d, 0x09, 0x00); /* ISA IDE ports, no DMA */
+    pci_device_set_config8(d, 0x09, 0x80); /* ISA IDE ports with DMA */
     return d;
 }
 
