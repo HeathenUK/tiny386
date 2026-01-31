@@ -1,3 +1,31 @@
 *~
 *.o
 .depends
+
+# Build artifacts
+build/
+out/
+tiny386
+tiny386_nosdl
+tiny386_kvm
+wifikbd
+initnet
+
+# Generated files
+fmopl.inc
+
+# Disk images
+*.img
+
+# Debug/dump files (port numbers)
+0x*
+
+# AI assistant content
+CLAUDE.md
+
+# ESP-IDF tooling and caches
+esp/.cache/
+esp/.submodules_update_done
+esp/esp-idf/
+esp/esp-idf-tools/
+esp/badgelink/
