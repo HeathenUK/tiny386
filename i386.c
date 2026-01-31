@@ -7,6 +7,7 @@
 
 #ifdef BUILD_ESP32
 #include "esp_attr.h"
+#include "esp_heap_caps.h"
 #else
 #define IRAM_ATTR
 #define IRAM_ATTR_CPU_EXEC1
@@ -356,6 +357,98 @@ const static u8 parity_tab[256] = {
   0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
   1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1
 };
+
+/*
+ * Pre-computed flags tables for 8-bit ALU operations.
+ * Eliminates per-flag computation in hot paths.
+ *
+ * flags_logic8[result] - ZF|SF|PF for logical ops (AND, OR, XOR)
+ * flags_add8[src1][src2] - CF|PF|AF|ZF|SF|OF for ADD
+ * flags_sub8[src1][src2] - CF|PF|AF|ZF|SF|OF for SUB/CMP
+ *
+ * Tables are 256 + 128KB + 128KB = ~256KB, stored in PSRAM on ESP32.
+ */
+typedef uint16_t flags8_arith_t[256][256];
+static uint8_t *flags_logic8 = NULL;
+static flags8_arith_t *flags_add8 = NULL;
+static flags8_arith_t *flags_sub8 = NULL;
+
+/* Initialize 8-bit flags lookup tables */
+void i386_init_flags_tables(void)
+{
+	if (flags_logic8 != NULL)
+		return;  /* Already initialized */
+
+#ifdef BUILD_ESP32
+	extern void *psmalloc(long size);
+	flags_logic8 = psmalloc(256);
+	flags_add8 = psmalloc(sizeof(flags8_arith_t));
+	flags_sub8 = psmalloc(sizeof(flags8_arith_t));
+#else
+	flags_logic8 = malloc(256);
+	flags_add8 = malloc(sizeof(flags8_arith_t));
+	flags_sub8 = malloc(sizeof(flags8_arith_t));
+#endif
+
+	if (!flags_logic8 || !flags_add8 || !flags_sub8) {
+		/* Allocation failed - will fall back to computed flags */
+		flags_logic8 = NULL;
+		flags_add8 = NULL;
+		flags_sub8 = NULL;
+		return;
+	}
+
+	/* Build logical ops flags table (result-only flags) */
+	for (int r = 0; r < 256; r++) {
+		uint8_t f = 0;
+		if (r == 0) f |= ZF;
+		if (r & 0x80) f |= SF;
+		if (parity_tab[r]) f |= PF;
+		flags_logic8[r] = f;
+	}
+
+	/* Build ADD8 flags table */
+	for (int s1 = 0; s1 < 256; s1++) {
+		for (int s2 = 0; s2 < 256; s2++) {
+			int r = (s1 + s2) & 0xff;
+			uint16_t f = 0;
+			/* CF: unsigned overflow */
+			if ((s1 + s2) > 0xff) f |= CF;
+			/* PF: parity of result */
+			if (parity_tab[r]) f |= PF;
+			/* AF: carry from bit 3 to bit 4 */
+			if (((s1 ^ s2 ^ r) & 0x10)) f |= AF;
+			/* ZF: result is zero */
+			if (r == 0) f |= ZF;
+			/* SF: sign of result */
+			if (r & 0x80) f |= SF;
+			/* OF: signed overflow */
+			if (((s1 ^ r) & (s2 ^ r) & 0x80)) f |= OF;
+			(*flags_add8)[s1][s2] = f;
+		}
+	}
+
+	/* Build SUB8 flags table */
+	for (int s1 = 0; s1 < 256; s1++) {
+		for (int s2 = 0; s2 < 256; s2++) {
+			int r = (s1 - s2) & 0xff;
+			uint16_t f = 0;
+			/* CF: borrow (unsigned s1 < s2) */
+			if (s1 < s2) f |= CF;
+			/* PF: parity of result */
+			if (parity_tab[r]) f |= PF;
+			/* AF: borrow from bit 4 */
+			if (((s1 ^ s2 ^ r) & 0x10)) f |= AF;
+			/* ZF: result is zero */
+			if (r == 0) f |= ZF;
+			/* SF: sign of result */
+			if (r & 0x80) f |= SF;
+			/* OF: signed overflow */
+			if (((s1 ^ s2) & (s1 ^ r) & 0x80)) f |= OF;
+			(*flags_sub8)[s1][s2] = f;
+		}
+	}
+}
 
 static int get_PF(CPUI386 *cpu)
 {
@@ -1591,6 +1684,87 @@ static inline void clear_segs(CPUI386 *cpu)
 /*
  * instructions
  */
+
+/*
+ * Optimized 8-bit ALU helpers using pre-computed flags tables.
+ * These directly store all flags from table lookup, avoiding lazy computation.
+ */
+#define AOP8_ADD_helper(a, b, la, sa, lb, sb) \
+	{ \
+		u8 _s1 = la(a), _s2 = lb(b); \
+		u8 _r = _s1 + _s2; \
+		if (flags_add8) { \
+			cpu->flags = (cpu->flags & ~(CF|PF|AF|ZF|SF|OF)) | (*flags_add8)[_s1][_s2]; \
+			cpu->cc.mask = 0; \
+		} else { \
+			cpu->cc.src1 = sext8(_s1); \
+			cpu->cc.src2 = sext8(_s2); \
+			cpu->cc.dst = sext8(_r); \
+			cpu->cc.op = CC_ADD; \
+			cpu->cc.mask = CF | PF | AF | ZF | SF | OF; \
+		} \
+		sa(a, _r); \
+	}
+
+#define AOP8_SUB_helper(a, b, la, sa, lb, sb) \
+	{ \
+		u8 _s1 = la(a), _s2 = lb(b); \
+		u8 _r = _s1 - _s2; \
+		if (flags_sub8) { \
+			cpu->flags = (cpu->flags & ~(CF|PF|AF|ZF|SF|OF)) | (*flags_sub8)[_s1][_s2]; \
+			cpu->cc.mask = 0; \
+		} else { \
+			cpu->cc.src1 = sext8(_s1); \
+			cpu->cc.src2 = sext8(_s2); \
+			cpu->cc.dst = sext8(_r); \
+			cpu->cc.op = CC_SUB; \
+			cpu->cc.mask = CF | PF | AF | ZF | SF | OF; \
+		} \
+		sa(a, _r); \
+	}
+
+#define AOP8_CMP_helper(a, b, la, sa, lb, sb) \
+	{ \
+		u8 _s1 = la(a), _s2 = lb(b); \
+		if (flags_sub8) { \
+			cpu->flags = (cpu->flags & ~(CF|PF|AF|ZF|SF|OF)) | (*flags_sub8)[_s1][_s2]; \
+			cpu->cc.mask = 0; \
+		} else { \
+			cpu->cc.src1 = sext8(_s1); \
+			cpu->cc.src2 = sext8(_s2); \
+			cpu->cc.dst = sext8((u8)(_s1 - _s2)); \
+			cpu->cc.op = CC_SUB; \
+			cpu->cc.mask = CF | PF | AF | ZF | SF | OF; \
+		} \
+	}
+
+#define LOP8_helper(OP, a, b, la, sa, lb, sb) \
+	{ \
+		u8 _r = la(a) OP lb(b); \
+		if (flags_logic8) { \
+			cpu->flags = (cpu->flags & ~(CF|PF|ZF|SF|OF)) | flags_logic8[_r]; \
+			cpu->cc.mask = 0; \
+		} else { \
+			cpu->cc.dst = sext8(_r); \
+			cpu->cc.op = CC_AND; \
+			cpu->cc.mask = CF | PF | ZF | SF | OF; \
+		} \
+		sa(a, _r); \
+	}
+
+#define LOP8_TEST_helper(OP, a, b, la, sa, lb, sb) \
+	{ \
+		u8 _r = la(a) OP lb(b); \
+		if (flags_logic8) { \
+			cpu->flags = (cpu->flags & ~(CF|PF|ZF|SF|OF)) | flags_logic8[_r]; \
+			cpu->cc.mask = 0; \
+		} else { \
+			cpu->cc.dst = sext8(_r); \
+			cpu->cc.op = CC_AND; \
+			cpu->cc.mask = CF | PF | ZF | SF | OF; \
+		} \
+	}
+
 #define ACOP_helper(NAME1, NAME2, BIT, OP, a, b, la, sa, lb, sb) \
 	int cf = get_CF(cpu); \
 	cpu->cc.src1 = sext ## BIT(la(a)); \
@@ -1641,25 +1815,25 @@ static inline void clear_segs(CPUI386 *cpu)
 #define SBBb(...) ACOP_helper(SBB, SUB,  8, -, __VA_ARGS__)
 #define SBBw(...) ACOP_helper(SBB, SUB, 16, -, __VA_ARGS__)
 #define SBBd(...) ACOP_helper(SBB, SUB, 32, -, __VA_ARGS__)
-#define ADDb(...) AOP_helper(ADD,  8, +, __VA_ARGS__)
+#define ADDb(...) AOP8_ADD_helper(__VA_ARGS__)
 #define ADDw(...) AOP_helper(ADD, 16, +, __VA_ARGS__)
 #define ADDd(...) AOP_helper(ADD, 32, +, __VA_ARGS__)
-#define SUBb(...) AOP_helper(SUB,  8, -, __VA_ARGS__)
+#define SUBb(...) AOP8_SUB_helper(__VA_ARGS__)
 #define SUBw(...) AOP_helper(SUB, 16, -, __VA_ARGS__)
 #define SUBd(...) AOP_helper(SUB, 32, -, __VA_ARGS__)
-#define ORb(...)  LOP_helper(OR,   8, |, __VA_ARGS__)
+#define ORb(...)  LOP8_helper(|, __VA_ARGS__)
 #define ORw(...)  LOP_helper(OR,  16, |, __VA_ARGS__)
 #define ORd(...)  LOP_helper(OR,  32, |, __VA_ARGS__)
-#define ANDb(...) LOP_helper(AND,  8, &, __VA_ARGS__)
+#define ANDb(...) LOP8_helper(&, __VA_ARGS__)
 #define ANDw(...) LOP_helper(AND, 16, &, __VA_ARGS__)
 #define ANDd(...) LOP_helper(AND, 32, &, __VA_ARGS__)
-#define XORb(...) LOP_helper(XOR,  8, ^, __VA_ARGS__)
+#define XORb(...) LOP8_helper(^, __VA_ARGS__)
 #define XORw(...) LOP_helper(XOR, 16, ^, __VA_ARGS__)
 #define XORd(...) LOP_helper(XOR, 32, ^, __VA_ARGS__)
-#define CMPb(...)  AOP0_helper(SUB,  8, -, __VA_ARGS__)
+#define CMPb(...)  AOP8_CMP_helper(__VA_ARGS__)
 #define CMPw(...)  AOP0_helper(SUB, 16, -, __VA_ARGS__)
 #define CMPd(...)  AOP0_helper(SUB, 32, -, __VA_ARGS__)
-#define TESTb(...) LOP0_helper(AND,  8, &, __VA_ARGS__)
+#define TESTb(...) LOP8_TEST_helper(&, __VA_ARGS__)
 #define TESTw(...) LOP0_helper(AND, 16, &, __VA_ARGS__)
 #define TESTd(...) LOP0_helper(AND, 32, &, __VA_ARGS__)
 #define INCb(...) INCDEC_helper(INC,  8, +, __VA_ARGS__)
@@ -5001,7 +5175,16 @@ long IRAM_ATTR cpui386_get_cycle(CPUI386 *cpu)
 
 CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 {
+	/* Initialize flags lookup tables (256KB in PSRAM for fast flag computation) */
+	i386_init_flags_tables();
+
+#ifdef BUILD_ESP32
+	// Cache-aligned allocation for better memory access performance
+	CPUI386 *cpu = heap_caps_aligned_alloc(64, sizeof(CPUI386),
+	                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
 	CPUI386 *cpu = malloc(sizeof(CPUI386));
+#endif
 	switch (gen) {
 	case 3: cpu->flags_mask = EFLAGS_MASK_386; break;
 	case 4: cpu->flags_mask = EFLAGS_MASK_486; break;
@@ -5011,7 +5194,13 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 	cpu->gen = gen;
 
 	cpu->tlb.size = tlb_size;
+#ifdef BUILD_ESP32
+	// Allocate TLB in internal RAM for fastest access
+	cpu->tlb.tab = heap_caps_malloc(sizeof(struct tlb_entry) * tlb_size,
+	                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
 	cpu->tlb.tab = malloc(sizeof(struct tlb_entry) * tlb_size);
+#endif
 
 	cpu->phys_mem = (u8 *) phys_mem;
 	cpu->phys_mem_size = phys_mem_size;
@@ -5040,6 +5229,7 @@ void cpui386_delete(CPUI386 *cpu)
 {
 	if (cpu->fpu)
 		fpu_delete(cpu->fpu);
+	free(cpu->tlb.tab);
 	free(cpu);
 }
 
