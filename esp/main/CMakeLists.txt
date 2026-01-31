@@ -23,8 +23,8 @@ set(COMMON_SRCS
 
 # Board-specific sources based on DEVICE variable
 if(DEVICE STREQUAL "tanmatsu")
-    # Tanmatsu build with badge-bsp (physical keyboard, no network for now)
-    set(BOARD_SRCS "lcd_bsp.c" "input_bsp.c")
+    # Tanmatsu build with badge-bsp (physical keyboard, custom OSD)
+    set(BOARD_SRCS "lcd_bsp.c" "input_bsp.c" "tanmatsu_osd.c")
     set(BOARD_HEADER "board_tanmatsu.h")
 elseif(DEVICE STREQUAL "jc4880p433")
     # JC4880P433 build with direct hardware access
@@ -61,6 +61,9 @@ set_source_files_properties("../../pc.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3"
 set_source_files_properties("../../ne2000.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("../../sb16.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("../../i8257.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
+set_source_files_properties("../../osd/osd.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
+set_source_files_properties("../../osd/microui.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
+set_source_files_properties("tanmatsu_osd.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../fmopl.inc")
     message(FATAL_ERROR "Please run `make prepare` first")

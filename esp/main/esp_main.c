@@ -97,8 +97,13 @@ Console *console_init(int width, int height)
 	c->fb1 = fbmalloc(LCD_WIDTH * LCD_HEIGHT / NN * 2);
 #ifdef USE_LCD_BSP
 	// For BSP backend, fb is allocated in vga_task after BSP init
-	// This ensures esp_ptr_external_ram() works for PPA
-	c->fb = globals.fb;
+	// Use atomic load for cross-core visibility
+	c->fb = atomic_load(&globals.fb);
+	fprintf(stderr, "console_init: fb=%p\n", c->fb);
+	if (!c->fb) {
+		fprintf(stderr, "ERROR: globals.fb is NULL!\n");
+		abort();
+	}
 #else
 	c->fb = bigmalloc(LCD_WIDTH * LCD_HEIGHT * 2);
 #endif
@@ -128,6 +133,7 @@ static void stub(void *opaque)
 
 static int pc_main(const char *file)
 {
+	fprintf(stderr, "pc_main: start, file=%s\n", file ? file : "(null)");
 	PCConfig conf;
 	memset(&conf, 0, sizeof(conf));
 	conf.linuxstart = "linuxstart.bin";
@@ -140,31 +146,58 @@ static int pc_main(const char *file)
 	conf.cpu_gen = 4;
 	conf.fpu = 0;
 
+	fprintf(stderr, "pc_main: parsing ini\n");
 	int err = ini_parse(file, parse_conf_ini, &conf);
 	if (err) {
 		printf("error %d\n", err);
 		return err;
 	}
+	conf.ini_path = file;  // Store ini path for saving settings
+	fprintf(stderr, "pc_main: ini parsed, width=%d height=%d\n", conf.width, conf.height);
 
 #ifdef USE_LCD_BSP
 	// Tell LCD backend the actual VGA dimensions for PPA scaling
 	lcd_set_vga_dimensions(conf.width, conf.height);
+	fprintf(stderr, "pc_main: lcd dimensions set\n");
 #endif
 
+	fprintf(stderr, "pc_main: calling console_init\n");
 	Console *console = console_init(conf.width, conf.height);
+	fprintf(stderr, "pc_main: console_init returned %p\n", console);
 	PC *pc = pc_new(redraw, stub, console, console->fb, &conf);
 	console->pc = pc;
 	globals.pc = pc;
 	globals.kbd = pc->kbd;
 	globals.mouse = pc->mouse;
+#ifndef USE_LCD_BSP
+	// For non-BSP backends, console allocates fb - store it globally
 	globals.fb = console->fb;
+#endif
 	xEventGroupSetBits(global_event_group, BIT0);
 
 	load_bios_and_reset(pc);
 
 	pc->boot_start_time = get_uticks();
+	uint32_t last_delay_time = get_uticks();
 	for (; pc->shutdown_state != 8;) {
+#ifdef USE_BADGE_BSP
+		// Check for soft reset request from OSD
+		if (globals.reset_pending) {
+			globals.reset_pending = false;
+			pc_reset(pc);
+			pc->boot_start_time = get_uticks();
+		}
+#endif
 		pc_step(pc);
+		// CRITICAL: Use vTaskDelay() not taskYIELD() to let IDLE task run.
+		// taskYIELD only yields to equal/higher priority tasks, but IDLE
+		// is priority 0. Without IDLE running, the watchdog triggers.
+		// Delay every 100ms for ~1 tick to feed the watchdog.
+		uint32_t now = get_uticks();
+		if (now - last_delay_time >= 100000) {  // 100ms
+			last_delay_time = now;
+			vTaskDelay(1);
+		}
 	}
 	return 0;
 }
@@ -207,7 +240,12 @@ static void i386_task(void *arg)
 			    pdFALSE,
 			    pdFALSE,
 			    portMAX_DELAY);
-	fprintf(stderr, "Display ready, starting PC emulator\n");
+	void *fb_check = atomic_load(&globals.fb);
+	fprintf(stderr, "Display ready, fb=%p, starting PC emulator\n", fb_check);
+	if (!fb_check) {
+		fprintf(stderr, "ERROR: globals.fb is NULL after BIT1!\n");
+		vTaskDelay(1000 / portTICK_PERIOD_MS);
+	}
 #endif
 
 	pc_main(config->filename);

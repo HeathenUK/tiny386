@@ -15,6 +15,7 @@
 #include "esp_attr.h"
 #include "esp_lcd_panel_ops.h"
 #include "driver/ppa.h"
+#include "driver/gpio.h"
 #include "esp_heap_caps.h"
 #include "esp_memory_utils.h"
 #include <stdatomic.h>
@@ -25,6 +26,7 @@
 #include "esp_psram.h"
 
 #include "common.h"
+#include "tanmatsu_osd.h"
 
 static const char *TAG = "lcd_bsp";
 
@@ -46,6 +48,11 @@ static ppa_client_handle_t ppa_srm_handle = NULL;
 // Actual VGA dimensions - set from globals after PC init
 static int vga_width = 720;   // Default, updated at runtime
 static int vga_height = 480;
+
+// Triple buffering for rotation output (lock-free)
+#define NUM_ROTATE_BUFFERS 2
+static uint16_t *fb_rotated_buffers[NUM_ROTATE_BUFFERS];
+static _Atomic int rotate_write_idx = 0;  // Buffer being written by PPA
 
 void pc_vga_step(void *o);
 
@@ -179,6 +186,8 @@ void lcd_set_vga_dimensions(int width, int height)
 {
 	vga_width = width;
 	vga_height = height;
+	globals.vga_width = width;
+	globals.vga_height = height;
 	ESP_LOGI(TAG, "VGA dimensions set to %dx%d", width, height);
 }
 
@@ -221,41 +230,64 @@ void vga_task(void *arg)
 		return;
 	}
 	memset(fb, 0, fb_size);
-	globals.fb = fb;
+	atomic_store(&globals.fb, fb);  // Atomic store for cross-core visibility
 
 	ESP_LOGI(TAG, "VGA framebuffer at %p (ext=%d)", fb, esp_ptr_external_ram(fb));
 
-	// Rotated framebuffer (480x800 RGB565)
+	// Rotated framebuffers (480x800 RGB565) - double buffer for lock-free updates
 	size_t fb_rot_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
-	ESP_LOGI(TAG, "Allocating rotated framebuffer: %d bytes", (int)fb_rot_size);
+	ESP_LOGI(TAG, "Allocating %d rotated framebuffers: %d bytes each", NUM_ROTATE_BUFFERS, (int)fb_rot_size);
 
-	uint16_t *fb_rotated = heap_caps_aligned_alloc(64, fb_rot_size,
-	                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-	if (!fb_rotated) {
-		ESP_LOGE(TAG, "Failed to allocate rotated framebuffer");
-		vTaskDelete(NULL);
-		return;
+	for (int i = 0; i < NUM_ROTATE_BUFFERS; i++) {
+		fb_rotated_buffers[i] = heap_caps_aligned_alloc(64, fb_rot_size,
+		                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+		if (!fb_rotated_buffers[i]) {
+			ESP_LOGE(TAG, "Failed to allocate rotated framebuffer %d", i);
+			vTaskDelete(NULL);
+			return;
+		}
+		memset(fb_rotated_buffers[i], 0, fb_rot_size);
+		ESP_LOGI(TAG, "Rotated framebuffer[%d] at %p (ext=%d)", i,
+		         fb_rotated_buffers[i], esp_ptr_external_ram(fb_rotated_buffers[i]));
 	}
-	memset(fb_rotated, 0, fb_rot_size);
-	globals.fb_rotated = fb_rotated;
+	globals.fb_rotated = fb_rotated_buffers[0];
 
-	ESP_LOGI(TAG, "Rotated framebuffer at %p (ext=%d)", fb_rotated, esp_ptr_external_ram(fb_rotated));
+	// 2. Reset display before BSP init to ensure clean state
+	// (Launcher may have left MIPI DSI in unknown state)
+	#define LCD_RESET_PIN 14
+	gpio_config_t reset_conf = {
+		.pin_bit_mask = (1ULL << LCD_RESET_PIN),
+		.mode = GPIO_MODE_OUTPUT,
+	};
+	gpio_config(&reset_conf);
+	gpio_set_level(LCD_RESET_PIN, 0);  // Assert reset
+	vTaskDelay(pdMS_TO_TICKS(10));
+	gpio_set_level(LCD_RESET_PIN, 1);  // Release reset
+	vTaskDelay(pdMS_TO_TICKS(50));     // Wait for display to stabilize
+	ESP_LOGI(TAG, "Display reset complete");
 
-	// 2. Initialize BSP (display, input, audio, etc.)
+	// 3. Initialize BSP (display, input, audio, etc.)
 	bsp_configuration_t bsp_config = {
 		.display = {
 			.requested_color_format = LCD_COLOR_PIXEL_FORMAT_RGB565,
-			.num_fbs = 2,
+			.num_fbs = 1,  // Single FB to reduce init time
 		},
 	};
+	ESP_LOGI(TAG, "Calling bsp_device_initialize...");
+	uint32_t t0 = esp_log_timestamp();
 	ESP_ERROR_CHECK(bsp_device_initialize(&bsp_config));
+	ESP_LOGI(TAG, "bsp_device_initialize took %lu ms", esp_log_timestamp() - t0);
 
 	// Get the display panel handle
 	esp_lcd_panel_handle_t panel = NULL;
+	t0 = esp_log_timestamp();
 	ESP_ERROR_CHECK(bsp_display_get_panel(&panel));
+	ESP_LOGI(TAG, "bsp_display_get_panel took %lu ms", esp_log_timestamp() - t0);
 
 	// Set backlight brightness
+	t0 = esp_log_timestamp();
 	ESP_ERROR_CHECK(bsp_display_set_backlight_brightness(30));
+	ESP_LOGI(TAG, "bsp_display_set_backlight_brightness took %lu ms", esp_log_timestamp() - t0);
 
 	// Get display parameters for debugging
 	size_t h_res, v_res;
@@ -284,9 +316,19 @@ void vga_task(void *arg)
 		// Step the VGA emulator (this calls the redraw callback internally)
 		pc_vga_step(globals.pc);
 
-		// Rotate and blit the full framebuffer to display
+		// Render OSD overlay if enabled
+		if (globals.osd_enabled && globals.osd && globals.fb) {
+			osd_render(globals.osd, (uint8_t *)globals.fb,
+				   vga_width, vga_height,
+				   vga_width * sizeof(uint16_t));
+		}
+
+		// Rotate and blit using alternating buffers (lock-free double buffering)
 		if (globals.fb) {
-			rotate_and_blit((uint16_t *)globals.fb, fb_rotated);
+			int write_idx = atomic_load(&rotate_write_idx);
+			rotate_and_blit((uint16_t *)globals.fb, fb_rotated_buffers[write_idx]);
+			// Swap to next buffer for next frame
+			atomic_store(&rotate_write_idx, (write_idx + 1) % NUM_ROTATE_BUFFERS);
 		}
 
 		vTaskDelay(10 / portTICK_PERIOD_MS);

@@ -1,6 +1,7 @@
 // requires esp-idf v5.5.x and badge-bsp
 #define BUILD_ESP32
 #define USE_BADGE_BSP
+#define TANMATSU_BUILD  // Guards for Tanmatsu-specific features in core code
 
 // PSRAM pool for emulator - leave room for BSP framebuffers (~1.5MB)
 // User's SD card ini may specify up to 24MB mem_size
