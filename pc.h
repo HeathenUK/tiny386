@@ -82,6 +82,8 @@ typedef struct {
 	const char *cmdline;
 	int enable_serial;
 	int full_update;
+
+	const char *ini_path;  // Path to ini file for saving settings
 } PC;
 
 typedef struct {
@@ -103,10 +105,13 @@ typedef struct {
 	int fpu;
 	int enable_serial;
 	int vga_force_8dm;
+	int boot_order;  // 0=HDD, 1=Floppy, 2=CD (see misc.h BOOT_ORDER_*)
+	const char *ini_path;  // Path to ini file for saving settings
 } PCConfig;
 
 PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	   u8 *fb, PCConfig *conf);
+void pc_reset(PC *pc);
 
 // XXX: still contains ESP32-specific logic
 void pc_vga_step(void *o);

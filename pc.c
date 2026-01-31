@@ -642,6 +642,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	pc->kernel = conf->kernel;
 	pc->initrd = conf->initrd;
 	pc->cmdline = conf->cmdline;
+	pc->ini_path = conf->ini_path;
 	pc->enable_serial = conf->enable_serial;
 #if !defined(_WIN32) && !defined(__wasm__)
 	if (pc->enable_serial)
@@ -680,6 +681,9 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 
 	if (conf->fill_cmos)
 		ide_fill_cmos(pc->ide, pc->cmos, cmos_set);
+
+	// Set boot order from config (default: HDD first) - can be changed via OSD
+	cmos_set_boot_order(pc->cmos, conf->boot_order);
 
 	int piix3_devfn;
 	pc->i440fx = i440fx_init(&pc->pcibus, &piix3_devfn);
@@ -820,6 +824,14 @@ void load_bios_and_reset(PC *pc)
 #endif
 }
 
+void pc_reset(PC *pc)
+{
+	// Clear conventional memory (0-640KB) but preserve video/BIOS areas
+	memset(pc->phys_mem, 0, 0xa0000);
+	// Reload BIOS and reset CPU
+	load_bios_and_reset(pc);
+}
+
 static long parse_mem_size(const char *value)
 {
 	int len = strlen(value);
@@ -891,6 +903,29 @@ int parse_conf_ini(void* user, const char* section,
 			conf->enable_serial = atoi(value);
 		} else if (NAME("vga_force_8dm")) {
 			conf->vga_force_8dm = atoi(value);
+		} else if (NAME("boot_order")) {
+			// Index 0-5 or name like "hdd,floppy,cd"
+#ifdef BUILD_ESP32
+			printf("INI: boot_order value='%s'\n", value);
+#endif
+			int idx = atoi(value);
+			if (idx >= 0 && idx < BOOT_ORDER_COUNT && value[0] >= '0' && value[0] <= '9') {
+				conf->boot_order = idx;
+#ifdef BUILD_ESP32
+				printf("INI: boot_order parsed as index %d\n", idx);
+#endif
+			} else {
+				// Try to match by name
+				for (int i = 0; i < BOOT_ORDER_COUNT; i++) {
+					if (strcasecmp(value, boot_order_names[i]) == 0) {
+						conf->boot_order = i;
+#ifdef BUILD_ESP32
+						printf("INI: boot_order matched name '%s' -> %d\n", boot_order_names[i], i);
+#endif
+						break;
+					}
+				}
+			}
 		}
 	} else if (SEC("display")) {
 		if (NAME("width")) {

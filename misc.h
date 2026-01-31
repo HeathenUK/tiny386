@@ -18,10 +18,29 @@ void cmos_ioport_write(CMOS *cmos, int addr, uint8_t val);
 
 uint8_t cmos_set(void *cmos, int addr, uint8_t val);
 
+// Boot order presets (indexes into boot_orders array)
+// Each is a 3-device sequence: {first, second, third}
+// Device codes: 1=Floppy, 2=HDD, 3=CD
+#define BOOT_ORDER_COUNT 6
+extern const int boot_orders[BOOT_ORDER_COUNT][3];
+extern const char *boot_order_names[BOOT_ORDER_COUNT];
+
+void cmos_set_boot_order(CMOS *cmos, int order_index);
+int cmos_get_boot_order(CMOS *cmos);
+
+// Save all settings to ini file
+int save_settings_to_ini(const char *ini_path, int boot_order,
+                         const char *fda, const char *fdb,
+                         const char *cda, const char *cdb,
+                         const char *cdc, const char *cdd);
+
 typedef struct EMULINK EMULINK;
 EMULINK *emulink_init();
 
 int emulink_attach_floppy(EMULINK *e, int i, const char *filename);
+#ifdef TANMATSU_BUILD
+const char *emulink_get_floppy_path(EMULINK *e, int i);
+#endif
 uint32_t emulink_status_read(void *s);
 void emulink_cmd_write(void *s, uint32_t val);
 void emulink_data_write(void *s, uint32_t val);

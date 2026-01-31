@@ -369,6 +369,181 @@ uint8_t cmos_set(void *cmos, int addr, uint8_t val)
 	return val;
 }
 
+// SeaBIOS boot device codes: 1=floppy, 2=HDD, 3=CD-ROM
+// CMOS 0x38: bit 0 = enable extended boot order, bits 4-7 = 3rd device
+// CMOS 0x3d: bits 0-3 = 1st device, bits 4-7 = 2nd device
+
+// All permutations of boot order
+const int boot_orders[BOOT_ORDER_COUNT][3] = {
+	{2, 1, 3},  // HDD, Floppy, CD
+	{2, 3, 1},  // HDD, CD, Floppy
+	{1, 2, 3},  // Floppy, HDD, CD
+	{1, 3, 2},  // Floppy, CD, HDD
+	{3, 2, 1},  // CD, HDD, Floppy
+	{3, 1, 2},  // CD, Floppy, HDD
+};
+
+const char *boot_order_names[BOOT_ORDER_COUNT] = {
+	"HDD, Floppy, CD",
+	"HDD, CD, Floppy",
+	"Floppy, HDD, CD",
+	"Floppy, CD, HDD",
+	"CD, HDD, Floppy",
+	"CD, Floppy, HDD",
+};
+
+void cmos_set_boot_order(CMOS *cmos, int order_index)
+{
+	if (order_index < 0 || order_index >= BOOT_ORDER_COUNT)
+		order_index = 0;
+
+	const int *order = boot_orders[order_index];
+	// CMOS 0x3d: low nibble = 1st, high nibble = 2nd
+	uint8_t reg_3d = (order[0] & 0xf) | ((order[1] & 0xf) << 4);
+	// CMOS 0x38: bit 0 = enable, high nibble = 3rd device
+	uint8_t reg_38 = 0x01 | ((order[2] & 0xf) << 4);
+
+	cmos_set(cmos, 0x38, reg_38);
+	cmos_set(cmos, 0x3d, reg_3d);
+}
+
+int cmos_get_boot_order(CMOS *cmos)
+{
+	uint8_t reg_3d = cmos->data[0x3d];
+	uint8_t reg_38 = cmos->data[0x38];
+
+	int dev1 = reg_3d & 0xf;
+	int dev2 = (reg_3d >> 4) & 0xf;
+	int dev3 = (reg_38 >> 4) & 0xf;
+
+	// Find matching preset
+	for (int i = 0; i < BOOT_ORDER_COUNT; i++) {
+		if (boot_orders[i][0] == dev1 &&
+		    boot_orders[i][1] == dev2 &&
+		    boot_orders[i][2] == dev3)
+			return i;
+	}
+	return 0;  // Default to first preset
+}
+
+// Helper to check if a line starts with a key
+static int line_starts_with(const char *line, const char *key)
+{
+	size_t len = strlen(key);
+	return strncmp(line, key, len) == 0 && (line[len] == ' ' || line[len] == '=');
+}
+
+// Save all settings to ini file
+int save_settings_to_ini(const char *ini_path, int boot_order,
+                         const char *fda, const char *fdb,
+                         const char *cda, const char *cdb,
+                         const char *cdc, const char *cdd)
+{
+	if (!ini_path) return -1;
+	if (boot_order < 0 || boot_order >= BOOT_ORDER_COUNT)
+		boot_order = 0;
+
+	// Read existing file
+	FILE *f = fopen(ini_path, "r");
+	if (!f) return -1;
+
+	// Read all lines into memory (heap allocated to avoid stack overflow)
+	char (*lines)[256] = malloc(64 * 256);
+	if (!lines) {
+		fclose(f);
+		return -1;
+	}
+	int line_count = 0;
+	int in_pc_section = 0;
+	int pc_section_end = -1;
+
+	// Track which settings we found
+	int found_boot_order = -1, found_fda = -1, found_fdb = -1;
+	int found_cda = -1, found_cdb = -1, found_cdc = -1, found_cdd = -1;
+
+	while (line_count < 64 && fgets(lines[line_count], 256, f)) {
+		// Check for [pc] section
+		if (strncmp(lines[line_count], "[pc]", 4) == 0) {
+			in_pc_section = 1;
+		} else if (lines[line_count][0] == '[') {
+			if (in_pc_section && pc_section_end < 0) {
+				pc_section_end = line_count;
+			}
+			in_pc_section = 0;
+		}
+
+		// Check for existing settings in [pc] section
+		if (in_pc_section) {
+			if (line_starts_with(lines[line_count], "boot_order")) found_boot_order = line_count;
+			else if (line_starts_with(lines[line_count], "fda")) found_fda = line_count;
+			else if (line_starts_with(lines[line_count], "fdb")) found_fdb = line_count;
+			else if (line_starts_with(lines[line_count], "cda")) found_cda = line_count;
+			else if (line_starts_with(lines[line_count], "cdb")) found_cdb = line_count;
+			else if (line_starts_with(lines[line_count], "cdc")) found_cdc = line_count;
+			else if (line_starts_with(lines[line_count], "cdd")) found_cdd = line_count;
+		}
+
+		line_count++;
+	}
+	fclose(f);
+
+	// If no [pc] section end found, it goes to end of file
+	if (in_pc_section && pc_section_end < 0) {
+		pc_section_end = line_count;
+	}
+
+	// Write back with updated settings
+	f = fopen(ini_path, "w");
+	if (!f) {
+		free(lines);
+		return -1;
+	}
+
+	for (int i = 0; i < line_count; i++) {
+		// Replace existing lines
+		if (i == found_boot_order) {
+			fprintf(f, "boot_order = %s\n", boot_order_names[boot_order]);
+		} else if (i == found_fda) {
+			if (fda && fda[0]) fprintf(f, "fda = %s\n", fda);
+			// else skip line (remove setting)
+		} else if (i == found_fdb) {
+			if (fdb && fdb[0]) fprintf(f, "fdb = %s\n", fdb);
+		} else if (i == found_cda) {
+			if (cda && cda[0]) fprintf(f, "cda = %s\n", cda);
+		} else if (i == found_cdb) {
+			if (cdb && cdb[0]) fprintf(f, "cdb = %s\n", cdb);
+		} else if (i == found_cdc) {
+			if (cdc && cdc[0]) fprintf(f, "cdc = %s\n", cdc);
+		} else if (i == found_cdd) {
+			if (cdd && cdd[0]) fprintf(f, "cdd = %s\n", cdd);
+		} else {
+			fputs(lines[i], f);
+		}
+
+		// Add new settings at end of [pc] section
+		if (i == pc_section_end - 1) {
+			if (found_boot_order < 0)
+				fprintf(f, "boot_order = %s\n", boot_order_names[boot_order]);
+			if (found_fda < 0 && fda && fda[0])
+				fprintf(f, "fda = %s\n", fda);
+			if (found_fdb < 0 && fdb && fdb[0])
+				fprintf(f, "fdb = %s\n", fdb);
+			if (found_cda < 0 && cda && cda[0])
+				fprintf(f, "cda = %s\n", cda);
+			if (found_cdb < 0 && cdb && cdb[0])
+				fprintf(f, "cdb = %s\n", cdb);
+			if (found_cdc < 0 && cdc && cdc[0])
+				fprintf(f, "cdc = %s\n", cdc);
+			if (found_cdd < 0 && cdd && cdd[0])
+				fprintf(f, "cdd = %s\n", cdd);
+		}
+	}
+
+	fclose(f);
+	free(lines);
+	return 0;
+}
+
 struct fdfmt {
 	uint8_t sectors;
 	uint8_t tracks;
@@ -428,6 +603,9 @@ struct EMULINK {
 	// fake floppy drive
 	FILE *fdd[2];
 	int fdfmti[2];
+#ifdef TANMATSU_BUILD
+	char fdd_path[2][256];  // Store filenames for OSD display
+#endif
 };
 
 EMULINK *emulink_init()
@@ -445,8 +623,18 @@ int emulink_attach_floppy(EMULINK *e, int i, const char *filename)
 			fclose(e->fdd[i]);
 			e->fdd[i] = NULL;
 		}
-		if (filename)
+#ifdef TANMATSU_BUILD
+		e->fdd_path[i][0] = '\0';
+#endif
+		if (filename) {
 			e->fdd[i] = fopen(filename, "r+b");
+#ifdef TANMATSU_BUILD
+			if (e->fdd[i]) {
+				strncpy(e->fdd_path[i], filename, sizeof(e->fdd_path[i]) - 1);
+				e->fdd_path[i][sizeof(e->fdd_path[i]) - 1] = '\0';
+			}
+#endif
+		}
 		if (!e->fdd[i])
 			return -1;
 		fseek(e->fdd[i], 0, SEEK_END);
@@ -463,6 +651,15 @@ int emulink_attach_floppy(EMULINK *e, int i, const char *filename)
 	return 0;
 }
 
+#ifdef TANMATSU_BUILD
+const char *emulink_get_floppy_path(EMULINK *e, int i)
+{
+	if (i >= 0 && i < 2)
+		return e->fdd_path[i];
+	return NULL;
+}
+#endif
+
 uint32_t emulink_status_read(void *s)
 {
 	EMULINK *e = s;
@@ -477,11 +674,10 @@ static void exec_cmd(EMULINK *e)
 		e->cmd = -1;
 		break;
 	case 0x100:
-		e->status = 0;
-		if (e->fdd[0])
-			e->status |= 0x40;
-		if (e->fdd[1])
-			e->status |= 0x04;
+		// Always report floppy drives as present (even if no disk mounted)
+		// This allows hot-mounting floppies at runtime via OSD
+		// Bit 0x40 = drive 0 present, Bit 0x04 = drive 1 present
+		e->status = 0x40 | 0x04;
 		e->cmd = -1;
 		break;
 	case 0x101:
