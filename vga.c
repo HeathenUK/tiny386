@@ -47,6 +47,74 @@ void *pcmalloc(long size);
 //#define DEBUG_VBE
 //#define DEBUG_VGA_REG
 
+/*
+ * Planar expansion lookup table for EGA/VGA 16-color modes.
+ * For each byte value (0-255), provides the 8 individual bits (MSB first).
+ * planar_expand[byte][bit_idx] = (byte >> (7 - bit_idx)) & 1
+ *
+ * This replaces expensive per-pixel bit shifting with a simple table lookup,
+ * dramatically improving EGA mode rendering performance.
+ */
+static const uint8_t planar_expand[256][8] = {
+#define PE(n) {((n)>>7)&1,((n)>>6)&1,((n)>>5)&1,((n)>>4)&1,((n)>>3)&1,((n)>>2)&1,((n)>>1)&1,(n)&1}
+#define PE4(n) PE(n),PE(n+1),PE(n+2),PE(n+3)
+#define PE16(n) PE4(n),PE4(n+4),PE4(n+8),PE4(n+12)
+#define PE64(n) PE16(n),PE16(n+16),PE16(n+32),PE16(n+48)
+    PE64(0), PE64(64), PE64(128), PE64(192)
+#undef PE
+#undef PE4
+#undef PE16
+#undef PE64
+};
+
+/*
+ * Two-plane combine tables for even faster EGA rendering.
+ * Pre-combines pairs of planes: planes 0+1 and planes 2+3.
+ * planar_combine_XX[p_lo][p_hi][bit] gives 2 bits of the palette index.
+ *
+ * Size: 256 * 256 * 8 = 512KB per table, 1MB total.
+ * Allocated in PSRAM on ESP32, reduces 4 lookups to 2 per pixel.
+ */
+typedef uint8_t planar_combine_t[256][256][8];
+static planar_combine_t *planar_combine_01 = NULL;  /* planes 0,1 -> bits 0,1 */
+static planar_combine_t *planar_combine_23 = NULL;  /* planes 2,3 -> bits 2,3 (before shift) */
+
+/* Initialize the two-plane combine tables. Call once at startup. */
+void vga_init_planar_tables(void)
+{
+    if (planar_combine_01 != NULL)
+        return;  /* Already initialized */
+
+#ifdef BUILD_ESP32
+    extern void *psmalloc(long size);
+    planar_combine_01 = psmalloc(sizeof(planar_combine_t));
+    planar_combine_23 = psmalloc(sizeof(planar_combine_t));
+#else
+    planar_combine_01 = malloc(sizeof(planar_combine_t));
+    planar_combine_23 = malloc(sizeof(planar_combine_t));
+#endif
+
+    if (!planar_combine_01 || !planar_combine_23) {
+        /* Allocation failed - will fall back to simple table */
+        planar_combine_01 = NULL;
+        planar_combine_23 = NULL;
+        return;
+    }
+
+    /* Generate the combined tables */
+    for (int p_lo = 0; p_lo < 256; p_lo++) {
+        for (int p_hi = 0; p_hi < 256; p_hi++) {
+            for (int bit = 0; bit < 8; bit++) {
+                /* Combine two planes: bit from p_lo in position 0, bit from p_hi in position 1 */
+                (*planar_combine_01)[p_lo][p_hi][bit] =
+                    planar_expand[p_lo][bit] | (planar_expand[p_hi][bit] << 1);
+                (*planar_combine_23)[p_lo][p_hi][bit] =
+                    planar_expand[p_lo][bit] | (planar_expand[p_hi][bit] << 1);
+            }
+        }
+    }
+}
+
 #define MSR_COLOR_EMULATION 0x01
 #define MSR_PAGE_SELECT     0x20
 
@@ -100,6 +168,7 @@ struct VGAState {
     int cursor_visible_phase;
     uint32_t retrace_time;
     int retrace_phase;
+    int render_pending;  /* Set by 3DA polling optimization when V_RETRACE entered */
     int force_8dm;
 
     uint8_t *vga_ram;
@@ -907,6 +976,22 @@ static void vga_graphic_refresh(VGAState *s,
     h++;
 
     int shift_control = (s->gr[0x05] >> 5) & 3;
+
+    /* Detect mode changes and clear framebuffer to avoid leftover pixels */
+    static int last_w = 0, last_h = 0, last_sc = -1;
+    if (w != last_w || h != last_h || shift_control != last_sc) {
+        fprintf(stderr, "VGA: w=%d h=%d shift_ctrl=%d cr01=%02x cr13=%02x sr01=%02x gr05=%02x\n",
+                w, h, shift_control, s->cr[0x01], s->cr[0x13], s->sr[0x01], s->gr[0x05]);
+        /* Clear entire framebuffer on mode change to remove old frame remnants */
+        memset(fb_dev->fb_data, 0, fb_dev->stride * fb_dev->height);
+        last_w = w; last_h = h; last_sc = shift_control;
+    }
+
+    /* Debug timing for performance analysis */
+    static uint32_t frame_count = 0;
+    static uint32_t slow_frame_count = 0;
+    static uint32_t last_report = 0;
+    uint32_t t_start = get_uticks();
     int double_scan = (s->cr[0x09] >> 7);
     int multi_scan, multi_run;
     if (shift_control != 1) {
@@ -938,13 +1023,13 @@ static void vga_graphic_refresh(VGAState *s,
         update_palette16(s, palette);
         if (s->sr[0x01] & 8) {
             xdiv = 2;
-            if (shift_control == 1) // XXX
-                w *= 2;
+            w *= 2;
         }
     } else {
         if (!vbe_enabled(s)) {
             update_palette256(s, palette);
             xdiv = 2;
+            w *= 2;
             bpp = 8;
         } else {
             bpp = s->vbe_regs[VBE_DISPI_INDEX_BPP];
@@ -1012,15 +1097,54 @@ static void vga_graphic_refresh(VGAState *s,
         if (!(s->cr[0x17] & 2)) {
             addr = (addr & ~0x8000) | ((y1 & 2) << 14);
         }
+        /*
+         * Fast path for EGA planar modes - DISABLED for debugging
+         * TODO: Fix framebuffer indexing issues
+         */
+#if 0 && BPP == 16 && !defined(SCALE_3_2) && !defined(SWAPXY)
+        if (shift_control == 0 && planar_combine_01) {
+            /* ... disabled ... */
+        }
+#endif
+        /* Cache for EGA planar mode - pre-compute all 8 colors when VRAM changes */
+        uint32_t cached_byte_addr = ~0u;
+        uint32_t cached_colors[8];  /* Pre-computed RGB colors for 8 source pixels */
         for (int x = 0; x < w; x++) {
             int x1 = x / xdiv;
             uint32_t color;
             if (shift_control == 0) {
-                int k = ((vram[addr + 4 * (x1 >> 3)] >> (7 - (x1 & 7))) & 1) << 0;
-                k |= ((vram[addr + 4 * (x1 >> 3) + 1] >> (7 - (x1 & 7))) & 1) << 1;
-                k |= ((vram[addr + 4 * (x1 >> 3) + 2] >> (7 - (x1 & 7))) & 1) << 2;
-                k |= ((vram[addr + 4 * (x1 >> 3) + 3] >> (7 - (x1 & 7))) & 1) << 3;
-                color = palette[k];
+                /* EGA 16-color planar mode - use lookup tables for fast bit extraction */
+                uint32_t byte_addr = addr + 4 * (x1 >> 3);
+                int bit = x1 & 7;
+                /* Pre-compute all 8 colors when byte address changes */
+                if (byte_addr != cached_byte_addr) {
+                    cached_byte_addr = byte_addr;
+                    uint8_t v0 = vram[byte_addr];
+                    uint8_t v1 = vram[byte_addr + 1];
+                    uint8_t v2 = vram[byte_addr + 2];
+                    uint8_t v3 = vram[byte_addr + 3];
+                    if (planar_combine_01) {
+                        /* Fast path: two-plane combined tables (2 lookups per pixel) */
+                        const uint8_t *p01 = (*planar_combine_01)[v0][v1];
+                        const uint8_t *p23 = (*planar_combine_23)[v2][v3];
+                        for (int i = 0; i < 8; i++) {
+                            int k = p01[i] | (p23[i] << 2);
+                            cached_colors[i] = palette[k];
+                        }
+                    } else {
+                        /* Fallback: simple expansion tables (4 lookups per pixel) */
+                        const uint8_t *p0 = planar_expand[v0];
+                        const uint8_t *p1 = planar_expand[v1];
+                        const uint8_t *p2 = planar_expand[v2];
+                        const uint8_t *p3 = planar_expand[v3];
+                        for (int i = 0; i < 8; i++) {
+                            int k = p0[i] | (p1[i] << 1) | (p2[i] << 2) | (p3[i] << 3);
+                            cached_colors[i] = palette[k];
+                        }
+                    }
+                }
+                /* Hot path: just index into pre-computed colors - no table lookups! */
+                color = cached_colors[bit];
             } else if (shift_control == 1) {
                 int k = ((vram[addr + 4 * (x1 >> 3) + ((x1 & 4) >> 2)] >>
                           (6 - 2 * (x1 & 3))) & 3);
@@ -1119,6 +1243,7 @@ static void vga_graphic_refresh(VGAState *s,
 #error "bad bpp"
 #endif
         }
+/* next_line: label removed - fast path disabled */
         if (!multi_run) {
             int mask = (s->cr[0x17] & 3) ^ 3;
             if ((y1 & mask) == mask)
@@ -1148,6 +1273,24 @@ static void vga_graphic_refresh(VGAState *s,
         }
 #endif
     }
+
+    /* Debug timing report */
+    uint32_t t_end = get_uticks();
+    uint32_t elapsed = t_end - t_start;
+    frame_count++;
+    if (elapsed > 50000) {  /* > 50ms is slow */
+        slow_frame_count++;
+    }
+    if (t_end - last_report > 5000000) {  /* Report every 5 seconds */
+        if (slow_frame_count > 0) {
+            fprintf(stderr, "VGA perf: %u frames, %u slow (>50ms), last=%uus, w=%d h=%d sc=%d\n",
+                    frame_count, slow_frame_count, elapsed, w, h, shift_control);
+        }
+        frame_count = 0;
+        slow_frame_count = 0;
+        last_report = t_end;
+    }
+
     redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
 }
 
@@ -1161,6 +1304,13 @@ int vga_step(VGAState *s)
 {
     uint32_t now = get_uticks();
     int ret = 0;
+
+    /* Check if 3DA polling optimization already triggered a render */
+    if (s->render_pending) {
+        s->render_pending = 0;
+        ret = 1;
+    }
+
     if (after_eq(now, s->retrace_time)) {
         if (s->retrace_phase == 0) {
             s->st01 |= ST01_DISP_ENABLE;
@@ -1322,10 +1472,80 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
             break;
         case 0x3ba:
         case 0x3da:
-            /* just toggle to fool polling */
-//            s->st01 ^= ST01_V_RETRACE | ST01_DISP_ENABLE;
+            /* Retrace status register - with polling optimization */
             val = s->st01;
             s->ar_flip_flop = 0;
+            /*
+             * Polling optimization: DOS games poll 0x3DA in tight loops.
+             * We detect rapid consecutive polls and fast-forward the state
+             * machine, but only during actual tight loops (polls <20us apart).
+             */
+            {
+                static uint32_t poll_count = 0;
+                static uint32_t last_poll_report = 0;
+                static uint32_t last_poll_time = 0;
+                static uint32_t rapid_poll_count = 0;
+                uint32_t now = get_uticks();
+                poll_count++;
+
+                /* Detect tight polling loop: polls within 20us of each other */
+                if (now - last_poll_time < 20) {
+                    rapid_poll_count++;
+                } else {
+                    rapid_poll_count = 0;  /* Gap detected, reset */
+                }
+                last_poll_time = now;
+
+                /*
+                 * Fast-forward logic: Only if we're in a tight polling loop
+                 * (500+ rapid consecutive polls = ~10ms of tight polling)
+                 * AND in display period (phase 0), skip to retrace.
+                 */
+#ifdef BUILD_ESP32
+                const uint32_t rapid_threshold = 500;
+#else
+                const uint32_t rapid_threshold = 2000;
+#endif
+                int should_advance = after_eq(now, s->retrace_time);
+
+                /* Fast-forward from display period if polling heavily */
+                if (!should_advance && rapid_poll_count > rapid_threshold &&
+                    s->retrace_phase == 0) {
+                    should_advance = 1;
+                }
+
+                if (should_advance) {
+                    rapid_poll_count = 0;
+                    if (s->retrace_phase == 0) {
+                        s->st01 |= ST01_DISP_ENABLE;
+                        s->retrace_phase = 1;
+                        s->retrace_time = now + 833;
+                    } else if (s->retrace_phase == 1) {
+                        s->st01 |= ST01_V_RETRACE;
+                        s->retrace_phase = 2;
+                        s->retrace_time = now + 833;
+                        s->render_pending = 1;  /* Signal vga_step to trigger render */
+                    } else {
+                        s->st01 &= ~(ST01_V_RETRACE | ST01_DISP_ENABLE);
+                        s->retrace_phase = 0;
+#ifdef BUILD_ESP32
+                        s->retrace_time = now + 15000/3;
+#else
+                        s->retrace_time = now + 15000;
+#endif
+                    }
+                    val = s->st01;
+                }
+
+                /* Debug report */
+                if (now - last_poll_report > 1000000) {
+                    if (poll_count > 1000) {
+                        fprintf(stderr, "VGA: 3DA polled %u/sec st01=%02x\n", poll_count, val);
+                    }
+                    poll_count = 0;
+                    last_poll_report = now;
+                }
+            }
             break;
         default:
             val = 0x00;
@@ -1980,6 +2200,9 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
                    uint8_t *fb, int width, int height)
 {
     VGAState *s;
+
+    /* Initialize planar lookup tables (1MB in PSRAM for fast EGA rendering) */
+    vga_init_planar_tables();
 
     s = pcmalloc(sizeof(*s));
     memset(s, 0, sizeof(*s));
