@@ -1,0 +1,17 @@
+--- a/stub/badge_bsp_device.c
++++ b/stub/badge_bsp_device.c
+@@ -38,12 +38,14 @@ bool __attribute__((weak)) bsp_device_get_initialized_without_coprocessor(void)
+
+ void __attribute__((weak)) bsp_device_restart_to_launcher(void) {
+     // This function is common to all supported devices, but it can still be overridden if needed
++#if CONFIG_IDF_TARGET_ESP32
++    // RTC retain memory only available on ESP32, not on ESP32-P4
+     rtc_retain_mem_t* mem = bootloader_common_get_rtc_retain_mem();
+
+     // Remove the magic value set by the launcher to invalidated appfs bootloader struct
+     memset(mem->custom, 0, sizeof(uint64_t));
+-
++#endif
+     // Restart the device
+     esp_restart();
+ }

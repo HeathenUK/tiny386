@@ -1,0 +1,38 @@
+# Tanmatsu (ESP32-P4 with badge-bsp) configuration
+# Matching trackmatsu sdkconfig for PSRAM compatibility
+CONFIG_IDF_TARGET="esp32p4"
+
+# Select Tanmatsu as the BSP target
+CONFIG_BSP_TARGET_TANMATSU=y
+
+# Flash configuration
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# PSRAM configuration - match trackmatsu exactly
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=256
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# Experimental features needed for ESP32-P4
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# Disable PSRAM memory protection pre-configuration
+# (This may be causing the address mismatch between heap and tracking)
+CONFIG_SPIRAM_PRE_CONFIGURE_MEMORY_PROTECTION=n
+
+# USB console
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Power management
+CONFIG_PM_ENABLE=y
+CONFIG_PM_DFS_INIT_AUTO=y
+
+# FAT filesystem
+CONFIG_FATFS_VOLUME_COUNT=3
+
+# Flash support
+CONFIG_SPI_FLASH_SUPPORT_WINBOND_CHIP=y

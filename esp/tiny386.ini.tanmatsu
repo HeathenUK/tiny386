@@ -1,0 +1,47 @@
+[esp]
+; Tanmatsu has a physical keyboard - no WiFi needed for input
+ssid =
+pass =
+
+[pc]
+; /sdcard is the root directory of SD card
+bios = /sdcard/bios.bin
+vga_bios = /sdcard/vgabios.bin
+
+; Tanmatsu has 32MB PSRAM - use 24MB for emulated RAM
+; This is enough for Windows 98 SE, Windows NT 4.0, or Windows 2000
+mem_size = 24M
+
+; 2MB VGA memory for higher resolution modes
+vga_mem_size = 2M
+
+; Disk images - adjust paths as needed
+; hda = /sdcard/win98.img
+; hda = /sdcard/winnt4.img
+hda = /sdcard/disk.img
+
+; CD-ROM support
+; cda = /sdcard/install.iso
+
+; Floppy support
+; fda = /sdcard/boot.img
+
+; CMOS settings:
+; fill_cmos = 1 for Windows 95/98/ME
+; fill_cmos = 0 for Windows NT/2000/XP
+fill_cmos = 1
+
+[display]
+; Tanmatsu display is 800x480
+; VGA output will be scaled/centered as needed
+width = 720
+height = 480
+
+[cpu]
+; CPU generation: 3=386, 4=486, 5=Pentium
+; Pentium enables more instructions and better compatibility
+gen = 5
+
+; Enable FPU for floating-point support
+; Required for many Windows applications and games
+fpu = 1

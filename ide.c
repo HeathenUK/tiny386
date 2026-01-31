@@ -2022,7 +2022,7 @@ static BlockDevice *block_device_init(const char *filename,
     f = fopen(filename, mode_str);
     if (!f) {
         perror(filename);
-        exit(1);
+        return NULL;
     }
     char buf[8];
     int start_offset = 0;
@@ -2170,6 +2170,9 @@ int ide_attach(IDEIFState *s, int drive, const char *filename)
 #else
     BlockDevice *bs = block_device_init(filename, BF_MODE_RW);
 #endif
+    if (!bs) {
+        return -1;
+    }
     s->drives[drive] = ide_hddrive_init(s, bs);
     return 0;
 }
@@ -2178,6 +2181,9 @@ int ide_attach_cd(IDEIFState *s, int drive, const char *filename)
 {
     assert(MAX_MULT_SECTORS >= 4);
     BlockDevice *bs = block_device_init(filename, BF_MODE_RO);
+    if (!bs) {
+        return -1;
+    }
     s->drives[drive] = ide_cddrive_init(s, bs);
     return 0;
 }

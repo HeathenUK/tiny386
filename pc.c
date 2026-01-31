@@ -716,7 +716,9 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 			continue;
 		int ret;
 		ret = emulink_attach_floppy(pc->emulink, i, fdd[i]);
-		assert(ret == 0);
+		if (ret != 0) {
+			fprintf(stderr, "Warning: failed to attach floppy %d: %s\n", i, fdd[i]);
+		}
 	}
 
 	cb->iomem = pc;

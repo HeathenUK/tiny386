@@ -95,7 +95,13 @@ Console *console_init(int width, int height)
 {
 	Console *c = malloc(sizeof(Console));
 	c->fb1 = fbmalloc(LCD_WIDTH * LCD_HEIGHT / NN * 2);
+#ifdef USE_LCD_BSP
+	// For BSP backend, fb is allocated in vga_task after BSP init
+	// This ensures esp_ptr_external_ram() works for PPA
+	c->fb = globals.fb;
+#else
 	c->fb = bigmalloc(LCD_WIDTH * LCD_HEIGHT * 2);
+#endif
 	return c;
 }
 
@@ -146,6 +152,7 @@ static int pc_main(const char *file)
 	globals.pc = pc;
 	globals.kbd = pc->kbd;
 	globals.mouse = pc->mouse;
+	globals.fb = console->fb;
 	xEventGroupSetBits(global_event_group, BIT0);
 
 	load_bios_and_reset(pc);
@@ -163,7 +170,17 @@ static const char *TAG = "esp_main";
 void *esp_psram_get(size_t *size);
 void vga_task(void *arg);
 void i2s_main();
+#ifdef USE_BADGE_BSP
+void input_bsp_init(void);
+
+// Override the weak stub implementation from badge-bsp that uses
+// incompatible bootloader_common_get_rtc_retain_mem() API on ESP32-P4
+void bsp_device_restart_to_launcher(void) {
+    esp_restart();
+}
+#else
 void wifi_main(const char *, const char *);
+#endif
 void storage_init(void);
 
 struct esp_ini_config {
@@ -177,6 +194,17 @@ static void i386_task(void *arg)
 	struct esp_ini_config *config = arg;
 	int core_id = esp_cpu_get_core_id();
 	fprintf(stderr, "main runs on core %d\n", core_id);
+
+#ifdef USE_LCD_BSP
+	// Wait for display to be ready (vga_task allocates fb after BSP init)
+	xEventGroupWaitBits(global_event_group,
+			    BIT1,
+			    pdFALSE,
+			    pdFALSE,
+			    portMAX_DELAY);
+	fprintf(stderr, "Display ready, starting PC emulator\n");
+#endif
+
 	pc_main(config->filename);
 	vTaskDelete(NULL);
 }
@@ -273,12 +301,18 @@ void app_main(void)
 			break;
 		}
 	}
+#ifndef USE_BADGE_BSP
 	if (config.ssid[0]) {
 		wifi_main(config.ssid, config.pass);
 	}
+#endif
 
 	if (psram) {
 		xTaskCreatePinnedToCore(i386_task, "i386_main", 4096, &config, 3, NULL, 1);
 		xTaskCreatePinnedToCore(vga_task, "vga_task", 4096, NULL, 0, NULL, 0);
+#ifdef USE_BADGE_BSP
+		// Start input task after vga_task (which initializes BSP)
+		input_bsp_init();
+#endif
 	}
 }
