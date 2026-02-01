@@ -34,6 +34,9 @@
 
 #ifdef BUILD_ESP32
 #include "esp_attr.h"
+#ifdef TANMATSU_BUILD
+#include "common.h"
+#endif
 #else
 #define IRAM_ATTR
 #endif
@@ -42,6 +45,13 @@
 void *pcmalloc(long size);
 #else
 #define pcmalloc malloc
+#endif
+
+/* PIE (SIMD) functions for ESP32-P4 - defined in vga_pie.S */
+#if defined(BUILD_ESP32) && defined(CONFIG_IDF_TARGET_ESP32P4)
+extern void pie_write_8pixels(uint16_t *dst, uint16_t *colors);
+extern void pie_write_8pixels_doubled(uint16_t *dst, uint16_t *colors);
+extern void pie_memcpy_128(void *dst, const void *src, size_t n);
 #endif
 
 //#define DEBUG_VBE
@@ -79,6 +89,10 @@ typedef uint8_t planar_combine_t[256][256][8];
 static planar_combine_t *planar_combine_01 = NULL;  /* planes 0,1 -> bits 0,1 */
 static planar_combine_t *planar_combine_23 = NULL;  /* planes 2,3 -> bits 2,3 (before shift) */
 
+/* Debug flags for tracing fast path usage (reset on mode change) */
+static int ega_fast_logged = 0;
+static int vga256_fast_logged = 0;
+
 /* Initialize the two-plane combine tables. Call once at startup. */
 void vga_init_planar_tables(void)
 {
@@ -86,9 +100,12 @@ void vga_init_planar_tables(void)
         return;  /* Already initialized */
 
 #ifdef BUILD_ESP32
-    extern void *psmalloc(long size);
-    planar_combine_01 = psmalloc(sizeof(planar_combine_t));
-    planar_combine_23 = psmalloc(sizeof(planar_combine_t));
+    /* On ESP32, skip the 1MB planar_combine tables - the smaller 2KB
+     * planar_expand tables are faster due to cache effects (PSRAM is slow).
+     * This trades more ALU ops for fewer memory accesses. */
+    planar_combine_01 = NULL;
+    planar_combine_23 = NULL;
+    return;
 #else
     planar_combine_01 = malloc(sizeof(planar_combine_t));
     planar_combine_23 = malloc(sizeof(planar_combine_t));
@@ -170,6 +187,7 @@ struct VGAState {
     int retrace_phase;
     int render_pending;  /* Set by 3DA polling optimization when V_RETRACE entered */
     int force_8dm;
+    int force_graphic_clear;  /* Force clear when switching to graphics mode */
 
     uint8_t *vga_ram;
     int vga_ram_size;
@@ -194,6 +212,18 @@ struct VGAState {
     uint8_t dac_8bit;
     uint8_t dac_cache[3]; /* used when writing */
     uint8_t palette[768];
+    uint8_t palette_before_switch[768]; /* For mid-frame palette switching (top) */
+    uint8_t palette_after_switch[768];  /* For mid-frame palette switching (bottom) */
+    int palette_switch_scanline;        /* -1 if no switch, else scanline number */
+    uint32_t palette_generation;        /* Incremented on DAC writes for dirty tracking */
+    uint32_t palette_before_gen;        /* Generation of palette_before_switch */
+    uint32_t palette_after_gen;         /* Generation of palette_after_switch */
+    int hblank_poll_count;              /* Count of 0x3DA reads (hblank counting) */
+    /* Render snapshots - copied at start of render to avoid race conditions */
+    uint8_t palette_snapshot[768];
+    uint8_t palette_before_snapshot[768];
+    uint8_t palette_after_snapshot[768];
+    int palette_switch_snapshot;        /* Snapshot of palette_switch_scanline */
     int32_t bank_offset;
 
     uint32_t latch;
@@ -448,13 +478,13 @@ static int update_palette256(VGAState *s, uint32_t *palette)
     v = 0;
     for(i = 0; i < 256; i++) {
         if (s->dac_8bit) {
-          col = rgb_to_pixel(s->palette[v],
-                             s->palette[v + 1],
-                             s->palette[v + 2]);
+          col = rgb_to_pixel(s->palette_snapshot[v],
+                             s->palette_snapshot[v + 1],
+                             s->palette_snapshot[v + 2]);
         } else {
-          col = rgb_to_pixel(c6_to_8(s->palette[v]),
-                             c6_to_8(s->palette[v + 1]),
-                             c6_to_8(s->palette[v + 2]));
+          col = rgb_to_pixel(c6_to_8(s->palette_snapshot[v]),
+                             c6_to_8(s->palette_snapshot[v + 1]),
+                             c6_to_8(s->palette_snapshot[v + 2]));
         }
         if (col != palette[i]) {
             full_update = 1;
@@ -478,9 +508,9 @@ static int update_palette16(VGAState *s, uint32_t *palette)
         else
             v = ((s->ar[0x14] & 0xc) << 4) | (v & 0x3f);
         v = v * 3;
-        col = (c6_to_8(s->palette[v]) << 16) |
-            (c6_to_8(s->palette[v + 1]) << 8) |
-            c6_to_8(s->palette[v + 2]);
+        col = (c6_to_8(s->palette_snapshot[v]) << 16) |
+            (c6_to_8(s->palette_snapshot[v + 1]) << 8) |
+            c6_to_8(s->palette_snapshot[v + 2]);
         if (col != palette[i]) {
             full_update = 1;
             palette[i] = col;
@@ -498,13 +528,13 @@ static int update_palette256(VGAState *s, uint32_t *palette)
     v = 0;
     for(i = 0; i < 256; i++) {
         if (s->dac_8bit) {
-            col = ((s->palette[v + 2] >> 3)) |
-                ((s->palette[v + 1] >> 2) << 5) |
-                ((s->palette[v] >> 3) << 11);
+            col = ((s->palette_snapshot[v + 2] >> 3)) |
+                ((s->palette_snapshot[v + 1] >> 2) << 5) |
+                ((s->palette_snapshot[v] >> 3) << 11);
         } else {
-            col = (s->palette[v + 2] >> 1) |
-                ((s->palette[v + 1]) << 5) |
-                ((s->palette[v] >> 1) << 11);
+            col = (s->palette_snapshot[v + 2] >> 1) |
+                ((s->palette_snapshot[v + 1]) << 5) |
+                ((s->palette_snapshot[v] >> 1) << 11);
         }
         if (col != palette[i]) {
             full_update = 1;
@@ -528,9 +558,9 @@ static int update_palette16(VGAState *s, uint32_t *palette)
         else
             v = ((s->ar[0x14] & 0xc) << 4) | (v & 0x3f);
         v = v * 3;
-        col = (s->palette[v + 2] >> 1) |
-              ((s->palette[v + 1]) << 5) |
-              ((s->palette[v] >> 1) << 11);
+        col = (s->palette_snapshot[v + 2] >> 1) |
+              ((s->palette_snapshot[v + 1]) << 5) |
+              ((s->palette_snapshot[v] >> 1) << 11);
         if (col != palette[i]) {
             full_update = 1;
             palette[i] = col;
@@ -752,6 +782,9 @@ static void vga_text_refresh(VGAState *s,
         s->cursor_visible_phase = !s->cursor_visible_phase;
     }
 
+    /* Snapshot palette at render start to avoid race conditions */
+    memcpy(s->palette_snapshot, s->palette, 768);
+
     full_update = full_update || update_palette16(s, s->last_palette);
 
     vga_ram = s->vga_ram;
@@ -799,8 +832,18 @@ static void vga_text_refresh(VGAState *s,
     if (fb_dev->width < width1 || fb_dev->height < height1 ||
         width > MAX_TEXT_WIDTH || height > MAX_TEXT_HEIGHT)
         return; /* not enough space */
+#ifdef TANMATSU_BUILD
+    /* For Tanmatsu, render at 0,0 and let PPA handle scaling/centering.
+     * Text mode outputs at native resolution (no pixel doubling). */
+    x1 = 0;
+    y1 = 0;
+    globals.vga_mode_width = width1;
+    globals.vga_mode_height = height1;
+    globals.vga_pixel_double = 1;
+#else
     x1 = (fb_dev->width - width1) / 2;
     y1 = (fb_dev->height - height1) / 2;
+#endif
     int stride = fb_dev->stride;
 #endif
     if (s->last_line_offset != line_offset ||
@@ -969,6 +1012,27 @@ static void vga_graphic_refresh(VGAState *s,
                                 int full_update)
 {
     FBDevice *fb_dev = s->fb_dev;
+
+    /* Snapshot all palette data at render start to avoid race conditions
+     * with CPU core modifying palettes during render (palette animation).
+     * Use generation counters to skip copy when palettes haven't changed. */
+    static uint32_t last_palette_gen = 0;
+    static uint32_t last_before_gen = 0;
+    static uint32_t last_after_gen = 0;
+    if (s->palette_generation != last_palette_gen) {
+        memcpy(s->palette_snapshot, s->palette, 768);
+        last_palette_gen = s->palette_generation;
+    }
+    if (s->palette_before_gen != last_before_gen) {
+        memcpy(s->palette_before_snapshot, s->palette_before_switch, 768);
+        last_before_gen = s->palette_before_gen;
+    }
+    if (s->palette_after_gen != last_after_gen) {
+        memcpy(s->palette_after_snapshot, s->palette_after_switch, 768);
+        last_after_gen = s->palette_after_gen;
+    }
+    s->palette_switch_snapshot = s->palette_switch_scanline;
+
     int w = (s->cr[0x01] + 1) * 8;
     int h = s->cr[0x12] |
         ((s->cr[0x07] & 0x02) << 7) |
@@ -979,19 +1043,53 @@ static void vga_graphic_refresh(VGAState *s,
 
     /* Detect mode changes and clear framebuffer to avoid leftover pixels */
     static int last_w = 0, last_h = 0, last_sc = -1;
+    /* Force clear when transitioning from text/blank to graphics mode */
+    if (s->force_graphic_clear) {
+        last_w = last_h = 0;
+        last_sc = -1;
+        s->force_graphic_clear = 0;
+    }
     if (w != last_w || h != last_h || shift_control != last_sc) {
-        fprintf(stderr, "VGA: w=%d h=%d shift_ctrl=%d cr01=%02x cr13=%02x sr01=%02x gr05=%02x\n",
-                w, h, shift_control, s->cr[0x01], s->cr[0x13], s->sr[0x01], s->gr[0x05]);
+#ifdef DEBUG_VGA
+        fprintf(stderr, "VGA: w=%d h=%d shift_ctrl=%d cr01=%02x cr13=%02x sr01=%02x gr05=%02x ar10=%02x ar12=%02x\n",
+                w, h, shift_control, s->cr[0x01], s->cr[0x13], s->sr[0x01], s->gr[0x05],
+                s->ar[0x10], s->ar[0x12]);
+        /* Print AR palette (attribute controller palette mapping) */
+        fprintf(stderr, "VGA AR palette: ");
+        for (int i = 0; i < 16; i++)
+            fprintf(stderr, "%02x ", s->ar[i]);
+        fprintf(stderr, "\n");
+#endif
         /* Clear entire framebuffer on mode change to remove old frame remnants */
         memset(fb_dev->fb_data, 0, fb_dev->stride * fb_dev->height);
+        /* Reset mid-frame palette switching - new mode may not use it */
+        s->palette_switch_scanline = -1;
         last_w = w; last_h = h; last_sc = shift_control;
+        /* Reset fast path debug logging on mode change */
+        ega_fast_logged = 0;
+        vga256_fast_logged = 0;
+        fprintf(stderr, "VGA mode: %dx%d sc=%d xdiv=%d bpp=%d cr17=0x%02x\n",
+                w, h, shift_control, (s->sr[0x01] & 8) ? 2 : 1,
+                (shift_control >= 2) ? 8 : 4, s->cr[0x17]);
     }
 
+#ifdef DEBUG_VGA
     /* Debug timing for performance analysis */
     static uint32_t frame_count = 0;
     static uint32_t slow_frame_count = 0;
     static uint32_t last_report = 0;
+    static uint32_t last_palette_dump = 0;
     uint32_t t_start = get_uticks();
+
+    /* Periodic AR palette dump (every 5 seconds) to catch mid-session changes */
+    if (t_start - last_palette_dump > 5000000) {
+        fprintf(stderr, "VGA AR[0-15]: ");
+        for (int i = 0; i < 16; i++)
+            fprintf(stderr, "%02x ", s->ar[i]);
+        fprintf(stderr, "AR14=%02x\n", s->ar[0x14]);
+        last_palette_dump = t_start;
+    }
+#endif
     int double_scan = (s->cr[0x09] >> 7);
     int multi_scan, multi_run;
     if (shift_control != 1) {
@@ -1001,6 +1099,15 @@ static void vga_graphic_refresh(VGAState *s,
         /* XXX: is it correct ? */
         multi_scan = double_scan;
     }
+#ifdef TANMATSU_BUILD
+    /* For Tanmatsu 256-color modes, skip CPU vertical doubling - PPA will scale.
+     * This outputs native 200 lines instead of doubled 400 for mode 13h. */
+    int tanmatsu_vdouble = 0;
+    if (shift_control >= 2 && !vbe_enabled(s) && multi_scan > 0) {
+        tanmatsu_vdouble = multi_scan + 1;  /* Remember original for height calc */
+        multi_scan = 0;
+    }
+#endif
     multi_run = multi_scan;
 
     uint32_t start_addr = s->cr[0x0d] | (s->cr[0x0c] << 8);
@@ -1017,10 +1124,41 @@ static void vga_graphic_refresh(VGAState *s,
     uint32_t addr1 = 4 * start_addr;
     uint8_t *vram = s->vga_ram;
     uint32_t palette[256];
+    uint32_t palette_before[16];  /* For mid-frame palette switching (top) */
+    uint32_t palette_after[16];   /* For mid-frame palette switching (bottom) */
+    int palette_switch_line = -1; /* Only set if we build alternate palettes */
     int xdiv = 1;
     int bpp = 4;
     if (shift_control == 0 || shift_control == 1) {
         update_palette16(s, palette);
+        /* Build alternate palettes if mid-frame switch detected (using snapshots) */
+        if (s->palette_switch_snapshot >= 0) {
+            palette_switch_line = s->palette_switch_snapshot;
+            /* Build "before" palette from pre-switch DAC state (for top of screen) */
+            for (int i = 0; i < 16; i++) {
+                int v = s->ar[i];
+                if (s->ar[0x10] & 0x80)
+                    v = ((s->ar[0x14] & 0xf) << 4) | (v & 0xf);
+                else
+                    v = ((s->ar[0x14] & 0xc) << 4) | (v & 0x3f);
+                v = v * 3;
+#if BPP == 32
+                palette_before[i] = (c6_to_8(s->palette_before_snapshot[v]) << 16) |
+                    (c6_to_8(s->palette_before_snapshot[v + 1]) << 8) |
+                    c6_to_8(s->palette_before_snapshot[v + 2]);
+                palette_after[i] = (c6_to_8(s->palette_after_snapshot[v]) << 16) |
+                    (c6_to_8(s->palette_after_snapshot[v + 1]) << 8) |
+                    c6_to_8(s->palette_after_snapshot[v + 2]);
+#elif BPP == 16
+                palette_before[i] = (s->palette_before_snapshot[v + 2] >> 1) |
+                    ((s->palette_before_snapshot[v + 1]) << 5) |
+                    ((s->palette_before_snapshot[v] >> 1) << 11);
+                palette_after[i] = (s->palette_after_snapshot[v + 2] >> 1) |
+                    ((s->palette_after_snapshot[v + 1]) << 5) |
+                    ((s->palette_after_snapshot[v] >> 1) << 11);
+#endif
+            }
+        }
         if (s->sr[0x01] & 8) {
             xdiv = 2;
             w *= 2;
@@ -1028,8 +1166,20 @@ static void vga_graphic_refresh(VGAState *s,
     } else {
         if (!vbe_enabled(s)) {
             update_palette256(s, palette);
+#ifdef TANMATSU_BUILD
+            /* For Tanmatsu, output native resolution and let PPA handle scaling.
+             * CRTC gives output resolution (640x400), native is (320x200).
+             * xdiv=1 means no software pixel doubling - PPA will scale 2x.
+             * Also halve height since we skipped multi_scan above. */
+            xdiv = 1;
+            w = w / 2;  /* Native width: 640->320, 800->400, etc. */
+            if (tanmatsu_vdouble > 0)
+                h = h / tanmatsu_vdouble;  /* Native height: 400->200 */
+#else
+            /* For other platforms, software pixel doubling.
+             * xdiv=2 means source is half of w, each byte displayed twice. */
             xdiv = 2;
-            w *= 2;
+#endif
             bpp = 8;
         } else {
             bpp = s->vbe_regs[VBE_DISPI_INDEX_BPP];
@@ -1077,6 +1227,18 @@ static void vga_graphic_refresh(VGAState *s,
 #else
     int hx = fb_dev->height;
     int wx = fb_dev->width;
+#ifdef TANMATSU_BUILD
+    /* For Tanmatsu, don't center - render at 0,0 and let PPA handle scaling.
+     * Report native VGA dimensions and pixel doubling factor for PPA. */
+    globals.vga_mode_width = (w < wx) ? w : wx;
+    globals.vga_mode_height = (h < hx) ? h : hx;
+    /* For 256-color modes, we output native (half width) and PPA doubles.
+     * For text/EGA modes, output is already at intended resolution. */
+    globals.vga_pixel_double = (shift_control >= 2 && !vbe_enabled(s)) ? 2 : 1;
+    if (h > hx) h = hx;
+    if (w > wx) w = wx;
+    /* i0 stays 0 - no centering offset */
+#else
     if (h < hx)
         i0 += (hx - h) / 2 * fb_dev->stride;
     else
@@ -1086,7 +1248,16 @@ static void vga_graphic_refresh(VGAState *s,
     else
         w = wx;
 #endif
+#endif
     for (int y = 0; y < h; y++) {
+        /* Select palette based on scanline for mid-frame palette switching */
+        uint32_t *cur_palette;
+        if (palette_switch_line >= 0) {
+            cur_palette = (y < palette_switch_line) ? palette_before : palette_after;
+        } else {
+            cur_palette = palette;
+        }
+
         uint32_t addr = addr1;
         if (!(s->cr[0x17] & 1)) {
             int shift;
@@ -1097,15 +1268,318 @@ static void vga_graphic_refresh(VGAState *s,
         if (!(s->cr[0x17] & 2)) {
             addr = (addr & ~0x8000) | ((y1 & 2) << 14);
         }
+
         /*
-         * Fast path for EGA planar modes - DISABLED for debugging
-         * TODO: Fix framebuffer indexing issues
+         * Fast path for EGA planar modes - process 16 source pixels at a time (2 bytes)
+         * Conditions: BPP==16, shift_control==0, no scaling, standard CRT mode
+         * Handles both xdiv==1 (1:1) and xdiv==2 (pixel doubling for 320-wide modes)
+         *
+         * Optimizations:
+         * - Uses small planar_expand tables (2KB, cache-friendly) instead of 1MB PSRAM tables
+         * - Special case for cpe_mask==0xf (all planes enabled) - skips AND operation
+         * - Loop unrolled 2x to process 16 source pixels per iteration
+         * - PIE 128-bit stores for aligned xdiv==1 case
          */
-#if 0 && BPP == 16 && !defined(SCALE_3_2) && !defined(SWAPXY)
-        if (shift_control == 0 && planar_combine_01) {
-            /* ... disabled ... */
+#if BPP == 16 && !defined(SCALE_3_2) && !defined(SWAPXY)
+        if (shift_control == 0 && (s->cr[0x17] & 3) == 3) {
+            /* Debug: trace fast path usage (only on first scanline of first frame) */
+            if (y == 0 && !ega_fast_logged) {
+                fprintf(stderr, "VGA: EGA fast path active (w=%d xdiv=%d cpe=0x%x)\n",
+                        w, xdiv, s->ar[0x12] & 0x0f);
+                ega_fast_logged = 1;
+            }
+            int cpe_mask = s->ar[0x12] & 0x0f;
+            uint16_t *fb_row = (uint16_t *)(fb_dev->fb_data + i0 + y * fb_dev->stride);
+            int src_bytes = (w / xdiv) >> 3;  /* source bytes to process */
+
+            /* Process 2 bytes (16 pixels) per iteration when possible */
+            int bx = 0;
+            for (; bx + 1 < src_bytes; bx += 2) {
+                uint32_t byte_addr = addr + 4 * bx;
+
+                /* First 8 pixels */
+                const uint8_t *p0 = planar_expand[vram[byte_addr]];
+                const uint8_t *p1 = planar_expand[vram[byte_addr + 1]];
+                const uint8_t *p2 = planar_expand[vram[byte_addr + 2]];
+                const uint8_t *p3 = planar_expand[vram[byte_addr + 3]];
+
+                /* Second 8 pixels */
+                const uint8_t *q0 = planar_expand[vram[byte_addr + 4]];
+                const uint8_t *q1 = planar_expand[vram[byte_addr + 5]];
+                const uint8_t *q2 = planar_expand[vram[byte_addr + 6]];
+                const uint8_t *q3 = planar_expand[vram[byte_addr + 7]];
+
+                if (cpe_mask == 0x0f) {
+                    /* Fast path: all planes enabled, no masking needed */
+                    if (xdiv == 2) {
+                        uint32_t *fb32 = (uint32_t *)fb_row;
+                        /* First 8 source pixels -> 16 output pixels */
+                        uint32_t c0 = cur_palette[p0[0] | (p1[0] << 1) | (p2[0] << 2) | (p3[0] << 3)];
+                        uint32_t c1 = cur_palette[p0[1] | (p1[1] << 1) | (p2[1] << 2) | (p3[1] << 3)];
+                        uint32_t c2 = cur_palette[p0[2] | (p1[2] << 1) | (p2[2] << 2) | (p3[2] << 3)];
+                        uint32_t c3 = cur_palette[p0[3] | (p1[3] << 1) | (p2[3] << 2) | (p3[3] << 3)];
+                        uint32_t c4 = cur_palette[p0[4] | (p1[4] << 1) | (p2[4] << 2) | (p3[4] << 3)];
+                        uint32_t c5 = cur_palette[p0[5] | (p1[5] << 1) | (p2[5] << 2) | (p3[5] << 3)];
+                        uint32_t c6 = cur_palette[p0[6] | (p1[6] << 1) | (p2[6] << 2) | (p3[6] << 3)];
+                        uint32_t c7 = cur_palette[p0[7] | (p1[7] << 1) | (p2[7] << 2) | (p3[7] << 3)];
+                        fb32[0] = c0 | (c0 << 16); fb32[1] = c1 | (c1 << 16);
+                        fb32[2] = c2 | (c2 << 16); fb32[3] = c3 | (c3 << 16);
+                        fb32[4] = c4 | (c4 << 16); fb32[5] = c5 | (c5 << 16);
+                        fb32[6] = c6 | (c6 << 16); fb32[7] = c7 | (c7 << 16);
+                        /* Second 8 source pixels -> 16 output pixels */
+                        c0 = cur_palette[q0[0] | (q1[0] << 1) | (q2[0] << 2) | (q3[0] << 3)];
+                        c1 = cur_palette[q0[1] | (q1[1] << 1) | (q2[1] << 2) | (q3[1] << 3)];
+                        c2 = cur_palette[q0[2] | (q1[2] << 1) | (q2[2] << 2) | (q3[2] << 3)];
+                        c3 = cur_palette[q0[3] | (q1[3] << 1) | (q2[3] << 2) | (q3[3] << 3)];
+                        c4 = cur_palette[q0[4] | (q1[4] << 1) | (q2[4] << 2) | (q3[4] << 3)];
+                        c5 = cur_palette[q0[5] | (q1[5] << 1) | (q2[5] << 2) | (q3[5] << 3)];
+                        c6 = cur_palette[q0[6] | (q1[6] << 1) | (q2[6] << 2) | (q3[6] << 3)];
+                        c7 = cur_palette[q0[7] | (q1[7] << 1) | (q2[7] << 2) | (q3[7] << 3)];
+                        fb32[8] = c0 | (c0 << 16); fb32[9] = c1 | (c1 << 16);
+                        fb32[10] = c2 | (c2 << 16); fb32[11] = c3 | (c3 << 16);
+                        fb32[12] = c4 | (c4 << 16); fb32[13] = c5 | (c5 << 16);
+                        fb32[14] = c6 | (c6 << 16); fb32[15] = c7 | (c7 << 16);
+                        fb_row += 32;
+                    } else {
+                        /* xdiv==1: write 16 pixels directly */
+                        fb_row[0] = cur_palette[p0[0] | (p1[0] << 1) | (p2[0] << 2) | (p3[0] << 3)];
+                        fb_row[1] = cur_palette[p0[1] | (p1[1] << 1) | (p2[1] << 2) | (p3[1] << 3)];
+                        fb_row[2] = cur_palette[p0[2] | (p1[2] << 1) | (p2[2] << 2) | (p3[2] << 3)];
+                        fb_row[3] = cur_palette[p0[3] | (p1[3] << 1) | (p2[3] << 2) | (p3[3] << 3)];
+                        fb_row[4] = cur_palette[p0[4] | (p1[4] << 1) | (p2[4] << 2) | (p3[4] << 3)];
+                        fb_row[5] = cur_palette[p0[5] | (p1[5] << 1) | (p2[5] << 2) | (p3[5] << 3)];
+                        fb_row[6] = cur_palette[p0[6] | (p1[6] << 1) | (p2[6] << 2) | (p3[6] << 3)];
+                        fb_row[7] = cur_palette[p0[7] | (p1[7] << 1) | (p2[7] << 2) | (p3[7] << 3)];
+                        fb_row[8] = cur_palette[q0[0] | (q1[0] << 1) | (q2[0] << 2) | (q3[0] << 3)];
+                        fb_row[9] = cur_palette[q0[1] | (q1[1] << 1) | (q2[1] << 2) | (q3[1] << 3)];
+                        fb_row[10] = cur_palette[q0[2] | (q1[2] << 1) | (q2[2] << 2) | (q3[2] << 3)];
+                        fb_row[11] = cur_palette[q0[3] | (q1[3] << 1) | (q2[3] << 2) | (q3[3] << 3)];
+                        fb_row[12] = cur_palette[q0[4] | (q1[4] << 1) | (q2[4] << 2) | (q3[4] << 3)];
+                        fb_row[13] = cur_palette[q0[5] | (q1[5] << 1) | (q2[5] << 2) | (q3[5] << 3)];
+                        fb_row[14] = cur_palette[q0[6] | (q1[6] << 1) | (q2[6] << 2) | (q3[6] << 3)];
+                        fb_row[15] = cur_palette[q0[7] | (q1[7] << 1) | (q2[7] << 2) | (q3[7] << 3)];
+                        fb_row += 16;
+                    }
+                } else {
+                    /* Slow path: need to mask with cpe_mask */
+                    if (xdiv == 2) {
+                        uint32_t *fb32 = (uint32_t *)fb_row;
+                        for (int i = 0; i < 8; i++) {
+                            uint32_t c = cur_palette[(p0[i] | (p1[i] << 1) | (p2[i] << 2) | (p3[i] << 3)) & cpe_mask];
+                            fb32[i] = c | (c << 16);
+                        }
+                        for (int i = 0; i < 8; i++) {
+                            uint32_t c = cur_palette[(q0[i] | (q1[i] << 1) | (q2[i] << 2) | (q3[i] << 3)) & cpe_mask];
+                            fb32[8 + i] = c | (c << 16);
+                        }
+                        fb_row += 32;
+                    } else {
+                        for (int i = 0; i < 8; i++)
+                            fb_row[i] = cur_palette[(p0[i] | (p1[i] << 1) | (p2[i] << 2) | (p3[i] << 3)) & cpe_mask];
+                        for (int i = 0; i < 8; i++)
+                            fb_row[8 + i] = cur_palette[(q0[i] | (q1[i] << 1) | (q2[i] << 2) | (q3[i] << 3)) & cpe_mask];
+                        fb_row += 16;
+                    }
+                }
+            }
+
+            /* Handle remaining byte if src_bytes is odd */
+            for (; bx < src_bytes; bx++) {
+                uint32_t byte_addr = addr + 4 * bx;
+                const uint8_t *p0 = planar_expand[vram[byte_addr]];
+                const uint8_t *p1 = planar_expand[vram[byte_addr + 1]];
+                const uint8_t *p2 = planar_expand[vram[byte_addr + 2]];
+                const uint8_t *p3 = planar_expand[vram[byte_addr + 3]];
+
+                if (xdiv == 2) {
+                    uint32_t *fb32 = (uint32_t *)fb_row;
+                    for (int i = 0; i < 8; i++) {
+                        uint32_t c = cur_palette[(p0[i] | (p1[i] << 1) | (p2[i] << 2) | (p3[i] << 3)) & cpe_mask];
+                        fb32[i] = c | (c << 16);
+                    }
+                    fb_row += 16;
+                } else {
+                    for (int i = 0; i < 8; i++)
+                        fb_row[i] = cur_palette[(p0[i] | (p1[i] << 1) | (p2[i] << 2) | (p3[i] << 3)) & cpe_mask];
+                    fb_row += 8;
+                }
+            }
+            goto next_line;
+        }
+
+        /* Legacy code path - kept for reference but not used on ESP32 with above fast path */
+#if 0
+        if (shift_control == 0 && (s->cr[0x17] & 3) == 3) {
+            int cpe_mask = s->ar[0x12] & 0x0f;
+            uint16_t *fb_row = (uint16_t *)(fb_dev->fb_data + i0 + y * fb_dev->stride);
+            int src_bytes = (w / xdiv) >> 3;
+
+            for (int bx = 0; bx < src_bytes; bx++) {
+                uint32_t byte_addr = addr + 4 * bx;
+                uint8_t v0 = vram[byte_addr];
+                uint8_t v1 = vram[byte_addr + 1];
+                uint8_t v2 = vram[byte_addr + 2];
+                uint8_t v3 = vram[byte_addr + 3];
+
+                uint16_t colors[8] __attribute__((aligned(16)));
+                if (planar_combine_01) {
+                    const uint8_t *p01 = (*planar_combine_01)[v0][v1];
+                    const uint8_t *p23 = (*planar_combine_23)[v2][v3];
+                    colors[0] = cur_palette[(p01[0] | (p23[0] << 2)) & cpe_mask];
+                    colors[1] = cur_palette[(p01[1] | (p23[1] << 2)) & cpe_mask];
+                    colors[2] = cur_palette[(p01[2] | (p23[2] << 2)) & cpe_mask];
+                    colors[3] = cur_palette[(p01[3] | (p23[3] << 2)) & cpe_mask];
+                    colors[4] = cur_palette[(p01[4] | (p23[4] << 2)) & cpe_mask];
+                    colors[5] = cur_palette[(p01[5] | (p23[5] << 2)) & cpe_mask];
+                    colors[6] = cur_palette[(p01[6] | (p23[6] << 2)) & cpe_mask];
+                    colors[7] = cur_palette[(p01[7] | (p23[7] << 2)) & cpe_mask];
+                } else {
+                    const uint8_t *p0 = planar_expand[v0];
+                    const uint8_t *p1 = planar_expand[v1];
+                    const uint8_t *p2 = planar_expand[v2];
+                    const uint8_t *p3 = planar_expand[v3];
+                    for (int i = 0; i < 8; i++) {
+                        colors[i] = cur_palette[(p0[i] | (p1[i] << 1) | (p2[i] << 2) | (p3[i] << 3)) & cpe_mask];
+                    }
+                }
+
+                if (xdiv == 1) {
+#if defined(BUILD_ESP32) && defined(CONFIG_IDF_TARGET_ESP32P4)
+                    if (((uintptr_t)fb_row & 0xf) == 0) {
+                        pie_write_8pixels(fb_row, colors);
+                    } else
+#endif
+                    {
+                        fb_row[0] = colors[0]; fb_row[1] = colors[1];
+                        fb_row[2] = colors[2]; fb_row[3] = colors[3];
+                        fb_row[4] = colors[4]; fb_row[5] = colors[5];
+                        fb_row[6] = colors[6]; fb_row[7] = colors[7];
+                    }
+                    fb_row += 8;
+                } else {
+#if defined(BUILD_ESP32) && defined(CONFIG_IDF_TARGET_ESP32P4)
+                    if (((uintptr_t)fb_row & 0x3) == 0) {
+                        uint32_t *fb32 = (uint32_t *)fb_row;
+                        fb32[0] = colors[0] | (colors[0] << 16);
+                        fb32[1] = colors[1] | (colors[1] << 16);
+                        fb32[2] = colors[2] | (colors[2] << 16);
+                        fb32[3] = colors[3] | (colors[3] << 16);
+                        fb32[4] = colors[4] | (colors[4] << 16);
+                        fb32[5] = colors[5] | (colors[5] << 16);
+                        fb32[6] = colors[6] | (colors[6] << 16);
+                        fb32[7] = colors[7] | (colors[7] << 16);
+                    } else
+#endif
+                    {
+                        fb_row[0] = colors[0]; fb_row[1] = colors[0];
+                        fb_row[2] = colors[1]; fb_row[3] = colors[1];
+                        fb_row[4] = colors[2]; fb_row[5] = colors[2];
+                        fb_row[6] = colors[3]; fb_row[7] = colors[3];
+                        fb_row[8] = colors[4]; fb_row[9] = colors[4];
+                        fb_row[10] = colors[5]; fb_row[11] = colors[5];
+                        fb_row[12] = colors[6]; fb_row[13] = colors[6];
+                        fb_row[14] = colors[7]; fb_row[15] = colors[7];
+                    }
+                    fb_row += 16;
+                }
+            }
+            goto next_line;
+        }
+#endif /* Legacy code path */
+
+        /*
+         * Fast path for VGA 256-color mode (mode 13h and similar)
+         * Conditions: BPP==16, shift_control==2, bpp==8, xdiv==2
+         */
+        if (shift_control == 2 && bpp == 8 && xdiv == 2) {
+            /* Debug: trace fast path usage (only on first scanline of first frame) */
+            if (y == 0 && !vga256_fast_logged) {
+                fprintf(stderr, "VGA: VGA256 (w=%d h=%d i0=%d stride=%d fbw=%d)\n",
+                        w, h, i0, fb_dev->stride, fb_dev->width);
+                vga256_fast_logged = 1;
+            }
+            uint16_t *fb_row = (uint16_t *)(fb_dev->fb_data + i0 + y * fb_dev->stride);
+            /* Calculate source bytes: use min of display width and VRAM line width */
+            /* line_offset is the VRAM bytes per line (CR[0x13] << 3) */
+            int src_from_display = w / 2;  /* Source pixels based on display width */
+            int src_from_vram = (line_offset > 0) ? line_offset : src_from_display;
+            int src_bytes = (src_from_display < src_from_vram) ? src_from_display : src_from_vram;
+            int num_chunks = src_bytes >> 3;  /* Process 8 source pixels at a time */
+
+            for (int chunk = 0; chunk < num_chunks; chunk++) {
+                uint8_t *vram_ptr = vram + addr + chunk * 8;
+                /* Read 8 palette indices and look up colors */
+                uint16_t colors[8] __attribute__((aligned(16)));
+                colors[0] = palette[vram_ptr[0]];
+                colors[1] = palette[vram_ptr[1]];
+                colors[2] = palette[vram_ptr[2]];
+                colors[3] = palette[vram_ptr[3]];
+                colors[4] = palette[vram_ptr[4]];
+                colors[5] = palette[vram_ptr[5]];
+                colors[6] = palette[vram_ptr[6]];
+                colors[7] = palette[vram_ptr[7]];
+
+                /* Write 16 pixels (8 source pixels doubled) using 32-bit stores */
+                uint32_t *fb32 = (uint32_t *)fb_row;
+                fb32[0] = colors[0] | (colors[0] << 16);
+                fb32[1] = colors[1] | (colors[1] << 16);
+                fb32[2] = colors[2] | (colors[2] << 16);
+                fb32[3] = colors[3] | (colors[3] << 16);
+                fb32[4] = colors[4] | (colors[4] << 16);
+                fb32[5] = colors[5] | (colors[5] << 16);
+                fb32[6] = colors[6] | (colors[6] << 16);
+                fb32[7] = colors[7] | (colors[7] << 16);
+                fb_row += 16;
+            }
+            goto next_line;
+        }
+
+#ifdef TANMATSU_BUILD
+        /*
+         * Fast path for VGA 256-color native output (Tanmatsu with PPA scaling)
+         * Conditions: shift_control==2, bpp==8, xdiv==1 (no CPU pixel doubling)
+         * Uses PIE 128-bit stores for 8 pixels at a time
+         */
+        if (shift_control == 2 && bpp == 8 && xdiv == 1) {
+            if (y == 0 && !vga256_fast_logged) {
+                fprintf(stderr, "VGA: VGA256 native (w=%d h=%d stride=%d) PIE accelerated\n",
+                        w, h, fb_dev->stride);
+                vga256_fast_logged = 1;
+            }
+            uint16_t *fb_row = (uint16_t *)(fb_dev->fb_data + i0 + y * fb_dev->stride);
+            int src_bytes = w;  /* Native: 1 byte = 1 pixel */
+            int num_chunks = src_bytes >> 3;  /* Process 8 pixels at a time */
+
+            for (int chunk = 0; chunk < num_chunks; chunk++) {
+                uint8_t *vram_ptr = vram + addr + chunk * 8;
+                /* Read 8 palette indices and look up colors */
+                uint16_t colors[8] __attribute__((aligned(16)));
+                colors[0] = palette[vram_ptr[0]];
+                colors[1] = palette[vram_ptr[1]];
+                colors[2] = palette[vram_ptr[2]];
+                colors[3] = palette[vram_ptr[3]];
+                colors[4] = palette[vram_ptr[4]];
+                colors[5] = palette[vram_ptr[5]];
+                colors[6] = palette[vram_ptr[6]];
+                colors[7] = palette[vram_ptr[7]];
+
+                /* Write 8 pixels using PIE 128-bit store if aligned */
+                if (((uintptr_t)fb_row & 0xf) == 0) {
+                    pie_write_8pixels(fb_row, colors);
+                } else {
+                    /* Fallback for unaligned (shouldn't happen with proper buffer allocation) */
+                    fb_row[0] = colors[0]; fb_row[1] = colors[1];
+                    fb_row[2] = colors[2]; fb_row[3] = colors[3];
+                    fb_row[4] = colors[4]; fb_row[5] = colors[5];
+                    fb_row[6] = colors[6]; fb_row[7] = colors[7];
+                }
+                fb_row += 8;
+            }
+            goto next_line;
         }
 #endif
+#endif
+
         /* Cache for EGA planar mode - pre-compute all 8 colors when VRAM changes */
         uint32_t cached_byte_addr = ~0u;
         uint32_t cached_colors[8];  /* Pre-computed RGB colors for 8 source pixels */
@@ -1123,13 +1597,15 @@ static void vga_graphic_refresh(VGAState *s,
                     uint8_t v1 = vram[byte_addr + 1];
                     uint8_t v2 = vram[byte_addr + 2];
                     uint8_t v3 = vram[byte_addr + 3];
+                    /* AR[0x12] Color Plane Enable - mask which planes contribute */
+                    int cpe_mask = s->ar[0x12] & 0x0f;
                     if (planar_combine_01) {
                         /* Fast path: two-plane combined tables (2 lookups per pixel) */
                         const uint8_t *p01 = (*planar_combine_01)[v0][v1];
                         const uint8_t *p23 = (*planar_combine_23)[v2][v3];
                         for (int i = 0; i < 8; i++) {
-                            int k = p01[i] | (p23[i] << 2);
-                            cached_colors[i] = palette[k];
+                            int k = (p01[i] | (p23[i] << 2)) & cpe_mask;
+                            cached_colors[i] = cur_palette[k];
                         }
                     } else {
                         /* Fallback: simple expansion tables (4 lookups per pixel) */
@@ -1138,8 +1614,8 @@ static void vga_graphic_refresh(VGAState *s,
                         const uint8_t *p2 = planar_expand[v2];
                         const uint8_t *p3 = planar_expand[v3];
                         for (int i = 0; i < 8; i++) {
-                            int k = p0[i] | (p1[i] << 1) | (p2[i] << 2) | (p3[i] << 3);
-                            cached_colors[i] = palette[k];
+                            int k = (p0[i] | (p1[i] << 1) | (p2[i] << 2) | (p3[i] << 3)) & cpe_mask;
+                            cached_colors[i] = cur_palette[k];
                         }
                     }
                 }
@@ -1148,14 +1624,14 @@ static void vga_graphic_refresh(VGAState *s,
             } else if (shift_control == 1) {
                 int k = ((vram[addr + 4 * (x1 >> 3) + ((x1 & 4) >> 2)] >>
                           (6 - 2 * (x1 & 3))) & 3);
-                color = palette[k];
+                color = cur_palette[k];
             } else
 #if BPP == 32
             {
                 switch (bpp) {
                 case 8: {
                     int k = vram[addr + x1];
-                    color = palette[k];
+                    color = cur_palette[k];
                     break;
                 }
                 case 15: {
@@ -1201,7 +1677,7 @@ static void vga_graphic_refresh(VGAState *s,
             {
                 switch (bpp) {
                 case 8: {
-                    color = palette[vram[addr + x1]];
+                    color = cur_palette[vram[addr + x1]];
                     break;
                 }
                 case 15: {
@@ -1243,7 +1719,7 @@ static void vga_graphic_refresh(VGAState *s,
 #error "bad bpp"
 #endif
         }
-/* next_line: label removed - fast path disabled */
+next_line:
         if (!multi_run) {
             int mask = (s->cr[0x17] & 3) ^ 3;
             if ((y1 & mask) == mask)
@@ -1274,6 +1750,7 @@ static void vga_graphic_refresh(VGAState *s,
 #endif
     }
 
+#ifdef DEBUG_VGA
     /* Debug timing report */
     uint32_t t_end = get_uticks();
     uint32_t elapsed = t_end - t_start;
@@ -1290,6 +1767,7 @@ static void vga_graphic_refresh(VGAState *s,
         slow_frame_count = 0;
         last_report = t_end;
     }
+#endif
 
     redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
 }
@@ -1324,6 +1802,8 @@ int vga_step(VGAState *s)
         } else {
             s->st01 &= ~(ST01_V_RETRACE | ST01_DISP_ENABLE);
             s->retrace_phase = 0;
+            /* Reset mid-frame palette tracking for new frame */
+            s->hblank_poll_count = 0;
 #ifdef BUILD_ESP32
             s->retrace_time = now + 15000/3;
 #else
@@ -1355,6 +1835,8 @@ void vga_refresh(VGAState *s,
         full_update = 1;
         s->cursor_blink_time = get_uticks();
         simplefb_clear(fb_dev, redraw_func, opaque);
+        /* Force vga_graphic_refresh to re-clear on mode change */
+        s->force_graphic_clear = 1;
     }
 
     if (s->graphic_mode == 2) {
@@ -1362,6 +1844,11 @@ void vga_refresh(VGAState *s,
     } else if (s->graphic_mode == 1) {
         vga_text_refresh(s, redraw_func, opaque, full_update);
     }
+#ifdef TANMATSU_BUILD
+    /* Increment frame generation counter for dirty tracking.
+     * lcd_bsp.c can skip PPA rotation if this hasn't changed. */
+    globals.vga_frame_gen++;
+#endif
 }
 
 /* force some bits to zero */
@@ -1528,6 +2015,8 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
                     } else {
                         s->st01 &= ~(ST01_V_RETRACE | ST01_DISP_ENABLE);
                         s->retrace_phase = 0;
+                        /* Reset mid-frame palette tracking for new frame */
+                        s->hblank_poll_count = 0;
 #ifdef BUILD_ESP32
                         s->retrace_time = now + 15000/3;
 #else
@@ -1537,7 +2026,13 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
                     val = s->st01;
                 }
 
-                /* Debug report */
+                /* Track hblank polling for mid-frame palette detection */
+                if (s->retrace_phase == 0) {
+                    s->hblank_poll_count++;
+                }
+
+#ifdef DEBUG_VGA
+                /* Debug report - disabled by default to reduce overhead */
                 if (now - last_poll_report > 1000000) {
                     if (poll_count > 1000) {
                         fprintf(stderr, "VGA: 3DA polled %u/sec st01=%02x\n", poll_count, val);
@@ -1545,6 +2040,7 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
                     poll_count = 0;
                     last_poll_report = now;
                 }
+#endif
             }
             break;
         default:
@@ -1628,7 +2124,40 @@ void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
     case 0x3c9:
         s->dac_cache[s->dac_sub_index] = val;
         if (++s->dac_sub_index == 3) {
+            /* Mid-frame palette switching detection:
+             * - LOW poll count (< 50): "before" palette writes (frame start, top of screen)
+             * - HIGH poll count (> 400): "after" palette writes (mid-frame, bottom of screen)
+             *
+             * Key insight: once we detect mid-frame switching, we KEEP palette_switch_scanline
+             * set permanently. This ensures render always sees the split, avoiding race conditions
+             * where render might catch us during the frame-start write window. */
+            int is_mid_frame_write = (s->hblank_poll_count > 400);
+
+            /* Always apply the write to the main palette */
             memcpy(&s->palette[s->dac_write_index * 3], s->dac_cache, 3);
+            s->palette_generation++;
+
+            if (is_mid_frame_write) {
+                /* Mid-frame write - this is the "after" palette (bottom of screen) */
+                if (s->palette_switch_scanline < 0) {
+                    /* First time detecting mid-frame switch: set the scanline and
+                     * capture current state as "before" (it has the top palette) */
+                    s->palette_switch_scanline = s->hblank_poll_count / 8;
+                    if (s->palette_switch_scanline > 400)
+                        s->palette_switch_scanline = 400;
+                    memcpy(s->palette_before_switch, s->palette, 768);
+                    s->palette_before_gen = s->palette_generation;
+                }
+                /* Always update "after" palette with current state */
+                memcpy(s->palette_after_switch, s->palette, 768);
+                s->palette_after_gen = s->palette_generation;
+            } else if (s->palette_switch_scanline >= 0 && s->hblank_poll_count < 50) {
+                /* Frame-start write while mid-frame switching is active.
+                 * Update the "before" palette to reflect the new top-of-screen colors.
+                 * DON'T reset palette_switch_scanline - keep split rendering active. */
+                memcpy(s->palette_before_switch, s->palette, 768);
+                s->palette_before_gen = s->palette_generation;
+            }
             s->dac_sub_index = 0;
             s->dac_write_index++;
         }
@@ -2214,6 +2743,8 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
     s->cursor_visible_phase = 1;
     s->retrace_time = get_uticks();
     s->retrace_phase = 0;
+    s->palette_switch_scanline = -1;  /* No mid-frame switch initially */
+    s->hblank_poll_count = 0;
     fb_dev->width = width;
     fb_dev->height = height;
 #ifdef SWAPXY
