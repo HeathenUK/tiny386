@@ -779,10 +779,8 @@ static void complete (SB16State *s)
                     if (s->time_const != -1) {
                         int tmp = 256 - s->time_const;
                         s->freq = (1000000 + (tmp / 2)) / tmp;
-                        dolog("DAC init: time_const=%d -> freq=%d Hz\n", s->time_const, s->freq);
                     } else {
                         s->freq = 11025;
-                        dolog("DAC init: no time_const, defaulting to %d Hz\n", s->freq);
                     }
                     s->dac_estimated_freq = s->freq;
                     s->dac_last_time = now;
@@ -791,8 +789,6 @@ static void complete (SB16State *s)
                     s->voice = s;
                 } else if (s->dac_last_time == 0 || (now - s->dac_last_time) > 1000000) {
                     /* Reset timing if first DAC write or gap > 1 second */
-                    dolog("DAC timing reset: was %llu us ago\n",
-                          s->dac_last_time ? (unsigned long long)(now - s->dac_last_time) : 0ULL);
                     s->dac_last_time = now;
                     s->dac_sample_count = 0;
                     /* Keep current freq estimate */
@@ -809,12 +805,8 @@ static void complete (SB16State *s)
                         if (new_freq < 1000) new_freq = 1000;
                         if (new_freq > 23000) new_freq = 23000;
                         /* Smooth with previous estimate (75% old, 25% new) */
-                        int old_freq = s->dac_estimated_freq;
                         s->dac_estimated_freq = (s->dac_estimated_freq * 3 + new_freq) / 4;
                         s->freq = s->dac_estimated_freq;
-                        dolog("DAC: %d samples in %llu us -> raw %d Hz, smoothed %d -> %d Hz\n",
-                              s->dac_sample_count, (unsigned long long)elapsed,
-                              new_freq, old_freq, s->dac_estimated_freq);
                     }
                     s->dac_last_time = now;
                     s->dac_sample_count = 0;

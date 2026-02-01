@@ -101,6 +101,14 @@ struct CPUI386 {
 	bool intr;
 	CPU_CB cb;
 
+	/* Cached INT 8 (timer) vector for fast interrupt dispatch.
+	 * Real-mode timer ISR address rarely changes after boot.
+	 * We use a warmup counter to avoid caching during game setup
+	 * when the vector might still be changing. */
+	uint32_t cached_int8_vector;
+	bool int8_cache_valid;
+	uint32_t int8_warmup_counter;  /* Count INT 8 calls before trusting cache */
+
 	int gen;
 	struct {
 		uword cs, eip, esp;
@@ -2397,16 +2405,28 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		TRY(pmret(cpu, opsz16, 0, true)); \
 	} else { \
 		if (!opsz16) cpu_abort(cpu, -201); \
-		OptAddr meml1, meml2, meml3; \
 		uword sp = lreg32(4); \
-		/* ip */ TRY(translate16(cpu, &meml1, 1, SEG_SS, sp & sp_mask)); \
-		uword newip = laddr16(&meml1); \
-		/* cs */ TRY(translate16(cpu, &meml2, 1, SEG_SS, (sp + 2) & sp_mask)); \
-		int newcs = laddr16(&meml2); \
-		/* flags */ TRY(translate16(cpu, &meml3, 1, SEG_SS, (sp + 4) & sp_mask)); \
-		uword oldflags = cpu->flags; \
-		if (cpu->flags & VM) cpu->flags = (cpu->flags & (0xffff0000 | IOPL)) | (laddr16(&meml3) & ~IOPL); \
-		else cpu->flags = (cpu->flags & 0xffff0000) | laddr16(&meml3); \
+		uword newip, oldflags; \
+		int newcs; \
+		uint16_t newflags_val; \
+		/* Fast path: direct memory read if 6 bytes won't cross page */ \
+		if (likely(((sp & 0xfff) <= 0xffa))) { \
+			uint8_t *stack = cpu->phys_mem + cpu->seg[SEG_SS].base + (sp & sp_mask); \
+			newip = *(uint16_t *)(stack + 0); \
+			newcs = *(uint16_t *)(stack + 2); \
+			newflags_val = *(uint16_t *)(stack + 4); \
+		} else { \
+			OptAddr meml1, meml2, meml3; \
+			/* ip */ TRY(translate16(cpu, &meml1, 1, SEG_SS, sp & sp_mask)); \
+			newip = laddr16(&meml1); \
+			/* cs */ TRY(translate16(cpu, &meml2, 1, SEG_SS, (sp + 2) & sp_mask)); \
+			newcs = laddr16(&meml2); \
+			/* flags */ TRY(translate16(cpu, &meml3, 1, SEG_SS, (sp + 4) & sp_mask)); \
+			newflags_val = laddr16(&meml3); \
+		} \
+		oldflags = cpu->flags; \
+		if (cpu->flags & VM) cpu->flags = (cpu->flags & (0xffff0000 | IOPL)) | (newflags_val & ~IOPL); \
+		else cpu->flags = (cpu->flags & 0xffff0000) | newflags_val; \
 		cpu->flags &= EFLAGS_MASK; \
 		cpu->flags |= 0x2; \
 		if (!set_seg(cpu, SEG_CS, newcs)) { cpu->flags = oldflags; return false; } \
@@ -3360,7 +3380,9 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 #define LIDT(addr) \
 	LXXX(addr) \
 	cpu->idt.base = base; \
-	cpu->idt.limit = limit;
+	cpu->idt.limit = limit; \
+	cpu->int8_cache_valid = false; \
+	cpu->int8_warmup_counter = 0;  /* Reset INT 8 cache */
 
 #define LLDT(a, la, sa) \
 	if (cpu->cpl != 0) THROW(EX_GP, 0); \
@@ -4620,25 +4642,67 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 	if (!(cpu->cr0 & 1)) {
 		/* REAL-ADDRESS-MODE */
 		uword sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
-		OptAddr meml;
-		uword base = cpu->idt.base;
-		int off = no * 4;
-		TRY1(translate_laddr(cpu, &meml, 1, base + off, 4, 0));
-		uword w1 = load32(cpu, &meml);
-		int newcs = w1 >> 16;
-		uword newip = w1 & 0xffff;
+		int newcs, newip;
 
-		OptAddr meml1, meml2, meml3;
+		/* Fast path: use cached INT 8 (timer) vector.
+		 * Timer interrupts are the hot path for music timing.
+		 * We use a warmup period (10000 calls) before trusting the cache,
+		 * since games hook INT 8 during early startup/sound detection. */
+		#define INT8_WARMUP_THRESHOLD 10000
+		if (no == 8 && cpu->int8_cache_valid && cpu->int8_warmup_counter >= INT8_WARMUP_THRESHOLD) {
+			newcs = cpu->cached_int8_vector >> 16;
+			newip = cpu->cached_int8_vector & 0xffff;
+		} else {
+			/* Normal IDT lookup */
+			OptAddr meml;
+			uword base = cpu->idt.base;
+			int off = no * 4;
+			TRY1(translate_laddr(cpu, &meml, 1, base + off, 4, 0));
+			uword w1 = load32(cpu, &meml);
+			newcs = w1 >> 16;
+			newip = w1 & 0xffff;
+
+			/* Cache/update INT 8 vector and increment warmup counter */
+			if (no == 8) {
+				if (cpu->int8_cache_valid && cpu->cached_int8_vector != w1) {
+					/* Vector changed - reset warmup counter */
+					cpu->int8_warmup_counter = 0;
+				}
+				cpu->cached_int8_vector = w1;
+				cpu->int8_cache_valid = true;
+				if (cpu->int8_warmup_counter < INT8_WARMUP_THRESHOLD)
+					cpu->int8_warmup_counter++;
+			}
+		}
+
+		/* Fast path: batch stack operations with direct memory access.
+		 * In real mode, we can write directly to physical memory if the
+		 * 6 bytes of stack won't cross a page boundary. */
 		uword sp = lreg32(4);
-		TRY1(translate(cpu, &meml1, 2, SEG_SS, (sp - 2 * 1) & sp_mask, 2, 0));
-		TRY1(translate(cpu, &meml2, 2, SEG_SS, (sp - 2 * 2) & sp_mask, 2, 0));
-		TRY1(translate(cpu, &meml3, 2, SEG_SS, (sp - 2 * 3) & sp_mask, 2, 0));
-		refresh_flags(cpu);
-		cpu->cc.mask = 0;
-		saddr16(&meml1, cpu->flags);
-		saddr16(&meml2, cpu->seg[SEG_CS].sel);
-		saddr16(&meml3, cpu->ip);
-		sreg32(4, (sp - 2 * 3) & sp_mask);
+		uword ss_base = cpu->seg[SEG_SS].base;
+		uword new_sp = (sp - 6) & sp_mask;
+
+		if (likely((sp & 0xfff) >= 6)) {
+			/* Fast path: direct memory write, no page crossing */
+			uint8_t *stack = cpu->phys_mem + ss_base + new_sp;
+			refresh_flags(cpu);
+			cpu->cc.mask = 0;
+			*(uint16_t *)(stack + 0) = cpu->ip;           /* IP at lowest addr */
+			*(uint16_t *)(stack + 2) = cpu->seg[SEG_CS].sel;  /* CS */
+			*(uint16_t *)(stack + 4) = cpu->flags;        /* FLAGS at highest */
+		} else {
+			/* Slow path: stack crosses page boundary, use translate */
+			OptAddr meml1, meml2, meml3;
+			TRY1(translate(cpu, &meml1, 2, SEG_SS, (sp - 2 * 1) & sp_mask, 2, 0));
+			TRY1(translate(cpu, &meml2, 2, SEG_SS, (sp - 2 * 2) & sp_mask, 2, 0));
+			TRY1(translate(cpu, &meml3, 2, SEG_SS, (sp - 2 * 3) & sp_mask, 2, 0));
+			refresh_flags(cpu);
+			cpu->cc.mask = 0;
+			saddr16(&meml1, cpu->flags);
+			saddr16(&meml2, cpu->seg[SEG_CS].sel);
+			saddr16(&meml3, cpu->ip);
+		}
+		sreg32(4, new_sp);
 
 		TRY1(set_seg(cpu, SEG_CS, newcs));
 		cpu->next_ip = newip;
@@ -5182,6 +5246,8 @@ void cpui386_reset(CPUI386 *cpu)
 	cpu->idt.limit = 0x3ff;
 	cpu->gdt.base = 0;
 	cpu->gdt.limit = 0;
+	cpu->int8_cache_valid = false;
+	cpu->int8_warmup_counter = 0;  /* Reset INT 8 cache */
 
 	cpu->cr0 = cpu->fpu ? 0x10 : 0;
 	cpu->cr2 = 0;
