@@ -31,6 +31,12 @@ struct Globals {
 	int vga_mode_height;
 	int vga_pixel_double; // Pixel doubling factor (1=none, 2=double width for mode 13h)
 	uint32_t vga_frame_gen; // Frame generation counter - incremented on each VGA render
+	int brightness;   // Current brightness (0-100)
+	int volume;       // Current volume (0-100)
+	// Overlay bar for META+arrow feedback
+	int overlay_type;     // 0=none, 1=brightness, 2=volume
+	int overlay_value;    // Current value (0-100)
+	uint32_t overlay_hide_time;  // Timestamp when overlay should hide
 #endif
 };
 

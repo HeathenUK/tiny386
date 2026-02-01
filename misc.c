@@ -438,7 +438,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
                          const char *fda, const char *fdb,
                          const char *cda, const char *cdb,
                          const char *cdc, const char *cdd,
-                         int cpu_gen, int fpu, long mem_size)
+                         int cpu_gen, int fpu, long mem_size,
+                         int brightness, int volume, int frame_skip)
 {
 	if (!ini_path) return -1;
 	if (boot_order < 0 || boot_order >= BOOT_ORDER_COUNT)
@@ -465,6 +466,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	int found_cda = -1, found_cdb = -1, found_cdc = -1, found_cdd = -1;
 	int found_mem_size = -1;
 	int found_gen = -1, found_fpu = -1;
+	int found_brightness = -1, found_volume = -1, found_frame_skip = -1;
 
 	while (line_count < 64 && fgets(lines[line_count], 256, f)) {
 		// Check for section headers
@@ -501,6 +503,9 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			else if (line_starts_with(lines[line_count], "cdc")) found_cdc = line_count;
 			else if (line_starts_with(lines[line_count], "cdd")) found_cdd = line_count;
 			else if (line_starts_with(lines[line_count], "mem_size")) found_mem_size = line_count;
+			else if (line_starts_with(lines[line_count], "brightness")) found_brightness = line_count;
+			else if (line_starts_with(lines[line_count], "volume")) found_volume = line_count;
+			else if (line_starts_with(lines[line_count], "frame_skip")) found_frame_skip = line_count;
 		}
 
 		// Check for existing settings in [cpu] section
@@ -547,6 +552,12 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			if (cdd && cdd[0]) fprintf(f, "cdd = %s\n", cdd);
 		} else if (i == found_mem_size) {
 			fprintf(f, "mem_size = %ldM\n", mem_size / (1024 * 1024));
+		} else if (i == found_brightness) {
+			fprintf(f, "brightness = %d\n", brightness);
+		} else if (i == found_volume) {
+			fprintf(f, "volume = %d\n", volume);
+		} else if (i == found_frame_skip) {
+			fprintf(f, "frame_skip = %d\n", frame_skip);
 		} else if (i == found_gen) {
 			fprintf(f, "gen = %d\n", cpu_gen);
 		} else if (i == found_fpu) {
@@ -574,6 +585,12 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			if (found_mem_size < 0) {
 				fprintf(f, "mem_size = %ldM\n", mem_size / (1024 * 1024));
 			}
+			if (found_brightness < 0)
+				fprintf(f, "brightness = %d\n", brightness);
+			if (found_volume < 0)
+				fprintf(f, "volume = %d\n", volume);
+			if (found_frame_skip < 0)
+				fprintf(f, "frame_skip = %d\n", frame_skip);
 		}
 
 		// Add new settings at end of [cpu] section

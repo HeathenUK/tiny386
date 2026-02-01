@@ -487,7 +487,7 @@ static void render_main_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ "Save Settings", 0, 0, NULL },
 		{ NULL, 1, 0, NULL },  // SEP2
 		{ "Ctrl+Alt+Del", 0, 0, NULL },
-		{ "Reset", 0, 0, NULL },
+		{ "Exit to Launcher", 0, 0, NULL },
 		{ NULL, 1, 0, NULL },  // SEP3
 		{ "Exit", 0, 0, NULL },
 	};
@@ -667,12 +667,14 @@ static void render_browser(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 // Apply brightness setting
 static void apply_brightness(OSD *osd)
 {
+	globals.brightness = osd->brightness;  // Sync to globals
 	bsp_display_set_backlight_brightness(osd->brightness);
 }
 
 // Apply volume setting
 static void apply_volume(OSD *osd)
 {
+	globals.volume = osd->volume;  // Sync to globals
 	bsp_audio_set_volume((float)osd->volume);
 }
 
@@ -792,7 +794,8 @@ static int handle_main_select(OSD *osd)
 			                     osd->drive_paths[0], osd->drive_paths[1],
 			                     osd->drive_paths[2], osd->drive_paths[3],
 			                     osd->drive_paths[4], osd->drive_paths[5],
-			                     osd->cpu_gen, osd->fpu, osd_get_mem_size_bytes(osd));
+			                     osd->cpu_gen, osd->fpu, osd_get_mem_size_bytes(osd),
+			                     osd->brightness, osd->volume, osd->frame_skip);
 		}
 		break;
 	case MAIN_CTRLALTDEL:
@@ -864,8 +867,9 @@ OSD *osd_init(void)
 	osd->mount_sel = MOUNT_FDA;
 	osd->av_sel = AV_BRIGHTNESS;
 	osd->sys_sel = SYS_CPU_GEN;
-	osd->brightness = 30;  // Default brightness
-	osd->volume = 80;      // Default volume
+	// Load brightness/volume from globals (set from INI in esp_main.c)
+	osd->brightness = globals.brightness;
+	osd->volume = globals.volume;
 	osd->frame_skip = vga_frame_skip_max;  // Load from config
 
 	// Default system settings
@@ -920,6 +924,9 @@ long osd_get_mem_size_bytes(OSD *osd)
 void osd_refresh(OSD *osd)
 {
 	populate_drive_paths(osd);
+	// Sync brightness/volume from globals (may have been changed via META+arrow)
+	osd->brightness = globals.brightness;
+	osd->volume = globals.volume;
 }
 
 void osd_handle_mouse_motion(OSD *osd, int x, int y)

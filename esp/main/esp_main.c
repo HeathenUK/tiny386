@@ -146,6 +146,8 @@ static int pc_main(const char *file)
 	conf.height = LCD_HEIGHT;
 	conf.cpu_gen = 4;
 	conf.fpu = 0;
+	conf.brightness = 30;  // Default brightness
+	conf.volume = 80;      // Default volume
 
 	fprintf(stderr, "pc_main: parsing ini\n");
 	if (!file) {
@@ -190,6 +192,14 @@ static int pc_main(const char *file)
 	if (vga_frame_skip_max > 0) {
 		fprintf(stderr, "Frame skip enabled: max %d frames\n", vga_frame_skip_max);
 	}
+
+#ifdef USE_BADGE_BSP
+	/* Store brightness/volume in globals for input_bsp and OSD to use */
+	globals.brightness = conf.brightness;
+	globals.volume = conf.volume;
+	fprintf(stderr, "Audio/Visual: brightness=%d%%, volume=%d%%\n",
+	        globals.brightness, globals.volume);
+#endif
 #ifndef USE_LCD_BSP
 	// For non-BSP backends, console allocates fb - store it globally
 	globals.fb = console->fb;
@@ -205,6 +215,10 @@ static int pc_main(const char *file)
 		// Check for soft reset request from OSD
 		if (globals.reset_pending) {
 			globals.reset_pending = false;
+			// Clear VGA framebuffer to avoid artifacts from old mode
+			if (globals.fb && globals.vga_width > 0 && globals.vga_height > 0) {
+				memset(globals.fb, 0, globals.vga_width * globals.vga_height * sizeof(uint16_t));
+			}
 			pc_reset(pc);
 			pc->boot_start_time = get_uticks();
 		}

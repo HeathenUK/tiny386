@@ -969,6 +969,19 @@ int parse_conf_ini(void* user, const char* section,
 					}
 				}
 			}
+		} else if (NAME("brightness")) {
+			conf->brightness = atoi(value);
+			if (conf->brightness < 0) conf->brightness = 0;
+			if (conf->brightness > 100) conf->brightness = 100;
+		} else if (NAME("volume")) {
+			conf->volume = atoi(value);
+			if (conf->volume < 0) conf->volume = 0;
+			if (conf->volume > 100) conf->volume = 100;
+		} else if (NAME("frame_skip")) {
+			// Also accept frame_skip in [pc] section (save_settings_to_ini writes here)
+			conf->frame_skip = atoi(value);
+			if (conf->frame_skip < 0) conf->frame_skip = 0;
+			if (conf->frame_skip > 10) conf->frame_skip = 10;
 		}
 	} else if (SEC("display")) {
 		if (NAME("width")) {

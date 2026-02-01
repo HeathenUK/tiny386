@@ -189,6 +189,96 @@ static void update_scale_params(void)
 	         cached_out_w, cached_out_h, cached_offset_x, cached_offset_y);
 }
 
+// Overlay bar rendering - using same colors as OSD (tanmatsu_osd.c)
+#define OVERLAY_NONE       0
+#define OVERLAY_BRIGHTNESS 1
+#define OVERLAY_VOLUME     2
+
+// OSD color scheme (RGB565)
+#define OSD_COLOR_PANEL   0x18E3  // Dark blue-gray panel background
+#define OSD_COLOR_BORDER  0x4A69  // Medium gray border
+#define OSD_COLOR_TEXT    0xFFFF  // White
+#define OSD_COLOR_HILITE  0x04FF  // Bright blue highlight
+#define OSD_COLOR_TITLE   0xFFE0  // Yellow for titles
+#define OSD_COLOR_VALUE   0x87FF  // Light cyan for values
+
+// Draw filled rectangle (portrait buffer coordinates)
+static void overlay_fill_rect(uint16_t *fb, int x, int y, int w, int h, uint16_t color)
+{
+	for (int dy = 0; dy < h; dy++) {
+		if (y + dy < 0 || y + dy >= DISPLAY_HEIGHT) continue;
+		uint16_t *row = fb + (y + dy) * DISPLAY_WIDTH;
+		for (int dx = 0; dx < w; dx++) {
+			if (x + dx < 0 || x + dx >= DISPLAY_WIDTH) continue;
+			row[x + dx] = color;
+		}
+	}
+}
+
+// Render brightness/volume overlay bar
+static void render_overlay_bar(uint16_t *fb)
+{
+	uint32_t now = esp_log_timestamp();
+
+	// Check if overlay should still be visible
+	if (globals.overlay_type == OVERLAY_NONE) return;
+	if (now >= globals.overlay_hide_time) {
+		globals.overlay_type = OVERLAY_NONE;
+		return;
+	}
+
+	// Bar dimensions - centered horizontally, near bottom
+	int bar_w = 300;
+	int bar_h = 32;
+	int bar_x = (DISPLAY_WIDTH - bar_w) / 2;
+	int bar_y = DISPLAY_HEIGHT - 80;  // Near bottom of portrait display
+	int padding = 4;
+	int icon_area = 24;  // Space for icon on left
+
+	// Colors matching OSD
+	uint16_t bg_color = OSD_COLOR_PANEL;
+	uint16_t border_color = OSD_COLOR_BORDER;
+	uint16_t fill_color = (globals.overlay_type == OVERLAY_BRIGHTNESS)
+	                      ? OSD_COLOR_TITLE    // Yellow for brightness
+	                      : OSD_COLOR_VALUE;   // Light cyan for volume
+	uint16_t icon_color = OSD_COLOR_TEXT;
+
+	// Draw background
+	overlay_fill_rect(fb, bar_x, bar_y, bar_w, bar_h, bg_color);
+
+	// Draw border (1 pixel)
+	overlay_fill_rect(fb, bar_x, bar_y, bar_w, 1, border_color);
+	overlay_fill_rect(fb, bar_x, bar_y + bar_h - 1, bar_w, 1, border_color);
+	overlay_fill_rect(fb, bar_x, bar_y, 1, bar_h, border_color);
+	overlay_fill_rect(fb, bar_x + bar_w - 1, bar_y, 1, bar_h, border_color);
+
+	// Draw fill bar background (darker area)
+	int fill_area_x = bar_x + icon_area + padding;
+	int fill_area_w = bar_w - icon_area - padding * 2;
+	overlay_fill_rect(fb, fill_area_x, bar_y + padding,
+	                  fill_area_w, bar_h - padding * 2, border_color);
+
+	// Draw fill bar (active portion)
+	int fill_w = fill_area_w * globals.overlay_value / 100;
+	overlay_fill_rect(fb, fill_area_x, bar_y + padding,
+	                  fill_w, bar_h - padding * 2, fill_color);
+
+	// Draw icon (centered in icon area)
+	int icon_cx = bar_x + icon_area / 2;
+	int icon_cy = bar_y + bar_h / 2;
+	if (globals.overlay_type == OVERLAY_BRIGHTNESS) {
+		// Sun icon - simple cross/star pattern
+		overlay_fill_rect(fb, icon_cx - 1, icon_cy - 5, 3, 10, icon_color);
+		overlay_fill_rect(fb, icon_cx - 5, icon_cy - 1, 10, 3, icon_color);
+		overlay_fill_rect(fb, icon_cx - 3, icon_cy - 3, 7, 7, icon_color);
+	} else {
+		// Speaker icon - simple wedge shape
+		overlay_fill_rect(fb, icon_cx - 4, icon_cy - 2, 3, 5, icon_color);
+		overlay_fill_rect(fb, icon_cx - 1, icon_cy - 4, 2, 9, icon_color);
+		overlay_fill_rect(fb, icon_cx + 1, icon_cy - 5, 2, 11, icon_color);
+	}
+}
+
 // Rotate VGA buffer to display buffer (does not blit to display)
 static void IRAM_ATTR rotate_vga_to_display(uint16_t *fb, uint16_t *fb_rotated)
 {
@@ -423,6 +513,11 @@ void vga_task(void *arg)
 				osd_render(globals.osd, (uint8_t *)fb_rot,
 					   DISPLAY_WIDTH, DISPLAY_HEIGHT,
 					   DISPLAY_WIDTH * sizeof(uint16_t));
+			}
+
+			// Render brightness/volume overlay (if not showing full OSD)
+			if (!globals.osd_enabled) {
+				render_overlay_bar(fb_rot);
 			}
 
 			// Blit to display

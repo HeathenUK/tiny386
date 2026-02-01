@@ -19,8 +19,15 @@
 #include "../../pc.h"
 #include "bsp/display.h"
 #include "bsp/audio.h"
+#include "esp_log.h"  // For esp_log_timestamp()
 
 static const char *TAG = "input_bsp";
+
+// Overlay types
+#define OVERLAY_NONE       0
+#define OVERLAY_BRIGHTNESS 1
+#define OVERLAY_VOLUME     2
+#define OVERLAY_DURATION_MS 1500  // How long to show overlay
 
 // OSD toggle scancode (Meta/Windows key)
 #define SC_OSD_TOGGLE BSP_INPUT_SCANCODE_ESCAPED_LEFTMETA  // 0xe05b
@@ -34,10 +41,6 @@ static const char *TAG = "input_bsp";
 // META key state for META+arrow shortcuts
 static bool meta_held = false;
 static bool meta_consumed = false;  // Set if META+arrow was used
-
-// Current brightness and volume (0-100)
-static int current_brightness = 100;
-static int current_volume = 80;
 
 static void handle_scancode(uint8_t code, int is_down)
 {
@@ -61,20 +64,26 @@ static void handle_scancode(uint8_t code, int is_down)
 
 static void adjust_brightness(int delta)
 {
-	current_brightness += delta;
-	if (current_brightness < 0) current_brightness = 0;
-	if (current_brightness > 100) current_brightness = 100;
-	bsp_display_set_backlight_brightness((uint8_t)current_brightness);
-	ESP_LOGI(TAG, "Brightness: %d%%", current_brightness);
+	globals.brightness += delta;
+	if (globals.brightness < 0) globals.brightness = 0;
+	if (globals.brightness > 100) globals.brightness = 100;
+	bsp_display_set_backlight_brightness((uint8_t)globals.brightness);
+	// Show overlay bar
+	globals.overlay_type = OVERLAY_BRIGHTNESS;
+	globals.overlay_value = globals.brightness;
+	globals.overlay_hide_time = esp_log_timestamp() + OVERLAY_DURATION_MS;
 }
 
 static void adjust_volume(int delta)
 {
-	current_volume += delta;
-	if (current_volume < 0) current_volume = 0;
-	if (current_volume > 100) current_volume = 100;
-	bsp_audio_set_volume((float)current_volume);
-	ESP_LOGI(TAG, "Volume: %d%%", current_volume);
+	globals.volume += delta;
+	if (globals.volume < 0) globals.volume = 0;
+	if (globals.volume > 100) globals.volume = 100;
+	bsp_audio_set_volume((float)globals.volume);
+	// Show overlay bar
+	globals.overlay_type = OVERLAY_VOLUME;
+	globals.overlay_value = globals.volume;
+	globals.overlay_hide_time = esp_log_timestamp() + OVERLAY_DURATION_MS;
 }
 
 static void toggle_osd(void)
@@ -128,7 +137,12 @@ static void input_task(void *arg)
 	// Attach console to OSD for button callbacks
 	osd_attach_console(globals.osd, NULL);
 
-	ESP_LOGI(TAG, "Input task started, Meta key to toggle OSD");
+	// Apply initial brightness/volume from config (globals set by esp_main.c)
+	bsp_display_set_backlight_brightness((uint8_t)globals.brightness);
+	bsp_audio_set_volume((float)globals.volume);
+
+	ESP_LOGI(TAG, "Input task started, brightness=%d%%, volume=%d%%",
+	         globals.brightness, globals.volume);
 
 	bsp_input_event_t event;
 	while (1) {
