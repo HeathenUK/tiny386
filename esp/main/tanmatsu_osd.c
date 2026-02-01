@@ -27,36 +27,71 @@ enum {
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "common.h"
+#include "bsp/display.h"
+#include "bsp/audio.h"
 
 #include "../../vga.h"
 #include "../../misc.h"
 #include "../../ide.h"
 #include "../../pc.h"
 
-// Menu items
-typedef enum {
-	MENU_FDA = 0,
-	MENU_FDB,
-	MENU_CDA,
-	MENU_CDB,
-	MENU_CDC,
-	MENU_CDD,
-	MENU_SEP1,
-	MENU_BOOT_ORDER,
-	MENU_SAVE_INI,
-	MENU_SEP2,
-	MENU_CTRLALTDEL,
-	MENU_RESET,
-	MENU_SEP3,
-	MENU_EXIT,
-	MENU_COUNT
-} MenuItem;
-
 // View modes
 typedef enum {
-	VIEW_MENU,
+	VIEW_MAIN_MENU,
+	VIEW_MOUNTING,
+	VIEW_AUDIOVISUAL,
+	VIEW_SYSTEM,
 	VIEW_FILEBROWSER
 } ViewMode;
+
+// Main menu items
+typedef enum {
+	MAIN_MOUNTING = 0,
+	MAIN_AUDIOVISUAL,
+	MAIN_SYSTEM,
+	MAIN_SEP1,
+	MAIN_BOOT_ORDER,
+	MAIN_SAVE_INI,
+	MAIN_SEP2,
+	MAIN_CTRLALTDEL,
+	MAIN_RESET,
+	MAIN_SEP3,
+	MAIN_EXIT,
+	MAIN_COUNT
+} MainMenuItem;
+
+// Mounting submenu items
+typedef enum {
+	MOUNT_FDA = 0,
+	MOUNT_FDB,
+	MOUNT_SEP1,
+	MOUNT_CDA,
+	MOUNT_CDB,
+	MOUNT_CDC,
+	MOUNT_CDD,
+	MOUNT_SEP2,
+	MOUNT_BACK,
+	MOUNT_COUNT
+} MountMenuItem;
+
+// Audio/Visual submenu items
+typedef enum {
+	AV_BRIGHTNESS = 0,
+	AV_VOLUME,
+	AV_SEP1,
+	AV_BACK,
+	AV_COUNT
+} AVMenuItem;
+
+// System Settings submenu items
+typedef enum {
+	SYS_CPU_GEN = 0,
+	SYS_FPU,
+	SYS_MEMSIZE,
+	SYS_SEP1,
+	SYS_BACK,
+	SYS_COUNT
+} SysMenuItem;
 
 // File entry for browser
 #define MAX_FILES 256
@@ -80,9 +115,23 @@ struct OSD {
 	// Current view
 	ViewMode view;
 
-	// Main menu state
-	int menu_sel;
+	// Menu selection state
+	int main_sel;
+	int mount_sel;
+	int av_sel;
+	int sys_sel;
+
+	// Drive paths
 	char drive_paths[6][MAX_PATH_LEN];  // FDA, FDB, CDA-CDD
+
+	// Audio/Visual settings
+	int brightness;  // 0-100
+	int volume;      // 0-100
+
+	// System settings (require restart to take effect)
+	int cpu_gen;     // 3=386, 4=486, 5=586
+	int fpu;         // 0=disabled, 1=enabled
+	int mem_size_mb; // Memory in MB (1 to 24)
 
 	// File browser state
 	int browser_target;  // Which drive slot we're browsing for
@@ -112,10 +161,28 @@ struct OSD {
 #define COLOR_DIR     0x07E0  // Green
 #define COLOR_TITLE   0xFFE0  // Yellow
 #define COLOR_EJECT   0xF800  // Red
+#define COLOR_VALUE   0x07FF  // Cyan
 
 // Forward declarations
 static void populate_drive_paths(OSD *osd);
 static void scan_directory(OSD *osd);
+
+// Separator checks for each menu
+static int is_main_separator(int item) {
+	return item == MAIN_SEP1 || item == MAIN_SEP2 || item == MAIN_SEP3;
+}
+
+static int is_mount_separator(int item) {
+	return item == MOUNT_SEP1 || item == MOUNT_SEP2;
+}
+
+static int is_av_separator(int item) {
+	return item == AV_SEP1;
+}
+
+static int is_sys_separator(int item) {
+	return item == SYS_SEP1;
+}
 
 // Get just the filename from a path
 static const char *basename_ptr(const char *path)
@@ -151,56 +218,44 @@ static void populate_drive_paths(OSD *osd)
 	}
 }
 
-// Compare function for sorting files (directories first, then alphabetical)
-static int file_compare(const void *a, const void *b)
+// Directory scanning for file browser
+static int compare_files(const void *a, const void *b)
 {
-	const FileEntry *fa = a;
-	const FileEntry *fb = b;
-	// ".." always first
-	if (strcmp(fa->name, "..") == 0) return -1;
-	if (strcmp(fb->name, "..") == 0) return 1;
-	// Directories before files
-	if (fa->is_dir != fb->is_dir) return fb->is_dir - fa->is_dir;
-	// Alphabetical (case-insensitive)
+	const FileEntry *fa = (const FileEntry *)a;
+	const FileEntry *fb = (const FileEntry *)b;
+	// Directories first, then alphabetical
+	if (fa->is_dir != fb->is_dir) {
+		return fb->is_dir - fa->is_dir;
+	}
 	return strcasecmp(fa->name, fb->name);
 }
 
-// Scan current directory and populate file list
 static void scan_directory(OSD *osd)
 {
 	osd->file_count = 0;
 	osd->file_sel = 0;
 	osd->file_scroll = 0;
 
-	// Add "[Eject]" option if drive currently has an image mounted
-	int drive_idx = osd->browser_target;
-	if (drive_idx >= MENU_FDA && drive_idx <= MENU_CDD) {
-		int path_idx = drive_idx;  // FDA=0, FDB=1, CDA=2, etc.
-		if (osd->drive_paths[path_idx][0] != '\0') {
-			strcpy(osd->files[osd->file_count].name, "[Eject]");
-			osd->files[osd->file_count].is_dir = FILE_TYPE_EJECT;
-			osd->file_count++;
-		}
+	// Add "eject" option at top for drives that support it
+	if (osd->browser_target >= 0 && osd->browser_target < 6) {
+		strcpy(osd->files[osd->file_count].name, "[Eject]");
+		osd->files[osd->file_count].is_dir = FILE_TYPE_EJECT;
+		osd->file_count++;
 	}
 
-	DIR *dir = opendir(osd->browser_path);
-	if (!dir) {
-		// Try falling back to root
-		strcpy(osd->browser_path, "/sdcard");
-		dir = opendir(osd->browser_path);
-		if (!dir) return;
-	}
-
-	// Add ".." for parent directory (unless at root)
-	if (strcmp(osd->browser_path, "/") != 0 && strcmp(osd->browser_path, "/sdcard") != 0) {
+	// Add parent directory option
+	if (strlen(osd->browser_path) > 1) {
 		strcpy(osd->files[osd->file_count].name, "..");
 		osd->files[osd->file_count].is_dir = 1;
 		osd->file_count++;
 	}
 
+	DIR *dir = opendir(osd->browser_path);
+	if (!dir) return;
+
 	struct dirent *ent;
 	while ((ent = readdir(dir)) != NULL && osd->file_count < MAX_FILES) {
-		// Skip hidden files and . entry
+		// Skip hidden files and . / ..
 		if (ent->d_name[0] == '.') continue;
 
 		strncpy(osd->files[osd->file_count].name, ent->d_name, MAX_FILENAME - 1);
@@ -211,7 +266,7 @@ static void scan_directory(OSD *osd)
 		snprintf(fullpath, sizeof(fullpath), "%s/%s", osd->browser_path, ent->d_name);
 		struct stat st;
 		if (stat(fullpath, &st) == 0) {
-			osd->files[osd->file_count].is_dir = S_ISDIR(st.st_mode);
+			osd->files[osd->file_count].is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
 		} else {
 			osd->files[osd->file_count].is_dir = 0;
 		}
@@ -219,130 +274,120 @@ static void scan_directory(OSD *osd)
 	}
 	closedir(dir);
 
-	// Sort: directories first, then alphabetical
-	if (osd->file_count > 0) {
-		qsort(osd->files, osd->file_count, sizeof(FileEntry), file_compare);
+	// Sort (keep eject and .. at top)
+	int sort_start = (osd->browser_target >= 0) ? 1 : 0;
+	if (strlen(osd->browser_path) > 1) sort_start++;
+	if (osd->file_count > sort_start) {
+		qsort(&osd->files[sort_start], osd->file_count - sort_start,
+		      sizeof(FileEntry), compare_files);
 	}
 }
 
 // Text rendering using atlas
-static void draw_char(uint8_t *pixels, int w, int h, int pitch,
-                      int x, int y, char c, uint16_t color)
+static int get_char_width(int c)
 {
-	int chr = (unsigned char)c;
-	if (chr > 127) chr = '?';
+	if (c < 32 || c >= 127) return 0;
+	return atlas[ATLAS_FONT + c].w;
+}
 
-	int srcx = atlas[ATLAS_FONT + chr].x;
-	int srcy = atlas[ATLAS_FONT + chr].y;
-	int srcw = atlas[ATLAS_FONT + chr].w;
-	int srch = atlas[ATLAS_FONT + chr].h;
-
-	for (int dy = 0; dy < srch && y + dy < h; dy++) {
-		if (y + dy < 0) continue;
-		for (int dx = 0; dx < srcw && x + dx < w; dx++) {
-			if (x + dx < 0) continue;
-			uint8_t alpha = atlas_texture[(srcy + dy) * 128 + (srcx + dx)];
-			if (alpha > 128) {
-#if BPP == 16
-				*(uint16_t *)&pixels[(y + dy) * pitch + 2 * (x + dx)] = color;
-#elif BPP == 32
-				uint32_t c32 = (color & 0x1F) << 3 | ((color >> 5) & 0x3F) << 10 |
-				               ((color >> 11) & 0x1F) << 19 | 0xFF000000;
-				*(uint32_t *)&pixels[(y + dy) * pitch + 4 * (x + dx)] = c32;
-#endif
-			}
-		}
+static int get_text_width(const char *text)
+{
+	int width = 0;
+	while (*text) {
+		width += get_char_width(*text);
+		text++;
 	}
+	return width;
 }
 
 static int draw_text(uint8_t *pixels, int w, int h, int pitch,
-                     int x, int y, const char *text, uint16_t color, int max_width)
+                     int x, int y, const char *text, uint16_t color, int max_w)
 {
-	int startx = x;
-	for (const char *p = text; *p && (max_width == 0 || x - startx < max_width - 8); p++) {
-		if ((*p & 0xc0) == 0x80) continue;  // Skip UTF-8 continuation bytes
-		draw_char(pixels, w, h, pitch, x, y, *p, color);
-		int chr = (unsigned char)*p;
-		if (chr > 127) chr = '?';
-		x += atlas[ATLAS_FONT + chr].w;
+	int start_x = x;
+	while (*text) {
+		int c = (unsigned char)*text;
+		if (c < 32 || c >= 127) { text++; continue; }
+
+		mu_Rect src = atlas[ATLAS_FONT + c];
+		if (max_w > 0 && (x - start_x + src.w) > max_w) break;
+
+		// Draw character from atlas (1-bit font)
+		for (int dy = 0; dy < src.h && (y + dy) < h; dy++) {
+			for (int dx = 0; dx < src.w && (x + dx) < w; dx++) {
+				int sx = src.x + dx;
+				int sy = src.y + dy;
+				int byte_idx = sy * ATLAS_WIDTH + sx;
+				if (atlas_texture[byte_idx]) {
+					int px = x + dx;
+					int py = y + dy;
+					if (px >= 0 && px < w && py >= 0 && py < h) {
+						uint16_t *p = (uint16_t *)(pixels + py * pitch + px * 2);
+						*p = color;
+					}
+				}
+			}
+		}
+		x += src.w;
+		text++;
 	}
-	return x - startx;
+	return x - start_x;
 }
 
 static void draw_rect(uint8_t *pixels, int w, int h, int pitch,
-                      int x, int y, int rw, int rh, uint16_t color)
+                      int rx, int ry, int rw, int rh, uint16_t color)
 {
-	for (int dy = 0; dy < rh && y + dy < h; dy++) {
-		if (y + dy < 0) continue;
-		for (int dx = 0; dx < rw && x + dx < w; dx++) {
-			if (x + dx < 0) continue;
-#if BPP == 16
-			*(uint16_t *)&pixels[(y + dy) * pitch + 2 * (x + dx)] = color;
-#elif BPP == 32
-			uint32_t c32 = (color & 0x1F) << 3 | ((color >> 5) & 0x3F) << 10 |
-			               ((color >> 11) & 0x1F) << 19 | 0xFF000000;
-			*(uint32_t *)&pixels[(y + dy) * pitch + 4 * (x + dx)] = c32;
-#endif
+	for (int y = ry; y < ry + rh && y < h; y++) {
+		if (y < 0) continue;
+		for (int x = rx; x < rx + rw && x < w; x++) {
+			if (x < 0) continue;
+			uint16_t *p = (uint16_t *)(pixels + y * pitch + x * 2);
+			*p = color;
 		}
 	}
 }
 
-// Check if menu item is a separator
-static int is_separator(int item)
+// Draw a horizontal bar (for brightness/volume)
+static void draw_bar(uint8_t *pixels, int w, int h, int pitch,
+                     int x, int y, int bar_w, int bar_h, int value, int max_val)
 {
-	return item == MENU_SEP1 || item == MENU_SEP2 || item == MENU_SEP3;
+	// Background
+	draw_rect(pixels, w, h, pitch, x, y, bar_w, bar_h, COLOR_BORDER);
+	// Filled portion
+	int fill_w = (bar_w - 2) * value / max_val;
+	draw_rect(pixels, w, h, pitch, x + 1, y + 1, fill_w, bar_h - 2, COLOR_VALUE);
 }
 
-// Get menu item label
-static const char *get_menu_label(OSD *osd, int item)
-{
-	static char buf[80];
-	switch (item) {
-	case MENU_FDA:
-		snprintf(buf, sizeof(buf), "FDA: %s", basename_ptr(osd->drive_paths[0]));
-		return buf;
-	case MENU_FDB:
-		snprintf(buf, sizeof(buf), "FDB: %s", basename_ptr(osd->drive_paths[1]));
-		return buf;
-	case MENU_CDA:
-		snprintf(buf, sizeof(buf), "CDA: %s", basename_ptr(osd->drive_paths[2]));
-		return buf;
-	case MENU_CDB:
-		snprintf(buf, sizeof(buf), "CDB: %s", basename_ptr(osd->drive_paths[3]));
-		return buf;
-	case MENU_CDC:
-		snprintf(buf, sizeof(buf), "CDC: %s", basename_ptr(osd->drive_paths[4]));
-		return buf;
-	case MENU_CDD:
-		snprintf(buf, sizeof(buf), "CDD: %s", basename_ptr(osd->drive_paths[5]));
-		return buf;
-	case MENU_BOOT_ORDER:
-		{
-			const char *order_str = boot_order_names[0];
-			if (osd->pc && osd->pc->cmos) {
-				int order = cmos_get_boot_order(osd->pc->cmos);
-				if (order >= 0 && order < BOOT_ORDER_COUNT)
-					order_str = boot_order_names[order];
-			}
-			snprintf(buf, sizeof(buf), "Boot: %s", order_str);
-			return buf;
-		}
-	case MENU_SAVE_INI: return "Save Settings to INI";
-	case MENU_CTRLALTDEL: return "Send Ctrl+Alt+Del";
-	case MENU_RESET: return "Reset Emulator";
-	case MENU_EXIT: return "Reboot ESP32";
-	default: return "";
-	}
-}
+// Generic menu rendering
+typedef struct {
+	const char *label;
+	int is_separator;
+	int is_submenu;  // Shows ">" arrow
+	const char *value;  // Optional value to show on right
+} MenuEntry;
 
-// Render main menu
-static void render_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
+static void render_generic_menu(uint8_t *pixels, int w, int h, int pitch,
+                                const char *title, MenuEntry *entries, int count,
+                                int selection, const char *help_text)
 {
-	int menu_x = 40;
-	int menu_y = 40;
-	int menu_w = 360;
-	int menu_h = 280;
 	int line_h = 22;
+	int title_h = 32;
+	int help_h = 25;
+	int padding = 8;
+
+	// Calculate menu height
+	int num_separators = 0;
+	int num_items = 0;
+	for (int i = 0; i < count; i++) {
+		if (entries[i].is_separator)
+			num_separators++;
+		else
+			num_items++;
+	}
+	int content_h = title_h + (num_items * line_h) + (num_separators * line_h / 2) + help_h;
+	int menu_h = content_h + padding * 2;
+	int menu_w = 380;
+	int menu_x = (w - menu_w) / 2;
+	int menu_y = (h - menu_h) / 2;
 
 	// Background
 	draw_rect(pixels, w, h, pitch, menu_x, menu_y, menu_w, menu_h, COLOR_BG);
@@ -354,41 +399,160 @@ static void render_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	draw_rect(pixels, w, h, pitch, menu_x + menu_w - 2, menu_y, 2, menu_h, COLOR_BORDER);
 
 	// Title
-	draw_text(pixels, w, h, pitch, menu_x + 10, menu_y + 8, "tiny386", COLOR_TITLE, 0);
+	draw_text(pixels, w, h, pitch, menu_x + 10, menu_y + 8, title, COLOR_TITLE, 0);
 
 	// Menu items
-	int y = menu_y + 32;
-	for (int i = 0; i < MENU_COUNT; i++) {
-		if (is_separator(i)) {
-			// Draw separator line
+	int y = menu_y + title_h;
+	for (int i = 0; i < count; i++) {
+		if (entries[i].is_separator) {
 			draw_rect(pixels, w, h, pitch, menu_x + 10, y + 8, menu_w - 20, 1, COLOR_SEP);
 			y += line_h / 2;
 		} else {
 			// Highlight selected item
-			if (i == osd->menu_sel) {
+			if (i == selection) {
 				draw_rect(pixels, w, h, pitch, menu_x + 4, y, menu_w - 8, line_h, COLOR_HILITE);
 			}
 
 			// Draw label
-			const char *label = get_menu_label(osd, i);
-			draw_text(pixels, w, h, pitch, menu_x + 10, y + 2, label, COLOR_TEXT, menu_w - 20);
+			draw_text(pixels, w, h, pitch, menu_x + 10, y + 2, entries[i].label, COLOR_TEXT, menu_w - 80);
+
+			// Draw value or submenu arrow on right
+			if (entries[i].is_submenu) {
+				draw_text(pixels, w, h, pitch, menu_x + menu_w - 20, y + 2, ">", COLOR_TEXT, 0);
+			} else if (entries[i].value) {
+				int vw = get_text_width(entries[i].value);
+				draw_text(pixels, w, h, pitch, menu_x + menu_w - 10 - vw, y + 2,
+				          entries[i].value, COLOR_VALUE, 0);
+			}
 			y += line_h;
 		}
 	}
 
 	// Help text
-	draw_text(pixels, w, h, pitch, menu_x + 10, menu_y + menu_h - 20,
-	          "Up/Down:Select  Enter:Open  Meta:Close", COLOR_SEP, 0);
+	draw_text(pixels, w, h, pitch, menu_x + 10, menu_y + menu_h - 20, help_text, COLOR_SEP, 0);
+}
+
+// Render main menu
+static void render_main_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
+{
+	// Get current boot order name
+	const char *boot_order_val = "Unknown";
+	if (osd->pc && osd->pc->cmos) {
+		int order = cmos_get_boot_order(osd->pc->cmos);
+		if (order >= 0 && order < BOOT_ORDER_COUNT)
+			boot_order_val = boot_order_names[order];
+	}
+
+	MenuEntry entries[MAIN_COUNT] = {
+		{ "Mounting", 0, 1, NULL },
+		{ "Audio/Visual", 0, 1, NULL },
+		{ "System", 0, 1, NULL },
+		{ NULL, 1, 0, NULL },  // SEP1
+		{ "Boot Order:", 0, 0, boot_order_val },
+		{ "Save Settings", 0, 0, NULL },
+		{ NULL, 1, 0, NULL },  // SEP2
+		{ "Ctrl+Alt+Del", 0, 0, NULL },
+		{ "Reset", 0, 0, NULL },
+		{ NULL, 1, 0, NULL },  // SEP3
+		{ "Exit", 0, 0, NULL },
+	};
+
+	render_generic_menu(pixels, w, h, pitch, "tiny386", entries, MAIN_COUNT,
+	                    osd->main_sel, "Up/Down:Select  Enter:Open  Meta:Close");
+}
+
+// Render mounting submenu
+static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
+{
+	char fda_val[32], fdb_val[32];
+	char cda_val[32], cdb_val[32], cdc_val[32], cdd_val[32];
+
+	snprintf(fda_val, sizeof(fda_val), "%.20s", basename_ptr(osd->drive_paths[0]));
+	snprintf(fdb_val, sizeof(fdb_val), "%.20s", basename_ptr(osd->drive_paths[1]));
+	snprintf(cda_val, sizeof(cda_val), "%.20s", basename_ptr(osd->drive_paths[2]));
+	snprintf(cdb_val, sizeof(cdb_val), "%.20s", basename_ptr(osd->drive_paths[3]));
+	snprintf(cdc_val, sizeof(cdc_val), "%.20s", basename_ptr(osd->drive_paths[4]));
+	snprintf(cdd_val, sizeof(cdd_val), "%.20s", basename_ptr(osd->drive_paths[5]));
+
+	MenuEntry entries[MOUNT_COUNT] = {
+		{ "Floppy A:", 0, 0, fda_val },
+		{ "Floppy B:", 0, 0, fdb_val },
+		{ NULL, 1, 0, NULL },  // SEP1
+		{ "CD-ROM A:", 0, 0, cda_val },
+		{ "CD-ROM B:", 0, 0, cdb_val },
+		{ "CD-ROM C:", 0, 0, cdc_val },
+		{ "CD-ROM D:", 0, 0, cdd_val },
+		{ NULL, 1, 0, NULL },  // SEP2
+		{ "< Back", 0, 0, NULL },
+	};
+
+	render_generic_menu(pixels, w, h, pitch, "Mounting", entries, MOUNT_COUNT,
+	                    osd->mount_sel, "Enter:Browse  Esc:Back");
+}
+
+// Render audio/visual submenu
+static void render_av_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
+{
+	char bright_val[16], vol_val[16];
+	snprintf(bright_val, sizeof(bright_val), "%d%%", osd->brightness);
+	snprintf(vol_val, sizeof(vol_val), "%d%%", osd->volume);
+
+	MenuEntry entries[AV_COUNT] = {
+		{ "Brightness:", 0, 0, bright_val },
+		{ "Volume:", 0, 0, vol_val },
+		{ NULL, 1, 0, NULL },  // SEP1
+		{ "< Back", 0, 0, NULL },
+	};
+
+	render_generic_menu(pixels, w, h, pitch, "Audio/Visual", entries, AV_COUNT,
+	                    osd->av_sel, "Left/Right:Adjust  Esc:Back");
+}
+
+// CPU generation names
+static const char *cpu_gen_names[] = { "i386", "i486", "i586" };
+
+// Render system settings submenu
+static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
+{
+	char cpu_val[16], fpu_val[16], mem_val[16];
+
+	// CPU generation (3=386, 4=486, 5=586)
+	int gen_idx = osd->cpu_gen - 3;
+	if (gen_idx < 0) gen_idx = 0;
+	if (gen_idx > 2) gen_idx = 2;
+	snprintf(cpu_val, sizeof(cpu_val), "%s", cpu_gen_names[gen_idx]);
+
+	// FPU
+	snprintf(fpu_val, sizeof(fpu_val), "%s", osd->fpu ? "Enabled" : "Disabled");
+
+	// Memory size
+	snprintf(mem_val, sizeof(mem_val), "%d MB", osd->mem_size_mb);
+
+	MenuEntry entries[SYS_COUNT] = {
+		{ "CPU:", 0, 0, cpu_val },
+		{ "FPU:", 0, 0, fpu_val },
+		{ "Memory:", 0, 0, mem_val },
+		{ NULL, 1, 0, NULL },  // SEP1
+		{ "< Back (restart to apply)", 0, 0, NULL },
+	};
+
+	render_generic_menu(pixels, w, h, pitch, "System (restart req.)", entries, SYS_COUNT,
+	                    osd->sys_sel, "Left/Right:Adjust  Esc:Back");
 }
 
 // Render file browser
 static void render_browser(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	int browser_x = 30;
-	int browser_y = 30;
-	int browser_w = 380;
-	int browser_h = 300;
 	int line_h = 18;
+	int header_h = 32;
+	int help_h = 25;
+	int padding = 8;
+
+	int browser_w = (w > 400) ? 380 : w - 20;
+	int browser_h = h - 40;
+	if (browser_h > 400) browser_h = 400;
+	int browser_x = (w - browser_w) / 2;
+	int browser_y = (h - browser_h) / 2;
 
 	// Background
 	draw_rect(pixels, w, h, pitch, browser_x, browser_y, browser_w, browser_h, COLOR_BG);
@@ -406,14 +570,15 @@ static void render_browser(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	draw_rect(pixels, w, h, pitch, browser_x + 4, browser_y + 26, browser_w - 8, 1, COLOR_SEP);
 
 	// Calculate visible area
-	int list_y = browser_y + 32;
-	int list_h = browser_h - 60;
+	int list_y = browser_y + header_h;
+	int list_h = browser_h - header_h - help_h - padding;
 	osd->files_visible = list_h / line_h;
 
 	// Adjust scroll to keep selection visible
 	if (osd->file_sel < osd->file_scroll) {
 		osd->file_scroll = osd->file_sel;
-	} else if (osd->file_sel >= osd->file_scroll + osd->files_visible) {
+	}
+	if (osd->file_sel >= osd->file_scroll + osd->files_visible) {
 		osd->file_scroll = osd->file_sel - osd->files_visible + 1;
 	}
 
@@ -425,31 +590,26 @@ static void render_browser(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 			draw_rect(pixels, w, h, pitch, browser_x + 4, y, browser_w - 8, line_h, COLOR_HILITE);
 		}
 
-		// Icon/prefix for directories and special entries
-		uint16_t color;
-		const char *prefix;
+		// Format entry with icon
+		char line[MAX_FILENAME + 4];
+		uint16_t color = COLOR_TEXT;
 		if (osd->files[i].is_dir == FILE_TYPE_EJECT) {
+			snprintf(line, sizeof(line), "  %s", osd->files[i].name);
 			color = COLOR_EJECT;
-			prefix = "";
-		} else if (osd->files[i].is_dir == 1) {
+		} else if (osd->files[i].is_dir) {
+			snprintf(line, sizeof(line), "[%s]", osd->files[i].name);
 			color = COLOR_DIR;
-			prefix = "[D] ";
 		} else {
-			color = COLOR_TEXT;
-			prefix = "    ";
+			snprintf(line, sizeof(line), "  %s", osd->files[i].name);
 		}
 
-		char line[MAX_FILENAME + 8];
-		snprintf(line, sizeof(line), "%s%s", prefix, osd->files[i].name);
 		draw_text(pixels, w, h, pitch, browser_x + 8, y + 1, line, color, browser_w - 16);
-
 		y += line_h;
 	}
 
 	// Scroll indicator
 	if (osd->file_count > osd->files_visible) {
-		int scroll_h = list_h * osd->files_visible / osd->file_count;
-		if (scroll_h < 10) scroll_h = 10;
+		int scroll_h = (browser_h - header_h - help_h) * osd->files_visible / osd->file_count;
 		int scroll_y = list_y + (list_h - scroll_h) * osd->file_scroll / (osd->file_count - osd->files_visible);
 		draw_rect(pixels, w, h, pitch, browser_x + browser_w - 8, scroll_y, 4, scroll_h, COLOR_SEP);
 	}
@@ -459,102 +619,16 @@ static void render_browser(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	          "Enter:Select  Backspace:Up  Esc:Cancel", COLOR_SEP, 0);
 }
 
-// External function to send keypresses to emulator (defined in input_bsp.c)
-extern void console_send_kbd(void *opaque, int keypress, int keycode);
-
-// Send Ctrl+Alt+Del
-static void send_ctrl_alt_del(OSD *osd)
+// Apply brightness setting
+static void apply_brightness(OSD *osd)
 {
-	(void)osd;
-	console_send_kbd(NULL, 1, 0x1d);  // Ctrl down
-	vTaskDelay(pdMS_TO_TICKS(10));
-	console_send_kbd(NULL, 1, 0x38);  // Alt down
-	vTaskDelay(pdMS_TO_TICKS(10));
-	// Extended Delete key (E0 53)
-	console_send_kbd(NULL, 1, 0xe0);  // E0 prefix
-	vTaskDelay(pdMS_TO_TICKS(5));
-	console_send_kbd(NULL, 1, 0x53);  // Del down
-	vTaskDelay(pdMS_TO_TICKS(10));
-	console_send_kbd(NULL, 1, 0xe0);  // E0 prefix
-	vTaskDelay(pdMS_TO_TICKS(5));
-	console_send_kbd(NULL, 0, 0x53);  // Del up
-	vTaskDelay(pdMS_TO_TICKS(10));
-	console_send_kbd(NULL, 0, 0x38);  // Alt up
-	vTaskDelay(pdMS_TO_TICKS(10));
-	console_send_kbd(NULL, 0, 0x1d);  // Ctrl up
+	bsp_display_set_backlight_brightness(osd->brightness);
 }
 
-// Soft reset the emulator (not full ESP32 reboot)
-static void do_reset(OSD *osd)
+// Apply volume setting
+static void apply_volume(OSD *osd)
 {
-	(void)osd;
-	ESP_LOGI("OSD", "Soft reset requested");
-	globals.reset_pending = true;
-}
-
-// Handle menu selection
-static int handle_menu_select(OSD *osd)
-{
-	switch (osd->menu_sel) {
-	case MENU_FDA:
-	case MENU_FDB:
-	case MENU_CDA:
-	case MENU_CDB:
-	case MENU_CDC:
-	case MENU_CDD:
-		// Open file browser for this drive
-		osd->browser_target = osd->menu_sel;
-		strcpy(osd->browser_path, "/sdcard");
-		scan_directory(osd);
-		osd->view = VIEW_FILEBROWSER;
-		return 0;
-
-	case MENU_BOOT_ORDER:
-		// Cycle through all boot order permutations
-		ESP_LOGI("OSD", "Boot order: pc=%p cmos=%p", osd->pc, osd->pc ? osd->pc->cmos : NULL);
-		if (osd->pc && osd->pc->cmos) {
-			int order = cmos_get_boot_order(osd->pc->cmos);
-			ESP_LOGI("OSD", "Current boot order: %d", order);
-			order = (order + 1) % BOOT_ORDER_COUNT;
-			cmos_set_boot_order(osd->pc->cmos, order);
-			ESP_LOGI("OSD", "New boot order: %d", order);
-		} else {
-			ESP_LOGE("OSD", "Cannot change boot order: pc or cmos is NULL");
-		}
-		return 0;  // Stay in OSD to see the change
-
-	case MENU_SAVE_INI:
-		// Save all current settings to ini file
-		ESP_LOGI("OSD", "Save INI: pc=%p ini_path=%s", osd->pc, osd->pc ? osd->pc->ini_path : "NULL");
-		if (osd->pc && osd->pc->ini_path) {
-			int boot_order = osd->pc->cmos ? cmos_get_boot_order(osd->pc->cmos) : 0;
-			ESP_LOGI("OSD", "Saving: boot_order=%d", boot_order);
-			int ret = save_settings_to_ini(osd->pc->ini_path, boot_order,
-			                     osd->drive_paths[0], osd->drive_paths[1],
-			                     osd->drive_paths[2], osd->drive_paths[3],
-			                     osd->drive_paths[4], osd->drive_paths[5]);
-			ESP_LOGI("OSD", "save_settings_to_ini returned %d", ret);
-		} else {
-			ESP_LOGE("OSD", "Cannot save: pc or ini_path is NULL");
-		}
-		return 0;  // Stay in OSD
-
-	case MENU_CTRLALTDEL:
-		ESP_LOGI("OSD", "Sending Ctrl+Alt+Del");
-		send_ctrl_alt_del(osd);
-		ESP_LOGI("OSD", "Ctrl+Alt+Del sent");
-		return 1;  // Close OSD
-
-	case MENU_RESET:
-		do_reset(osd);
-		return 1;  // Close OSD after reset
-
-	case MENU_EXIT:
-		ESP_LOGI("OSD", "Full ESP32 reboot");
-		esp_restart();
-		return 1;  // Won't reach here
-	}
-	return 0;
+	bsp_audio_set_volume((float)osd->volume);
 }
 
 // Handle file selection
@@ -562,105 +636,207 @@ static int handle_file_select(OSD *osd)
 {
 	if (osd->file_sel < 0 || osd->file_sel >= osd->file_count) return 0;
 
-	FileEntry *sel = &osd->files[osd->file_sel];
+	FileEntry *f = &osd->files[osd->file_sel];
 
-	if (sel->is_dir == FILE_TYPE_EJECT) {
-		// Eject/unmount the current image
-		switch (osd->browser_target) {
-		case MENU_FDA:
-			if (osd->emulink) emulink_attach_floppy(osd->emulink, 0, NULL);
-			break;
-		case MENU_FDB:
-			if (osd->emulink) emulink_attach_floppy(osd->emulink, 1, NULL);
-			break;
-		case MENU_CDA:
-			if (osd->ide) ide_change_cd(osd->ide, 0, "");
-			break;
-		case MENU_CDB:
-			if (osd->ide) ide_change_cd(osd->ide, 1, "");
-			break;
-		case MENU_CDC:
-			if (osd->ide2) ide_change_cd(osd->ide2, 0, "");
-			break;
-		case MENU_CDD:
-			if (osd->ide2) ide_change_cd(osd->ide2, 1, "");
-			break;
+	if (f->is_dir == FILE_TYPE_EJECT) {
+		// Eject the drive
+		if (osd->browser_target < 2) {
+			// Floppy
+			if (osd->emulink) emulink_attach_floppy(osd->emulink, osd->browser_target, NULL);
+		} else {
+			// CD-ROM
+			IDEIFState *ide = (osd->browser_target < 4) ? osd->ide : osd->ide2;
+			if (ide) ide_change_cd(ide, (osd->browser_target - 2) % 2, "");
 		}
-		// Update drive paths and return to menu
 		populate_drive_paths(osd);
-		osd->view = VIEW_MENU;
+		osd->view = VIEW_MOUNTING;
 		return 0;
-	} else if (sel->is_dir == 1) {
+	}
+
+	if (f->is_dir) {
 		// Navigate into directory
-		if (strcmp(sel->name, "..") == 0) {
-			// Go up
+		if (strcmp(f->name, "..") == 0) {
 			char *slash = strrchr(osd->browser_path, '/');
 			if (slash && slash != osd->browser_path) {
 				*slash = '\0';
 			}
 		} else {
-			// Go into subdirectory
-			int len = strlen(osd->browser_path);
-			if (len < MAX_PATH_LEN - MAX_FILENAME - 2) {
+			if (strlen(osd->browser_path) + strlen(f->name) + 2 < MAX_PATH_LEN) {
 				strcat(osd->browser_path, "/");
-				strcat(osd->browser_path, sel->name);
+				strcat(osd->browser_path, f->name);
 			}
 		}
 		scan_directory(osd);
 		return 0;
+	}
+
+	// Mount the file
+	char fullpath[MAX_PATH_LEN];
+	snprintf(fullpath, sizeof(fullpath), "%s/%s", osd->browser_path, f->name);
+
+	if (osd->browser_target < 2) {
+		// Floppy
+		if (osd->emulink) emulink_attach_floppy(osd->emulink, osd->browser_target, fullpath);
 	} else {
-		// Select this file
-		char fullpath[MAX_PATH_LEN + MAX_FILENAME];
-		snprintf(fullpath, sizeof(fullpath), "%s/%s", osd->browser_path, sel->name);
+		// CD-ROM
+		IDEIFState *ide = (osd->browser_target < 4) ? osd->ide : osd->ide2;
+		if (ide) ide_change_cd(ide, (osd->browser_target - 2) % 2, fullpath);
+	}
 
-		// Mount the file
-		switch (osd->browser_target) {
-		case MENU_FDA:
-			if (osd->emulink) emulink_attach_floppy(osd->emulink, 0, fullpath);
-			break;
-		case MENU_FDB:
-			if (osd->emulink) emulink_attach_floppy(osd->emulink, 1, fullpath);
-			break;
-		case MENU_CDA:
-			if (osd->ide) ide_change_cd(osd->ide, 0, fullpath);
-			break;
-		case MENU_CDB:
-			if (osd->ide) ide_change_cd(osd->ide, 1, fullpath);
-			break;
-		case MENU_CDC:
-			if (osd->ide2) ide_change_cd(osd->ide2, 0, fullpath);
-			break;
-		case MENU_CDD:
-			if (osd->ide2) ide_change_cd(osd->ide2, 1, fullpath);
-			break;
+	populate_drive_paths(osd);
+	osd->view = VIEW_MOUNTING;
+	return 0;
+}
+
+// Handle mounting menu selection
+static int handle_mount_select(OSD *osd)
+{
+	switch (osd->mount_sel) {
+	case MOUNT_FDA:
+	case MOUNT_FDB:
+		osd->browser_target = osd->mount_sel;  // 0 or 1
+		strcpy(osd->browser_path, "/sdcard");
+		scan_directory(osd);
+		osd->view = VIEW_FILEBROWSER;
+		break;
+	case MOUNT_CDA:
+	case MOUNT_CDB:
+	case MOUNT_CDC:
+	case MOUNT_CDD:
+		osd->browser_target = (osd->mount_sel - MOUNT_CDA) + 2;  // 2-5
+		strcpy(osd->browser_path, "/sdcard");
+		scan_directory(osd);
+		osd->view = VIEW_FILEBROWSER;
+		break;
+	case MOUNT_BACK:
+		osd->view = VIEW_MAIN_MENU;
+		break;
+	}
+	return 0;
+}
+
+// Handle main menu selection
+static int handle_main_select(OSD *osd)
+{
+	switch (osd->main_sel) {
+	case MAIN_MOUNTING:
+		osd->view = VIEW_MOUNTING;
+		osd->mount_sel = MOUNT_FDA;
+		break;
+	case MAIN_AUDIOVISUAL:
+		osd->view = VIEW_AUDIOVISUAL;
+		osd->av_sel = AV_BRIGHTNESS;
+		break;
+	case MAIN_SYSTEM:
+		osd->view = VIEW_SYSTEM;
+		osd->sys_sel = SYS_CPU_GEN;
+		break;
+	case MAIN_BOOT_ORDER:
+		// Cycle boot order
+		if (osd->pc && osd->pc->cmos) {
+			int order = cmos_get_boot_order(osd->pc->cmos);
+			order = (order + 1) % BOOT_ORDER_COUNT;
+			cmos_set_boot_order(osd->pc->cmos, order);
 		}
+		break;
+	case MAIN_SAVE_INI:
+		// Save all current settings to ini file
+		if (osd->pc && osd->pc->ini_path) {
+			int boot_order = osd->pc->cmos ? cmos_get_boot_order(osd->pc->cmos) : 0;
+			save_settings_to_ini(osd->pc->ini_path, boot_order,
+			                     osd->drive_paths[0], osd->drive_paths[1],
+			                     osd->drive_paths[2], osd->drive_paths[3],
+			                     osd->drive_paths[4], osd->drive_paths[5],
+			                     osd->cpu_gen, osd->fpu, osd_get_mem_size_bytes(osd));
+		}
+		break;
+	case MAIN_CTRLALTDEL:
+		globals.reset_pending = true;  // Signal soft reset
+		return 1;  // Close OSD
+	case MAIN_RESET:
+		esp_restart();
+		break;
+	case MAIN_EXIT:
+		return 1;  // Close OSD
+	}
+	return 0;
+}
 
-		// Update drive paths and return to menu
-		populate_drive_paths(osd);
-		osd->view = VIEW_MENU;
-		return 0;
+// Handle A/V adjustment with left/right
+static void handle_av_adjust(OSD *osd, int delta)
+{
+	switch (osd->av_sel) {
+	case AV_BRIGHTNESS:
+		osd->brightness += delta * 5;
+		if (osd->brightness < 5) osd->brightness = 5;
+		if (osd->brightness > 100) osd->brightness = 100;
+		apply_brightness(osd);
+		break;
+	case AV_VOLUME:
+		osd->volume += delta * 5;
+		if (osd->volume < 0) osd->volume = 0;
+		if (osd->volume > 100) osd->volume = 100;
+		apply_volume(osd);
+		break;
 	}
 }
 
-// Public API
+// Handle system settings adjustment with left/right
+static void handle_sys_adjust(OSD *osd, int delta)
+{
+	switch (osd->sys_sel) {
+	case SYS_CPU_GEN:
+		osd->cpu_gen += delta;
+		if (osd->cpu_gen < 3) osd->cpu_gen = 5;  // Wrap
+		if (osd->cpu_gen > 5) osd->cpu_gen = 3;
+		break;
+	case SYS_FPU:
+		osd->fpu = !osd->fpu;
+		break;
+	case SYS_MEMSIZE:
+		// Adjust in 1MB increments, max 24MB, min 1MB
+		osd->mem_size_mb += delta;
+		if (osd->mem_size_mb < 1) osd->mem_size_mb = 1;
+		if (osd->mem_size_mb > 24) osd->mem_size_mb = 24;
+		break;
+	}
+}
+
+// Initialize OSD
 OSD *osd_init(void)
 {
 	OSD *osd = calloc(1, sizeof(OSD));
-	osd->view = VIEW_MENU;
-	osd->menu_sel = MENU_FDA;
+	if (!osd) return NULL;
+
+	osd->view = VIEW_MAIN_MENU;
+	osd->main_sel = MAIN_MOUNTING;
+	osd->mount_sel = MOUNT_FDA;
+	osd->av_sel = AV_BRIGHTNESS;
+	osd->sys_sel = SYS_CPU_GEN;
+	osd->brightness = 30;  // Default brightness
+	osd->volume = 80;      // Default volume
+
+	// Default system settings
+	osd->cpu_gen = 4;      // i486
+	osd->fpu = 1;          // Enabled
+	osd->mem_size_mb = 16; // 16MB
+
 	strcpy(osd->browser_path, "/sdcard");
+
 	return osd;
 }
 
 void osd_attach_emulink(OSD *osd, void *emulink)
 {
 	osd->emulink = emulink;
+	populate_drive_paths(osd);
 }
 
 void osd_attach_ide(OSD *osd, void *ide, void *ide2)
 {
 	osd->ide = ide;
 	osd->ide2 = ide2;
+	populate_drive_paths(osd);
 }
 
 void osd_attach_pc(OSD *osd, void *pc)
@@ -673,6 +849,22 @@ void osd_attach_console(OSD *osd, void *console)
 	osd->console = console;
 }
 
+void osd_set_system_config(OSD *osd, int cpu_gen, int fpu, long mem_size)
+{
+	osd->cpu_gen = cpu_gen;
+	osd->fpu = fpu;
+	// Convert bytes to MB
+	osd->mem_size_mb = (int)(mem_size / (1024 * 1024));
+	if (osd->mem_size_mb < 1) osd->mem_size_mb = 1;
+	if (osd->mem_size_mb > 24) osd->mem_size_mb = 24;
+}
+
+// Get system memory size in bytes for saving
+long osd_get_mem_size_bytes(OSD *osd)
+{
+	return (long)osd->mem_size_mb * 1024 * 1024;
+}
+
 void osd_refresh(OSD *osd)
 {
 	populate_drive_paths(osd);
@@ -681,57 +873,154 @@ void osd_refresh(OSD *osd)
 void osd_handle_mouse_motion(OSD *osd, int x, int y)
 {
 	(void)osd; (void)x; (void)y;
-	// Not used on Tanmatsu
 }
 
 void osd_handle_mouse_button(OSD *osd, int x, int y, int down, int btn)
 {
 	(void)osd; (void)x; (void)y; (void)down; (void)btn;
-	// Not used on Tanmatsu
 }
 
 // Returns 1 if OSD should close
 int osd_handle_key(OSD *osd, int keycode, int down)
 {
-	if (!down) return 0;  // Only handle key press, not release
+	if (!down) return 0;
 
-	if (osd->view == VIEW_MENU) {
+	switch (osd->view) {
+	case VIEW_MAIN_MENU:
 		switch (keycode) {
 		case SC_UP:
 			do {
-				osd->menu_sel--;
-				if (osd->menu_sel < 0) osd->menu_sel = MENU_COUNT - 1;
-			} while (is_separator(osd->menu_sel));
+				osd->main_sel--;
+				if (osd->main_sel < 0) osd->main_sel = MAIN_COUNT - 1;
+			} while (is_main_separator(osd->main_sel));
 			break;
-
 		case SC_DOWN:
 			do {
-				osd->menu_sel++;
-				if (osd->menu_sel >= MENU_COUNT) osd->menu_sel = 0;
-			} while (is_separator(osd->menu_sel));
+				osd->main_sel++;
+				if (osd->main_sel >= MAIN_COUNT) osd->main_sel = 0;
+			} while (is_main_separator(osd->main_sel));
 			break;
-
 		case SC_ENTER:
-			return handle_menu_select(osd);
-
+		case SC_RIGHT:
+			return handle_main_select(osd);
 		case SC_ESC:
-			return 1;  // Close OSD
+			return 1;
 		}
-	} else if (osd->view == VIEW_FILEBROWSER) {
+		break;
+
+	case VIEW_MOUNTING:
+		switch (keycode) {
+		case SC_UP:
+			do {
+				osd->mount_sel--;
+				if (osd->mount_sel < 0) osd->mount_sel = MOUNT_COUNT - 1;
+			} while (is_mount_separator(osd->mount_sel));
+			break;
+		case SC_DOWN:
+			do {
+				osd->mount_sel++;
+				if (osd->mount_sel >= MOUNT_COUNT) osd->mount_sel = 0;
+			} while (is_mount_separator(osd->mount_sel));
+			break;
+		case SC_ENTER:
+		case SC_RIGHT:
+			return handle_mount_select(osd);
+		case SC_ESC:
+		case SC_LEFT:
+			osd->view = VIEW_MAIN_MENU;
+			break;
+		}
+		break;
+
+	case VIEW_AUDIOVISUAL:
+		switch (keycode) {
+		case SC_UP:
+			do {
+				osd->av_sel--;
+				if (osd->av_sel < 0) osd->av_sel = AV_COUNT - 1;
+			} while (is_av_separator(osd->av_sel));
+			break;
+		case SC_DOWN:
+			do {
+				osd->av_sel++;
+				if (osd->av_sel >= AV_COUNT) osd->av_sel = 0;
+			} while (is_av_separator(osd->av_sel));
+			break;
+		case SC_LEFT:
+			if (osd->av_sel == AV_BACK) {
+				osd->view = VIEW_MAIN_MENU;
+			} else {
+				handle_av_adjust(osd, -1);
+			}
+			break;
+		case SC_RIGHT:
+			if (osd->av_sel == AV_BACK) {
+				// Do nothing
+			} else {
+				handle_av_adjust(osd, +1);
+			}
+			break;
+		case SC_ENTER:
+			if (osd->av_sel == AV_BACK) {
+				osd->view = VIEW_MAIN_MENU;
+			}
+			break;
+		case SC_ESC:
+			osd->view = VIEW_MAIN_MENU;
+			break;
+		}
+		break;
+
+	case VIEW_SYSTEM:
+		switch (keycode) {
+		case SC_UP:
+			do {
+				osd->sys_sel--;
+				if (osd->sys_sel < 0) osd->sys_sel = SYS_COUNT - 1;
+			} while (is_sys_separator(osd->sys_sel));
+			break;
+		case SC_DOWN:
+			do {
+				osd->sys_sel++;
+				if (osd->sys_sel >= SYS_COUNT) osd->sys_sel = 0;
+			} while (is_sys_separator(osd->sys_sel));
+			break;
+		case SC_LEFT:
+			if (osd->sys_sel == SYS_BACK) {
+				osd->view = VIEW_MAIN_MENU;
+			} else {
+				handle_sys_adjust(osd, -1);
+			}
+			break;
+		case SC_RIGHT:
+			if (osd->sys_sel == SYS_BACK) {
+				// Do nothing
+			} else {
+				handle_sys_adjust(osd, +1);
+			}
+			break;
+		case SC_ENTER:
+			if (osd->sys_sel == SYS_BACK) {
+				osd->view = VIEW_MAIN_MENU;
+			}
+			break;
+		case SC_ESC:
+			osd->view = VIEW_MAIN_MENU;
+			break;
+		}
+		break;
+
+	case VIEW_FILEBROWSER:
 		switch (keycode) {
 		case SC_UP:
 			if (osd->file_sel > 0) osd->file_sel--;
 			break;
-
 		case SC_DOWN:
 			if (osd->file_sel < osd->file_count - 1) osd->file_sel++;
 			break;
-
 		case SC_ENTER:
 			return handle_file_select(osd);
-
 		case SC_BACKSPACE:
-			// Go up a directory
 			{
 				char *slash = strrchr(osd->browser_path, '/');
 				if (slash && slash != osd->browser_path) {
@@ -740,12 +1029,12 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 				}
 			}
 			break;
-
 		case SC_ESC:
-			// Back to menu
-			osd->view = VIEW_MENU;
+		case SC_LEFT:
+			osd->view = VIEW_MOUNTING;
 			break;
 		}
+		break;
 	}
 
 	return 0;
@@ -753,9 +1042,21 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 
 void osd_render(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	if (osd->view == VIEW_MENU) {
-		render_menu(osd, pixels, w, h, pitch);
-	} else if (osd->view == VIEW_FILEBROWSER) {
+	switch (osd->view) {
+	case VIEW_MAIN_MENU:
+		render_main_menu(osd, pixels, w, h, pitch);
+		break;
+	case VIEW_MOUNTING:
+		render_mounting_menu(osd, pixels, w, h, pitch);
+		break;
+	case VIEW_AUDIOVISUAL:
+		render_av_menu(osd, pixels, w, h, pitch);
+		break;
+	case VIEW_SYSTEM:
+		render_sys_menu(osd, pixels, w, h, pitch);
+		break;
+	case VIEW_FILEBROWSER:
 		render_browser(osd, pixels, w, h, pitch);
+		break;
 	}
 }

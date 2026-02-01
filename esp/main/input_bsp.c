@@ -51,6 +51,7 @@ static void toggle_osd(void)
 		osd_attach_emulink(globals.osd, pc->emulink);
 		osd_attach_ide(globals.osd, pc->ide, pc->ide2);
 		osd_attach_pc(globals.osd, pc);
+		osd_set_system_config(globals.osd, pc->cpu_gen, pc->fpu, pc->phys_mem_size);
 		osd_refresh(globals.osd);
 	}
 	ESP_LOGI(TAG, "OSD %s", globals.osd_enabled ? "enabled" : "disabled");
