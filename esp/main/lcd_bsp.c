@@ -136,6 +136,16 @@ static void update_scale_params(void)
 	cached_mode_h = native_h;
 	cached_pixel_double = pixel_double;
 
+	/* Mode changed - clear both rotated framebuffers to black to avoid
+	 * leaving behind artifacts in the outer areas not covered by the
+	 * new scaled/centered content */
+	size_t fb_rot_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
+	for (int i = 0; i < NUM_ROTATE_BUFFERS; i++) {
+		if (fb_rotated_buffers[i]) {
+			memset(fb_rotated_buffers[i], 0, fb_rot_size);
+		}
+	}
+
 	/* Calculate intended VGA output dimensions (native * pixel_double).
 	 * For mode 13h: native 320x200, intended 640x400 (2x both dimensions).
 	 * For text mode: native 720x400, intended 720x400 (pixel_double=1). */
@@ -179,11 +189,12 @@ static void update_scale_params(void)
 	         cached_out_w, cached_out_h, cached_offset_x, cached_offset_y);
 }
 
-static void IRAM_ATTR rotate_and_blit(uint16_t *fb, uint16_t *fb_rotated)
+// Rotate VGA buffer to display buffer (does not blit to display)
+static void IRAM_ATTR rotate_vga_to_display(uint16_t *fb, uint16_t *fb_rotated)
 {
 	if (!fb || !fb_rotated) {
 		if (blit_debug_count < 5) {
-			ESP_LOGE(TAG, "rotate_and_blit: invalid params fb=%p fb_rot=%p",
+			ESP_LOGE(TAG, "rotate: invalid params fb=%p fb_rot=%p",
 			         fb, fb_rotated);
 			blit_debug_count++;
 		}
@@ -236,7 +247,6 @@ static void IRAM_ATTR rotate_and_blit(uint16_t *fb, uint16_t *fb_rotated)
 
 		esp_err_t ret = ppa_do_scale_rotate_mirror(ppa_srm_handle, &srm_config);
 		if (ret == ESP_OK) {
-			bsp_display_blit(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, fb_rotated);
 			return;
 		}
 
@@ -247,7 +257,6 @@ static void IRAM_ATTR rotate_and_blit(uint16_t *fb, uint16_t *fb_rotated)
 
 	// Software rotation fallback (no scaling, just rotation)
 	software_rotate_90cw_stride(fb, fb_rotated, vga_width, vga_height, vga_width);
-	bsp_display_blit(0, 0, vga_height, vga_width, fb_rotated);
 }
 
 // Set VGA framebuffer dimensions - called after PC config is loaded
@@ -400,20 +409,24 @@ void vga_task(void *arg)
 		pc_vga_step(globals.pc);
 		t1 = esp_log_timestamp();
 
-		// Render OSD overlay to VGA buffer BEFORE rotation
-		// This ensures OSD gets rotated along with VGA content for correct orientation
-		if (globals.osd_enabled && globals.osd && globals.fb) {
-			osd_render(globals.osd, (uint8_t *)globals.fb,
-				   vga_width, vga_height,
-				   vga_width * sizeof(uint16_t));
-		}
-
-		// Rotate and blit using alternating buffers (lock-free double buffering)
+		// Rotate, render OSD, and blit using alternating buffers
 		if (globals.fb) {
 			int write_idx = atomic_load(&rotate_write_idx);
+			uint16_t *fb_rot = fb_rotated_buffers[write_idx];
 			t2 = esp_log_timestamp();
 
-			rotate_and_blit((uint16_t *)globals.fb, fb_rotated_buffers[write_idx]);
+			// Rotate VGA content to display buffer
+			rotate_vga_to_display((uint16_t *)globals.fb, fb_rot);
+
+			// Render OSD overlay to rotated buffer (consistent size/position)
+			if (globals.osd_enabled && globals.osd) {
+				osd_render(globals.osd, (uint8_t *)fb_rot,
+					   DISPLAY_WIDTH, DISPLAY_HEIGHT,
+					   DISPLAY_WIDTH * sizeof(uint16_t));
+			}
+
+			// Blit to display
+			bsp_display_blit(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, fb_rot);
 
 			t3 = esp_log_timestamp();
 			// Swap to next buffer for next frame

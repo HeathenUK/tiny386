@@ -51,6 +51,7 @@ static void handle_scancode(uint8_t code, int is_down)
 		if (osd_handle_key(globals.osd, code, is_down)) {
 			// OSD requested close
 			globals.osd_enabled = false;
+			globals.vga_force_redraw = true;  // Force VGA to redraw over OSD
 			ESP_LOGI(TAG, "OSD disabled");
 		}
 	} else {

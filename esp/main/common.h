@@ -23,6 +23,7 @@ struct Globals {
 	void *osd;         // OSD context
 	bool osd_enabled;  // OSD visible
 	bool reset_pending; // Soft reset requested from OSD
+	bool vga_force_redraw; // Force full VGA redraw (e.g., after OSD closes)
 	uint8_t key_pressed[KEYCODE_MAX];  // Key state tracking
 	int vga_width;     // VGA framebuffer dimensions for OSD rendering
 	int vga_height;

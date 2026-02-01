@@ -301,10 +301,39 @@ static int get_text_width(const char *text)
 	return width;
 }
 
+// Portrait mode: OSD renders to 480x800 portrait buffer but uses 800x480 logical coords
+// User views display rotated 90 CCW, so we rotate OSD 90 CCW to compensate
+// Transform: logical (x, y) in 800x480 -> buffer (479-y, x) in 480x800
+static int osd_portrait_mode = 0;
+static int osd_phys_w = 0;  // Physical buffer width
+static int osd_phys_h = 0;  // Physical buffer height
+static int osd_phys_pitch = 0;  // Physical buffer pitch
+static uint8_t *osd_pixels = NULL;
+
+static inline void put_pixel(int x, int y, uint16_t color)
+{
+	int bx, by;
+	if (osd_portrait_mode) {
+		// Rotate 90 CCW for user viewing display rotated 90 CCW
+		// Logical (x,y) in 800x480 -> buffer (phys_w-1-y, x) in 480x800
+		bx = osd_phys_w - 1 - y;
+		by = x;
+	} else {
+		bx = x;
+		by = y;
+	}
+	if (bx < 0 || bx >= osd_phys_w || by < 0 || by >= osd_phys_h) return;
+	uint16_t *p = (uint16_t *)(osd_pixels + by * osd_phys_pitch + bx * 2);
+	*p = color;
+}
+
 static int draw_text(uint8_t *pixels, int w, int h, int pitch,
                      int x, int y, const char *text, uint16_t color, int max_w)
 {
+	(void)pixels; (void)pitch;  // Using globals instead
 	int start_x = x;
+	// w and h are logical dimensions (swapped by osd_render in portrait mode)
+
 	while (*text) {
 		unsigned char c = *text++;
 		if (c < 32) continue;
@@ -319,8 +348,7 @@ static int draw_text(uint8_t *pixels, int w, int h, int pitch,
 			for (int dx = 0; dx < FONT_WIDTH && (x + dx) < w; dx++) {
 				if (x + dx < 0) continue;
 				if (row & (0x80 >> dx)) {
-					uint16_t *p = (uint16_t *)(pixels + (y + dy) * pitch + (x + dx) * 2);
-					*p = color;
+					put_pixel(x + dx, y + dy, color);
 				}
 			}
 		}
@@ -332,12 +360,14 @@ static int draw_text(uint8_t *pixels, int w, int h, int pitch,
 static void draw_rect(uint8_t *pixels, int w, int h, int pitch,
                       int rx, int ry, int rw, int rh, uint16_t color)
 {
+	(void)pixels; (void)pitch;  // Using globals instead
+	// w and h are logical dimensions (swapped by osd_render in portrait mode)
+
 	for (int y = ry; y < ry + rh && y < h; y++) {
 		if (y < 0) continue;
 		for (int x = rx; x < rx + rw && x < w; x++) {
 			if (x < 0) continue;
-			uint16_t *p = (uint16_t *)(pixels + y * pitch + x * 2);
-			*p = color;
+			put_pixel(x, y, color);
 		}
 	}
 }
@@ -381,9 +411,14 @@ static void render_generic_menu(uint8_t *pixels, int w, int h, int pitch,
 	}
 	int content_h = title_h + (num_items * line_h) + (num_separators * line_h / 2) + help_h;
 	int menu_h = content_h + padding * 2;
+	// Adapt menu width to available screen space
 	int menu_w = 380;
+	if (menu_w > w - 10) menu_w = w - 10;
+	if (menu_w < 100) menu_w = 100;  // Minimum usable width
 	int menu_x = (w - menu_w) / 2;
+	if (menu_x < 0) menu_x = 0;
 	int menu_y = (h - menu_h) / 2;
+	if (menu_y < 0) menu_y = 0;
 
 	// Background with panel color
 	draw_rect(pixels, w, h, pitch, menu_x, menu_y, menu_w, menu_h, COLOR_PANEL);
@@ -545,10 +580,14 @@ static void render_browser(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	int padding = 8;
 
 	int browser_w = (w > 400) ? 380 : w - 20;
+	if (browser_w < 100) browser_w = 100;  // Minimum usable width
 	int browser_h = h - 40;
 	if (browser_h > 400) browser_h = 400;
+	if (browser_h < 100) browser_h = 100;  // Minimum usable height
 	int browser_x = (w - browser_w) / 2;
+	if (browser_x < 0) browser_x = 0;
 	int browser_y = (h - browser_h) / 2;
+	if (browser_y < 0) browser_y = 0;
 
 	// Background
 	draw_rect(pixels, w, h, pitch, browser_x, browser_y, browser_w, browser_h, COLOR_BG);
@@ -1038,6 +1077,24 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 
 void osd_render(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
+	// Store physical buffer info for put_pixel
+	osd_pixels = pixels;
+	osd_phys_w = w;
+	osd_phys_h = h;
+	osd_phys_pitch = pitch;
+
+	// Enable portrait mode if buffer is taller than wide
+	// User views display rotated 90 CCW, so OSD uses 800x480 logical coords
+	if (h > w) {
+		osd_portrait_mode = 1;
+		// Swap dimensions for logical landscape coordinates
+		int tmp = w;
+		w = h;  // Logical width = 800
+		h = tmp;  // Logical height = 480
+	} else {
+		osd_portrait_mode = 0;
+	}
+
 	switch (osd->view) {
 	case VIEW_MAIN_MENU:
 		render_main_menu(osd, pixels, w, h, pitch);

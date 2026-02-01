@@ -5,6 +5,9 @@
 #include <assert.h>
 #include <fcntl.h>
 #include <unistd.h>
+#ifdef BUILD_ESP32
+#include "common.h"
+#endif
 
 #ifdef USEKVM
 #define cpu_raise_irq cpukvm_raise_irq
@@ -451,8 +454,17 @@ void pc_vga_step(void *o)
 {
 	PC *pc = o;
 	int refresh = vga_step(pc->vga);
+	int full_update = 0;
+#ifdef BUILD_ESP32
+	/* Check if a full redraw was requested (e.g., OSD closed) */
+	if (globals.vga_force_redraw) {
+		globals.vga_force_redraw = false;
+		full_update = 1;
+		refresh = 1;  /* Force refresh even if VGA unchanged */
+	}
+#endif
 	if (refresh) {
-		vga_refresh(pc->vga, pc->redraw, pc->redraw_data, 0);
+		vga_refresh(pc->vga, pc->redraw, pc->redraw_data, full_update);
 	}
 }
 
