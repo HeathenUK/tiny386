@@ -32,7 +32,8 @@ int cmos_get_boot_order(CMOS *cmos);
 int save_settings_to_ini(const char *ini_path, int boot_order,
                          const char *fda, const char *fdb,
                          const char *cda, const char *cdb,
-                         const char *cdc, const char *cdd);
+                         const char *cdc, const char *cdd,
+                         int cpu_gen, int fpu, long mem_size);
 
 typedef struct EMULINK EMULINK;
 EMULINK *emulink_init();

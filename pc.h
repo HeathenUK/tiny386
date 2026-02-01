@@ -48,6 +48,10 @@ typedef struct {
 	int vga_mem_size;
 	int64_t boot_start_time;
 
+	// CPU config (stored for OSD access)
+	int cpu_gen;  // 3=386, 4=486, 5=586
+	int fpu;      // 0=disabled, 1=enabled
+
 	SimpleFBDrawFunc *redraw;
 	void *redraw_data;
 	void (*poll)(void *);

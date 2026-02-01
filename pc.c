@@ -172,7 +172,9 @@ static u16 pc_io_read16(void *o, int addr)
 	case 0x220:
 		return adlib_read(pc->adlib, addr);
 	default:
+#ifdef DEBUG_IO
 		fprintf(stderr, "inw 0x%x <= 0x%x\n", addr, 0xffff);
+#endif
 		return 0xffff;
 	}
 }
@@ -396,7 +398,9 @@ static void pc_io_write16(void *o, int addr, u16 val)
 		ne2000_asic_ioport_write(pc->ne2000, addr, val);
 		return;
 	default:
+#ifdef DEBUG_IO
 		fprintf(stderr, "outw 0x%x => 0x%x\n", val, addr);
+#endif
 		return;
 	}
 }
@@ -644,6 +648,8 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	pc->cmdline = conf->cmdline;
 	pc->ini_path = conf->ini_path;
 	pc->enable_serial = conf->enable_serial;
+	pc->cpu_gen = conf->cpu_gen;
+	pc->fpu = conf->fpu;
 #if !defined(_WIN32) && !defined(__wasm__)
 	if (pc->enable_serial)
 		CaptureKeyboardInput();

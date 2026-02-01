@@ -437,7 +437,8 @@ static int line_starts_with(const char *line, const char *key)
 int save_settings_to_ini(const char *ini_path, int boot_order,
                          const char *fda, const char *fdb,
                          const char *cda, const char *cdb,
-                         const char *cdc, const char *cdd)
+                         const char *cdc, const char *cdd,
+                         int cpu_gen, int fpu, long mem_size)
 {
 	if (!ini_path) return -1;
 	if (boot_order < 0 || boot_order >= BOOT_ORDER_COUNT)
@@ -455,21 +456,39 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	}
 	int line_count = 0;
 	int in_pc_section = 0;
+	int in_cpu_section = 0;
 	int pc_section_end = -1;
+	int cpu_section_end = -1;
 
 	// Track which settings we found
 	int found_boot_order = -1, found_fda = -1, found_fdb = -1;
 	int found_cda = -1, found_cdb = -1, found_cdc = -1, found_cdd = -1;
+	int found_mem_size = -1;
+	int found_gen = -1, found_fpu = -1;
 
 	while (line_count < 64 && fgets(lines[line_count], 256, f)) {
-		// Check for [pc] section
+		// Check for section headers
 		if (strncmp(lines[line_count], "[pc]", 4) == 0) {
+			if (in_cpu_section && cpu_section_end < 0) {
+				cpu_section_end = line_count;
+			}
 			in_pc_section = 1;
-		} else if (lines[line_count][0] == '[') {
+			in_cpu_section = 0;
+		} else if (strncmp(lines[line_count], "[cpu]", 5) == 0) {
 			if (in_pc_section && pc_section_end < 0) {
 				pc_section_end = line_count;
 			}
 			in_pc_section = 0;
+			in_cpu_section = 1;
+		} else if (lines[line_count][0] == '[') {
+			if (in_pc_section && pc_section_end < 0) {
+				pc_section_end = line_count;
+			}
+			if (in_cpu_section && cpu_section_end < 0) {
+				cpu_section_end = line_count;
+			}
+			in_pc_section = 0;
+			in_cpu_section = 0;
 		}
 
 		// Check for existing settings in [pc] section
@@ -481,15 +500,25 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			else if (line_starts_with(lines[line_count], "cdb")) found_cdb = line_count;
 			else if (line_starts_with(lines[line_count], "cdc")) found_cdc = line_count;
 			else if (line_starts_with(lines[line_count], "cdd")) found_cdd = line_count;
+			else if (line_starts_with(lines[line_count], "mem_size")) found_mem_size = line_count;
+		}
+
+		// Check for existing settings in [cpu] section
+		if (in_cpu_section) {
+			if (line_starts_with(lines[line_count], "gen")) found_gen = line_count;
+			else if (line_starts_with(lines[line_count], "fpu")) found_fpu = line_count;
 		}
 
 		line_count++;
 	}
 	fclose(f);
 
-	// If no [pc] section end found, it goes to end of file
+	// If no section end found, it goes to end of file
 	if (in_pc_section && pc_section_end < 0) {
 		pc_section_end = line_count;
+	}
+	if (in_cpu_section && cpu_section_end < 0) {
+		cpu_section_end = line_count;
 	}
 
 	// Write back with updated settings
@@ -516,6 +545,12 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			if (cdc && cdc[0]) fprintf(f, "cdc = %s\n", cdc);
 		} else if (i == found_cdd) {
 			if (cdd && cdd[0]) fprintf(f, "cdd = %s\n", cdd);
+		} else if (i == found_mem_size) {
+			fprintf(f, "mem_size = %ldM\n", mem_size / (1024 * 1024));
+		} else if (i == found_gen) {
+			fprintf(f, "gen = %d\n", cpu_gen);
+		} else if (i == found_fpu) {
+			fprintf(f, "fpu = %d\n", fpu);
 		} else {
 			fputs(lines[i], f);
 		}
@@ -536,6 +571,17 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 				fprintf(f, "cdc = %s\n", cdc);
 			if (found_cdd < 0 && cdd && cdd[0])
 				fprintf(f, "cdd = %s\n", cdd);
+			if (found_mem_size < 0) {
+				fprintf(f, "mem_size = %ldM\n", mem_size / (1024 * 1024));
+			}
+		}
+
+		// Add new settings at end of [cpu] section
+		if (i == cpu_section_end - 1) {
+			if (found_gen < 0)
+				fprintf(f, "gen = %d\n", cpu_gen);
+			if (found_fpu < 0)
+				fprintf(f, "fpu = %d\n", fpu);
 		}
 	}
 
