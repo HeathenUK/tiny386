@@ -55,9 +55,8 @@ struct AdlibState {
     int ticking[2];
     int enabled;
     int active;
-#ifdef DEBUG
-    int64_t exp[2];
-#endif
+    uint32_t timer_expire[2];  /* Expiration time in microseconds */
+    uint32_t timer_start[2];   /* Start time in microseconds */
     void *voice;
     FM_OPL *opl;
 };
@@ -101,14 +100,12 @@ uint32_t adlib_read(void *opaque, uint32_t nport)
     return OPLRead (s->opl, a);
 }
 
+extern uint32_t get_uticks(void);
+
 static void timer_handler (void *opaque, int c, FLOAT interval_Sec)
 {
     AdlibState *s = opaque;
     unsigned n = c & 1;
-#ifdef DEBUG
-    double interval;
-    int64_t exp;
-#endif
 
     if (interval_Sec == 0.0) {
         s->ticking[n] = 0;
@@ -116,19 +113,28 @@ static void timer_handler (void *opaque, int c, FLOAT interval_Sec)
     }
 
     s->ticking[n] = 1;
-#ifdef DEBUG
-    interval = NANOSECONDS_PER_SECOND * interval_Sec;
-    exp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + interval;
-    s->exp[n] = exp;
-#endif
-
-//    AUD_init_time_stamp_out (s->voice, &s->ats);
+    s->timer_start[n] = get_uticks();
+    /* Convert seconds to microseconds */
+    s->timer_expire[n] = (uint32_t)(interval_Sec * 1000000.0f);
 }
 
 void adlib_callback (void *opaque, uint8_t *stream, int free)
 {
     AdlibState *s = opaque;
     int samples;
+
+    /* Check and fire expired OPL timers */
+    uint32_t now = get_uticks();
+    for (int n = 0; n < 2; n++) {
+        if (s->ticking[n]) {
+            uint32_t elapsed = now - s->timer_start[n];
+            if (elapsed >= s->timer_expire[n]) {
+                OPLTimerOver(s->opl, n);
+                /* Timer may be restarted by OPLTimerOver, update start time */
+                s->timer_start[n] = now;
+            }
+        }
+    }
 
     samples = free >> SHIFT;
     if (!(s->active && s->enabled) || !samples) {

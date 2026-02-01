@@ -35,7 +35,7 @@ void *pcmalloc(long size);
 #define pcmalloc malloc
 #endif
 
-#ifdef SB16_LOG
+#if defined(SB16_LOG) || defined(BUILD_ESP32)
 #define dolog(...) fprintf(stderr, "sb16: " __VA_ARGS__)
 #define qemu_log_mask(_, ...) fprintf(stderr, "sb16: " __VA_ARGS__)
 #else
@@ -437,7 +437,7 @@ static void command (SB16State *s, uint8_t cmd)
 
         case 0x10:
             s->needed_bytes = 1;
-            goto warn;
+            break;
 
         case 0x14:
             s->needed_bytes = 2;
@@ -750,8 +750,32 @@ static void complete (SB16State *s)
             break;
 
         case 0x10:
+            /* Direct DAC output - write single 8-bit sample to DAC */
             d0 = dsp_get_data (s);
-            dolog ("cmd 0x10 d0=%#x\n", d0);
+            /* Initialize audio if needed */
+            if (!s->voice) {
+                s->fmt = AUDIO_FORMAT_U8;
+                s->fmt_bits = 8;
+                s->fmt_signed = 0;
+                s->fmt_stereo = 0;
+                /* Direct DAC typically polled at ~12-15kHz by games */
+                s->freq = 12000;
+                set_audio(s, s->fmt, s->freq, 1);
+                s->voice = s;
+            }
+            /* Put sample into audio buffer */
+            {
+                unsigned int len = AUDIO_BUF_LEN - (s->audio_q - s->audio_p);
+                if (len > AUDIO_BUF_LEN)
+                    len = 0;
+                if (len > 0) {
+                    unsigned int q = s->audio_q % AUDIO_BUF_LEN;
+                    s->audio_buf[q] = d0;
+                    s->audio_q++;
+                }
+            }
+            AUD_set_active_out(s, 1);
+            speaker(s, 1);
             break;
 
         case 0x14:
