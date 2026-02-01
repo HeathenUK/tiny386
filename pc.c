@@ -950,6 +950,10 @@ int parse_conf_ini(void* user, const char* section,
 			conf->width = atoi(value);
 		} else if (NAME("height")) {
 			conf->height = atoi(value);
+		} else if (NAME("frame_skip")) {
+			conf->frame_skip = atoi(value);
+			if (conf->frame_skip < 0) conf->frame_skip = 0;
+			if (conf->frame_skip > 10) conf->frame_skip = 10;
 		}
 	} else if (SEC("cpu")) {
 		if (NAME("gen")) {

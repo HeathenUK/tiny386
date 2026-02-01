@@ -18,6 +18,7 @@
 
 #include "../../ini.h"
 #include "../../pc.h"
+#include "../../vga.h"
 #include "common.h"
 
 //
@@ -183,6 +184,12 @@ static int pc_main(const char *file)
 	globals.pc = pc;
 	globals.kbd = pc->kbd;
 	globals.mouse = pc->mouse;
+
+	/* Apply frame skip setting from config */
+	vga_frame_skip_max = conf.frame_skip;
+	if (vga_frame_skip_max > 0) {
+		fprintf(stderr, "Frame skip enabled: max %d frames\n", vga_frame_skip_max);
+	}
 #ifndef USE_LCD_BSP
 	// For non-BSP backends, console allocates fb - store it globally
 	globals.fb = console->fb;

@@ -107,4 +107,91 @@ pie_memcpy_128:
     ret
     .size   pie_memcpy_128, . - pie_memcpy_128
 
+/*
+ * Render 8 Mode 13h pixels: load indices, lookup palette, store RGB565
+ * Interleaves operations to hide memory latency
+ *
+ * void pie_render_8pixels_mode13(uint16_t *dst, const uint8_t *indices, const uint16_t *palette);
+ *   a0 = destination pointer (should be 16-byte aligned)
+ *   a1 = pointer to 8 palette indices
+ *   a2 = pointer to 256-entry RGB565 palette
+ */
+    .global pie_render_8pixels_mode13
+    .type   pie_render_8pixels_mode13, @function
+pie_render_8pixels_mode13:
+    /* Load 8 indices as two 32-bit words */
+    lw      t0, 0(a1)           /* indices 0-3 */
+    lw      t1, 4(a1)           /* indices 4-7 */
+
+    /* Extract index 0 and start lookup (hide latency with other extracts) */
+    andi    t2, t0, 0xFF        /* idx0 */
+    slli    t2, t2, 1           /* idx0 * 2 (byte offset) */
+    add     t2, a2, t2
+
+    srli    t3, t0, 8
+    andi    t3, t3, 0xFF        /* idx1 */
+    slli    t3, t3, 1
+    add     t3, a2, t3
+
+    srli    t4, t0, 16
+    andi    t4, t4, 0xFF        /* idx2 */
+    slli    t4, t4, 1
+    add     t4, a2, t4
+
+    srli    t5, t0, 24          /* idx3 (no mask needed) */
+    slli    t5, t5, 1
+    add     t5, a2, t5
+
+    /* Load first 4 colors (interleaved with index 4-7 calculation) */
+    lhu     a3, 0(t2)           /* color0 */
+
+    andi    t2, t1, 0xFF        /* idx4 */
+    slli    t2, t2, 1
+    add     t2, a2, t2
+
+    lhu     a4, 0(t3)           /* color1 */
+
+    srli    t3, t1, 8
+    andi    t3, t3, 0xFF        /* idx5 */
+    slli    t3, t3, 1
+    add     t3, a2, t3
+
+    lhu     a5, 0(t4)           /* color2 */
+
+    srli    t4, t1, 16
+    andi    t4, t4, 0xFF        /* idx6 */
+    slli    t4, t4, 1
+    add     t4, a2, t4
+
+    lhu     a6, 0(t5)           /* color3 */
+
+    srli    t5, t1, 24          /* idx7 */
+    slli    t5, t5, 1
+    add     t5, a2, t5
+
+    /* Load colors 4-7 */
+    lhu     a7, 0(t2)           /* color4 */
+    lhu     t0, 0(t3)           /* color5 */
+    lhu     t1, 0(t4)           /* color6 */
+    lhu     t2, 0(t5)           /* color7 */
+
+    /* Pack into 32-bit words for efficient store */
+    slli    t3, a4, 16
+    or      t3, t3, a3          /* colors[1:0] */
+    slli    t4, a6, 16
+    or      t4, t4, a5          /* colors[3:2] */
+    slli    t5, t0, 16
+    or      t5, t5, a7          /* colors[5:4] */
+    slli    t6, t2, 16
+    or      t6, t6, t1          /* colors[7:6] */
+
+    /* Store 16 bytes (8 pixels) */
+    sw      t3, 0(a0)
+    sw      t4, 4(a0)
+    sw      t5, 8(a0)
+    sw      t6, 12(a0)
+
+    ret
+    .size   pie_render_8pixels_mode13, . - pie_render_8pixels_mode13
+
 #endif /* CONFIG_IDF_TARGET_ESP32P4 */

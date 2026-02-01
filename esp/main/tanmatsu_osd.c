@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "../../vga.h"  // For vga_frame_skip_max
+
 // VGA 8x16 bitmap font for clean text rendering
 #include "vga_font_8x16.h"
 
@@ -71,6 +73,7 @@ typedef enum {
 typedef enum {
 	AV_BRIGHTNESS = 0,
 	AV_VOLUME,
+	AV_FRAME_SKIP,
 	AV_SEP1,
 	AV_BACK,
 	AV_COUNT
@@ -120,6 +123,7 @@ struct OSD {
 	// Audio/Visual settings
 	int brightness;  // 0-100
 	int volume;      // 0-100
+	int frame_skip;  // 0-10 max frames to skip
 
 	// System settings (require restart to take effect)
 	int cpu_gen;     // 3=386, 4=486, 5=586
@@ -524,13 +528,19 @@ static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pi
 // Render audio/visual submenu
 static void render_av_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	char bright_val[16], vol_val[16];
+	char bright_val[16], vol_val[16], skip_val[16];
 	snprintf(bright_val, sizeof(bright_val), "%d%%", osd->brightness);
 	snprintf(vol_val, sizeof(vol_val), "%d%%", osd->volume);
+	if (osd->frame_skip == 0) {
+		snprintf(skip_val, sizeof(skip_val), "Off");
+	} else {
+		snprintf(skip_val, sizeof(skip_val), "Max %d", osd->frame_skip);
+	}
 
 	MenuEntry entries[AV_COUNT] = {
 		{ "Brightness:", 0, 0, bright_val },
 		{ "Volume:", 0, 0, vol_val },
+		{ "Frame Skip:", 0, 0, skip_val },
 		{ NULL, 1, 0, NULL },  // SEP1
 		{ "< Back", 0, 0, NULL },
 	};
@@ -813,6 +823,12 @@ static void handle_av_adjust(OSD *osd, int delta)
 		if (osd->volume > 100) osd->volume = 100;
 		apply_volume(osd);
 		break;
+	case AV_FRAME_SKIP:
+		osd->frame_skip += delta;
+		if (osd->frame_skip < 0) osd->frame_skip = 0;
+		if (osd->frame_skip > 10) osd->frame_skip = 10;
+		vga_frame_skip_max = osd->frame_skip;
+		break;
 	}
 }
 
@@ -850,6 +866,7 @@ OSD *osd_init(void)
 	osd->sys_sel = SYS_CPU_GEN;
 	osd->brightness = 30;  // Default brightness
 	osd->volume = 80;      // Default volume
+	osd->frame_skip = vga_frame_skip_max;  // Load from config
 
 	// Default system settings
 	osd->cpu_gen = 4;      // i486

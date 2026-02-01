@@ -110,6 +110,7 @@ typedef struct {
 	int enable_serial;
 	int vga_force_8dm;
 	int boot_order;  // 0=HDD, 1=Floppy, 2=CD (see misc.h BOOT_ORDER_*)
+	int frame_skip;  // 0=disabled, 1-10=max frames to skip (adaptive)
 	const char *ini_path;  // Path to ini file for saving settings
 } PCConfig;
 

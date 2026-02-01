@@ -31,7 +31,17 @@
 
 #ifdef BUILD_ESP32
 void *pcmalloc(long size);
+#include "esp_timer.h"
+static inline uint64_t sb_get_time_us(void) {
+    return esp_timer_get_time();
+}
 #else
+#include <time.h>
+static inline uint64_t sb_get_time_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
 #define pcmalloc malloc
 #endif
 
@@ -127,6 +137,11 @@ struct SB16State {
 
     uint8_t e2_valadd;
     uint8_t e2_valxor;
+
+    /* Direct DAC rate estimation (DOSBox-style) */
+    uint64_t dac_last_time;      /* Timestamp of last Direct DAC write (microseconds) */
+    int dac_sample_count;        /* Samples since last rate update */
+    int dac_estimated_freq;      /* Current estimated frequency */
 };
 
 static void AUD_set_active_out (SB16State *s, int i)
@@ -750,21 +765,51 @@ static void complete (SB16State *s)
             break;
 
         case 0x10:
-            /* Direct DAC output - write single 8-bit sample to DAC */
+            /* Direct DAC output - write single 8-bit sample to DAC
+             * DOSBox-style: measure actual write interval to estimate rate */
             d0 = dsp_get_data (s);
-            /* Initialize audio if needed */
-            if (!s->voice) {
-                s->fmt = AUDIO_FORMAT_U8;
-                s->fmt_bits = 8;
-                s->fmt_signed = 0;
-                s->fmt_stereo = 0;
-                /* Direct DAC typically polled at ~12-15kHz by games */
-                s->freq = 12000;
-                set_audio(s, s->fmt, s->freq, 1);
-                s->voice = s;
-            }
-            /* Put sample into audio buffer */
             {
+                uint64_t now = sb_get_time_us();
+
+                /* Initialize audio on first sample */
+                if (!s->voice) {
+                    s->fmt = AUDIO_FORMAT_U8;
+                    s->fmt_bits = 8;
+                    s->fmt_signed = 0;
+                    s->fmt_stereo = 0;
+                    /* Start with time constant if set, otherwise 11025Hz */
+                    if (s->time_const != -1) {
+                        int tmp = 256 - s->time_const;
+                        s->freq = (1000000 + (tmp / 2)) / tmp;
+                    } else {
+                        s->freq = 11025;
+                    }
+                    s->dac_estimated_freq = s->freq;
+                    s->dac_last_time = now;
+                    s->dac_sample_count = 0;
+                    set_audio(s, s->fmt, s->freq, 1);
+                    s->voice = s;
+                }
+
+                /* Estimate sample rate from write intervals (every 64 samples) */
+                s->dac_sample_count++;
+                if (s->dac_sample_count >= 64 && now > s->dac_last_time) {
+                    uint64_t elapsed = now - s->dac_last_time;
+                    if (elapsed > 0) {
+                        /* Calculate rate: samples * 1,000,000 / microseconds */
+                        int new_freq = (int)((uint64_t)s->dac_sample_count * 1000000 / elapsed);
+                        /* Clamp to reasonable range (1kHz - 23kHz) */
+                        if (new_freq < 1000) new_freq = 1000;
+                        if (new_freq > 23000) new_freq = 23000;
+                        /* Smooth with previous estimate (75% old, 25% new) */
+                        s->dac_estimated_freq = (s->dac_estimated_freq * 3 + new_freq) / 4;
+                        s->freq = s->dac_estimated_freq;
+                    }
+                    s->dac_last_time = now;
+                    s->dac_sample_count = 0;
+                }
+
+                /* Put sample into audio buffer */
                 unsigned int len = AUDIO_BUF_LEN - (s->audio_q - s->audio_p);
                 if (len > AUDIO_BUF_LEN)
                     len = 0;
@@ -1430,29 +1475,36 @@ static int resample_u16s(int16_t *out, int olen, int os,
 static int resample_u8m(int16_t *out, int olen, int os,
                         uint8_t *in, int ip, int ilen, int itlen, int is)
 {
-    int g = gcd(os, is);
-    os = os / g;
-    is = is / g;
-    int uc = os;
-    int dc = is;
-    int i = 0;
+    /* Linear interpolation resampler for better audio quality */
+    if (ilen < 2) return 0;
+
     int j = 0;
-    while (i < ilen && j + 1 < olen) {
-        dc--;
-        if (dc == 0) {
-            dc = is;
-            int8_t d = in[(ip + i) % itlen] - 128;
-            out[j] = d << 8;
-            out[j + 1] = out[j];
-            j += 2;
-        }
-        uc--;
-        if (uc == 0) {
-            uc = os;
-            i++;
-        }
+    /* Fixed-point position in input, 16 bits fractional */
+    uint32_t pos = 0;
+    uint32_t step = ((uint32_t)is << 16) / os;
+
+    while (j + 1 < olen) {
+        int i = pos >> 16;
+        if (i + 1 >= ilen) break;
+
+        /* Get two adjacent samples */
+        int s0 = (int)(in[(ip + i) % itlen]) - 128;
+        int s1 = (int)(in[(ip + i + 1) % itlen]) - 128;
+
+        /* Linear interpolation */
+        int frac = (pos >> 8) & 0xFF;  /* 8 bits of fraction */
+        int sample = s0 + ((s1 - s0) * frac >> 8);
+
+        /* Scale to 16-bit and output as stereo */
+        int16_t out_sample = (int16_t)(sample << 8);
+        out[j] = out_sample;
+        out[j + 1] = out_sample;
+        j += 2;
+
+        pos += step;
     }
-    return i;
+
+    return pos >> 16;  /* Return number of input samples consumed */
 }
 
 static int resample_u8s(int16_t *out, int olen, int os,

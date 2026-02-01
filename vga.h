@@ -20,6 +20,9 @@ void vga_refresh(VGAState *s,
 void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val);
 uint32_t vga_ioport_read(VGAState *s, uint32_t addr);
 
+/* Adaptive frame skipping (0=disabled, 1-10=max frames to skip) */
+extern int vga_frame_skip_max;
+
 void vbe_write(VGAState *s, uint32_t offset, uint32_t val);
 uint32_t vbe_read(VGAState *s, uint32_t offset);
 
