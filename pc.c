@@ -1,4 +1,5 @@
 #include "pc.h"
+#include "i8042.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -871,6 +872,8 @@ void pc_reset(PC *pc)
 {
 	// Clear conventional memory (0-640KB) but preserve video/BIOS areas
 	memset(pc->phys_mem, 0, 0xa0000);
+	// Reset keyboard controller and clear any pending input
+	i8042_reset(pc->i8042);
 	// Reload BIOS and reset CPU
 	load_bios_and_reset(pc);
 }

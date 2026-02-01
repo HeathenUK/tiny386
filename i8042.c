@@ -317,6 +317,8 @@ static void kbd_reset(void *opaque)
 
     s->mode = KBD_MODE_KBD_INT | KBD_MODE_MOUSE_INT | KBD_MODE_KCC;
     s->status = KBD_STAT_CMD | KBD_STAT_UNLOCKED;
+    s->pending = 0;
+    s->write_cmd = 0;
 }
 
 KBDState *i8042_init(PS2KbdState **pkbd,
@@ -899,4 +901,16 @@ PS2MouseState *ps2_mouse_init(void (*update_irq)(void *, int), void *update_arg)
     s->common.update_arg = update_arg;
     ps2_reset(&s->common);
     return s;
+}
+
+/* Public reset function - called on soft reset (Ctrl+Alt+Del) */
+void i8042_reset(KBDState *s)
+{
+    if (!s) return;
+    kbd_reset(s);
+    if (s->kbd) ps2_reset(&s->kbd->common);
+    if (s->mouse) ps2_reset(&s->mouse->common);
+    /* Clear any pending IRQs */
+    s->set_irq(s->pic, s->irq_kbd, 0);
+    s->set_irq(s->pic, s->irq_mouse, 0);
 }

@@ -219,6 +219,10 @@ static int pc_main(const char *file)
 			if (globals.fb && globals.vga_width > 0 && globals.vga_height > 0) {
 				memset(globals.fb, 0, globals.vga_width * globals.vga_height * sizeof(uint16_t));
 			}
+			// Clear rotated framebuffer (480x800 portrait)
+			if (globals.fb_rotated) {
+				memset(globals.fb_rotated, 0, 480 * 800 * sizeof(uint16_t));
+			}
 			pc_reset(pc);
 			pc->boot_start_time = get_uticks();
 		}
