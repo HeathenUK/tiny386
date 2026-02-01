@@ -39,12 +39,19 @@
 #endif
 #else
 #define IRAM_ATTR
+#define DRAM_ATTR
 #endif
 
 #ifdef BUILD_ESP32
 void *pcmalloc(long size);
+/* Allocate from PSRAM outside emulator pool (for caches, etc.) */
+#include "esp_heap_caps.h"
+static inline void *psram_malloc(size_t size) {
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+}
 #else
 #define pcmalloc malloc
+#define psram_malloc malloc
 #endif
 
 /* PIE (SIMD) functions for ESP32-P4 - defined in vga_pie.S */
@@ -65,7 +72,7 @@ extern void pie_memcpy_128(void *dst, const void *src, size_t n);
  * This replaces expensive per-pixel bit shifting with a simple table lookup,
  * dramatically improving EGA mode rendering performance.
  */
-static const uint8_t planar_expand[256][8] = {
+static const DRAM_ATTR uint8_t planar_expand[256][8] = {
 #define PE(n) {((n)>>7)&1,((n)>>6)&1,((n)>>5)&1,((n)>>4)&1,((n)>>3)&1,((n)>>2)&1,((n)>>1)&1,(n)&1}
 #define PE4(n) PE(n),PE(n+1),PE(n+2),PE(n+3)
 #define PE16(n) PE4(n),PE4(n+4),PE4(n+8),PE4(n+12)
@@ -240,6 +247,26 @@ struct VGAState {
     uint16_t last_cursor_offset;
     uint8_t last_cursor_start;
     uint8_t last_cursor_end;
+
+#ifdef TEXT_RENDER_OPT
+    /* Text rendering optimizations */
+    uint32_t text_hash;           /* CRC32 of text buffer for frame skip */
+    uint32_t last_text_start;     /* Last text buffer start address */
+    uint32_t last_text_size;      /* Last text buffer size */
+    int scroll_lines;             /* Detected scroll amount (positive=up, negative=down) */
+
+    /* Glyph tile cache: LRU cache of pre-rendered glyph+fg+bg combinations */
+    #define GLYPH_CACHE_SIZE 512  /* 512 entries * 256 bytes = 128KB (allocated from free PSRAM) */
+    #define GLYPH_TILE_SIZE (8 * 16 * 2)  /* 8x16 pixels * 2 bytes RGB565 */
+    uint8_t *glyph_cache_tiles;   /* GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE bytes */
+    uint32_t glyph_cache_keys[GLYPH_CACHE_SIZE];  /* char | (fg << 8) | (bg << 12) | (cheight << 16) */
+    uint8_t glyph_cache_lru[GLYPH_CACHE_SIZE];    /* LRU counter */
+    uint8_t glyph_cache_counter;  /* Global LRU counter */
+
+    /* Font IRAM cache */
+    uint8_t *font_cache;          /* 256 * 16 * 4 = 16KB in IRAM */
+    uint32_t font_cache_base;     /* VGA RAM offset of cached font */
+#endif
 
     /* VBE extension */
     uint16_t vbe_index;
@@ -763,6 +790,193 @@ static void vbe_update_vgaregs(VGAState *s)
     s->cr[VGA_CRTC_MAX_SCAN] &= ~0x9f; /* no double scan */
 }
 
+#ifdef TEXT_RENDER_OPT
+/* Fast CRC32 for text buffer hash - uses table lookup */
+static const DRAM_ATTR uint32_t crc32_table[256] = {
+    0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f,
+    0xe963a535, 0x9e6495a3, 0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988,
+    0x09b64c2b, 0x7eb17cbd, 0xe7b82d09, 0x90bf1d91, 0x1db71064, 0x6ab020f2,
+    0xf3b97148, 0x84be41de, 0x1adad47d, 0x6ddde4eb, 0xf4d4b551, 0x83d385c7,
+    0x136c9856, 0x646ba8c0, 0xfd62f97a, 0x8a65c9ec, 0x14015c4f, 0x63066cd9,
+    0xfa0f3d63, 0x8d080df5, 0x3b6e20c8, 0x4c69105e, 0xd56041e4, 0xa2677172,
+    0x3c03e4d1, 0x4b04d447, 0xd20d85fd, 0xa50ab56b, 0x35b5a8fa, 0x42b2986c,
+    0xdbbbc9d6, 0xacbcf940, 0x32d86ce3, 0x45df5c75, 0xdcd60dcf, 0xabd13d59,
+    0x26d930ac, 0x51de003a, 0xc8d75180, 0xbfd06116, 0x21b4f4b5, 0x56b3c423,
+    0xcfba9599, 0xb8bda50f, 0x2802b89e, 0x5f058808, 0xc60cd9b2, 0xb10be924,
+    0x2f6f7c87, 0x58684c11, 0xc1611dab, 0xb6662d3d, 0x76dc4190, 0x01db7106,
+    0x98d220bc, 0xefd5102a, 0x71b18589, 0x06b6b51f, 0x9fbfe4a5, 0xe8b8d433,
+    0x7807c9a2, 0x0f00f934, 0x9609a88e, 0xe10e9818, 0x7f6a0dbb, 0x086d3d2d,
+    0x91646c97, 0xe6635c01, 0x6b6b51f4, 0x1c6c6162, 0x856530d8, 0xf262004e,
+    0x6c0695ed, 0x1b01a57b, 0x8208f4c1, 0xf50fc457, 0x65b0d9c6, 0x12b7e950,
+    0x8bbeb8ea, 0xfcb9887c, 0x62dd1ddf, 0x15da2d49, 0x8cd37cf3, 0xfbd44c65,
+    0x4db26158, 0x3ab551ce, 0xa3bc0074, 0xd4bb30e2, 0x4adfa541, 0x3dd895d7,
+    0xa4d1c46d, 0xd3d6f4fb, 0x4369e96a, 0x346ed9fc, 0xad678846, 0xda60b8d0,
+    0x44042d73, 0x33031de5, 0xaa0a4c5f, 0xdd0d7cd9, 0x5005713c, 0x270241aa,
+    0xbe0b1010, 0xc90c2086, 0x5768b525, 0x206f85b3, 0xb966d409, 0xce61e49f,
+    0x5edef90e, 0x29d9c998, 0xb0d09822, 0xc7d7a8b4, 0x59b33d17, 0x2eb40d81,
+    0xb7bd5c3b, 0xc0ba6cad, 0xedb88320, 0x9abfb3b6, 0x03b6e20c, 0x74b1d29a,
+    0xead54739, 0x9dd277af, 0x04db2615, 0x73dc1683, 0xe3630b12, 0x94643b84,
+    0x0d6d6a3e, 0x7a6a5aa8, 0xe40ecf0b, 0x9309ff9d, 0x0a00ae27, 0x7d079eb1,
+    0xf00f9344, 0x8708a3d2, 0x1e01f268, 0x6906c2fe, 0xf762575d, 0x806567cb,
+    0x196c3671, 0x6e6b06e7, 0xfed41b76, 0x89d32be0, 0x10da7a5a, 0x67dd4acc,
+    0xf9b9df6f, 0x8ebeeff9, 0x17b7be43, 0x60b08ed5, 0xd6d6a3e8, 0xa1d1937e,
+    0x38d8c2c4, 0x4fdff252, 0xd1bb67f1, 0xa6bc5767, 0x3fb506dd, 0x48b2364b,
+    0xd80d2bda, 0xaf0a1b4c, 0x36034af6, 0x41047a60, 0xdf60efc3, 0xa867df55,
+    0x316e8eef, 0x4669be79, 0xcb61b38c, 0xbc66831a, 0x256fd2a0, 0x5268e236,
+    0xcc0c7795, 0xbb0b4703, 0x220216b9, 0x5505262f, 0xc5ba3bbe, 0xb2bd0b28,
+    0x2bb45a92, 0x5cb36a04, 0xc2d7ffa7, 0xb5d0cf31, 0x2cd99e8b, 0x5bdeae1d,
+    0x9b64c2b0, 0xec63f226, 0x756aa39c, 0x026d930a, 0x9c0906a9, 0xeb0e363f,
+    0x72076785, 0x05005713, 0x95bf4a82, 0xe2b87a14, 0x7bb12bae, 0x0cb61b38,
+    0x92d28e9b, 0xe5d5be0d, 0x7cdcefb7, 0x0bdbdf21, 0x86d3d2d4, 0xf1d4e242,
+    0x68ddb3f8, 0x1fda836e, 0x81be16cd, 0xf6b9265b, 0x6fb077e1, 0x18b74777,
+    0x88085ae6, 0xff0f6a70, 0x66063bca, 0x11010b5c, 0x8f659eff, 0xf862ae69,
+    0x616bffd3, 0x166ccf45, 0xa00ae278, 0xd70dd2ee, 0x4e048354, 0x3903b3c2,
+    0xa7672661, 0xd06016f7, 0x4969474d, 0x3e6e77db, 0xaed16a4a, 0xd9d65adc,
+    0x40df0b66, 0x37d83bf0, 0xa9bcae53, 0xdebb9ec5, 0x47b2cf7f, 0x30b5ffe9,
+    0xbdbdf21c, 0xcabac28a, 0x53b39330, 0x24b4a3a6, 0xbad03605, 0xcdd706b3,
+    0x54de5729, 0x23d967bf, 0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94,
+    0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d
+};
+
+static uint32_t IRAM_ATTR text_crc32(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xffffffff;
+    while (len >= 4) {
+        crc = crc32_table[(crc ^ data[0]) & 0xff] ^ (crc >> 8);
+        crc = crc32_table[(crc ^ data[1]) & 0xff] ^ (crc >> 8);
+        crc = crc32_table[(crc ^ data[2]) & 0xff] ^ (crc >> 8);
+        crc = crc32_table[(crc ^ data[3]) & 0xff] ^ (crc >> 8);
+        data += 4;
+        len -= 4;
+    }
+    while (len--) {
+        crc = crc32_table[(crc ^ *data++) & 0xff] ^ (crc >> 8);
+    }
+    return crc ^ 0xffffffff;
+}
+
+/* Detect scroll by comparing old and new text buffers.
+ * Returns number of lines scrolled (positive = up, negative = down, 0 = no scroll) */
+static int detect_text_scroll(const uint16_t *old_attrs, const uint16_t *new_vram,
+                               int width, int height, uint32_t line_offset)
+{
+    /* Check for 1-line scroll up (most common case) */
+    int line_words = width;
+    int total_words = width * height;
+
+    /* Compare line 0 of old with line 1 of new */
+    const uint16_t *old_line0 = old_attrs;
+    const uint16_t *new_line1 = new_vram + line_offset / 2;
+
+    int match_count = 0;
+    for (int i = 0; i < line_words && i < (height - 1) * width; i++) {
+        if (old_line0[i] == new_line1[i]) match_count++;
+    }
+
+    /* If >80% match, likely a scroll up */
+    if (match_count > line_words * 4 / 5) {
+        /* Verify more lines match the scroll pattern */
+        int lines_matched = 0;
+        for (int y = 0; y < height - 1; y++) {
+            const uint16_t *old_line = old_attrs + y * width;
+            const uint16_t *new_line = new_vram + (y + 1) * line_offset / 2;
+            int line_match = 0;
+            for (int x = 0; x < width; x++) {
+                if (old_line[x] == *(uint16_t *)((uint8_t *)new_vram + (y + 1) * line_offset + x * 2))
+                    line_match++;
+            }
+            if (line_match > width * 4 / 5) lines_matched++;
+        }
+        if (lines_matched > (height - 1) * 3 / 4) return 1;  /* Scroll up by 1 */
+    }
+
+    return 0;  /* No scroll detected */
+}
+
+/* Look up glyph in cache, returns pointer to tile or NULL if not cached */
+static uint8_t *glyph_cache_lookup(VGAState *s, uint32_t key)
+{
+    if (!s->glyph_cache_tiles) return NULL;
+
+    for (int i = 0; i < GLYPH_CACHE_SIZE; i++) {
+        if (s->glyph_cache_keys[i] == key) {
+            s->glyph_cache_lru[i] = s->glyph_cache_counter;
+            return s->glyph_cache_tiles + i * GLYPH_TILE_SIZE;
+        }
+    }
+    return NULL;
+}
+
+/* Store glyph in cache, evicting LRU entry if needed */
+static uint8_t *glyph_cache_store(VGAState *s, uint32_t key)
+{
+    if (!s->glyph_cache_tiles) return NULL;
+
+    /* Find LRU entry */
+    int lru_idx = 0;
+    uint8_t oldest = 255;
+    for (int i = 0; i < GLYPH_CACHE_SIZE; i++) {
+        if (s->glyph_cache_keys[i] == 0xffffffff) {
+            lru_idx = i;
+            break;
+        }
+        uint8_t age = s->glyph_cache_counter - s->glyph_cache_lru[i];
+        if (age > oldest || oldest == 255) {
+            oldest = age;
+            lru_idx = i;
+        }
+    }
+
+    s->glyph_cache_keys[lru_idx] = key;
+    s->glyph_cache_lru[lru_idx] = ++s->glyph_cache_counter;
+    return s->glyph_cache_tiles + lru_idx * GLYPH_TILE_SIZE;
+}
+
+/* Render a glyph to a tile buffer (8x16 RGB565) */
+static void render_glyph_tile(uint8_t *tile, const uint8_t *font_ptr,
+                               int cheight, uint32_t fgcol, uint32_t bgcol)
+{
+    uint16_t *dst = (uint16_t *)tile;
+    uint32_t xorcol = bgcol ^ fgcol;
+
+    for (int y = 0; y < cheight; y++) {
+        uint8_t font_data = font_ptr[0];
+        dst[0] = (-((font_data >> 7)) & xorcol) ^ bgcol;
+        dst[1] = (-((font_data >> 6) & 1) & xorcol) ^ bgcol;
+        dst[2] = (-((font_data >> 5) & 1) & xorcol) ^ bgcol;
+        dst[3] = (-((font_data >> 4) & 1) & xorcol) ^ bgcol;
+        dst[4] = (-((font_data >> 3) & 1) & xorcol) ^ bgcol;
+        dst[5] = (-((font_data >> 2) & 1) & xorcol) ^ bgcol;
+        dst[6] = (-((font_data >> 1) & 1) & xorcol) ^ bgcol;
+        dst[7] = (-((font_data >> 0) & 1) & xorcol) ^ bgcol;
+        font_ptr += 4;
+        dst += 8;
+    }
+}
+
+/* Update font cache from VGA RAM - called when font pointer changes */
+static void update_font_cache(VGAState *s, const uint8_t *font_base)
+{
+    if (!s->font_cache) return;
+
+    uint32_t font_offset = font_base - s->vga_ram;
+    if (font_offset == s->font_cache_base) return;  /* Font unchanged */
+
+    /* Copy font data to cache (256 chars * 16 rows * 4 bytes stride) */
+    for (int ch = 0; ch < 256; ch++) {
+        const uint8_t *src = font_base + ch * 32 * 4;  /* 32 rows * 4 bytes per char in VGA RAM */
+        uint8_t *dst = s->font_cache + ch * 16 * 4;    /* 16 rows * 4 bytes in cache */
+        for (int row = 0; row < 16; row++) {
+            dst[row * 4] = src[row * 4];
+        }
+    }
+    s->font_cache_base = font_offset;
+
+    /* Invalidate glyph cache since font changed */
+    memset(s->glyph_cache_keys, 0xff, sizeof(s->glyph_cache_keys));
+}
+#endif /* TEXT_RENDER_OPT */
+
 /* the text refresh is just for debugging and initial boot message, so
    it is very incomplete */
 static void vga_text_refresh(VGAState *s,
@@ -793,7 +1007,12 @@ static void vga_text_refresh(VGAState *s,
     uint32_t v = s->sr[0x3];
     font_base[0] = vga_ram + (((v >> 4) & 1) | ((v << 1) & 6)) * 8192 * 4 + 2;
     font_base[1] = vga_ram + (((v >> 5) & 1) | ((v >> 1) & 6)) * 8192 * 4 + 2;
-    
+
+#ifdef TEXT_RENDER_OPT
+    /* Update font cache if needed (copy font to faster memory) */
+    update_font_cache(s, font_base[0]);
+#endif
+
     line_offset = s->cr[0x13];
     line_offset <<= 3;
 
@@ -809,7 +1028,55 @@ static void vga_text_refresh(VGAState *s,
         ((s->cr[0x07] & 0x02) << 7) |
         ((s->cr[0x07] & 0x40) << 3);
     height = (height + 1) / cheight;
-    
+
+#ifdef TEXT_RENDER_OPT
+    /* Text buffer hash check - skip render if unchanged */
+    {
+        uint32_t text_size = width * height * 2;  /* 2 bytes per char (char + attr) */
+        uint32_t text_start = start_addr * 4;
+        if (text_start + text_size <= (uint32_t)s->vga_ram_size) {
+            uint32_t hash = text_crc32(vga_ram + text_start, text_size);
+            /* Also include cursor position in hash to detect cursor movement */
+            hash ^= (s->cr[0x0e] << 24) | (s->cr[0x0f] << 16) | (s->cursor_visible_phase << 8);
+
+            if (hash == s->text_hash && !full_update &&
+                s->last_text_start == text_start && s->last_text_size == text_size) {
+                /* Text buffer unchanged - skip rendering entirely */
+                return;
+            }
+
+            /* Check for scroll and optimize if detected */
+            if (!full_update && s->last_text_start == text_start &&
+                s->last_text_size == text_size && s->last_ch_attr[0] != 0xffff) {
+                int scroll = detect_text_scroll(s->last_ch_attr,
+                    (uint16_t *)(vga_ram + text_start), width, height, line_offset);
+                if (scroll == 1) {
+                    /* Scroll up by 1 line - memmove framebuffer */
+                    int w1 = width * cwidth;
+                    int line_bytes = w1 * (BPP / 8);
+                    int total_lines = height * cheight;
+                    uint8_t *fb = fb_dev->fb_data;
+                    memmove(fb, fb + line_bytes * cheight,
+                            line_bytes * (total_lines - cheight));
+                    /* Only need to render the last line */
+                    /* Mark all lines except last as unchanged */
+                    for (int y = 0; y < height - 1; y++) {
+                        for (int x = 0; x < width; x++) {
+                            s->last_ch_attr[y * width + x] =
+                                *(uint16_t *)(vga_ram + text_start + (y + 1) * line_offset + x * 2);
+                        }
+                    }
+                    s->scroll_lines = 1;
+                }
+            }
+
+            s->text_hash = hash;
+            s->last_text_start = text_start;
+            s->last_text_size = text_size;
+        }
+    }
+#endif
+
     width1 = width * cwidth;
     height1 = height * cheight;
 #if defined(SCALE_3_2) || defined(SWAPXY)
@@ -921,12 +1188,55 @@ static void vga_text_refresh(VGAState *s,
                 ch = ch_attr & 0xff;
                 cattr = ch_attr >> 8;
 
-                font_ptr = font_base[(cattr >> 3) & 1] + 32 * 4 * ch;
                 bgcol = s->last_palette[cattr >> 4];
                 fgcol = s->last_palette[cattr & 0x0f];
+#ifdef TEXT_RENDER_OPT
+                /* Use font cache if available and using primary font */
+                int use_alt_font = (cattr >> 3) & 1;
+                if (s->font_cache && !use_alt_font) {
+                    font_ptr = s->font_cache + ch * 16 * 4;
+                } else {
+                    font_ptr = font_base[use_alt_font] + 32 * 4 * ch;
+                }
+#else
+                font_ptr = font_base[(cattr >> 3) & 1] + 32 * 4 * ch;
+#endif
                 if (cwidth == 8) {
+#ifdef TEXT_RENDER_OPT
+                    /* Try glyph cache first */
+                    uint32_t cache_key = ch | ((cattr & 0x0f) << 8) | ((cattr >> 4) << 12) | (cheight << 16);
+                    uint8_t *tile = glyph_cache_lookup(s, cache_key);
+                    if (tile) {
+                        /* Cache hit - copy pre-rendered tile */
+                        uint8_t *d = dst;
+                        uint8_t *t = tile;
+                        for (int row = 0; row < cheight; row++) {
+                            memcpy(d, t, 16);  /* 8 pixels * 2 bytes */
+                            d += stride;
+                            t += 16;
+                        }
+                    } else {
+                        /* Cache miss - render and store */
+                        tile = glyph_cache_store(s, cache_key);
+                        if (tile) {
+                            render_glyph_tile(tile, font_ptr, cheight, fgcol, bgcol);
+                            /* Copy to framebuffer */
+                            uint8_t *d = dst;
+                            uint8_t *t = tile;
+                            for (int row = 0; row < cheight; row++) {
+                                memcpy(d, t, 16);
+                                d += stride;
+                                t += 16;
+                            }
+                        } else {
+                            /* No cache available - direct render */
+                            vga_draw_glyph8(dst, stride, font_ptr, cheight, fgcol, bgcol);
+                        }
+                    }
+#else
                     vga_draw_glyph8(dst, stride, font_ptr, cheight,
                                     fgcol, bgcol);
+#endif
                 } else {
                     dup9 = 0;
                     if (ch >= 0xb0 && ch <= 0xdf && (s->ar[0x10] & 0x04))
@@ -2759,6 +3069,29 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
 
     s->vbe_regs[VBE_DISPI_INDEX_ID] = VBE_DISPI_ID5;
     s->vbe_regs[VBE_DISPI_INDEX_VIDEO_MEMORY_64K] = s->vga_ram_size >> 16;
+
+#ifdef TEXT_RENDER_OPT
+#ifdef BUILD_ESP32
+    /* Try internal RAM first for font cache (16KB) - accessed every char */
+    s->font_cache = heap_caps_malloc(256 * 16 * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!s->font_cache) s->font_cache = psram_malloc(256 * 16 * 4);
+
+    /* Glyph tile cache (128KB) - try internal RAM, fall back to PSRAM */
+    s->glyph_cache_tiles = heap_caps_malloc(GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE,
+                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!s->glyph_cache_tiles)
+        s->glyph_cache_tiles = psram_malloc(GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE);
+#else
+    s->font_cache = psram_malloc(256 * 16 * 4);
+    s->glyph_cache_tiles = psram_malloc(GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE);
+#endif
+    if (s->glyph_cache_tiles) {
+        memset(s->glyph_cache_tiles, 0, GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE);
+        memset(s->glyph_cache_keys, 0xff, sizeof(s->glyph_cache_keys));  /* Invalid keys */
+    }
+    s->glyph_cache_counter = 0;
+    s->font_cache_base = 0xffffffff;
+#endif
 
     vga_initmode(s);
     return s;

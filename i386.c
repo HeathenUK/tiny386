@@ -93,6 +93,7 @@ struct CPUI386 {
 	long phys_mem_size;
 
 	long cycle;
+	uint64_t tsc;  /* Time stamp counter for RDTSC */
 
 	int excno;
 	uword excerr;
@@ -339,7 +340,7 @@ static int get_CF(CPUI386 *cpu)
 	assert(false);
 }
 
-const static u8 parity_tab[256] = {
+static const DRAM_ATTR u8 parity_tab[256] = {
   1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
   0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
   0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
@@ -381,9 +382,14 @@ void i386_init_flags_tables(void)
 
 #ifdef BUILD_ESP32
 	extern void *psmalloc(long size);
-	flags_logic8 = psmalloc(256);
-	flags_add8 = psmalloc(sizeof(flags8_arith_t));
-	flags_sub8 = psmalloc(sizeof(flags8_arith_t));
+	/* flags_logic8 in internal RAM for speed (accessed on every logical op) */
+	flags_logic8 = heap_caps_malloc(256, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	/* Try internal RAM for arithmetic tables (128KB each) - major speedup if fits */
+	flags_add8 = heap_caps_malloc(sizeof(flags8_arith_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	flags_sub8 = heap_caps_malloc(sizeof(flags8_arith_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	/* Fall back to PSRAM if internal RAM insufficient */
+	if (!flags_add8) flags_add8 = psmalloc(sizeof(flags8_arith_t));
+	if (!flags_sub8) flags_sub8 = psmalloc(sizeof(flags8_arith_t));
 #else
 	flags_logic8 = malloc(256);
 	flags_add8 = malloc(sizeof(flags8_arith_t));
@@ -919,6 +925,48 @@ bool cpu_store ## BIT(CPUI386 *cpu, int seg, uword addr, u ## BIT val) \
 LOADSTORE(8)
 LOADSTORE(16)
 LOADSTORE(32)
+
+/* Optimized 64-bit load: single translation when not crossing page boundary */
+bool IRAM_ATTR cpu_load64(CPUI386 *cpu, int seg, uword addr, uint64_t *res)
+{
+	/* Fast path: if both dwords on same page, translate once */
+	if (likely((addr & 0xfff) <= 0xff8)) {
+		OptAddr o;
+		TRY(translate32(cpu, &o, 1, seg, addr));
+		u32 lo = load32(cpu, &o);
+		/* Same page, just offset the physical address */
+		o.addr1 += 4;
+		if (o.res == ADDR_OK2) o.addr2 += 4;
+		u32 hi = load32(cpu, &o);
+		*res = ((uint64_t)hi << 32) | lo;
+		return true;
+	}
+	/* Slow path: crosses page boundary */
+	u32 lo, hi;
+	TRY(cpu_load32(cpu, seg, addr, &lo));
+	TRY(cpu_load32(cpu, seg, addr + 4, &hi));
+	*res = ((uint64_t)hi << 32) | lo;
+	return true;
+}
+
+/* Optimized 64-bit store: single translation when not crossing page boundary */
+bool IRAM_ATTR cpu_store64(CPUI386 *cpu, int seg, uword addr, uint64_t val)
+{
+	/* Fast path: if both dwords on same page, translate once */
+	if (likely((addr & 0xfff) <= 0xff8)) {
+		OptAddr o;
+		TRY(translate32(cpu, &o, 2, seg, addr));
+		store32(cpu, &o, (u32)val);
+		o.addr1 += 4;
+		if (o.res == ADDR_OK2) o.addr2 += 4;
+		store32(cpu, &o, (u32)(val >> 32));
+		return true;
+	}
+	/* Slow path: crosses page boundary */
+	TRY(cpu_store32(cpu, seg, addr, (u32)val));
+	TRY(cpu_store32(cpu, seg, addr + 4, (u32)(val >> 32)));
+	return true;
+}
 
 static bool IRAM_ATTR peek8(CPUI386 *cpu, u8 *val)
 {
@@ -3453,11 +3501,13 @@ static bool check_ioperm(CPUI386 *cpu, int port, int bit)
 			TRY(modsib(cpu, adsz16, mod, rm, &addr, &curr_seg)); \
 			if (cpu->fpu) { \
 				TRY(fpu_exec2(cpu->fpu, cpu, opsz16, op, group, curr_seg, addr)); \
+				cpu->tsc += 3;  /* FPU memory operations ~3-10 cycles */ \
 			} \
 		} else { \
 			int reg = modrm & 7; \
 			if (cpu->fpu) { \
 				TRY(fpu_exec1(cpu->fpu, cpu, op, group, reg)); \
+				cpu->tsc += 2;  /* FPU register operations ~2-8 cycles */ \
 			} \
 		} \
 	}
@@ -3774,23 +3824,39 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 #define CPUID_SIMD_FEATURE 0x0
 #endif
 
+/* CPUID model/stepping table per CPU generation
+ * Format: stepping | (model << 4) | (family << 8) | (type << 12)
+ * Type 0 = OEM, 1 = OverDrive, 2 = Dual
+ */
+static const u32 cpuid_signature[] = {
+	[3] = 0x0303,  /* 386DX stepping C (family 3, model 0, stepping 3) */
+	[4] = 0x0414,  /* 486DX-33 (family 4, model 1, stepping 4) */
+	[5] = 0x0543,  /* Pentium MMX (family 5, model 4, stepping 3) */
+	[6] = 0x0686,  /* Pentium III Coppermine (family 6, model 8, stepping 6) */
+};
+
 #define CPUID() \
 	switch (REGi(0)) { \
 	case 0: \
 		REGi(0) = 1; \
-		REGi(3) = 0x594e4954; \
-		REGi(2) = 0x20363833; \
-		REGi(1) = 0x20555043; \
+		/* "GenuineIntel" in little-endian dword order: EBX, EDX, ECX */ \
+		REGi(3) = 0x756e6547;  /* "Genu" */ \
+		REGi(2) = 0x6c65746e;  /* "ntel" */ \
+		REGi(1) = 0x49656e69;  /* "ineI" */ \
 		break; \
-	case 1: \
-		REGi(0) = 0 | (0 << 4) | (cpu->gen << 8); \
+	case 1: { \
+		int gen = cpu->gen < 3 ? 3 : (cpu->gen > 6 ? 6 : cpu->gen); \
+		REGi(0) = cpuid_signature[gen]; \
 		REGi(3) = 0; \
-		REGi(2) = 0x100; \
-		if (cpu->fpu) REGi(2) |= 1; \
-		if (cpu->gen > 5) REGi(2) |= 0x8820; \
+		/* EDX feature flags */ \
+		REGi(2) = 0x100;  /* CMPXCHG8B */ \
+		if (cpu->fpu) REGi(2) |= 1;  /* FPU on-chip */ \
+		if (cpu->gen >= 5) REGi(2) |= 0x10;  /* RDTSC */ \
+		if (cpu->gen > 5) REGi(2) |= 0x8820;  /* CMOV, FXSR, FXSAVE */ \
 		if (cpu->gen > 5 && cpu->fpu) REGi(2) |= CPUID_SIMD_FEATURE; \
 		REGi(1) = 0; \
 		break; \
+	} \
 	default: \
 		REGi(0) = 0; \
 		REGi(3) = 0; \
@@ -3799,19 +3865,12 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 		break; \
 	}
 
-#include <time.h>
-static uint64_t get_nticks()
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ((uint64_t) ts.tv_sec * 1000000000ull +
-		(uint64_t) ts.tv_nsec);
-}
-
+/* RDTSC returns emulated cycle count, scaled to approximate real timing.
+ * This provides more realistic timing for DOS-era benchmarks that use RDTSC.
+ */
 #define RDTSC() \
-	uint64_t tsc = get_nticks(); \
-	REGi(0) = tsc; \
-	REGi(2) = tsc >> 32;
+	REGi(0) = (u32)cpu->tsc; \
+	REGi(2) = (u32)(cpu->tsc >> 32);
 
 #define Mq Ms
 #define CMPXCH8B(addr) \
@@ -3950,6 +4009,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	cpu->ip = cpu->next_ip;
 	TRY(fetch8(cpu, &b1));
 	cpu->cycle++;
+	cpu->tsc++;  /* Base cycle for instruction fetch */
 
 #ifndef I386_OPT1
 	if (verbose) {
