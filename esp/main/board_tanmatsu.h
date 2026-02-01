@@ -7,13 +7,15 @@
 // User's SD card ini may specify up to 24MB mem_size
 #define PSRAM_ALLOC_LEN (28 * 1024 * 1024)
 
+// Note: cpu_exec1() is too large (~1600 lines) for IRAM on ESP32-P4
+// Keep empty to avoid IRAM overflow. Dispatch table in IRAM provides partial benefit.
 #define IRAM_ATTR_CPU_EXEC1
 
 #define BPP 16
 #define FULL_UPDATE
 #define USE_LCD_BSP
-// Display logical dimensions (VGA emulator output size)
-// lcd_bsp.c uses smaller internal dimensions (640x480) for PPA-friendly scaling
+// Physical LCD dimensions (landscape, before 270-degree rotation to portrait)
+// VGA framebuffer matches these dimensions; content is centered within
 #define LCD_WIDTH 800
 #define LCD_HEIGHT 480
 

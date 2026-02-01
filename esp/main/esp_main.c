@@ -141,8 +141,8 @@ static int pc_main(const char *file)
 	conf.vga_bios = "vgabios.bin";
 	conf.mem_size = 8 * 1024 * 1024;
 	conf.vga_mem_size = 256 * 1024;
-	conf.width = 720;
-	conf.height = 480;
+	conf.width = LCD_WIDTH;
+	conf.height = LCD_HEIGHT;
 	conf.cpu_gen = 4;
 	conf.fpu = 0;
 

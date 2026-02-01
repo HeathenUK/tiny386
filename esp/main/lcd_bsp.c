@@ -40,16 +40,17 @@ static ppa_client_handle_t ppa_srm_handle = NULL;
 #define DISPLAY_WIDTH  480
 #define DISPLAY_HEIGHT 800
 
-// Maximum VGA framebuffer - allocate large enough for any reasonable mode
-// Actual VGA resolution comes from ini config and may be smaller
+// Maximum VGA framebuffer - matches physical LCD dimensions (landscape)
+// VBE modes or other content may need the full display resolution
 #define VGA_MAX_WIDTH  800
-#define VGA_MAX_HEIGHT 600
+#define VGA_MAX_HEIGHT 480
 
 // Actual VGA dimensions - set from globals after PC init
-static int vga_width = 720;   // Default, updated at runtime
-static int vga_height = 480;
+// Defaults match physical LCD dimensions (landscape orientation)
+static int vga_width = VGA_MAX_WIDTH;    // 800
+static int vga_height = VGA_MAX_HEIGHT;  // 480
 
-// Triple buffering for rotation output (lock-free)
+// Double buffering for rotation output
 #define NUM_ROTATE_BUFFERS 2
 static uint16_t *fb_rotated_buffers[NUM_ROTATE_BUFFERS];
 static _Atomic int rotate_write_idx = 0;  // Buffer being written by PPA
@@ -74,21 +75,108 @@ static esp_err_t ppa_init(void)
 static int blit_debug_count = 0;
 static bool use_software_rotation = false;
 
-// Software rotation with stride support
+// Software rotation with stride support using block-based approach for cache efficiency
 // Source: 720x480 VGA in 800-stride buffer -> Dest: 480x720 portrait
+// Block-based rotation improves cache hit rate significantly
+#define ROTATE_BLOCK_SIZE 32
+
 static void IRAM_ATTR software_rotate_90cw_stride(uint16_t *src, uint16_t *dst,
                                                    int src_w, int src_h, int src_stride)
 {
 	// 90 CW: src(x,y) -> dst(src_h-1-y, x)
 	// dst_w = src_h, dst_h = src_w
 	int dst_w = src_h;
-	for (int y = 0; y < src_h; y++) {
-		for (int x = 0; x < src_w; x++) {
-			int dst_x = src_h - 1 - y;
-			int dst_y = x;
-			dst[dst_y * dst_w + dst_x] = src[y * src_stride + x];
+
+	// Process in blocks for better cache utilization
+	for (int by = 0; by < src_h; by += ROTATE_BLOCK_SIZE) {
+		int y_end = by + ROTATE_BLOCK_SIZE;
+		if (y_end > src_h) y_end = src_h;
+
+		for (int bx = 0; bx < src_w; bx += ROTATE_BLOCK_SIZE) {
+			int x_end = bx + ROTATE_BLOCK_SIZE;
+			if (x_end > src_w) x_end = src_w;
+
+			// Process one block
+			for (int y = by; y < y_end; y++) {
+				uint16_t *src_row = src + y * src_stride;
+				int dst_x = src_h - 1 - y;
+				for (int x = bx; x < x_end; x++) {
+					dst[x * dst_w + dst_x] = src_row[x];
+				}
+			}
 		}
 	}
+}
+
+// Cached scale parameters (recalculated when VGA mode dimensions change)
+static float cached_scale_x = 0, cached_scale_y = 0;
+static int cached_offset_x = 0, cached_offset_y = 0;
+static int cached_out_w = 0, cached_out_h = 0;
+static int cached_mode_w = 0, cached_mode_h = 0, cached_pixel_double = 0;
+
+static void update_scale_params(void)
+{
+	/* Get native VGA dimensions and pixel doubling factor from vga.c */
+	int native_w = globals.vga_mode_width;
+	int native_h = globals.vga_mode_height;
+	int pixel_double = globals.vga_pixel_double;
+
+	/* Sanity check - fall back to framebuffer dimensions if not set */
+	if (native_w <= 0 || native_h <= 0) {
+		native_w = vga_width;
+		native_h = vga_height;
+	}
+	if (pixel_double <= 0) pixel_double = 1;
+
+	if (cached_mode_w == native_w && cached_mode_h == native_h &&
+	    cached_pixel_double == pixel_double)
+		return;
+
+	cached_mode_w = native_w;
+	cached_mode_h = native_h;
+	cached_pixel_double = pixel_double;
+
+	/* Calculate intended VGA output dimensions (native * pixel_double).
+	 * For mode 13h: native 320x200, intended 640x400 (2x both dimensions).
+	 * For text mode: native 720x400, intended 720x400 (pixel_double=1). */
+	int intended_w = native_w * pixel_double;
+	int intended_h = native_h * pixel_double;
+
+	/* Calculate uniform base scale to fit INTENDED dimensions in display.
+	 * After 270° rotation: intended_w -> display Y, intended_h -> display X */
+	float base_scale_x = (float)DISPLAY_HEIGHT / intended_w;
+	float base_scale_y = (float)DISPLAY_WIDTH / intended_h;
+	float base_scale = (base_scale_x < base_scale_y) ? base_scale_x : base_scale_y;
+
+	/* Apply uniform scale to NATIVE dimensions:
+	 * Both scale_x and scale_y include pixel_double factor since vga.c
+	 * now outputs native resolution (320x200 for mode 13h) without any
+	 * software pixel doubling or scanline repetition.
+	 * After rotation: native_w (with scale_x) -> display height
+	 *                 native_h (with scale_y) -> display width */
+	float ideal_scale_x = base_scale * pixel_double;
+	float ideal_scale_y = base_scale * pixel_double;
+
+	/* PPA supports 1/16 scale precision - quantize both scales */
+	int scale_x_16 = (int)(ideal_scale_x * 16.0f);
+	int scale_y_16 = (int)(ideal_scale_y * 16.0f);
+	if (scale_x_16 < 1) scale_x_16 = 1;
+	if (scale_y_16 < 1) scale_y_16 = 1;
+	cached_scale_x = scale_x_16 / 16.0f;
+	cached_scale_y = scale_y_16 / 16.0f;
+
+	/* Output dimensions after non-uniform scaling and rotation */
+	cached_out_w = (int)(cached_scale_y * native_h);  /* rotated: height -> width */
+	cached_out_h = (int)(cached_scale_x * native_w);  /* rotated: width -> height */
+	cached_offset_x = (DISPLAY_WIDTH - cached_out_w) / 2;
+	cached_offset_y = (DISPLAY_HEIGHT - cached_out_h) / 2;
+	if (cached_offset_x < 0) cached_offset_x = 0;
+	if (cached_offset_y < 0) cached_offset_y = 0;
+
+	ESP_LOGI(TAG, "Scale: native %dx%d, double=%d, scale_x=%.3f scale_y=%.3f, "
+	         "output %dx%d at (%d,%d)",
+	         native_w, native_h, pixel_double, cached_scale_x, cached_scale_y,
+	         cached_out_w, cached_out_h, cached_offset_x, cached_offset_y);
 }
 
 static void IRAM_ATTR rotate_and_blit(uint16_t *fb, uint16_t *fb_rotated)
@@ -102,63 +190,45 @@ static void IRAM_ATTR rotate_and_blit(uint16_t *fb, uint16_t *fb_rotated)
 		return;
 	}
 
-	// Calculate scale factors to fit display while respecting PPA's 1/16 precision
-	// After 270° rotation: out_w = scale_y * in_h, out_h = scale_x * in_w
-	// We need: out_w <= DISPLAY_WIDTH (480), out_h <= DISPLAY_HEIGHT (800)
-	float ideal_scale_x = (float)DISPLAY_HEIGHT / vga_width;   // For height after rotation
-	float ideal_scale_y = (float)DISPLAY_WIDTH / vga_height;   // For width after rotation
-
-	// Use the smaller scale to maintain aspect ratio
-	float ideal_scale = (ideal_scale_x < ideal_scale_y) ? ideal_scale_x : ideal_scale_y;
-
-	// Round DOWN to 1/16 precision (PPA truncates, not rounds)
-	int scale_16 = (int)(ideal_scale * 16.0f);
-	if (scale_16 < 1) scale_16 = 1;  // Minimum scale
-	float scale = scale_16 / 16.0f;
-
-	// Calculate actual output dimensions after PPA's truncation
-	int out_w = (int)(scale * vga_height);  // Width after rotation
-	int out_h = (int)(scale * vga_width);   // Height after rotation
-
-	// Center on display
-	int offset_x = (DISPLAY_WIDTH - out_w) / 2;
-	int offset_y = (DISPLAY_HEIGHT - out_h) / 2;
-	if (offset_x < 0) offset_x = 0;
-	if (offset_y < 0) offset_y = 0;
+	update_scale_params();
 
 	// Debug: print buffer info once
 	if (blit_debug_count == 0) {
 		ESP_LOGI(TAG, "PPA blit: fb=%p (ext=%d) fb_rot=%p (ext=%d)",
 		         fb, esp_ptr_external_ram(fb),
 		         fb_rotated, esp_ptr_external_ram(fb_rotated));
-		ESP_LOGI(TAG, "VGA: %dx%d, ideal_scale=%.4f, actual_scale=%.4f (%d/16)",
-		         vga_width, vga_height, ideal_scale, scale, scale_16);
-		ESP_LOGI(TAG, "Output: %dx%d at offset (%d,%d) on %dx%d display",
-		         out_w, out_h, offset_x, offset_y, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+		ESP_LOGI(TAG, "VGA: %dx%d (x%d), scale %.3fx%.3f, out %dx%d at (%d,%d)",
+		         cached_mode_w, cached_mode_h, cached_pixel_double,
+		         cached_scale_x, cached_scale_y,
+		         cached_out_w, cached_out_h, cached_offset_x, cached_offset_y);
+		ESP_LOGI(TAG, "Display: %dx%d", DISPLAY_WIDTH, DISPLAY_HEIGHT);
 		blit_debug_count++;
 	}
 
 	// Try PPA first if not already failed
 	if (!use_software_rotation && ppa_srm_handle) {
+		/* PPA reads native VGA content and scales with pixel doubling.
+		 * scale_x includes pixel_double factor (e.g., 2x for mode 13h).
+		 * This offloads pixel doubling from CPU to PPA hardware. */
 		ppa_srm_oper_config_t srm_config = {
 			.in.buffer = fb,
-			.in.pic_w = vga_width,
+			.in.pic_w = vga_width,           /* Full framebuffer stride */
 			.in.pic_h = vga_height,
-			.in.block_w = vga_width,
-			.in.block_h = vga_height,
-			.in.block_offset_x = 0,
+			.in.block_w = cached_mode_w,     /* Native VGA content width */
+			.in.block_h = cached_mode_h,
+			.in.block_offset_x = 0,          /* Content at top-left */
 			.in.block_offset_y = 0,
 			.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
 			.out.buffer = fb_rotated,
 			.out.buffer_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t),
 			.out.pic_w = DISPLAY_WIDTH,
 			.out.pic_h = DISPLAY_HEIGHT,
-			.out.block_offset_x = offset_x,
-			.out.block_offset_y = offset_y,
+			.out.block_offset_x = cached_offset_x,
+			.out.block_offset_y = cached_offset_y,
 			.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
 			.rotation_angle = PPA_SRM_ROTATION_ANGLE_270,
-			.scale_x = scale,
-			.scale_y = scale,
+			.scale_x = cached_scale_x,       /* Includes pixel_double factor */
+			.scale_y = cached_scale_y,
 			.rgb_swap = 0,
 			.byte_swap = 0,
 			.mode = PPA_TRANS_MODE_BLOCKING,
@@ -177,18 +247,23 @@ static void IRAM_ATTR rotate_and_blit(uint16_t *fb, uint16_t *fb_rotated)
 
 	// Software rotation fallback (no scaling, just rotation)
 	software_rotate_90cw_stride(fb, fb_rotated, vga_width, vga_height, vga_width);
-	// After rotation: width=vga_height, height=vga_width
 	bsp_display_blit(0, 0, vga_height, vga_width, fb_rotated);
 }
 
-// Set VGA dimensions - called after PC config is loaded
+// Set VGA framebuffer dimensions - called after PC config is loaded
 void lcd_set_vga_dimensions(int width, int height)
 {
+	// Clamp to allocated framebuffer size
+	if (width > VGA_MAX_WIDTH) width = VGA_MAX_WIDTH;
+	if (height > VGA_MAX_HEIGHT) height = VGA_MAX_HEIGHT;
 	vga_width = width;
 	vga_height = height;
 	globals.vga_width = width;
 	globals.vga_height = height;
-	ESP_LOGI(TAG, "VGA dimensions set to %dx%d", width, height);
+	// Reset cached params to force recalculation on next frame
+	cached_mode_w = 0;
+	cached_mode_h = 0;
+	ESP_LOGI(TAG, "VGA framebuffer dimensions set to %dx%d", width, height);
 }
 
 // This function is called by the VGA emulator but we do full-frame updates instead
@@ -312,11 +387,21 @@ void vga_task(void *arg)
 
 	ESP_LOGI(TAG, "Starting display loop");
 
-	while (1) {
-		// Step the VGA emulator (this calls the redraw callback internally)
-		pc_vga_step(globals.pc);
+	// Profiling stats
+	uint32_t prof_vga_total = 0, prof_rotate_total = 0;
+	uint32_t prof_frame_count = 0;
+	uint32_t prof_last_report = esp_log_timestamp();
 
-		// Render OSD overlay if enabled
+	while (1) {
+		uint32_t t0, t1, t2, t3;
+
+		// Step the VGA emulator (this calls the redraw callback internally)
+		t0 = esp_log_timestamp();
+		pc_vga_step(globals.pc);
+		t1 = esp_log_timestamp();
+
+		// Render OSD overlay to VGA buffer BEFORE rotation
+		// This ensures OSD gets rotated along with VGA content for correct orientation
 		if (globals.osd_enabled && globals.osd && globals.fb) {
 			osd_render(globals.osd, (uint8_t *)globals.fb,
 				   vga_width, vga_height,
@@ -326,9 +411,31 @@ void vga_task(void *arg)
 		// Rotate and blit using alternating buffers (lock-free double buffering)
 		if (globals.fb) {
 			int write_idx = atomic_load(&rotate_write_idx);
+			t2 = esp_log_timestamp();
+
 			rotate_and_blit((uint16_t *)globals.fb, fb_rotated_buffers[write_idx]);
+
+			t3 = esp_log_timestamp();
 			// Swap to next buffer for next frame
 			atomic_store(&rotate_write_idx, (write_idx + 1) % NUM_ROTATE_BUFFERS);
+
+			prof_vga_total += (t1 - t0);
+			prof_rotate_total += (t3 - t2);
+			prof_frame_count++;
+		}
+
+		// Report profiling stats every 5 seconds
+		uint32_t now = esp_log_timestamp();
+		if (now - prof_last_report >= 5000 && prof_frame_count > 0) {
+			ESP_LOGI(TAG, "PERF: %lu frames, vga=%lums/f, rotate=%lums/f, fps=%.1f",
+			         prof_frame_count,
+			         prof_vga_total / prof_frame_count,
+			         prof_rotate_total / prof_frame_count,
+			         (float)prof_frame_count * 1000.0f / (now - prof_last_report));
+			prof_vga_total = 0;
+			prof_rotate_total = 0;
+			prof_frame_count = 0;
+			prof_last_report = now;
 		}
 
 		vTaskDelay(10 / portTICK_PERIOD_MS);

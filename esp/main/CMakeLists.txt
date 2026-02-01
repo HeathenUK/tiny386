@@ -24,7 +24,8 @@ set(COMMON_SRCS
 # Board-specific sources based on DEVICE variable
 if(DEVICE STREQUAL "tanmatsu")
     # Tanmatsu build with badge-bsp (physical keyboard, custom OSD)
-    set(BOARD_SRCS "lcd_bsp.c" "input_bsp.c" "tanmatsu_osd.c")
+    # Include PIE assembly for ESP32-P4 SIMD optimization
+    set(BOARD_SRCS "lcd_bsp.c" "input_bsp.c" "tanmatsu_osd.c" "vga_pie.S")
     set(BOARD_HEADER "board_tanmatsu.h")
 elseif(DEVICE STREQUAL "jc4880p433")
     # JC4880P433 build with direct hardware access
@@ -46,7 +47,7 @@ else()
 endif()
 
 idf_component_register(SRCS ${COMMON_SRCS} ${BOARD_SRCS}
-                       INCLUDE_DIRS "")
+                       INCLUDE_DIRS ".")
 
 add_definitions(-include ${CMAKE_CURRENT_SOURCE_DIR}/${BOARD_HEADER})
 

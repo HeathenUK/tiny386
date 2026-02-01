@@ -24,8 +24,12 @@ struct Globals {
 	bool osd_enabled;  // OSD visible
 	bool reset_pending; // Soft reset requested from OSD
 	uint8_t key_pressed[KEYCODE_MAX];  // Key state tracking
-	int vga_width;     // VGA dimensions for OSD rendering
+	int vga_width;     // VGA framebuffer dimensions for OSD rendering
 	int vga_height;
+	int vga_mode_width;   // Native VGA mode dimensions (before pixel doubling)
+	int vga_mode_height;
+	int vga_pixel_double; // Pixel doubling factor (1=none, 2=double width for mode 13h)
+	uint32_t vga_frame_gen; // Frame generation counter - incremented on each VGA render
 #endif
 };
 

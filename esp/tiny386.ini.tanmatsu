@@ -32,9 +32,9 @@ hda = /sdcard/disk.img
 fill_cmos = 1
 
 [display]
-; VGA emulator output resolution
-; Will be scaled to fit 480x800 portrait display with PPA hardware rotation
-width = 720
+; VGA framebuffer dimensions - should match physical LCD (800x480 landscape)
+; Content is centered within this framebuffer before PPA rotation to portrait
+width = 800
 height = 480
 
 [cpu]
