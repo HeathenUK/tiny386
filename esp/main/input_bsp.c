@@ -17,11 +17,27 @@
 #include "../../i8042.h"
 #include "tanmatsu_osd.h"
 #include "../../pc.h"
+#include "bsp/display.h"
+#include "bsp/audio.h"
 
 static const char *TAG = "input_bsp";
 
 // OSD toggle scancode (Meta/Windows key)
 #define SC_OSD_TOGGLE BSP_INPUT_SCANCODE_ESCAPED_LEFTMETA  // 0xe05b
+
+// Arrow scancodes (after E0 prefix removed)
+#define SC_ARROW_UP    0x48
+#define SC_ARROW_DOWN  0x50
+#define SC_ARROW_LEFT  0x4B
+#define SC_ARROW_RIGHT 0x4D
+
+// META key state for META+arrow shortcuts
+static bool meta_held = false;
+static bool meta_consumed = false;  // Set if META+arrow was used
+
+// Current brightness and volume (0-100)
+static int current_brightness = 100;
+static int current_volume = 80;
 
 static void handle_scancode(uint8_t code, int is_down)
 {
@@ -42,6 +58,24 @@ static void handle_scancode(uint8_t code, int is_down)
 	}
 }
 
+static void adjust_brightness(int delta)
+{
+	current_brightness += delta;
+	if (current_brightness < 0) current_brightness = 0;
+	if (current_brightness > 100) current_brightness = 100;
+	bsp_display_set_backlight_brightness((uint8_t)current_brightness);
+	ESP_LOGI(TAG, "Brightness: %d%%", current_brightness);
+}
+
+static void adjust_volume(int delta)
+{
+	current_volume += delta;
+	if (current_volume < 0) current_volume = 0;
+	if (current_volume > 100) current_volume = 100;
+	bsp_audio_set_volume((float)current_volume);
+	ESP_LOGI(TAG, "Volume: %d%%", current_volume);
+}
+
 static void toggle_osd(void)
 {
 	globals.osd_enabled = !globals.osd_enabled;
@@ -51,7 +85,6 @@ static void toggle_osd(void)
 		osd_attach_emulink(globals.osd, pc->emulink);
 		osd_attach_ide(globals.osd, pc->ide, pc->ide2);
 		osd_attach_pc(globals.osd, pc);
-		osd_set_system_config(globals.osd, pc->cpu_gen, pc->fpu, pc->phys_mem_size);
 		osd_refresh(globals.osd);
 	}
 	ESP_LOGI(TAG, "OSD %s", globals.osd_enabled ? "enabled" : "disabled");
@@ -103,12 +136,19 @@ static void input_task(void *arg)
 			if (event.type == INPUT_EVENT_TYPE_SCANCODE) {
 				uint16_t scancode = event.args_scancode.scancode;
 
-				// Check for OSD toggle (Meta key) - check raw scancode before processing
+				// Check for Meta key - track state for META+arrow shortcuts
 				uint16_t base_scancode = scancode & ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
 				if (base_scancode == SC_OSD_TOGGLE) {
 					int is_down = !(scancode & BSP_INPUT_SCANCODE_RELEASE_MODIFIER);
 					if (is_down) {
-						toggle_osd();
+						meta_held = true;
+						meta_consumed = false;
+					} else {
+						// META released - toggle OSD only if no arrow was pressed
+						if (!meta_consumed) {
+							toggle_osd();
+						}
+						meta_held = false;
 					}
 					vTaskDelay(5 / portTICK_PERIOD_MS);
 					continue;  // Don't pass meta key to emulator
@@ -117,16 +157,43 @@ static void input_task(void *arg)
 				// Check if this is an extended scancode (0xE0xx)
 				if (scancode >= 0xE000) {
 					// Extended scancode (E0 prefix)
+					uint8_t code = scancode & 0xFF;
+					int is_down = !(code & BSP_INPUT_SCANCODE_RELEASE_MODIFIER);
+					code &= ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
+
+					// Check for META+arrow shortcuts (only on key down)
+					if (meta_held && is_down) {
+						bool handled = false;
+						switch (code) {
+						case SC_ARROW_LEFT:
+							adjust_brightness(-5);
+							handled = true;
+							break;
+						case SC_ARROW_RIGHT:
+							adjust_brightness(5);
+							handled = true;
+							break;
+						case SC_ARROW_UP:
+							adjust_volume(5);
+							handled = true;
+							break;
+						case SC_ARROW_DOWN:
+							adjust_volume(-5);
+							handled = true;
+							break;
+						}
+						if (handled) {
+							meta_consumed = true;
+							vTaskDelay(5 / portTICK_PERIOD_MS);
+							continue;
+						}
+					}
+
 					// Send E0 prefix to emulator if not in OSD mode
 					if (!globals.osd_enabled) {
 						ps2_put_keycode(globals.kbd, 1, 0xE0);
 						vTaskDelay(1 / portTICK_PERIOD_MS);
 					}
-
-					// Extract the actual scancode (low byte)
-					uint8_t code = scancode & 0xFF;
-					int is_down = !(code & BSP_INPUT_SCANCODE_RELEASE_MODIFIER);
-					code &= ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
 
 					handle_scancode(code, is_down);
 				} else {

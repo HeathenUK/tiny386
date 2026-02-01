@@ -6,20 +6,13 @@
 #include "tanmatsu_osd.h"
 #include <stdlib.h>
 #include <stdio.h>
-
-// Define types needed by atlas.inl (normally from microui.h)
-typedef struct { int x, y, w, h; } mu_Rect;
-enum {
-	MU_ICON_CLOSE = 1,
-	MU_ICON_CHECK,
-	MU_ICON_COLLAPSED,
-	MU_ICON_EXPANDED,
-	MU_ICON_MAX
-};
-
-// Include the atlas data (font texture and glyph rects)
-#include "../../osd/atlas.inl"
 #include <string.h>
+
+// VGA 8x16 bitmap font for clean text rendering
+#include "vga_font_8x16.h"
+
+#define FONT_WIDTH 8
+#define FONT_HEIGHT 16
 #include <dirent.h>
 #include <sys/stat.h>
 #include "esp_system.h"
@@ -152,16 +145,18 @@ struct OSD {
 #define SC_ESC   0x01
 #define SC_BACKSPACE 0x0e
 
-// Colors (RGB565)
+// Colors (RGB565) - clean color scheme inspired by trackmatsu
 #define COLOR_BG      0x0000  // Black
-#define COLOR_BORDER  0x4208  // Dark gray
+#define COLOR_PANEL   0x18E3  // Dark blue-gray panel background
+#define COLOR_BORDER  0x4A69  // Medium gray border
 #define COLOR_TEXT    0xFFFF  // White
-#define COLOR_HILITE  0x001F  // Blue
-#define COLOR_SEP     0x4208  // Gray
-#define COLOR_DIR     0x07E0  // Green
-#define COLOR_TITLE   0xFFE0  // Yellow
-#define COLOR_EJECT   0xF800  // Red
-#define COLOR_VALUE   0x07FF  // Cyan
+#define COLOR_HILITE  0x04FF  // Bright blue highlight
+#define COLOR_SEP     0x39E7  // Medium gray separator
+#define COLOR_DIR     0x07E0  // Green for directories
+#define COLOR_TITLE   0xFFE0  // Yellow for titles
+#define COLOR_EJECT   0xFB20  // Orange-red for eject
+#define COLOR_VALUE   0x87FF  // Light cyan for values
+#define COLOR_DIM     0x8410  // Dim gray for inactive items
 
 // Forward declarations
 static void populate_drive_paths(OSD *osd);
@@ -283,19 +278,25 @@ static void scan_directory(OSD *osd)
 	}
 }
 
-// Text rendering using atlas
-static int get_char_width(int c)
+// Get font bitmap for a character
+static const uint8_t *get_font_char(int c)
 {
-	if (c < 32 || c >= 127) return 0;
-	return atlas[ATLAS_FONT + c].w;
+	if (c >= 32 && c <= 126) {
+		return vga_font_8x16_data[c - 32];
+	} else if (c >= 128 && c <= 133) {
+		return custom_glyphs[c - 128];
+	}
+	return vga_font_8x16_data['?' - 32];
 }
 
+// Text rendering using VGA 8x16 font
 static int get_text_width(const char *text)
 {
 	int width = 0;
 	while (*text) {
-		width += get_char_width(*text);
-		text++;
+		unsigned char c = *text++;
+		if (c >= 32 && c <= 126) width += FONT_WIDTH;
+		else if (c >= 128 && c <= 133) width += FONT_WIDTH;
 	}
 	return width;
 }
@@ -305,30 +306,25 @@ static int draw_text(uint8_t *pixels, int w, int h, int pitch,
 {
 	int start_x = x;
 	while (*text) {
-		int c = (unsigned char)*text;
-		if (c < 32 || c >= 127) { text++; continue; }
+		unsigned char c = *text++;
+		if (c < 32) continue;
 
-		mu_Rect src = atlas[ATLAS_FONT + c];
-		if (max_w > 0 && (x - start_x + src.w) > max_w) break;
+		const uint8_t *glyph = get_font_char(c);
+		if (max_w > 0 && (x - start_x + FONT_WIDTH) > max_w) break;
 
-		// Draw character from atlas (1-bit font)
-		for (int dy = 0; dy < src.h && (y + dy) < h; dy++) {
-			for (int dx = 0; dx < src.w && (x + dx) < w; dx++) {
-				int sx = src.x + dx;
-				int sy = src.y + dy;
-				int byte_idx = sy * ATLAS_WIDTH + sx;
-				if (atlas_texture[byte_idx]) {
-					int px = x + dx;
-					int py = y + dy;
-					if (px >= 0 && px < w && py >= 0 && py < h) {
-						uint16_t *p = (uint16_t *)(pixels + py * pitch + px * 2);
-						*p = color;
-					}
+		// Draw character from VGA font (1-bit bitmap, MSB is left pixel)
+		for (int dy = 0; dy < FONT_HEIGHT && (y + dy) < h; dy++) {
+			if (y + dy < 0) continue;
+			uint8_t row = glyph[dy];
+			for (int dx = 0; dx < FONT_WIDTH && (x + dx) < w; dx++) {
+				if (x + dx < 0) continue;
+				if (row & (0x80 >> dx)) {
+					uint16_t *p = (uint16_t *)(pixels + (y + dy) * pitch + (x + dx) * 2);
+					*p = color;
 				}
 			}
 		}
-		x += src.w;
-		text++;
+		x += FONT_WIDTH;
 	}
 	return x - start_x;
 }
@@ -369,10 +365,10 @@ static void render_generic_menu(uint8_t *pixels, int w, int h, int pitch,
                                 const char *title, MenuEntry *entries, int count,
                                 int selection, const char *help_text)
 {
-	int line_h = 22;
-	int title_h = 32;
-	int help_h = 25;
-	int padding = 8;
+	int line_h = 20;      // Slightly tighter for 16px font
+	int title_h = 28;     // Title area height
+	int help_h = 22;      // Help text area
+	int padding = 6;
 
 	// Calculate menu height
 	int num_separators = 0;
@@ -389,14 +385,14 @@ static void render_generic_menu(uint8_t *pixels, int w, int h, int pitch,
 	int menu_x = (w - menu_w) / 2;
 	int menu_y = (h - menu_h) / 2;
 
-	// Background
-	draw_rect(pixels, w, h, pitch, menu_x, menu_y, menu_w, menu_h, COLOR_BG);
+	// Background with panel color
+	draw_rect(pixels, w, h, pitch, menu_x, menu_y, menu_w, menu_h, COLOR_PANEL);
 
-	// Border
-	draw_rect(pixels, w, h, pitch, menu_x, menu_y, menu_w, 2, COLOR_BORDER);
-	draw_rect(pixels, w, h, pitch, menu_x, menu_y + menu_h - 2, menu_w, 2, COLOR_BORDER);
-	draw_rect(pixels, w, h, pitch, menu_x, menu_y, 2, menu_h, COLOR_BORDER);
-	draw_rect(pixels, w, h, pitch, menu_x + menu_w - 2, menu_y, 2, menu_h, COLOR_BORDER);
+	// Border (1 pixel)
+	draw_rect(pixels, w, h, pitch, menu_x, menu_y, menu_w, 1, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, menu_x, menu_y + menu_h - 1, menu_w, 1, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, menu_x, menu_y, 1, menu_h, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, menu_x + menu_w - 1, menu_y, 1, menu_h, COLOR_BORDER);
 
 	// Title
 	draw_text(pixels, w, h, pitch, menu_x + 10, menu_y + 8, title, COLOR_TITLE, 0);

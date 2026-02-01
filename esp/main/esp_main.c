@@ -147,6 +147,10 @@ static int pc_main(const char *file)
 	conf.fpu = 0;
 
 	fprintf(stderr, "pc_main: parsing ini\n");
+	if (!file) {
+		fprintf(stderr, "ERROR: No INI file found!\n");
+		return -1;
+	}
 	int err = ini_parse(file, parse_conf_ini, &conf);
 	if (err) {
 		printf("error %d\n", err);

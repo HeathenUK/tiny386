@@ -6,6 +6,8 @@
 #include "esp_vfs_fat.h"
 #include "esp_system.h"
 #include "sdmmc_cmd.h"
+#include "sd_pwr_ctrl.h"
+#include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #include "common.h"
 
 static const char *TAG = "storage";
@@ -16,6 +18,23 @@ void storage_init(void)
 {
 	bool sd_mount_ok = false;
 #ifdef SD_CLK
+	// Power cycle SD card via LDO4 to reset its state
+	ESP_LOGI(TAG, "Power cycling SD card...");
+	sd_pwr_ctrl_ldo_config_t ldo_config = {
+		.ldo_chan_id = 4,
+	};
+	sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
+	esp_err_t pwr_err = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
+	if (pwr_err == ESP_OK) {
+		sd_pwr_ctrl_set_io_voltage(pwr_ctrl_handle, 0);
+		vTaskDelay(pdMS_TO_TICKS(150));
+		sd_pwr_ctrl_set_io_voltage(pwr_ctrl_handle, 3300);
+		vTaskDelay(pdMS_TO_TICKS(150));
+		ESP_LOGI(TAG, "SD card power cycle complete");
+	} else {
+		ESP_LOGW(TAG, "Failed to init SD power control: %s", esp_err_to_name(pwr_err));
+	}
+
 #ifndef USE_RAWSD
 	// Options for mounting the filesystem.
 	esp_vfs_fat_sdmmc_mount_config_t sdmount_config = {
