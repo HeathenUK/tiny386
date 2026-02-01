@@ -26,6 +26,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include "adlib.h"
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -48,6 +49,8 @@
 
 #include "fmopl.h"
 #define SHIFT 1
+
+extern uint32_t get_uticks(void);
 
 struct AdlibState {
     uint32_t freq;
@@ -78,17 +81,35 @@ static void adlib_kill_timers (AdlibState *s)
     }
 }
 
+/* Debug: track OPL register write frequency */
+static uint32_t opl_write_count = 0;
+static uint32_t opl_write_last_report = 0;
+
 void adlib_write(void *opaque, uint32_t nport, uint32_t val)
 {
     AdlibState *s = opaque;
     int a = nport & 3;
 
     s->active = 1;
-//    AUD_set_active_out (s->voice, 1);
 
     adlib_kill_timers (s);
 
+    /* Apply write immediately */
     OPLWrite (s->opl, a, val);
+
+    /* Track write frequency */
+    opl_write_count++;
+    uint32_t now = get_uticks();
+    if (opl_write_last_report == 0)
+        opl_write_last_report = now;
+    if (now - opl_write_last_report >= 5000000) {
+        uint32_t elapsed = now - opl_write_last_report;
+        fprintf(stderr, "OPL writes: %u in %u ms (%d/sec)\n",
+                opl_write_count, elapsed / 1000,
+                (int)(opl_write_count * 1000000ULL / elapsed));
+        opl_write_count = 0;
+        opl_write_last_report = now;
+    }
 }
 
 uint32_t adlib_read(void *opaque, uint32_t nport)
@@ -97,10 +118,9 @@ uint32_t adlib_read(void *opaque, uint32_t nport)
     int a = nport & 3;
 
     adlib_kill_timers (s);
+
     return OPLRead (s->opl, a);
 }
-
-extern uint32_t get_uticks(void);
 
 static void timer_handler (void *opaque, int c, FLOAT interval_Sec)
 {
@@ -118,6 +138,11 @@ static void timer_handler (void *opaque, int c, FLOAT interval_Sec)
     s->timer_expire[n] = (uint32_t)(interval_Sec * 1000000.0f);
 }
 
+/* Debug: track OPL timer events */
+static uint32_t opl_timer_fires[2] = {0, 0};
+static uint32_t opl_last_report_time = 0;
+static uint32_t opl_callback_count = 0;
+
 void adlib_callback (void *opaque, uint8_t *stream, int free)
 {
     AdlibState *s = opaque;
@@ -132,14 +157,33 @@ void adlib_callback (void *opaque, uint8_t *stream, int free)
                 OPLTimerOver(s->opl, n);
                 /* Timer may be restarted by OPLTimerOver, update start time */
                 s->timer_start[n] = now;
+                opl_timer_fires[n]++;
             }
         }
+    }
+
+    opl_callback_count++;
+
+    /* Report OPL timer activity every ~5 seconds */
+    if (opl_last_report_time == 0)
+        opl_last_report_time = now;
+    if (now - opl_last_report_time >= 5000000) {
+        uint32_t elapsed = now - opl_last_report_time;
+        fprintf(stderr, "OPL: %u callbacks, timer0=%u fires (%d/sec), timer1=%u fires (%d/sec)\n",
+                opl_callback_count,
+                opl_timer_fires[0], (int)(opl_timer_fires[0] * 1000000ULL / elapsed),
+                opl_timer_fires[1], (int)(opl_timer_fires[1] * 1000000ULL / elapsed));
+        opl_timer_fires[0] = 0;
+        opl_timer_fires[1] = 0;
+        opl_callback_count = 0;
+        opl_last_report_time = now;
     }
 
     samples = free >> SHIFT;
     if (!(s->active && s->enabled) || !samples) {
         return;
     }
+
     YM3812UpdateOne (s->opl, (void *) stream, samples);
 }
 

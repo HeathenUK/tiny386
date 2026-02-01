@@ -479,7 +479,32 @@ void pc_step(PC *pc)
 #ifndef BUILD_ESP32
 	int refresh = vga_step(pc->vga);
 #endif
+
+#ifdef BUILD_ESP32
+	/* Burst catch-up for high-frequency PIT interrupts.
+	 * When games program PIT for music timing (e.g., 6000+ Hz), we can't
+	 * deliver that many interrupts per second. Instead of dropping them,
+	 * we process multiple ISRs per step to catch up. */
+	int pending = pit_get_pending_irqs(pc->pit);
+	if (pending > 1) {
+		/* Limit burst size to avoid stalling other emulation too long.
+		 * Higher burst = better music timing, but more stutter in graphics.
+		 * 48 bursts * 100 instructions = ~4800 inst/burst for music ISRs. */
+		int burst = pending > 48 ? 48 : pending;
+		for (int i = 0; i < burst; i++) {
+			if (!pit_fire_single_irq(pc->pit))
+				break;
+			/* Run enough instructions for a typical music ISR (~60-100) */
+			cpui386_step(pc->cpu, 100);
+		}
+	} else {
+		/* Normal single-interrupt path */
+		i8254_update_irq(pc->pit);
+	}
+#else
 	i8254_update_irq(pc->pit);
+#endif
+
 	cmos_update_irq(pc->cmos);
 	if (pc->enable_serial)
 		u8250_update(pc->serial);

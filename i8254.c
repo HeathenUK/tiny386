@@ -24,9 +24,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include <stdio.h>
 #include "i8254.h"
+#include "i8259.h"
 //#define DEBUG_PIT
 
 #define RW_STATE_LSB 1
@@ -116,13 +118,30 @@ static int pit_get_out1(PITChannelState *s, uint32_t current_time)
 	return out;
 }
 
+/* Debug: track PIT channel 0 programming and IRQ timing */
+static uint32_t pit_irq_delivered = 0;   /* IRQs actually delivered to CPU */
+static uint32_t pit_irq_dropped = 0;     /* IRQs dropped because previous pending */
+static uint32_t pit_last_irq_time = 0;
+static uint32_t pit_irq_interval_sum = 0;
+static uint32_t pit_last_report_time = 0;
+
 static inline void pit_load_count(PITState *pit, PITChannelState *s, int val)
 {
+	int channel = s - pit->channels;
 	if (val == 0)
 		val = 0x10000;
 	s->count_load_time = get_uticks();
 	s->last_irq_count = 0;
 	s->count = val;
+
+	/* Log channel 0 reprogramming (only when rate changes significantly) */
+	static int last_logged_count = 0;
+	if (channel == 0 && val != last_logged_count) {
+		int expected_hz = PIT_FREQ / val;
+		fprintf(stderr, "PIT: ch0 count=%d (0x%x) -> expected %d Hz (period %d us)\n",
+		        val, val, expected_hz, 1000000 / expected_hz);
+		last_logged_count = val;
+	}
 }
 
 /* if already latched, do not latch again */
@@ -273,12 +292,45 @@ void i8254_update_irq(PITState *pit)
 	switch(s->mode) {
 	case 2:
 	case 3:
-		if (s->last_irq_count + s->count - d >= 0x80000000) {
+		/* Count how many IRQs we should have fired by now */
+		while (s->last_irq_count + s->count - d >= 0x80000000) {
 			if (s->irq != -1) {
-				pit->set_irq(pit->pic, s->irq, 1);
-				pit->set_irq(pit->pic, s->irq, 0);
-				s->last_irq_count += s->count;
+				/* Only fire if previous IRQ has been handled */
+				if (!i8259_irq_pending(pit->pic, s->irq)) {
+					pit->set_irq(pit->pic, s->irq, 1);
+					pit->set_irq(pit->pic, s->irq, 0);
+					pit_irq_delivered++;
+
+					/* Track actual IRQ timing */
+					if (pit_last_irq_time != 0) {
+						uint32_t interval = uticks - pit_last_irq_time;
+						pit_irq_interval_sum += interval;
+					}
+					pit_last_irq_time = uticks;
+				} else {
+					pit_irq_dropped++;
+				}
 			}
+			s->last_irq_count += s->count;
+		}
+
+		/* Report every ~5 seconds */
+		if (pit_last_report_time == 0)
+			pit_last_report_time = uticks;
+		if (uticks - pit_last_report_time >= 5000000) {
+			uint32_t elapsed = uticks - pit_last_report_time;
+			uint32_t total = pit_irq_delivered + pit_irq_dropped;
+			int delivered_hz = (int)((uint64_t)pit_irq_delivered * 1000000 / elapsed);
+			int expected_hz = PIT_FREQ / s->count;
+			int avg_interval = pit_irq_delivered > 1 ? pit_irq_interval_sum / (pit_irq_delivered - 1) : 0;
+			fprintf(stderr, "PIT IRQ: delivered=%lu dropped=%lu (%.0f%% loss) in %lu ms, actual=%d Hz (expected=%d Hz), avg_interval=%d us\n",
+			        (unsigned long)pit_irq_delivered, (unsigned long)pit_irq_dropped,
+			        total > 0 ? 100.0 * pit_irq_dropped / total : 0.0,
+			        (unsigned long)(elapsed / 1000), delivered_hz, expected_hz, avg_interval);
+			pit_irq_delivered = 0;
+			pit_irq_dropped = 0;
+			pit_irq_interval_sum = 0;
+			pit_last_report_time = uticks;
 		}
 		break;
 	default:
@@ -351,4 +403,61 @@ int pit_get_mode(PITState *pit, int channel)
 {
 	PITChannelState *s = &pit->channels[channel];
 	return s->mode;
+}
+
+uint64_t pit_get_virtual_ticks(PITState *pit, int channel)
+{
+	PITChannelState *s = &pit->channels[channel];
+	uint32_t uticks = get_uticks();
+	/* Calculate how many ticks WOULD have elapsed based on wall-clock time */
+	return ((uint64_t)(uticks - s->count_load_time)) * PIT_FREQ / 1000000 / s->count;
+}
+
+/* Return the number of pending PIT channel 0 interrupts we haven't delivered.
+ * Used for burst catch-up processing. */
+int pit_get_pending_irqs(PITState *pit)
+{
+	PITChannelState *s = &pit->channels[0];
+	if (s->mode != 2 && s->mode != 3)
+		return 0;
+
+	uint32_t uticks = get_uticks();
+	uint32_t d = ((uint64_t)(uticks - s->count_load_time)) * PIT_FREQ / 1000000;
+
+	/* Calculate how many IRQs behind we are */
+	int pending = 0;
+	uint32_t check = s->last_irq_count;
+	while (check + s->count - d >= 0x80000000) {
+		pending++;
+		check += s->count;
+		if (pending > 100)  /* Sanity limit */
+			break;
+	}
+	return pending;
+}
+
+/* Fire a single PIT IRQ and advance the counter. Used for burst catch-up.
+ * Returns true if an IRQ was fired, false if nothing pending. */
+bool pit_fire_single_irq(PITState *pit)
+{
+	PITChannelState *s = &pit->channels[0];
+	if (s->mode != 2 && s->mode != 3)
+		return false;
+	if (s->irq == -1)
+		return false;
+
+	uint32_t uticks = get_uticks();
+	uint32_t d = ((uint64_t)(uticks - s->count_load_time)) * PIT_FREQ / 1000000;
+
+	/* Check if we're behind */
+	if (s->last_irq_count + s->count - d < 0x80000000)
+		return false;  /* Not behind */
+
+	/* Fire the IRQ */
+	pit->set_irq(pit->pic, s->irq, 1);
+	pit->set_irq(pit->pic, s->irq, 0);
+	s->last_irq_count += s->count;
+	pit_irq_delivered++;
+
+	return true;
 }

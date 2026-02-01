@@ -36,3 +36,28 @@ CONFIG_FATFS_VOLUME_COUNT=3
 
 # Flash support
 CONFIG_SPI_FLASH_SUPPORT_WINBOND_CHIP=y
+
+# =============================================================================
+# PERFORMANCE OPTIMIZATIONS FOR ESP32-P4
+# =============================================================================
+
+# L2 Cache: Increase from 128KB to 256KB for better cache hit rate
+# Trade-off: reduces available RAM but significantly improves code execution speed
+# NOTE: If 256KB works well, can try 512KB for even better performance
+CONFIG_CACHE_L2_CACHE_256KB=y
+
+# Disable hardware stack guard for slight performance improvement
+# (especially with frequent interrupts like PIT timer)
+CONFIG_ESP_SYSTEM_HW_STACK_GUARD=n
+
+# Disable assertions in release builds for performance
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
+
+# Reduce log level to ERROR only (less serial output overhead)
+CONFIG_LOG_DEFAULT_LEVEL_ERROR=y
+
+# Disable dynamic log level control (~10x faster logging)
+CONFIG_LOG_DYNAMIC_LEVEL_CONTROL=n
+
+# Optimize misaligned memory access (small IRAM cost for better performance)
+CONFIG_LIBC_OPTIMIZED_MISALIGNED_ACCESS=y

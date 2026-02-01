@@ -361,3 +361,11 @@ PicState2 *i8259_init(void (*raise_fn)(void *, PicState2 *s), void *obj)
 	s->obj = obj;
 	return s;
 }
+
+/* Check if an IRQ is pending (in irr or isr) */
+int i8259_irq_pending(PicState2 *s, int irq)
+{
+	PicState *pic = &s->pics[irq >> 3];
+	int mask = 1 << (irq & 7);
+	return (pic->irr | pic->isr) & mask;
+}

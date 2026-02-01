@@ -291,10 +291,9 @@ static void dma_cmd8 (SB16State *s, int mask, int dma_len)
                       " alignment %d\n", s->block_size, s->align + 1);
     }
 
-    ldebug ("freq %d, stereo %d, sign %d, bits %d, "
-            "dma %d, auto %d, fifo %d, high %d\n",
-            s->freq, s->fmt_stereo, s->fmt_signed, s->fmt_bits,
-            s->block_size, s->dma_auto, s->fifo, s->highspeed);
+    dolog("DMA8: freq=%d stereo=%d sign=%d bits=%d block=%d auto=%d\n",
+          s->freq, s->fmt_stereo, s->fmt_signed, s->fmt_bits,
+          s->block_size, s->dma_auto);
 
     continue_dma8 (s);
     speaker (s, 1);
@@ -339,10 +338,9 @@ static void dma_cmd (SB16State *s, uint8_t cmd, uint8_t d0, int dma_len)
         s->block_size <<= s->fmt_stereo;
     }
 
-    ldebug ("freq %d, stereo %d, sign %d, bits %d, "
-            "dma %d, auto %d, fifo %d, high %d\n",
-            s->freq, s->fmt_stereo, s->fmt_signed, s->fmt_bits,
-            s->block_size, s->dma_auto, s->fifo, s->highspeed);
+    dolog("DMA cmd=%02x: freq=%d stereo=%d sign=%d bits=%d block=%d auto=%d\n",
+          cmd, s->freq, s->fmt_stereo, s->fmt_signed, s->fmt_bits,
+          s->block_size, s->dma_auto);
 
     if (16 == s->fmt_bits) {
         if (s->fmt_signed) {
@@ -771,8 +769,8 @@ static void complete (SB16State *s)
             {
                 uint64_t now = sb_get_time_us();
 
-                /* Initialize audio on first sample */
-                if (!s->voice) {
+                /* Initialize audio on first sample or reset timing on new DAC session */
+                if (!s->voice || s->fmt != AUDIO_FORMAT_U8) {
                     s->fmt = AUDIO_FORMAT_U8;
                     s->fmt_bits = 8;
                     s->fmt_signed = 0;
@@ -781,14 +779,23 @@ static void complete (SB16State *s)
                     if (s->time_const != -1) {
                         int tmp = 256 - s->time_const;
                         s->freq = (1000000 + (tmp / 2)) / tmp;
+                        dolog("DAC init: time_const=%d -> freq=%d Hz\n", s->time_const, s->freq);
                     } else {
                         s->freq = 11025;
+                        dolog("DAC init: no time_const, defaulting to %d Hz\n", s->freq);
                     }
                     s->dac_estimated_freq = s->freq;
                     s->dac_last_time = now;
                     s->dac_sample_count = 0;
                     set_audio(s, s->fmt, s->freq, 1);
                     s->voice = s;
+                } else if (s->dac_last_time == 0 || (now - s->dac_last_time) > 1000000) {
+                    /* Reset timing if first DAC write or gap > 1 second */
+                    dolog("DAC timing reset: was %llu us ago\n",
+                          s->dac_last_time ? (unsigned long long)(now - s->dac_last_time) : 0ULL);
+                    s->dac_last_time = now;
+                    s->dac_sample_count = 0;
+                    /* Keep current freq estimate */
                 }
 
                 /* Estimate sample rate from write intervals (every 64 samples) */
@@ -802,8 +809,12 @@ static void complete (SB16State *s)
                         if (new_freq < 1000) new_freq = 1000;
                         if (new_freq > 23000) new_freq = 23000;
                         /* Smooth with previous estimate (75% old, 25% new) */
+                        int old_freq = s->dac_estimated_freq;
                         s->dac_estimated_freq = (s->dac_estimated_freq * 3 + new_freq) / 4;
                         s->freq = s->dac_estimated_freq;
+                        dolog("DAC: %d samples in %llu us -> raw %d Hz, smoothed %d -> %d Hz\n",
+                              s->dac_sample_count, (unsigned long long)elapsed,
+                              new_freq, old_freq, s->dac_estimated_freq);
                     }
                     s->dac_last_time = now;
                     s->dac_sample_count = 0;
@@ -829,7 +840,11 @@ static void complete (SB16State *s)
 
         case 0x40:
             s->time_const = dsp_get_data (s);
-            ldebug ("set time const %d\n", s->time_const);
+            {
+                int tmp = 256 - s->time_const;
+                int calc_freq = (1000000 + (tmp / 2)) / tmp;
+                dolog("set time_const=%d -> calculated freq=%d Hz\n", s->time_const, calc_freq);
+            }
             break;
 
         case 0x41:
@@ -842,7 +857,7 @@ static void complete (SB16State *s)
              * http://homepages.cae.wisc.edu/~brodskye/sb16doc/sb16doc.html#SamplingRate
              */
             s->freq = dsp_get_hilo (s);
-            ldebug ("set freq %d\n", s->freq);
+            dolog("set sample rate directly: freq=%d Hz (cmd=%02x)\n", s->freq, s->cmd);
             break;
 
         case 0x48:
