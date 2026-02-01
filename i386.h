@@ -57,6 +57,8 @@ bool cpu_load16(CPUI386 *cpu, int seg, uword addr, u16 *res);
 bool cpu_store16(CPUI386 *cpu, int seg, uword addr, u16 val);
 bool cpu_load32(CPUI386 *cpu, int seg, uword addr, u32 *res);
 bool cpu_store32(CPUI386 *cpu, int seg, uword addr, u32 val);
+bool cpu_load64(CPUI386 *cpu, int seg, uword addr, uint64_t *res);
+bool cpu_store64(CPUI386 *cpu, int seg, uword addr, uint64_t val);
 void cpu_setax(CPUI386 *cpu, u16 ax);
 u16 cpu_getax(CPUI386 *cpu);
 void cpu_setexc(CPUI386 *cpu, int excno, uword excerr);

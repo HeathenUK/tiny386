@@ -6,6 +6,12 @@
 #include <stdlib.h>
 #include <assert.h>
 
+#ifdef BUILD_ESP32
+#include "esp_attr.h"
+#else
+#define IRAM_ATTR
+#endif
+
 typedef struct {
 	uint32_t mant0;
 	uint32_t mant1;
@@ -22,10 +28,229 @@ union union32 {
 	uint32_t i;
 };
 
-#ifndef USE_FLOAT80
+// Use float32 on ESP32 for hardware FPU acceleration (no double-precision HW)
+#ifdef BUILD_ESP32
+#define USE_FLOAT32_FPU
+#endif
+
+#ifdef USE_FLOAT32_FPU
+// Float32-based FPU emulation - faster on chips without double-precision HW
+// Trades precision for speed (32-bit mantissa vs 64-bit)
+#include <math.h>
+#define BIAS80 16383
+#define BIAS32 127
+#define fpreal float
+#define FPCONST(x) x##f
+// Math function wrappers for float32
+#define fppow powf
+#define fplog2 log2f
+#define fpsin sinf
+#define fpcos cosf
+#define fptan tanf
+#define fpatan2 atan2f
+#define fpsqrt sqrtf
+#define fpfabs fabsf
+#define fpfrexp frexpf
+#define fpcopysign copysignf
+#define fpsignbit(x) signbit(x)
+#define fpisnan(x) isnan(x)
+#define fpisfinite(x) isfinite(x)
+#define fpisunordered(a,b) isunordered(a,b)
+#define fptrunc truncf
+#define fpround_fn roundf
+
+// Fast polynomial approximations for transcendental functions
+// Trading precision for speed - acceptable for DOS-era software
+
+// Fast 2^x approximation using bit manipulation
+// Valid for reasonable input range, avoids slow powf()
+static inline float IRAM_ATTR fast_pow2f(float x)
+{
+	// Handle edge cases
+	if (x < -126.0f) return 0.0f;
+	if (x > 128.0f) return INFINITY;
+
+	int i = (int)x;
+	float f = x - (float)i;
+	if (f < 0) { f += 1.0f; i--; }  // Handle negative fractional part
+
+	// Polynomial approximation for 2^f where 0 <= f < 1
+	// 2^f ≈ 1 + f*(ln2 + f*(ln2^2/2 + f*ln2^3/6))
+	float p = 1.0f + f * (0.693147f + f * (0.240226f + f * 0.055504f));
+
+	// Scale by 2^i using IEEE float bit manipulation
+	union { float f; uint32_t i; } u = { .f = p };
+	u.i += (uint32_t)i << 23;
+	return u.f;
+}
+
+// Fast log2 approximation
+static inline float IRAM_ATTR fast_log2f(float x)
+{
+	if (x <= 0.0f) return -INFINITY;
+
+	union { float f; uint32_t i; } u = { .f = x };
+	int exp = ((u.i >> 23) & 0xFF) - 127;
+	u.i = (u.i & 0x7FFFFF) | (127 << 23);  // Extract mantissa as 1.xxx
+
+	float m = u.f;
+	// Polynomial approximation for log2(m) where 1 <= m < 2
+	// log2(m) ≈ (m-1) * (1.4426950408 - 0.7213475 * (m-1) + 0.4809 * (m-1)^2)
+	float t = m - 1.0f;
+	return (float)exp + t * (1.4426950f - t * (0.7213475f - t * 0.4809f));
+}
+
+// Fast sine approximation using Bhaskara I formula (7th century)
+// Very fast, ~1.8% max error, good enough for DOS games
+static inline float IRAM_ATTR fast_sinf(float x)
+{
+	// Reduce to [0, 2*pi]
+	const float PI = 3.14159265f;
+	const float TWO_PI = 6.28318531f;
+	const float INV_TWO_PI = 0.15915494f;
+
+	x = x - TWO_PI * floorf(x * INV_TWO_PI);
+
+	// Reduce to [0, pi] and track sign
+	int sign = 1;
+	if (x > PI) {
+		x -= PI;
+		sign = -1;
+	}
+
+	// Bhaskara I formula: sin(x) ≈ 16x(π-x) / (5π² - 4x(π-x))
+	float xpi = x * (PI - x);
+	return sign * (16.0f * xpi) / (49.348f - 4.0f * xpi);
+}
+
+// Fast cosine via phase-shifted sine
+static inline float IRAM_ATTR fast_cosf(float x)
+{
+	return fast_sinf(x + 1.5707963f);  // cos(x) = sin(x + π/2)
+}
+
+// Fast tangent
+static inline float IRAM_ATTR fast_tanf(float x)
+{
+	float s = fast_sinf(x);
+	float c = fast_cosf(x);
+	if (fabsf(c) < 1e-10f) return copysignf(INFINITY, s);
+	return s / c;
+}
+
+// Override libm calls with fast versions for ESP32
+#undef fppow
+#undef fplog2
+#undef fpsin
+#undef fpcos
+#undef fptan
+#define fppow(base, exp) fast_pow2f((exp) * fast_log2f(base))
+#define fplog2 fast_log2f
+#define fpsin fast_sinf
+#define fpcos fast_cosf
+#define fptan fast_tanf
+
+static F80 tof80(float val)
+{
+	union union32 u = { .f = val };
+	uint32_t v = u.i;
+	int sign = v >> 31;
+	int exp = (v >> 23) & 0xFF;
+	uint64_t mant80 = (uint64_t)(v & 0x7FFFFF) << 40;  // 23-bit to 63-bit
+	if (exp == 0) {
+		// zero or subnormal
+		if (mant80 != 0) {
+			// subnormal
+			int shift = 64 - __builtin_ffsll(mant80);
+			mant80 <<= shift;
+			exp += BIAS80 - BIAS32 + 1 - shift;
+		}
+	} else if (exp == 0xFF) {
+		// inf or nan
+		mant80 |= (uint64_t) 1 << 63;
+		exp = 0x7fff;
+	} else {
+		// normal
+		mant80 |= (uint64_t) 1 << 63;
+		exp += BIAS80 - BIAS32;
+	}
+
+	F80 res;
+	res.high = (sign << 15) | (uint16_t) exp;
+	res.mant1 = mant80 >> 32;
+	res.mant0 = mant80;
+	return res;
+}
+
+static float fromf80(F80 f80)
+{
+	int sign = f80.high >> 15;
+	int exp = f80.high & 0x7fff;
+	uint64_t mant80 = f80.mant1;
+	mant80 = (mant80 << 32) | f80.mant0;
+
+	uint32_t mant32;
+	if (exp == 0) {
+		// f80 subnormal/zero => f32 zero
+		mant32 = 0;
+		exp = 0;
+	} else if (exp == 0x7fff) {
+		// inf or nan
+		exp = 0xFF;
+		mant32 = mant80 >> 40;
+		if (mant32 == 0 && mant80 != 0)
+			mant32 = 1;
+	} else {
+		// normal
+		exp += BIAS32 - BIAS80;
+		if (exp <= -23) {
+			// => f32 zero
+			exp = 0;
+			mant32 = 0;
+		} else if (exp <= 0) {
+			// => f32 subnormal
+			mant32 = mant80 >> (41 - exp);
+			exp = 0;
+		} else if (exp >= 0xFF) {
+			// => f32 inf
+			exp = 0xFF;
+			mant32 = 0;
+		} else {
+			mant32 = mant80 >> 40;
+			mant32 &= 0x7FFFFF;
+		}
+	}
+
+	uint32_t res = ((uint32_t) sign << 31) | ((uint32_t) exp << 23) | mant32;
+	union union32 u = { .i = res };
+	return u.f;
+}
+
+#elif !defined(USE_FLOAT80)
+// Float64-based FPU emulation - good precision, slow on chips without double HW
 #include <math.h>
 #define BIAS80 16383
 #define BIAS64 1023
+#define fpreal double
+#define FPCONST(x) x
+// Math function wrappers for float64
+#define fppow pow
+#define fplog2 log2
+#define fpsin sin
+#define fpcos cos
+#define fptan tan
+#define fpatan2 atan2
+#define fpsqrt sqrt
+#define fpfabs fabs
+#define fpfrexp frexp
+#define fpcopysign copysign
+#define fpsignbit(x) signbit(x)
+#define fpisnan(x) isnan(x)
+#define fpisfinite(x) isfinite(x)
+#define fpisunordered(a,b) isunordered(a,b)
+#define fptrunc trunc
+#define fpround_fn round
+
 static F80 tof80(double val)
 {
 	union union64 u = { .f = val };
@@ -103,6 +328,25 @@ static double fromf80(F80 f80)
 #else
 // if USE_FLOAT80 is defined, we have native f80 support (e.g. x87)
 #include <tgmath.h>
+#define fpreal long double
+#define FPCONST(x) x##L
+// Math function wrappers for long double
+#define fppow powl
+#define fplog2 log2l
+#define fpsin sinl
+#define fpcos cosl
+#define fptan tanl
+#define fpatan2 atan2l
+#define fpsqrt sqrtl
+#define fpfabs fabsl
+#define fpfrexp frexpl
+#define fpcopysign copysignl
+#define fpsignbit(x) signbit(x)
+#define fpisnan(x) isnan(x)
+#define fpisfinite(x) isfinite(x)
+#define fpisunordered(a,b) isunordered(a,b)
+#define fptrunc truncl
+#define fpround_fn roundl
 
 union union80 {
 	__float80 f;
@@ -121,7 +365,6 @@ static long double fromf80(F80 f80)
 	return u.f;
 }
 
-#define double long double
 #define sincos sincosl
 #endif
 
@@ -134,7 +377,7 @@ struct FPU {
 	u16 cw, sw; // TODO: tag word
 	unsigned int top;
 
-	double st[8];
+	fpreal st[8];
 	F80 rawst[8];
 	u8 rawtagr;
 	u8 rawtagw;
@@ -169,7 +412,19 @@ void fpu_delete(FPU *fpu)
 	free(fpu);
 }
 
-static double fpget(FPU *fpu, int i)
+#ifdef USE_FLOAT32_FPU
+// Fast path for ESP32 - skip F80 tracking, just use float32 directly
+static inline fpreal fpget(FPU *fpu, int i)
+{
+	return fpu->st[(fpu->top + i) & 7];
+}
+
+static inline void fpset(FPU *fpu, int i, fpreal val)
+{
+	fpu->st[(fpu->top + i) & 7] = val;
+}
+#else
+static fpreal fpget(FPU *fpu, int i)
 {
 	unsigned int idx = (fpu->top + i) & 7;
 	unsigned int mask = 1 << idx;
@@ -180,28 +435,29 @@ static double fpget(FPU *fpu, int i)
 	return fpu->st[idx];
 }
 
-static void fpset(FPU *fpu, int i, double val)
+static void fpset(FPU *fpu, int i, fpreal val)
 {
 	unsigned int idx = (fpu->top + i) & 7;
 	unsigned int mask = 1 << idx;
 	fpu->st[idx] = val;
 	fpu->rawtagw |= mask;
 }
+#endif
 
-static void fppush(FPU *fpu, double val)
+static inline void fppush(FPU *fpu, fpreal val)
 {
 	fpu->top = (fpu->top - 1) & 7;
 	// set tw
 	fpset(fpu, 0, val);
 }
 
-static void fppop(FPU *fpu)
+static inline void fppop(FPU *fpu)
 {
 	fpu->top = (fpu->top + 1) & 7;
 	// set tw
 }
 
-static bool fploadf32(void *cpu, int seg, uword addr, double *res)
+static bool IRAM_ATTR fploadf32(void *cpu, int seg, uword addr, fpreal *res)
 {
 	union union32 u;
 	if(!cpu_load32(cpu, seg, addr, &u.i))
@@ -210,21 +466,17 @@ static bool fploadf32(void *cpu, int seg, uword addr, double *res)
 	return true;
 }
 
-static bool fploadf64(void *cpu, int seg, uword addr, double *res)
+static bool IRAM_ATTR fploadf64(void *cpu, int seg, uword addr, fpreal *res)
 {
-	u32 v1, v2;
-	if(!cpu_load32(cpu, seg, addr, &v1))
+	uint64_t v;
+	if(!cpu_load64(cpu, seg, addr, &v))
 		return false;
-	if(!cpu_load32(cpu, seg, addr + 4, &v2))
-		return false;
-	uint64_t v = v2;
-	v = (v << 32) | v1;
 	union union64 u = { .i = v };
 	*res = u.f;
 	return true;
 }
 
-static bool fploadf80(void *cpu, int seg, uword addr, double *res)
+static bool fploadf80(void *cpu, int seg, uword addr, fpreal *res)
 {
 	F80 f80;
 	if(!cpu_load32(cpu, seg, addr, &f80.mant0))
@@ -237,7 +489,7 @@ static bool fploadf80(void *cpu, int seg, uword addr, double *res)
 	return true;
 }
 
-static bool fploadi16(void *cpu, int seg, uword addr, double *res)
+static bool fploadi16(void *cpu, int seg, uword addr, fpreal *res)
 {
 	u16 v;
 	if(!cpu_load16(cpu, seg, addr, &v))
@@ -246,7 +498,7 @@ static bool fploadi16(void *cpu, int seg, uword addr, double *res)
 	return true;
 }
 
-static bool fploadi32(void *cpu, int seg, uword addr, double *res)
+static bool IRAM_ATTR fploadi32(void *cpu, int seg, uword addr, fpreal *res)
 {
 	u32 v;
 	if(!cpu_load32(cpu, seg, addr, &v))
@@ -255,16 +507,12 @@ static bool fploadi32(void *cpu, int seg, uword addr, double *res)
 	return true;
 }
 
-static bool fploadi64(void *cpu, int seg, uword addr, double *res)
+static bool IRAM_ATTR fploadi64(void *cpu, int seg, uword addr, fpreal *res)
 {
-	u32 v1, v2;
-	if(!cpu_load32(cpu, seg, addr, &v1))
+	uint64_t v;
+	if(!cpu_load64(cpu, seg, addr, &v))
 		return false;
-	if(!cpu_load32(cpu, seg, addr + 4, &v2))
-		return false;
-	int64_t v = v2;
-	v = (v << 32) | v1;
-	*res = v;
+	*res = (int64_t)v;
 	return true;
 }
 
@@ -273,7 +521,7 @@ static int bcd100(u8 b)
 	return b - (6 * (b >> 4));
 }
 
-static bool fploadbcd(void *cpu, int seg, uword addr, double *res)
+static bool fploadbcd(void *cpu, int seg, uword addr, fpreal *res)
 {
 	u32 lo, mi;
 	u16 hi;
@@ -299,11 +547,11 @@ static bool fploadbcd(void *cpu, int seg, uword addr, double *res)
 		val = val * 100 + bcd100(hi);
 		hi >>= 8;
 	}
-	*res = copysign(val, sign ? -1.0 : 1.0);
+	*res = copysignf((float)val, sign ? -1.0f : 1.0f);
 	return true;
 }
 
-static bool fpstoref32(void *cpu, int seg, uword addr, double val)
+static bool IRAM_ATTR fpstoref32(void *cpu, int seg, uword addr, fpreal val)
 {
 	union union32 u = { .f = val };
 	u32 v = u.i;
@@ -312,18 +560,13 @@ static bool fpstoref32(void *cpu, int seg, uword addr, double val)
 	return true;
 }
 
-static bool fpstoref64(void *cpu, int seg, uword addr, double val)
+static bool IRAM_ATTR fpstoref64(void *cpu, int seg, uword addr, fpreal val)
 {
 	union union64 u = { .f = val };
-	uint64_t v = u.i;
-	if (!cpu_store32(cpu, seg, addr, v))
-		return false;
-	if (!cpu_store32(cpu, seg, addr + 4, v >> 32))
-		return false;
-	return true;
+	return cpu_store64(cpu, seg, addr, u.i);
 }
 
-static bool fpstoref80(void *cpu, int seg, uword addr, double val)
+static bool fpstoref80(void *cpu, int seg, uword addr, fpreal val)
 {
 	F80 f80 = tof80(val);
 	if (!cpu_store32(cpu, seg, addr, f80.mant0))
@@ -335,51 +578,63 @@ static bool fpstoref80(void *cpu, int seg, uword addr, double val)
 	return true;
 }
 
-static double fpround(double x, int rc)
+static fpreal IRAM_ATTR fpround(fpreal x, int rc)
 {
 	switch (rc) {
 	case 0:
+#ifdef USE_FLOAT32_FPU
+		return roundf(x);
+#else
 		return round(x);
+#endif
 	case 1:
+#ifdef USE_FLOAT32_FPU
+		return floorf(x);
+#else
 		return floor(x);
+#endif
 	case 2:
+#ifdef USE_FLOAT32_FPU
+		return ceilf(x);
+#else
 		return ceil(x);
+#endif
 	case 3:
+#ifdef USE_FLOAT32_FPU
+		return truncf(x);
+#else
 		return trunc(x);
+#endif
 	}
 	return x;
 }
 
-static bool fpstorei16(void *cpu, int seg, uword addr, double val)
+static bool fpstorei16(void *cpu, int seg, uword addr, fpreal val)
 {
-	s16 v = val < 32768.0 && val >= -32768.0 ? (s16) val : 0x8000;
+	s16 v = val < FPCONST(32768.0) && val >= FPCONST(-32768.0) ? (s16) val : 0x8000;
 	if (!cpu_store16(cpu, seg, addr, v))
 		return false;
 	return true;
 }
 
-static bool fpstorei32(void *cpu, int seg, uword addr, double val)
+static bool IRAM_ATTR fpstorei32(void *cpu, int seg, uword addr, fpreal val)
 {
-	s32 v = val < 2147483648.0 && val >= -2147483648.0 ? (s32) val : 0x80000000;
+	s32 v = val < FPCONST(2147483648.0) && val >= FPCONST(-2147483648.0) ? (s32) val : 0x80000000;
 	if (!cpu_store32(cpu, seg, addr, v))
 		return false;
 	return true;
 }
 
-static bool fpstorei64(void *cpu, int seg, uword addr, double val)
+static bool IRAM_ATTR fpstorei64(void *cpu, int seg, uword addr, fpreal val)
 {
-	int64_t v = val < 9223372036854775808.0 && val >= -9223372036854775808.0 ?
+	int64_t v = val < FPCONST(9223372036854775808.0) && val >= FPCONST(-9223372036854775808.0) ?
 		(int64_t) val : 0x8000000000000000ll;
-	if (!cpu_store32(cpu, seg, addr, v))
-		return false;
-	if (!cpu_store32(cpu, seg, addr + 4, v >> 32))
-		return false;
-	return true;
+	return cpu_store64(cpu, seg, addr, (uint64_t)v);
 }
 
-static bool fpstorebcd(void *cpu, int seg, uword addr, double val)
+static bool fpstorebcd(void *cpu, int seg, uword addr, fpreal val)
 {
-	int64_t v = val < 9223372036854775808.0 && val >= -9223372036854775808.0 ?
+	int64_t v = val < FPCONST(9223372036854775808.0) && val >= FPCONST(-9223372036854775808.0) ?
 		(int64_t) val : 0x8000000000000000ll;
 	int sign = 0;
 	if (v < 0) {
@@ -409,9 +664,9 @@ enum {
 	C3 = 0x4000,
 };
 
-static void fparith(FPU *fpu, int group, unsigned int d, double a, double b)
+static void IRAM_ATTR fparith(FPU *fpu, int group, unsigned int d, fpreal a, fpreal b)
 {
-	double c;
+	fpreal c;
 	switch (group) {
 	case 0: // FADD
 		c = a + b;
@@ -421,7 +676,7 @@ static void fparith(FPU *fpu, int group, unsigned int d, double a, double b)
 		break;
 	case 2: // FCOM
 	case 3: // FCOMP
-		if (isunordered(a, b)) {
+		if (fpisunordered(a, b)) {
 			fpu->sw |= C0 | C2 | C3;
 		} else if (a == b) {
 			fpu->sw |= C3;
@@ -455,13 +710,13 @@ static void fparith(FPU *fpu, int group, unsigned int d, double a, double b)
 	}
 }
 
-bool fpu_exec2(FPU *fpu, void *cpu, bool opsz16, int op, int group, int seg, uint32_t addr)
+bool IRAM_ATTR fpu_exec2(FPU *fpu, void *cpu, bool opsz16, int op, int group, int seg, uint32_t addr)
 {
-	double a;
+	fpreal a;
 	switch (op) {
 	case 0: {
 		a = fpget(fpu, 0);
-		double b;
+		fpreal b;
 		if (!fploadf32(cpu, seg, addr, &b)) {
 			return false;
 		}
@@ -543,7 +798,7 @@ bool fpu_exec2(FPU *fpu, void *cpu, bool opsz16, int op, int group, int seg, uin
 	}
 	case 2: {
 		a = fpget(fpu, 0);
-		double b;
+		fpreal b;
 		bool r = fploadi32(cpu, seg, addr, &b);
 		if (!r)
 			return false;
@@ -600,7 +855,7 @@ bool fpu_exec2(FPU *fpu, void *cpu, bool opsz16, int op, int group, int seg, uin
 		break;
 	case 4: {
 		a = fpget(fpu, 0);
-		double b;
+		fpreal b;
 		bool r = fploadf64(cpu, seg, addr, &b);
 		if (!r)
 			return false;
@@ -727,7 +982,7 @@ bool fpu_exec2(FPU *fpu, void *cpu, bool opsz16, int op, int group, int seg, uin
 		break;
 	case 6: {
 		a = fpget(fpu, 0);
-		double b;
+		fpreal b;
 		bool r = fploadi16(cpu, seg, addr, &b);
 		if (!r)
 			return false;
@@ -799,11 +1054,11 @@ bool fpu_exec2(FPU *fpu, void *cpu, bool opsz16, int op, int group, int seg, uin
 	return true;
 }
 
-#define PI		3.141592653589793238462L
-#define L2E		1.4426950408889634073605L
-#define L2T		3.3219280948873623478693L
-#define LN2		0.69314718055994530941683L
-#define LG2		0.30102999566398119521379L
+#define PI		FPCONST(3.141592653589793238462)
+#define L2E		FPCONST(1.4426950408889634073605)
+#define L2T		FPCONST(3.3219280948873623478693)
+#define LN2		FPCONST(0.69314718055994530941683)
+#define LG2		FPCONST(0.30102999566398119521379)
 
 enum {
 	CF = 0x1,
@@ -828,9 +1083,9 @@ static bool cmov_cond(FPU *fpu, void *cpu, int i)
 
 static void ucomi(FPU *fpu, void *cpu, int i)
 {
-	double a = fpget(fpu, 0);
-	double b = fpget(fpu, i);
-	if (isunordered(a, b)) {
+	fpreal a = fpget(fpu, 0);
+	fpreal b = fpget(fpu, i);
+	if (fpisunordered(a, b)) {
 		cpu_setflags(cpu, ZF | PF | CF, 0);
 	} else if (a == b) {
 		cpu_setflags(cpu, ZF, PF | CF);
@@ -841,17 +1096,17 @@ static void ucomi(FPU *fpu, void *cpu, int i)
 	}
 }
 
-bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
+bool IRAM_ATTR fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 {
 	switch (op) {
 	case 0: {
-		double a = fpget(fpu, 0);
-		double b = fpget(fpu, i);
+		fpreal a = fpget(fpu, 0);
+		fpreal b = fpget(fpu, i);
 		fparith(fpu, group, 0, a, b);
 		break;
 	}
 	case 1: {
-		double temp, temp2;
+		fpreal temp, temp2;
 		switch (group) {
 		case 0: // FLD
 			temp = fpget(fpu, i);
@@ -874,11 +1129,11 @@ bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 			temp = fpget(fpu, 0);
 			switch (i) {
 			case 0: // FCHS
-				fpset(fpu, 0, copysign(temp,
-						       signbit(temp) ? 1.0 : -1.0));
+				fpset(fpu, 0, fpcopysign(temp,
+						       fpsignbit(temp) ? FPCONST(1.0) : FPCONST(-1.0)));
 				break;
 			case 1: // FABS
-				fpset(fpu, 0, fabs(temp));
+				fpset(fpu, 0, fpfabs(temp));
 				break;
 			case 2:
 			case 3:
@@ -890,7 +1145,7 @@ bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 				fparith(fpu, 2, 0, temp, 0.0);
 				break;
 			case 5: // FXAM
-				if (signbit(temp)) {
+				if (fpsignbit(temp)) {
 					fpu->sw |= C1;
 				} else {
 					fpu->sw &= ~C1;
@@ -898,10 +1153,10 @@ bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 				if(temp == 0.0) {
 					fpu->sw |= C3;
 					fpu->sw &= ~(C0 | C2);
-				} else if (isnan(temp)) {
+				} else if (fpisnan(temp)) {
 					fpu->sw |= C0;
 					fpu->sw &= ~(C2 | C3);
-				} else if (isfinite(temp)) {
+				} else if (fpisfinite(temp)) {
 					fpu->sw |= C2;
 					fpu->sw &= ~(C0 | C3);
 				} else {
@@ -943,26 +1198,26 @@ bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 			temp = fpget(fpu, 0);
 			switch (i) {
 			case 0: // F2XM1
-				fpset(fpu, 0, pow(2.0, temp) - 1);
+				fpset(fpu, 0, fppow(FPCONST(2.0), temp) - 1);
 				break;
 			case 1: // FYL2X
 				temp2 = fpget(fpu, 1);
-				fpset(fpu, 1, temp2 * log2(temp));
+				fpset(fpu, 1, temp2 * fplog2(temp));
 				fppop(fpu);
 				break;
 			case 2: // FPTAN
-				fpset(fpu, 0, tan(temp));
+				fpset(fpu, 0, fptan(temp));
 				fppush(fpu, 1.0);
 				fpu->sw &= ~C2;
 				break;
 			case 3: // FPATAN
 				temp2 = fpget(fpu, 1);
-				fpset(fpu, 1, atan2(temp2, temp));
+				fpset(fpu, 1, fpatan2(temp2, temp));
 				fppop(fpu);
 				break;
 			case 4: { // FXTRACT
 				int exp;
-				double mant = frexp(temp, &exp);
+				fpreal mant = fpfrexp(temp, &exp);
 				mant *= 2;
 				exp--;
 				fpset(fpu, 0, exp);
@@ -1002,18 +1257,18 @@ bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 			}
 			case 1: // FYL2XP1
 				temp2 = fpget(fpu, 1);
-				fpset(fpu, 1, temp2 * log2(1.0 + temp));
+				fpset(fpu, 1, temp2 * fplog2(FPCONST(1.0) + temp));
 				break;
 			case 2: // FSQRT
-				fpset(fpu, 0, sqrt(temp));
+				fpset(fpu, 0, fpsqrt(temp));
 				break;
 			case 3: { // FSINCOS
-				double s, c;
-#ifdef _GNU_SOURCE
+				fpreal s, c;
+#if defined(_GNU_SOURCE) && !defined(USE_FLOAT32_FPU)
 				sincos(temp, &s, &c);
 #else
-				s = sin(temp);
-				c = cos(temp);
+				s = fpsin(temp);
+				c = fpcos(temp);
 #endif
 				fpset(fpu, 0, s);
 				fppush(fpu, c);
@@ -1027,14 +1282,14 @@ bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 			}
 			case 5: // FSCALE
 				fpset(fpu, 0,
-				      temp * pow(2.0, trunc(fpget(fpu, 1))));
+				      temp * fppow(FPCONST(2.0), fptrunc(fpget(fpu, 1))));
 				break;
 			case 6: // FSIN
-				fpset(fpu, 0, sin(temp));
+				fpset(fpu, 0, fpsin(temp));
 				fpu->sw &= ~C2;
 				break;
 			case 7: // FCOS
-				fpset(fpu, 0, cos(temp));
+				fpset(fpu, 0, fpcos(temp));
 				fpu->sw &= ~C2;
 				break;
 			}
@@ -1046,9 +1301,9 @@ bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 		switch (group) {
 		case 5:
 			if (i == 1) { // FUCOMPP
-				double a = fpget(fpu, 0);
-				double b = fpget(fpu, 1);
-				if (isunordered(a, b)) {
+				fpreal a = fpget(fpu, 0);
+				fpreal b = fpget(fpu, 1);
+				if (fpisunordered(a, b)) {
 					fpu->sw |= C0 | C2 | C3;
 				} else if (a == b) {
 					fpu->sw |= C3;
@@ -1112,13 +1367,13 @@ bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 		}
 		break;
 	case 4: {
-		double a = fpget(fpu, 0);
-		double b = fpget(fpu, i);
+		fpreal a = fpget(fpu, 0);
+		fpreal b = fpget(fpu, i);
 		fparith(fpu, group, i, a, b);
 		break;
 	}
 	case 5: {
-		double temp, temp2;
+		fpreal temp, temp2;
 		switch (group) {
 		case 0: // FFREE
 			// tw
@@ -1141,9 +1396,9 @@ bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 		case 4: // FUCOM
 		case 5: // FUCOMP
 		{
-			double a = fpget(fpu, 0);
-			double b = fpget(fpu, i);
-			if (isunordered(a, b)) {
+			fpreal a = fpget(fpu, 0);
+			fpreal b = fpget(fpu, i);
+			if (fpisunordered(a, b)) {
 				fpu->sw |= C0 | C2 | C3;
 			} else if (a == b) {
 				fpu->sw |= C3;
@@ -1166,8 +1421,8 @@ bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 		break;
 	}
 	case 6: {
-		double a = fpget(fpu, 0);
-		double b = fpget(fpu, i);
+		fpreal a = fpget(fpu, 0);
+		fpreal b = fpget(fpu, i);
 		fparith(fpu, group, i, a, b);
 		fppop(fpu);
 		break;
@@ -1179,15 +1434,15 @@ bool fpu_exec1(FPU *fpu, void *cpu, int op, int group, unsigned int i)
 			fppop(fpu);
 			break;
 		case 1: { // FXCH
-			double temp = fpget(fpu, i);
-			double temp2 = fpget(fpu, 0);
+			fpreal temp = fpget(fpu, i);
+			fpreal temp2 = fpget(fpu, 0);
 			fpset(fpu, i, temp2);
 			fpset(fpu, 0, temp);
 			break;
 		}
 		case 2: // FSTP
 		case 3: { // FSTP
-			double temp;
+			fpreal temp;
 			temp = fpget(fpu, 0);
 			fpset(fpu, i, temp);
 			fppop(fpu);
