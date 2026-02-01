@@ -30,7 +30,7 @@ static void i2s_task(void *arg)
 		memset(buf, 0, 128 * 2);
 		mixer_callback(globals.pc, (uint8_t *) buf, 128 * 2);
 		for (int i = 0; i < 128; i++) {
-			buf[i] = buf[i] / 16;
+			buf[i] = buf[i] / 2;
 		}
 		i2s_channel_write(tx_chan, buf, 128 * 2, &bwritten, portMAX_DELAY);
 	}
@@ -38,6 +38,8 @@ static void i2s_task(void *arg)
 }
 
 #ifdef USE_BADGE_BSP
+static int last_volume = -1;
+
 static void i2s_bsp_task(void *arg)
 {
 	int core_id = esp_cpu_get_core_id();
@@ -59,7 +61,6 @@ static void i2s_bsp_task(void *arg)
 
 	// Configure audio
 	bsp_audio_set_rate(44100);
-	bsp_audio_set_volume(80.0f);
 	bsp_audio_set_amplifier(true);
 
 	// Wait for PC to be initialized
@@ -69,6 +70,13 @@ static void i2s_bsp_task(void *arg)
 			    pdFALSE,
 			    portMAX_DELAY);
 
+	// Apply initial volume from globals
+	int vol = globals.volume;
+	if (vol < 0) vol = 0;
+	if (vol > 100) vol = 100;
+	bsp_audio_set_volume((float)vol);
+	last_volume = vol;
+
 	int16_t buf[128];
 	i2s_channel_enable(tx_chan);
 	for (;;) {
@@ -76,9 +84,18 @@ static void i2s_bsp_task(void *arg)
 		memset(buf, 0, 128 * 2);
 		mixer_callback(globals.pc, (uint8_t *) buf, 128 * 2);
 		for (int i = 0; i < 128; i++) {
-			buf[i] = buf[i] / 16;
+			buf[i] = buf[i] / 2;
 		}
 		i2s_channel_write(tx_chan, buf, 128 * 2, &bwritten, portMAX_DELAY);
+
+		/* Check if volume changed (from OSD or META+arrow) */
+		if (globals.volume != last_volume) {
+			vol = globals.volume;
+			if (vol < 0) vol = 0;
+			if (vol > 100) vol = 100;
+			bsp_audio_set_volume((float)vol);
+			last_volume = vol;
+		}
 	}
 	i2s_channel_disable(tx_chan);
 }

@@ -30,6 +30,7 @@ struct Globals {
 	int vga_mode_width;   // Native VGA mode dimensions (before pixel doubling)
 	int vga_mode_height;
 	int vga_pixel_double; // Pixel doubling factor (1=none, 2=double width for mode 13h)
+	bool vga_mode_changed; // Set by vga.c on any mode change, lcd_bsp clears all buffers
 	uint32_t vga_frame_gen; // Frame generation counter - incremented on each VGA render
 	int brightness;   // Current brightness (0-100)
 	int volume;       // Current volume (0-100)

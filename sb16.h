@@ -11,6 +11,15 @@ void sb16_mixer_write_indexb(void *opaque, uint32_t nport, uint32_t val);
 void sb16_mixer_write_datab(void *opaque, uint32_t nport, uint32_t val);
 void sb16_audio_callback (void *opaque, uint8_t *stream, int free);
 
+/* Get FM/OPL volume from mixer register 0x26 (0-7 scale for each channel) */
+void sb16_get_fm_volume(void *opaque, int *left, int *right);
+
+/* Get voice/digital volume from mixer register 0x04 (0-7 scale for each channel) */
+void sb16_get_voice_volume(void *opaque, int *left, int *right);
+
+/* Get master volume from mixer register 0x22 (0-7 scale for each channel) */
+void sb16_get_master_volume(void *opaque, int *left, int *right);
+
 SB16State *sb16_new(
     int port, // 0x220
     int irq, // 5

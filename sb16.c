@@ -1149,11 +1149,11 @@ static void reset_mixer (SB16State *s)
     s->mixer_regs[0x0e] = 0;
 
     /* voice volume L d5,d7, R d1,d3 */
-    s->mixer_regs[0x04] = (4 << 5) | (4 << 1);
+    s->mixer_regs[0x04] = (7 << 5) | (7 << 1);
     /* master ... */
-    s->mixer_regs[0x22] = (4 << 5) | (4 << 1);
+    s->mixer_regs[0x22] = (7 << 5) | (7 << 1);
     /* MIDI ... */
-    s->mixer_regs[0x26] = (4 << 5) | (4 << 1);
+    s->mixer_regs[0x26] = (7 << 5) | (7 << 1);
 
     for (i = 0x30; i < 0x48; i++) {
         s->mixer_regs[i] = 0x20;
@@ -1237,6 +1237,33 @@ uint32_t sb16_mixer_read(void *opaque, uint32_t nport)
             s->mixer_nreg, s->mixer_regs[s->mixer_nreg]);
 #endif
     return s->mixer_regs[s->mixer_nreg];
+}
+
+void sb16_get_fm_volume(void *opaque, int *left, int *right)
+{
+    SB16State *s = opaque;
+    /* Register 0x26: FM volume, bits 5-7 = left, bits 1-3 = right (0-7 scale) */
+    uint8_t reg = s->mixer_regs[0x26];
+    *left = (reg >> 5) & 7;
+    *right = (reg >> 1) & 7;
+}
+
+void sb16_get_voice_volume(void *opaque, int *left, int *right)
+{
+    SB16State *s = opaque;
+    /* Register 0x04: Voice volume, bits 5-7 = left, bits 1-3 = right (0-7 scale) */
+    uint8_t reg = s->mixer_regs[0x04];
+    *left = (reg >> 5) & 7;
+    *right = (reg >> 1) & 7;
+}
+
+void sb16_get_master_volume(void *opaque, int *left, int *right)
+{
+    SB16State *s = opaque;
+    /* Register 0x22: Master volume, bits 5-7 = left, bits 1-3 = right (0-7 scale) */
+    uint8_t reg = s->mixer_regs[0x22];
+    *left = (reg >> 5) & 7;
+    *right = (reg >> 1) & 7;
 }
 
 static int write_audio (SB16State *s, int nchan, int dma_pos,

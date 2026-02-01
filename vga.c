@@ -1496,6 +1496,8 @@ static void vga_graphic_refresh(VGAState *s,
         vga_mark_all_dirty();
         vga256_invalidate_palette();
         memset(vga_prev_line_hash, 0, sizeof(vga_prev_line_hash));
+        /* Signal lcd_bsp to clear all rotated buffers */
+        globals.vga_mode_changed = true;
 #endif
         fprintf(stderr, "VGA mode: %dx%d sc=%d xdiv=%d bpp=%d cr17=0x%02x\n",
                 w, h, shift_control, (s->sr[0x01] & 8) ? 2 : 1,
@@ -2311,6 +2313,10 @@ void vga_refresh(VGAState *s,
         simplefb_clear(fb_dev, redraw_func, opaque);
         /* Force vga_graphic_refresh to re-clear on mode change */
         s->force_graphic_clear = 1;
+#ifdef TANMATSU_BUILD
+        /* Signal lcd_bsp to clear all rotated buffers */
+        globals.vga_mode_changed = true;
+#endif
     }
 
     if (s->graphic_mode == 2) {

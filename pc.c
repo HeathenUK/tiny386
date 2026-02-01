@@ -1,5 +1,6 @@
 #include "pc.h"
 #include "i8042.h"
+#include "sb16.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -815,15 +816,39 @@ void mixer_callback (void *opaque, uint8_t *stream, int free)
 	adlib_callback(pc->adlib, tmpbuf, free / 2); // s16, mono
 	sb16_audio_callback(pc->sb16, stream, free); // s16, stereo
 
+	/* Get volume levels from SB16 mixer (0-7 scale per channel) */
+	int fm_vol_l, fm_vol_r;
+	int voice_vol_l, voice_vol_r;
+	int master_vol_l, master_vol_r;
+	sb16_get_fm_volume(pc->sb16, &fm_vol_l, &fm_vol_r);
+	sb16_get_voice_volume(pc->sb16, &voice_vol_l, &voice_vol_r);
+	sb16_get_master_volume(pc->sb16, &master_vol_l, &master_vol_r);
+
 	int16_t *d2 = (int16_t *) stream;
 	int16_t *d1 = (int16_t *) tmpbuf;
-	for (int i = 0; i < free / 2; i++) {
-		int res = d2[i] + d1[i / 2];
-		if (res > 32767) res = 32767;
-		if (res < -32768) res = -32768;
-		d2[i] = res;
+	for (int i = 0; i < free / 2; i += 2) {
+		/* Apply FM volume to OPL samples (0-7 range, 7 = full volume) */
+		int fm_l = (d1[i / 2] * fm_vol_l) / 7;
+		int fm_r = (d1[i / 2] * fm_vol_r) / 7;
+		/* Apply voice volume to SB16 digital audio */
+		int voice_l = (d2[i] * voice_vol_l) / 7;
+		int voice_r = (d2[i + 1] * voice_vol_r) / 7;
+		/* Mix FM with voice */
+		int mix_l = voice_l + fm_l;
+		int mix_r = voice_r + fm_r;
+		/* Apply master volume */
+		mix_l = (mix_l * master_vol_l) / 7;
+		mix_r = (mix_r * master_vol_r) / 7;
+		/* Clamp to 16-bit range */
+		if (mix_l > 32767) mix_l = 32767;
+		if (mix_l < -32768) mix_l = -32768;
+		if (mix_r > 32767) mix_r = 32767;
+		if (mix_r < -32768) mix_r = -32768;
+		d2[i] = mix_l;
+		d2[i + 1] = mix_r;
 	}
 
+	/* PC Speaker bypasses SB16 mixer (separate circuit on real hardware) */
 	if (pcspk_get_active_out(pc->pcspk)) {
 		memset(tmpbuf, 0x80, MIXER_BUF_LEN / 2);
 		pcspk_callback(pc->pcspk, tmpbuf, free / 4); // u8, mono

@@ -27,6 +27,7 @@
 
 #include "common.h"
 #include "tanmatsu_osd.h"
+#include "esp_cache.h"
 
 static const char *TAG = "lcd_bsp";
 
@@ -135,16 +136,6 @@ static void update_scale_params(void)
 	cached_mode_w = native_w;
 	cached_mode_h = native_h;
 	cached_pixel_double = pixel_double;
-
-	/* Mode changed - clear both rotated framebuffers to black to avoid
-	 * leaving behind artifacts in the outer areas not covered by the
-	 * new scaled/centered content */
-	size_t fb_rot_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
-	for (int i = 0; i < NUM_ROTATE_BUFFERS; i++) {
-		if (fb_rotated_buffers[i]) {
-			memset(fb_rotated_buffers[i], 0, fb_rot_size);
-		}
-	}
 
 	/* Calculate intended VGA output dimensions (native * pixel_double).
 	 * For mode 13h: native 320x200, intended 640x400 (2x both dimensions).
@@ -289,6 +280,21 @@ static void IRAM_ATTR rotate_vga_to_display(uint16_t *fb, uint16_t *fb_rotated)
 			blit_debug_count++;
 		}
 		return;
+	}
+
+	/* Check if VGA mode changed - clear ALL rotated buffers */
+	if (globals.vga_mode_changed) {
+		globals.vga_mode_changed = false;
+		size_t fb_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
+		for (int i = 0; i < NUM_ROTATE_BUFFERS; i++) {
+			if (fb_rotated_buffers[i]) {
+				memset(fb_rotated_buffers[i], 0, fb_size);
+				/* Flush cache to ensure DMA sees zeros */
+				esp_cache_msync(fb_rotated_buffers[i], fb_size,
+				                ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+			}
+		}
+		ESP_LOGI(TAG, "Mode change: cleared all rotated buffers");
 	}
 
 	update_scale_params();
