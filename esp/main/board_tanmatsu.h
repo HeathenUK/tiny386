@@ -3,16 +3,18 @@
 #define USE_BADGE_BSP
 #define TANMATSU_BUILD  // Guards for Tanmatsu-specific features in core code
 
-// PSRAM pool for emulator - leave room for BSP framebuffers (~1.5MB)
-// User's SD card ini may specify up to 24MB mem_size
-#define PSRAM_ALLOC_LEN (28 * 1024 * 1024)
+// PSRAM pool for emulator - leave room for BSP framebuffers, caches, etc.
+// Uses 24MB for PC RAM, leaving ~8MB for system (framebuffers, glyph cache, etc.)
+#define PSRAM_ALLOC_LEN (24 * 1024 * 1024)
+#define MAX_MEM_SIZE (24 * 1024 * 1024)  // Cap for ini mem_size
 
 // Note: cpu_exec1() is too large (~1600 lines) for IRAM on ESP32-P4
 // Keep empty to avoid IRAM overflow. Dispatch table in IRAM provides partial benefit.
 #define IRAM_ATTR_CPU_EXEC1
 
 #define BPP 16
-#define FULL_UPDATE
+// FULL_UPDATE removed - use incremental text rendering for performance
+#define TEXT_RENDER_OPT  // Enable text rendering optimizations
 #define USE_LCD_BSP
 // Physical LCD dimensions (landscape, before 270-degree rotation to portrait)
 // VGA framebuffer matches these dimensions; content is centered within

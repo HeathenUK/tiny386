@@ -157,7 +157,17 @@ static int pc_main(const char *file)
 		return err;
 	}
 	conf.ini_path = file;  // Store ini path for saving settings
-	fprintf(stderr, "pc_main: ini parsed, width=%d height=%d\n", conf.width, conf.height);
+
+#ifdef MAX_MEM_SIZE
+	// Cap mem_size to available PSRAM pool
+	if (conf.mem_size > MAX_MEM_SIZE) {
+		fprintf(stderr, "Warning: mem_size %ldM exceeds max %dM, capping\n",
+		        conf.mem_size / (1024 * 1024), MAX_MEM_SIZE / (1024 * 1024));
+		conf.mem_size = MAX_MEM_SIZE;
+	}
+#endif
+	fprintf(stderr, "pc_main: ini parsed, width=%d height=%d mem=%ldM\n",
+	        conf.width, conf.height, conf.mem_size / (1024 * 1024));
 
 #ifdef USE_LCD_BSP
 	// Tell LCD backend the actual VGA dimensions for PPA scaling
