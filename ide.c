@@ -32,7 +32,7 @@
 #include "ide.h"
 
 #ifdef TANMATSU_BUILD
-#define DEBUG_IDE
+//#define DEBUG_IDE
 #endif
 //#define DEBUG_IDE_ATAPI
 
