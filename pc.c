@@ -472,9 +472,24 @@ void pc_vga_step(void *o)
 
 void pc_step(PC *pc)
 {
+#ifdef BUILD_ESP32
+	/* Dynamic batch sizing: adjust instruction count based on step time.
+	 * Scale up when steps are fast, scale down when slow.
+	 * Uses hysteresis to prevent oscillation. */
+	static int batch_size = 512;           /* Current batch: 512-4096 */
+	static uint32_t step_time_accum = 0;   /* Accumulated step time */
+	static uint32_t step_count = 0;        /* Steps since last evaluation */
+#endif
+
 #ifndef USEKVM
 	if (pc->reset_request) {
 		pc->reset_request = 0;
+#ifdef BUILD_ESP32
+		/* Reset batch size on reboot - hardware detection is timing-sensitive */
+		batch_size = 512;
+		step_time_accum = 0;
+		step_count = 0;
+#endif
 		load_bios_and_reset(pc);
 	}
 #endif
@@ -483,7 +498,15 @@ void pc_step(PC *pc)
 #endif
 
 #ifdef BUILD_ESP32
-	/* Instrumentation for batch size tuning analysis */
+	/* Check if VGA mode changed - reset batch for new program */
+	if (globals.batch_reset_pending) {
+		globals.batch_reset_pending = false;
+		batch_size = 512;
+		step_time_accum = 0;
+		step_count = 0;
+	}
+
+	/* Instrumentation for monitoring */
 	static uint32_t stat_cpu_us = 0;
 	static uint32_t stat_periph_us = 0;
 	static uint32_t stat_calls = 0;
@@ -540,9 +563,34 @@ void pc_step(PC *pc)
 #else
 #ifdef BUILD_ESP32
 	t1 = get_uticks();
-	cpui386_step(pc->cpu, 512);
+	cpui386_step(pc->cpu, batch_size);
 	t2 = get_uticks();
 
+	/* Track step timing for dynamic batch adjustment */
+	uint32_t step_time = t2 - t0;
+	step_time_accum += step_time;
+	step_count++;
+
+	/* Evaluate and adjust batch size every 100 steps */
+	if (step_count >= 100) {
+		uint32_t avg_step_time = step_time_accum / step_count;
+
+		/* Hysteresis thresholds to prevent oscillation:
+		 * - Scale UP by 256 if avg < 800µs (fast steps, room to grow)
+		 * - Scale DOWN by 256 if avg > 2000µs (slow steps, reduce load)
+		 * - Dead zone 800-2000µs: hold current batch size
+		 * Range: 512-4096, step size 256 (15 levels) */
+		if (avg_step_time < 800 && batch_size < 4096) {
+			batch_size += 256;
+		} else if (avg_step_time > 2000 && batch_size > 512) {
+			batch_size -= 256;
+		}
+
+		step_time_accum = 0;
+		step_count = 0;
+	}
+
+	/* Instrumentation */
 	stat_periph_us += (t1 - t0);
 	stat_cpu_us += (t2 - t1);
 	stat_calls++;
@@ -551,11 +599,12 @@ void pc_step(PC *pc)
 	if (t2 - stat_last_report >= 2000000) {
 		uint32_t total = stat_cpu_us + stat_periph_us;
 		if (total > 0) {
-			fprintf(stderr, "pc_step stats: %u calls, cpu=%u us (%u%%), periph=%u us (%u%%), avg=%u us/call\n",
+			fprintf(stderr, "pc_step stats: %u calls, cpu=%u us (%u%%), periph=%u us (%u%%), avg=%u us/call, batch=%d\n",
 				stat_calls,
 				stat_cpu_us, (stat_cpu_us * 100) / total,
 				stat_periph_us, (stat_periph_us * 100) / total,
-				total / stat_calls);
+				total / stat_calls,
+				batch_size);
 		}
 		stat_cpu_us = 0;
 		stat_periph_us = 0;

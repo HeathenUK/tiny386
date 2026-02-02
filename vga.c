@@ -2311,6 +2311,11 @@ void vga_refresh(VGAState *s,
         simplefb_clear(fb_dev, redraw_func, opaque);
         /* Force vga_graphic_refresh to re-clear on mode change */
         s->force_graphic_clear = 1;
+#ifdef BUILD_ESP32
+        /* Signal to reset dynamic batch size - new program starting */
+        extern struct Globals globals;
+        globals.batch_reset_pending = true;
+#endif
     }
 
     if (s->graphic_mode == 2) {
