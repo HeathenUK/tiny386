@@ -30,4 +30,12 @@ int pit_get_pending_irqs(PITState *pit);
 #include <stdbool.h>
 bool pit_fire_single_irq(PITState *pit);
 
+#ifdef BUILD_ESP32
+/* Optimized burst functions that avoid repeated get_uticks() calls.
+ * pit_burst_start: validates mode, returns pending count and cached timing info.
+ * pit_burst_fire: fires one IRQ without re-checking, returns true if fired. */
+int pit_burst_start(PITState *pit, uint32_t *out_d, int *out_irq);
+bool pit_burst_fire(PITState *pit, uint32_t d, int irq);
+#endif
+
 #endif /* I8254_H */

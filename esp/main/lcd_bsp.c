@@ -418,28 +418,6 @@ void vga_task(void *arg)
 
 	xEventGroupSetBits(global_event_group, BIT1);  // Signal display ready
 
-	// Show splash screen while emulator initializes
-	{
-		uint16_t *splash = fb_rotated_buffers[0];
-		for (int i = 0; i < DISPLAY_WIDTH * DISPLAY_HEIGHT; i++) {
-			splash[i] = 0x0010;  // Dark blue
-		}
-		// Draw white border rectangle as loading indicator
-		const uint16_t white = 0xFFFF;
-		int cx = DISPLAY_WIDTH / 2;
-		int cy = DISPLAY_HEIGHT / 2;
-		for (int y = cy - 20; y < cy + 20; y++) {
-			for (int x = cx - 60; x < cx + 60; x++) {
-				if (y == cy - 20 || y == cy + 19 || x == cx - 60 || x == cx + 59) {
-					splash[y * DISPLAY_WIDTH + x] = white;
-				}
-			}
-		}
-		esp_cache_msync(splash, DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t),
-		                ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-		bsp_display_blit(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, splash);
-	}
-
 	// Wait for PC emulator to be ready
 	xEventGroupWaitBits(global_event_group,
 			    BIT0,

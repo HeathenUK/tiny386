@@ -413,3 +413,49 @@ bool pit_fire_single_irq(PITState *pit)
 
 	return true;
 }
+
+#ifdef BUILD_ESP32
+/* Optimized burst start: validates mode once and returns pending count + timing info.
+ * Returns number of pending IRQs (0 if none or invalid mode). */
+int pit_burst_start(PITState *pit, uint32_t *out_d, int *out_irq)
+{
+	PITChannelState *s = &pit->channels[0];
+	if (s->mode != 2 && s->mode != 3)
+		return 0;
+	if (s->irq == -1)
+		return 0;
+
+	uint32_t uticks = get_uticks();
+	uint32_t d = ((uint64_t)(uticks - s->count_load_time)) * PIT_FREQ / 1000000;
+	*out_d = d;
+	*out_irq = s->irq;
+
+	/* Count pending IRQs */
+	int pending = 0;
+	uint32_t check = s->last_irq_count;
+	while (check + s->count - d >= 0x80000000) {
+		pending++;
+		check += s->count;
+		if (pending > 100)
+			break;
+	}
+	return pending;
+}
+
+/* Optimized burst fire: fires one IRQ without re-validating mode/irq.
+ * Returns true if IRQ was fired, false if caught up. */
+bool pit_burst_fire(PITState *pit, uint32_t d, int irq)
+{
+	PITChannelState *s = &pit->channels[0];
+
+	/* Check if we're still behind */
+	if (s->last_irq_count + s->count - d < 0x80000000)
+		return false;  /* Caught up */
+
+	/* Fire the IRQ */
+	pit->set_irq(pit->pic, irq, 1);
+	pit->set_irq(pit->pic, irq, 0);
+	s->last_irq_count += s->count;
+	return true;
+}
+#endif

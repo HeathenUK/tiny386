@@ -483,24 +483,36 @@ void pc_step(PC *pc)
 #endif
 
 #ifdef BUILD_ESP32
+	/* Instrumentation for batch size tuning analysis */
+	static uint32_t stat_cpu_us = 0;
+	static uint32_t stat_periph_us = 0;
+	static uint32_t stat_calls = 0;
+	static uint32_t stat_last_report = 0;
+	uint32_t t0, t1, t2;
+
+	t0 = get_uticks();
+
 	/* Burst catch-up for high-frequency PIT interrupts.
 	 * When games program PIT for music timing (e.g., 6000+ Hz), we can't
 	 * deliver that many interrupts per second. Instead of dropping them,
-	 * we process multiple ISRs per step to catch up. */
-	int pending = pit_get_pending_irqs(pc->pit);
+	 * we process multiple ISRs per step to catch up.
+	 *
+	 * Optimized: use pit_burst_start/fire to avoid repeated get_uticks()
+	 * calls and mode validation on each iteration. */
+	uint32_t pit_d;
+	int pit_irq;
+	int pending = pit_burst_start(pc->pit, &pit_d, &pit_irq);
 	if (pending > 1) {
-		/* Limit burst size to avoid stalling other emulation too long.
-		 * Higher burst = better music timing, but more stutter in graphics.
-		 * 48 bursts * 100 instructions = ~4800 inst/burst for music ISRs. */
+		/* Limit burst size to avoid stalling other emulation too long. */
 		int burst = pending > 48 ? 48 : pending;
 		for (int i = 0; i < burst; i++) {
-			if (!pit_fire_single_irq(pc->pit))
+			if (!pit_burst_fire(pc->pit, pit_d, pit_irq))
 				break;
 			/* Run enough instructions for a typical music ISR (~60-100) */
 			cpui386_step(pc->cpu, 100);
 		}
-	} else {
-		/* Normal single-interrupt path */
+	} else if (pending == 1) {
+		/* Single IRQ pending - use normal path */
 		i8254_update_irq(pc->pit);
 	}
 #else
@@ -527,7 +539,29 @@ void pc_step(PC *pc)
 	cpukvm_step(pc->cpu, 4096);
 #else
 #ifdef BUILD_ESP32
+	t1 = get_uticks();
 	cpui386_step(pc->cpu, 512);
+	t2 = get_uticks();
+
+	stat_periph_us += (t1 - t0);
+	stat_cpu_us += (t2 - t1);
+	stat_calls++;
+
+	/* Report every ~2 seconds */
+	if (t2 - stat_last_report >= 2000000) {
+		uint32_t total = stat_cpu_us + stat_periph_us;
+		if (total > 0) {
+			fprintf(stderr, "pc_step stats: %u calls, cpu=%u us (%u%%), periph=%u us (%u%%), avg=%u us/call\n",
+				stat_calls,
+				stat_cpu_us, (stat_cpu_us * 100) / total,
+				stat_periph_us, (stat_periph_us * 100) / total,
+				total / stat_calls);
+		}
+		stat_cpu_us = 0;
+		stat_periph_us = 0;
+		stat_calls = 0;
+		stat_last_report = t2;
+	}
 #else
 	cpui386_step(pc->cpu, 10240);
 #endif
