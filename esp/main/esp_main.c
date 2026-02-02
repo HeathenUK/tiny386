@@ -23,6 +23,11 @@
 #include <errno.h>
 #include <sys/stat.h>
 
+#ifdef USE_BADGE_BSP
+#include "bsp/device.h"
+#include "bsp/display.h"
+#endif
+
 /* From storage.c */
 extern bool storage_sd_mounted(void);
 
@@ -240,12 +245,9 @@ static int pc_main(const char *file)
 #ifdef USE_LCD_BSP
 	// Tell LCD backend the actual VGA dimensions for PPA scaling
 	lcd_set_vga_dimensions(conf.width, conf.height);
-	fprintf(stderr, "pc_main: lcd dimensions set\n");
 #endif
 
-	fprintf(stderr, "pc_main: calling console_init\n");
 	Console *console = console_init(conf.width, conf.height);
-	fprintf(stderr, "pc_main: console_init returned %p\n", console);
 	PC *pc = pc_new(redraw, stub, console, console->fb, &conf);
 	console->pc = pc;
 	globals.pc = pc;
@@ -305,9 +307,6 @@ static int pc_main(const char *file)
 	}
 	return 0;
 }
-
-//
-static const char *TAG = "esp_main";
 
 void *esp_psram_get(size_t *size);
 void vga_task(void *arg);
@@ -420,6 +419,17 @@ void app_main(void)
 	if (uart_driver_install(UART_NUM_0, 2 * 1024, 0, 0, NULL, 0) != ESP_OK) {
 		assert(false);
 	}
+#endif
+
+#ifdef USE_BADGE_BSP
+	// Initialize BSP early in app_main (before storage/PSRAM) for fast display startup
+	bsp_configuration_t bsp_config = {
+		.display = {
+			.requested_color_format = LCD_COLOR_PIXEL_FORMAT_RGB565,
+			.num_fbs = 1,
+		},
+	};
+	ESP_ERROR_CHECK(bsp_device_initialize(&bsp_config));
 #endif
 
 	i2s_main();

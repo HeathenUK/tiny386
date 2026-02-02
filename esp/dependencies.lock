@@ -1,64 +1,9 @@
 dependencies:
   badgeteam/badge-bsp:
-    component_hash: 56bbd6cfc8ab8ddd5986785043ea562f0f63e645c82b5aaac55128c263d3221e
-    dependencies:
-    - name: badgeteam/mch2022-rp2040
-      registry_url: https://components.espressif.com
-      require: private
-      rules:
-      - if: target == esp32
-      version: '>=0.0.2'
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: 0.*
-    - name: espressif/esp_lcd_ili9341
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=2.0.0'
-    - name: espressif/led_strip
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=3.0.1'
-    - name: idf
-      require: private
-      version: '>=5.3'
-    - name: nicolaielectronics/bmi270
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=1.0.1'
-    - name: nicolaielectronics/es8156
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=0.0.2'
-    - name: nicolaielectronics/mipi_dsi_abstraction
-      registry_url: https://components.espressif.com
-      require: private
-      rules:
-      - if: target == esp32p4
-      version: '>=0.3.1'
-    - name: nicolaielectronics/mpr121
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=0.0.1'
-    - name: nicolaielectronics/ssd1619
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=0.0.1'
-    - name: nicolaielectronics/tanmatsu_coprocessor
-      registry_url: https://components.espressif.com
-      require: private
-      rules:
-      - if: target == esp32p4
-      version: '>=0.6.0'
+    dependencies: []
     source:
-      registry_url: https://components.espressif.com/
-      type: service
-    targets:
-    - esp32
-    - esp32p4
-    - esp32c6
-    - esp32c3
+      path: /home/gadyke/tiny386/esp/components/badgeteam__badge-bsp
+      type: local
     version: 0.8.0
   espressif/cmake_utilities:
     component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
@@ -67,7 +12,7 @@ dependencies:
       require: private
       version: '>=4.1'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 0.5.3
   espressif/esp_lcd_axs15231b:
@@ -115,7 +60,7 @@ dependencies:
       require: private
       version: '>=4.4'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 2.0.2
   espressif/esp_lcd_ili9881c:
@@ -174,7 +119,7 @@ dependencies:
       require: private
       version: '>=5.0'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 3.0.2
   idf:
@@ -185,7 +130,7 @@ dependencies:
     component_hash: 4eba2761d6fc2ea032c3e5321e594680f0a47a53ae76323a129628e16af38a0c
     dependencies: []
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 1.0.1
   nicolaielectronics/es8156:
@@ -199,7 +144,7 @@ dependencies:
       require: private
       version: '>=5.3'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 0.0.3
   nicolaielectronics/mipi_dsi_abstraction:
@@ -229,7 +174,7 @@ dependencies:
       require: private
       version: '>=5.4'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     targets:
     - esp32p4
@@ -245,7 +190,7 @@ dependencies:
       require: private
       version: '>=5.4'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 0.0.1
   nicolaielectronics/ssd1619:
@@ -259,7 +204,7 @@ dependencies:
       require: private
       version: '>=5.4'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 0.0.1
   nicolaielectronics/tanmatsu_coprocessor:
@@ -273,16 +218,25 @@ dependencies:
       require: private
       version: '>=5.3'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     targets:
     - esp32p4
     version: 0.6.0
 direct_dependencies:
 - badgeteam/badge-bsp
+- espressif/cmake_utilities
 - espressif/esp_lcd_axs15231b
+- espressif/esp_lcd_ili9341
 - espressif/esp_lcd_st7701
+- espressif/led_strip
 - idf
-manifest_hash: d41d9d47d4f6091ff4d3612a2057d9a2382870cca6b0a6d3aa35907a519bf55e
+- nicolaielectronics/bmi270
+- nicolaielectronics/es8156
+- nicolaielectronics/mipi_dsi_abstraction
+- nicolaielectronics/mpr121
+- nicolaielectronics/ssd1619
+- nicolaielectronics/tanmatsu_coprocessor
+manifest_hash: bbb4c27824890fed5a8c2ec662212da32c2ff46aaa7ac6f6fd8dd3dd526e03c6
 target: esp32p4
 version: 2.0.0

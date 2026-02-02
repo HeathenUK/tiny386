@@ -52,15 +52,14 @@ static void i2s_bsp_task(void *arg)
 			    pdFALSE,
 			    portMAX_DELAY);
 
-	// Get I2S handle from BSP
+	// Get I2S handle from BSP (audio already configured by bsp_device_initialize)
 	if (bsp_audio_get_i2s_handle(&tx_chan) != ESP_OK || !tx_chan) {
 		fprintf(stderr, "Failed to get I2S handle\n");
 		vTaskDelete(NULL);
 		return;
 	}
 
-	// Configure audio
-	bsp_audio_set_rate(44100);
+	// Enable amplifier (rate already set by BSP init)
 	bsp_audio_set_amplifier(true);
 
 	// Wait for PC to be initialized

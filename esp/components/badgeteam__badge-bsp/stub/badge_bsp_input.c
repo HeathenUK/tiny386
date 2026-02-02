@@ -1,0 +1,61 @@
+// Board support package API: Generic stub implementation
+// SPDX-FileCopyrightText: 2025 Nicolai Electronics
+// SPDX-License-Identifier: MIT
+
+#include <stdint.h>
+#include "bsp/input.h"
+#include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+
+esp_err_t __attribute__((weak)) bsp_input_initialize(void) {
+    return ESP_OK;
+}
+
+esp_err_t __attribute__((weak)) bsp_input_get_queue(QueueHandle_t* out_queue) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+bool __attribute__((weak)) bsp_input_needs_on_screen_keyboard(void) {
+    return false;
+}
+
+esp_err_t __attribute__((weak)) bsp_input_get_backlight_brightness(uint8_t* out_percentage) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t __attribute__((weak)) bsp_input_set_backlight_brightness(uint8_t percentage) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t __attribute__((weak)) bsp_input_read_navigation_key(bsp_input_navigation_key_t key, bool* out_state) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t __attribute__((weak)) bsp_input_read_scancode(bsp_input_scancode_t key, bool* out_state) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t __attribute__((weak)) bsp_input_read_action(bsp_input_action_type_t action, bool* out_state) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+// Input hook system stubs
+// Note: Targets that support hooks will override these with implementations
+// from common/badge_bsp_input_hooks.c. ISR-based targets cannot support hooks
+// because hook processing requires taking a mutex.
+
+int __attribute__((weak)) bsp_input_hook_register(bsp_input_hook_cb_t callback, void* user_data) {
+    (void)callback;
+    (void)user_data;
+    return -1;  // Not supported
+}
+
+void __attribute__((weak)) bsp_input_hook_unregister(int hook_id) {
+    (void)hook_id;
+}
+
+esp_err_t __attribute__((weak)) bsp_input_inject_event(bsp_input_event_t* event) {
+    (void)event;
+    return ESP_ERR_NOT_SUPPORTED;
+}

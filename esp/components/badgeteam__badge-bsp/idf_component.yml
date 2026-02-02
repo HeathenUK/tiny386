@@ -1,0 +1,41 @@
+dependencies:
+  badgeteam/mch2022-rp2040:
+    rules:
+    - if: target == esp32
+    version: '>=0.0.2'
+  cmake_utilities: 0.*
+  espressif/esp_lcd_ili9341:
+    version: '>=2.0.0'
+  espressif/led_strip:
+    version: '>=3.0.1'
+  idf: '>=5.3'
+  nicolaielectronics/bmi270:
+    version: '>=1.0.1'
+  nicolaielectronics/es8156:
+    version: '>=0.0.2'
+  nicolaielectronics/mipi_dsi_abstraction:
+    rules:
+    - if: target == esp32p4
+    version: '>=0.3.1'
+  nicolaielectronics/mpr121:
+    version: '>=0.0.1'
+  nicolaielectronics/ssd1619:
+    version: '>=0.0.1'
+  nicolaielectronics/tanmatsu_coprocessor:
+    rules:
+    - if: target == esp32p4
+    version: '>=0.6.0'
+description: Badge BSP
+issues: https://github.com/badgeteam/esp32-component-badge-bsp/issues
+license: MIT
+repository: git://github.com/badgeteam/esp32-component-badge-bsp.git
+repository_info:
+  commit_sha: f4bc578ccb013decdf31f81d2a8db438dfb06f0c
+  path: .
+targets:
+- esp32
+- esp32p4
+- esp32c6
+- esp32c3
+url: https://github.com/badgeteam/esp32-component-badge-bsp
+version: 0.8.0
