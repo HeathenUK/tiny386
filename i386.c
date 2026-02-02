@@ -2999,6 +2999,21 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 				continue; \
 			} \
 		} \
+		/* Fast path for VGA-to-RAM copy (e.g., collision detection) */ \
+		if (cpu->cb.iomem_read_string && in_iomem(memls.addr1) && \
+		    dir > 0 && in_iomem(memls.addr1 + count - 1) && \
+		    (memld.addr1 | 4095) < cpu->phys_mem_size && \
+		    !in_iomem(memld.addr1) && !in_iomem(memld.addr1 | 4095)) { \
+			if (cpu->cb.iomem_read_string( \
+				    cpu->cb.iomem, memls.addr1, \
+				    cpu->phys_mem + memld.addr1, count * dir)) { \
+				sreg ## ABIT(6, lreg ## ABIT(6) + count * dir); \
+				sreg ## ABIT(7, lreg ## ABIT(7) + count * dir); \
+				sreg ## ABIT(1, cx - count); \
+				cx = lreg ## ABIT(1); \
+				continue; \
+			} \
+		} \
 		for (uword i = 0; i <= count - 1; i++) { \
 			store ## BIT(cpu, &memld, load ## BIT(cpu, &memls)); \
 			memld.addr1 += dir; \

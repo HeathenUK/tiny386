@@ -39,6 +39,7 @@ typedef struct {
 	u32 (*iomem_read32)(void *, uword);
 	void (*iomem_write32)(void *, uword, u32);
 	bool (*iomem_write_string)(void *, uword, uint8_t *, int);
+	bool (*iomem_read_string)(void *, uword, uint8_t *, int);
 } CPU_CB;
 
 CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb);

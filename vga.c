@@ -3207,6 +3207,74 @@ uint8_t vga_mem_read(VGAState *s, uint32_t addr)
     return ret;
 }
 
+uint16_t IRAM_ATTR vga_mem_read16(VGAState *s, uint32_t addr)
+{
+    int memory_map_mode;
+
+    /* convert to VGA memory offset */
+    memory_map_mode = (s->gr[VGA_GFX_MISC] >> 2) & 3;
+    addr &= 0x1ffff;
+
+    /* Fast path for chain-4 mode (mode 13h) with memory map mode 1 */
+    if ((s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) && memory_map_mode == 1) {
+        if (addr >= 0x10000 - 1)
+            return vga_mem_read(s, addr) | ((uint16_t)vga_mem_read(s, addr + 1) << 8);
+        addr += s->bank_offset;
+        if (addr + 1 < s->vga_ram_size)
+            return *(uint16_t *)(s->vga_ram + addr);
+    }
+
+    /* Fall back to byte-by-byte for other modes */
+    return vga_mem_read(s, addr) | ((uint16_t)vga_mem_read(s, addr + 1) << 8);
+}
+
+uint32_t IRAM_ATTR vga_mem_read32(VGAState *s, uint32_t addr)
+{
+    int memory_map_mode;
+
+    /* convert to VGA memory offset */
+    memory_map_mode = (s->gr[VGA_GFX_MISC] >> 2) & 3;
+    addr &= 0x1ffff;
+
+    /* Fast path for chain-4 mode (mode 13h) with memory map mode 1 */
+    if ((s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) && memory_map_mode == 1) {
+        if (addr >= 0x10000 - 3)
+            return vga_mem_read16(s, addr) | ((uint32_t)vga_mem_read16(s, addr + 2) << 16);
+        addr += s->bank_offset;
+        if (addr + 3 < s->vga_ram_size)
+            return *(uint32_t *)(s->vga_ram + addr);
+    }
+
+    /* Fall back to 16-bit reads for other modes */
+    return vga_mem_read16(s, addr) | ((uint32_t)vga_mem_read16(s, addr + 2) << 16);
+}
+
+/* Bulk read from VGA memory - returns true if fast path used */
+bool IRAM_ATTR vga_mem_read_string(VGAState *s, uint32_t addr, uint8_t *buf, int len)
+{
+    int memory_map_mode;
+
+    if (len <= 0)
+        return true;
+
+    /* convert to VGA memory offset */
+    memory_map_mode = (s->gr[VGA_GFX_MISC] >> 2) & 3;
+    addr &= 0x1ffff;
+
+    /* Fast path for chain-4 mode (mode 13h) with memory map mode 1 */
+    if ((s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) && memory_map_mode == 1) {
+        if (addr + len > 0x10000)
+            return false;  /* would cross boundary */
+        uint32_t phys_addr = addr + s->bank_offset;
+        if (phys_addr + len <= s->vga_ram_size) {
+            memcpy(buf, s->vga_ram + phys_addr, len);
+            return true;
+        }
+    }
+
+    return false;  /* Use slow path */
+}
+
 static void vga_initmode(VGAState *s);
 
 VGAState *vga_init(char *vga_ram, int vga_ram_size,

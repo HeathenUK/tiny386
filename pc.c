@@ -680,8 +680,16 @@ static void iomem_write8(void *iomem, uword addr, u8 val)
 
 static u16 iomem_read16(void *iomem, uword addr)
 {
-	return iomem_read8(iomem, addr) |
-		((u16) iomem_read8(iomem, addr + 1) << 8);
+	PC *pc = iomem;
+	uword vga_addr2 = pc->pci_vga_ram_addr;
+	if (addr >= vga_addr2) {
+		addr -= vga_addr2;
+		if (addr + 1 < pc->vga_mem_size)
+			return *(uint16_t *)&(pc->vga_mem[addr]);
+		else
+			return 0;
+	}
+	return vga_mem_read16(pc->vga, addr - 0xa0000);
 }
 
 static void iomem_write16(void *iomem, uword addr, u16 val)
@@ -700,8 +708,16 @@ static void iomem_write16(void *iomem, uword addr, u16 val)
 
 static u32 iomem_read32(void *iomem, uword addr)
 {
-	return iomem_read16(iomem, addr) |
-		((u32) iomem_read16(iomem, addr + 2) << 16);
+	PC *pc = iomem;
+	uword vga_addr2 = pc->pci_vga_ram_addr;
+	if (addr >= vga_addr2) {
+		addr -= vga_addr2;
+		if (addr + 3 < pc->vga_mem_size)
+			return *(uint32_t *)&(pc->vga_mem[addr]);
+		else
+			return 0;
+	}
+	return vga_mem_read32(pc->vga, addr - 0xa0000);
 }
 
 static void iomem_write32(void *iomem, uword addr, u32 val)
@@ -734,6 +750,22 @@ static bool iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)
 		return false;
 	}
 	return vga_mem_write_string(pc->vga, addr - 0xa0000, buf, len);
+}
+
+static bool iomem_read_string(void *iomem, uword addr, uint8_t *buf, int len)
+{
+	PC *pc = iomem;
+	// fast path for vga ram
+	uword vga_addr2 = pc->pci_vga_ram_addr;
+	if (addr >= vga_addr2) {
+		addr -= vga_addr2;
+		if (addr + len <= pc->vga_mem_size) {
+			memcpy(buf, pc->vga_mem + addr, len);
+			return true;
+		}
+		return false;
+	}
+	return vga_mem_read_string(pc->vga, addr - 0xa0000, buf, len);
 }
 
 static void pc_reset_request(void *p)
@@ -861,6 +893,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	cb->iomem_read32 = iomem_read32;
 	cb->iomem_write32 = iomem_write32;
 	cb->iomem_write_string = iomem_write_string;
+	cb->iomem_read_string = iomem_read_string;
 
 	pc->redraw = redraw;
 	pc->redraw_data = redraw_data;
