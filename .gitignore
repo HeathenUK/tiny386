@@ -2,6 +2,9 @@
 *.o
 .depends
 
+# Local scripts
+mkimg.sh
+
 # Build artifacts
 build/
 out/
@@ -22,6 +25,7 @@ fmopl.inc
 
 # AI assistant content
 CLAUDE.md
+.claude/
 
 # ESP-IDF tooling and caches
 esp/.cache/
