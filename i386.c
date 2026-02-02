@@ -113,6 +113,11 @@ struct CPUI386 {
 	struct {
 		uword cs, eip, esp;
 	} sysenter;
+
+	/* Flat memory optimization: bitmask of segments with base=0 and limit=4GB.
+	 * When set, we can skip segment base addition and limit checks.
+	 * Used by DPMI programs like DOOM that set up flat 4GB segments. */
+	uint8_t seg_flat;
 };
 
 #define dolog(...) fprintf(stderr, __VA_ARGS__)
@@ -190,6 +195,9 @@ enum {
 #define REGi(x) (cpu->gpr[x])
 #endif
 #define SEGi(x) (cpu->seg[x].sel)
+
+/* Flat segment detection: base=0 and limit=0xFFFFFFFF (4GB) */
+#define SEG_IS_FLAT(cpu, seg) ((cpu)->seg_flat & (1 << (seg)))
 
 static void cpu_debug(CPUI386 *cpu);
 
@@ -738,9 +746,15 @@ static bool IRAM_ATTR segcheck(CPUI386 *cpu, int rwm, int seg, uword addr, int s
 static bool IRAM_ATTR translate(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr, int size, int cpl)
 {
 	assert(seg != -1);
-	uword laddr = cpu->seg[seg].base + addr;
+	uword laddr;
 
-	TRYL(segcheck(cpu, rwm, seg, addr, size));
+	/* Fast path for flat segments (base=0, limit=4GB): skip base addition and segcheck */
+	if (likely(SEG_IS_FLAT(cpu, seg))) {
+		laddr = addr;
+	} else {
+		laddr = cpu->seg[seg].base + addr;
+		TRYL(segcheck(cpu, rwm, seg, addr, size));
+	}
 
 	return translate_laddr(cpu, res, rwm, laddr, size, cpl);
 }
@@ -748,9 +762,15 @@ static bool IRAM_ATTR translate(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uw
 static bool IRAM_ATTR translate8r(CPUI386 *cpu, OptAddr *res, int seg, uword addr)
 {
 	assert(seg != -1);
-	uword laddr = cpu->seg[seg].base + addr;
+	uword laddr;
 
-	TRYL(segcheck(cpu, 1, seg, addr, 1));
+	/* Fast path for flat segments */
+	if (likely(SEG_IS_FLAT(cpu, seg))) {
+		laddr = addr;
+	} else {
+		laddr = cpu->seg[seg].base + addr;
+		TRYL(segcheck(cpu, 1, seg, addr, 1));
+	}
 
 	if (cpu->cr0 & CR0_PG) {
 		uword lpgno = laddr >> 12;
@@ -978,7 +998,10 @@ bool IRAM_ATTR cpu_store64(CPUI386 *cpu, int seg, uword addr, uint64_t val)
 
 static bool IRAM_ATTR peek8(CPUI386 *cpu, u8 *val)
 {
-	uword laddr = cpu->seg[SEG_CS].base + cpu->next_ip;
+	/* Fast path for flat CS: laddr = next_ip (skip base addition) */
+	uword laddr = likely(SEG_IS_FLAT(cpu, SEG_CS))
+		? cpu->next_ip
+		: cpu->seg[SEG_CS].base + cpu->next_ip;
 	if (likely((laddr ^ cpu->ifetch.laddr) < 4096)) {
 		*val = pload8(cpu, cpu->ifetch.xaddr ^ laddr);
 		return true;
@@ -1000,7 +1023,10 @@ static bool IRAM_ATTR fetch8(CPUI386 *cpu, u8 *val)
 
 static bool IRAM_ATTR fetch16(CPUI386 *cpu, u16 *val)
 {
-	uword laddr = cpu->seg[SEG_CS].base + cpu->next_ip;
+	/* Fast path for flat CS */
+	uword laddr = likely(SEG_IS_FLAT(cpu, SEG_CS))
+		? cpu->next_ip
+		: cpu->seg[SEG_CS].base + cpu->next_ip;
 	if (likely((laddr ^ cpu->ifetch.laddr) < 4095)) {
 		*val = pload16(cpu, cpu->ifetch.xaddr ^ laddr);
 	} else {
@@ -1014,7 +1040,10 @@ static bool IRAM_ATTR fetch16(CPUI386 *cpu, u16 *val)
 
 static bool IRAM_ATTR fetch32(CPUI386 *cpu, u32 *val)
 {
-	uword laddr = cpu->seg[SEG_CS].base + cpu->next_ip;
+	/* Fast path for flat CS */
+	uword laddr = likely(SEG_IS_FLAT(cpu, SEG_CS))
+		? cpu->next_ip
+		: cpu->seg[SEG_CS].base + cpu->next_ip;
 	if (likely((laddr ^ cpu->ifetch.laddr) < 4093)) {
 		*val = pload32(cpu, cpu->ifetch.xaddr ^ laddr);
 	} else {
@@ -1139,6 +1168,17 @@ static bool read_desc(CPUI386 *cpu, int sel, uword *w1, uword *w2)
 	return true;
 }
 
+/* Update flat segment flag based on current segment state */
+static inline void update_seg_flat(CPUI386 *cpu, int seg)
+{
+	/* Flat = base is 0 and limit is 4GB (0xFFFFFFFF) */
+	if (cpu->seg[seg].base == 0 && cpu->seg[seg].limit == 0xFFFFFFFF) {
+		cpu->seg_flat |= (1 << seg);
+	} else {
+		cpu->seg_flat &= ~(1 << seg);
+	}
+}
+
 static bool set_seg(CPUI386 *cpu, int seg, int sel)
 {
 	sel = sel & 0xffff;
@@ -1147,6 +1187,8 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 		cpu->seg[seg].base = sel << 4;
 		cpu->seg[seg].limit = 0xffff;
 		cpu->seg[seg].flags = 0; // D_BIT is not set
+		/* Real mode: never flat (base = sel << 4) */
+		cpu->seg_flat &= ~(1 << seg);
 		if (seg == SEG_CS) {
 			cpu->cpl = cpu->flags & VM ? 3 : 0;
 			cpu->code16 = true;
@@ -1181,6 +1223,8 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 	if (w2 & 0x00800000)
 		cpu->seg[seg].limit = (cpu->seg[seg].limit << 12) | 0xfff;
 	cpu->seg[seg].flags = (w2 >> 8) & 0xffff; // (w2 >> 20) & 0xf;
+	/* Update flat flag for this segment */
+	update_seg_flat(cpu, seg);
 	if (seg == SEG_CS) {
 //		if ((sel & 3) != cpu->cpl)
 //			dolog("set_seg: PVL %d => %d\n", cpu->cpl, sel & 3);
@@ -1207,6 +1251,8 @@ static inline void clear_segs(CPUI386 *cpu)
 				cpu->seg[segs[i]].base = 0;
 				cpu->seg[segs[i]].limit = 0;
 				cpu->seg[segs[i]].flags = 0;
+				/* Clear flat flag - segment is now null */
+				cpu->seg_flat &= ~(1 << segs[i]);
 			}
 		}
 	}
@@ -5261,6 +5307,9 @@ void cpui386_reset(CPUI386 *cpu)
 	cpu->sysenter.cs = 0;
 	cpu->sysenter.eip = 0;
 	cpu->sysenter.esp = 0;
+
+	/* No segments are flat at reset (all have limit=0, not 4GB) */
+	cpu->seg_flat = 0;
 }
 
 void cpui386_reset_pm(CPUI386 *cpu, uint32_t start_addr)
