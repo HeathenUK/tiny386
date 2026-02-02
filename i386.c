@@ -2813,6 +2813,30 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 #define STOS_helper2(BIT, ABIT) \
 	OptAddr memld; \
 	uword cx = lreg ## ABIT(1); \
+	/* Fast path: entire REP fits in single page, forward, RAM-only */ \
+	if (cx > 0 && dir > 0) { \
+		uword dst_log = lreg ## ABIT(7); \
+		uword bytes = cx * (BIT / 8); \
+		if (bytes <= 4096 && \
+		    (dst_log >> 12) == ((dst_log + bytes - 1) >> 12)) { \
+			TRY(translate ## BIT(cpu, &memld, 2, SEG_ES, dst_log)); \
+			if (!in_iomem(memld.addr1) && \
+			    memld.addr1 + bytes <= cpu->phys_mem_size) { \
+				u8 *dest = cpu->phys_mem + memld.addr1; \
+				if (BIT == 8) { \
+					memset(dest, ax, cx); \
+				} else { \
+					for (uword i = 0; i < cx; i++) { \
+						if (BIT == 16) *(u16 *)(dest + i * 2) = ax; \
+						else *(u32 *)(dest + i * 4) = ax; \
+					} \
+				} \
+				sreg ## ABIT(7, dst_log + bytes); \
+				sreg ## ABIT(1, 0); \
+				cx = 0; \
+			} \
+		} \
+	} \
 	while (cx) { \
 		TRY(translate ## BIT(cpu, &memld, 2, SEG_ES, lreg ## ABIT(7))); \
 		if (memld.addr1 % (BIT / 8)) { \
@@ -2914,6 +2938,29 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 #define MOVS_helper2(BIT, ABIT) \
 	OptAddr memls, memld; \
 	uword cx = lreg ## ABIT(1); \
+	/* Fast path: entire REP fits in single pages, forward, RAM-only */ \
+	if (cx > 0 && dir > 0 && curr_seg == SEG_DS) { \
+		uword src_log = lreg ## ABIT(6); \
+		uword dst_log = lreg ## ABIT(7); \
+		uword bytes = cx * (BIT / 8); \
+		/* Check logical addresses stay within same pages */ \
+		if (bytes <= 4096 && \
+		    (src_log >> 12) == ((src_log + bytes - 1) >> 12) && \
+		    (dst_log >> 12) == ((dst_log + bytes - 1) >> 12)) { \
+			TRY(translate ## BIT(cpu, &memls, 1, curr_seg, src_log)); \
+			TRY(translate ## BIT(cpu, &memld, 2, SEG_ES, dst_log)); \
+			if (!in_iomem(memls.addr1) && !in_iomem(memld.addr1) && \
+			    memls.addr1 + bytes <= cpu->phys_mem_size && \
+			    memld.addr1 + bytes <= cpu->phys_mem_size) { \
+				memmove(cpu->phys_mem + memld.addr1, \
+				        cpu->phys_mem + memls.addr1, bytes); \
+				sreg ## ABIT(6, src_log + bytes); \
+				sreg ## ABIT(7, dst_log + bytes); \
+				sreg ## ABIT(1, 0); \
+				cx = 0; \
+			} \
+		} \
+	} \
 	while (cx) { \
 		TRY(translate ## BIT(cpu, &memls, 1, curr_seg, lreg ## ABIT(6))); \
 		TRY(translate ## BIT(cpu, &memld, 2, SEG_ES, lreg ## ABIT(7))); \
