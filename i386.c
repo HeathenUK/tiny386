@@ -663,10 +663,22 @@ static bool IRAM_ATTR tlb_refill(CPUI386 *cpu, struct tlb_entry *ent, uword lpgn
 	return true;
 }
 
+#ifdef BUILD_ESP32
+/* Instrumentation counters for performance analysis */
+static uint32_t tlb_hits = 0;
+static uint32_t tlb_misses = 0;
+static uint32_t flat_accesses = 0;
+static uint32_t nonflat_accesses = 0;
+
+#endif
+
 static bool IRAM_ATTR translate_lpgno(CPUI386 *cpu, int rwm, uword lpgno, uword laddr, int cpl, uword *paddr)
 {
 	struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
 	if (ent->lpgno != lpgno) {
+#ifdef BUILD_ESP32
+		tlb_misses++;
+#endif
 		if (!tlb_refill(cpu, ent, lpgno)) {
 			cpu->cr2 = laddr;
 			cpu->excno = EX_PF;
@@ -678,6 +690,11 @@ static bool IRAM_ATTR translate_lpgno(CPUI386 *cpu, int rwm, uword lpgno, uword 
 			return false;
 		}
 	}
+#ifdef BUILD_ESP32
+	else {
+		tlb_hits++;
+	}
+#endif
 	if (ent->pte_lookup[cpl > 0][rwm > 1]) {
 		cpu->cr2 = laddr;
 		cpu->excno = EX_PF;
@@ -750,8 +767,14 @@ static bool IRAM_ATTR translate(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uw
 
 	/* Fast path for flat segments (base=0, limit=4GB): skip base addition and segcheck */
 	if (likely(SEG_IS_FLAT(cpu, seg))) {
+#ifdef BUILD_ESP32
+		flat_accesses++;
+#endif
 		laddr = addr;
 	} else {
+#ifdef BUILD_ESP32
+		nonflat_accesses++;
+#endif
 		laddr = cpu->seg[seg].base + addr;
 		TRYL(segcheck(cpu, rwm, seg, addr, size));
 	}
@@ -4045,6 +4068,40 @@ static bool verbose;
 #define C_16(_1, ...) CX(_1) C_15(__VA_ARGS__)
 #define C(...) PASTE(C_, ARGCOUNT(__VA_ARGS__))(__VA_ARGS__)
 
+#ifdef BUILD_ESP32
+/* Opcode frequency counter for profiling */
+static uint32_t opcode_freq[256];
+static uint32_t opcode_total = 0;
+
+static void report_hot_opcodes(void)
+{
+	/* Find top 5 opcodes */
+	uint8_t top[5] = {0};
+	for (int i = 0; i < 5; i++) {
+		uint32_t max = 0;
+		for (int j = 0; j < 256; j++) {
+			bool already = false;
+			for (int k = 0; k < i; k++) if (top[k] == j) already = true;
+			if (!already && opcode_freq[j] > max) {
+				max = opcode_freq[j];
+				top[i] = j;
+			}
+		}
+	}
+	if (opcode_total > 0) {
+		fprintf(stderr, "Hot opcodes: 0x%02x=%u%% 0x%02x=%u%% 0x%02x=%u%% 0x%02x=%u%% 0x%02x=%u%%\n",
+			top[0], (opcode_freq[top[0]] * 100) / opcode_total,
+			top[1], (opcode_freq[top[1]] * 100) / opcode_total,
+			top[2], (opcode_freq[top[2]] * 100) / opcode_total,
+			top[3], (opcode_freq[top[3]] * 100) / opcode_total,
+			top[4], (opcode_freq[top[4]] * 100) / opcode_total);
+	}
+	/* Reset */
+	for (int i = 0; i < 256; i++) opcode_freq[i] = 0;
+	opcode_total = 0;
+}
+#endif
+
 static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 {
 #ifndef I386_OPT2
@@ -4078,6 +4135,10 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	TRY(fetch8(cpu, &b1));
 	cpu->cycle++;
 	cpu->tsc++;  /* Base cycle for instruction fetch */
+#ifdef BUILD_ESP32
+	opcode_freq[b1]++;
+	opcode_total++;
+#endif
 
 #ifndef I386_OPT1
 	if (verbose) {
@@ -4160,7 +4221,130 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 		HANDLE_PREFIX(3e, curr_seg = SEG_DS)
 		HANDLE_PREFIX(64, curr_seg = SEG_FS)
 		HANDLE_PREFIX(65, curr_seg = SEG_GS)
-		HANDLE_PREFIX(66, opsz16 = !code16)
+		/* Prefix fusion for 0x66: inline common operations */
+		pfx66: {
+			opsz16 = !code16;
+			TRY(fetch8(cpu, &b1));
+			int reg = b1 & 7;
+			/* INC r16/r32 (0x40-0x47) */
+			if (b1 >= 0x40 && b1 <= 0x47) {
+				int cf = get_CF(cpu);
+				if (!code16) {
+					cpu->cc.dst = sext16((u16)(lreg16(reg) + 1));
+					cpu->cc.op = CC_INC16;
+					sreg16(reg, cpu->cc.dst);
+				} else {
+					cpu->cc.dst = sext32((u32)(lreg32(reg) + 1));
+					cpu->cc.op = CC_INC32;
+					sreg32(reg, cpu->cc.dst);
+				}
+				SET_BIT(cpu->flags, cf, CF);
+				cpu->cc.mask = PF | AF | ZF | SF | OF;
+				continue;
+			}
+			/* DEC r16/r32 (0x48-0x4f) */
+			if (b1 >= 0x48 && b1 <= 0x4f) {
+				int cf = get_CF(cpu);
+				if (!code16) {
+					cpu->cc.dst = sext16((u16)(lreg16(reg) - 1));
+					cpu->cc.op = CC_DEC16;
+					sreg16(reg, cpu->cc.dst);
+				} else {
+					cpu->cc.dst = sext32((u32)(lreg32(reg) - 1));
+					cpu->cc.op = CC_DEC32;
+					sreg32(reg, cpu->cc.dst);
+				}
+				SET_BIT(cpu->flags, cf, CF);
+				cpu->cc.mask = PF | AF | ZF | SF | OF;
+				continue;
+			}
+			/* PUSH r16/r32 (0x50-0x57) */
+			if (b1 >= 0x50 && b1 <= 0x57) {
+				OptAddr meml1;
+				uword sp = lreg32(4);
+				if (!code16) {
+					u16 val = lreg16(reg);
+					TRY(translate16(cpu, &meml1, 2, SEG_SS, (sp - 2) & sp_mask));
+					set_sp(sp - 2, sp_mask);
+					saddr16(&meml1, val);
+				} else {
+					u32 val = lreg32(reg);
+					TRY(translate32(cpu, &meml1, 2, SEG_SS, (sp - 4) & sp_mask));
+					set_sp(sp - 4, sp_mask);
+					saddr32(&meml1, val);
+				}
+				continue;
+			}
+			/* POP r16/r32 (0x58-0x5f) */
+			if (b1 >= 0x58 && b1 <= 0x5f) {
+				OptAddr meml1;
+				uword sp = lreg32(4);
+				if (!code16) {
+					TRY(translate16(cpu, &meml1, 1, SEG_SS, sp & sp_mask));
+					u16 val = laddr16(&meml1);
+					set_sp(sp + 2, sp_mask);
+					sreg16(reg, val);
+				} else {
+					TRY(translate32(cpu, &meml1, 1, SEG_SS, sp & sp_mask));
+					u32 val = laddr32(&meml1);
+					set_sp(sp + 4, sp_mask);
+					sreg32(reg, val);
+				}
+				continue;
+			}
+			/* MOV r/m, r or MOV r, r/m - fast path for reg-to-reg (mod=3) */
+			if (b1 == 0x89 || b1 == 0x8b) {
+				u8 modrm_peek;
+				TRY(peek8(cpu, &modrm_peek));
+				if ((modrm_peek >> 6) == 3) {
+					/* mod=3: register to register, no memory */
+					cpu->next_ip++;
+					int rm = modrm_peek & 7;
+					int r = (modrm_peek >> 3) & 7;
+					if (!code16) {
+						/* 32-bit mode + 0x66 = 16-bit MOV */
+						if (b1 == 0x89) sreg16(rm, lreg16(r));
+						else sreg16(r, lreg16(rm));
+					} else {
+						/* 16-bit mode + 0x66 = 32-bit MOV */
+						if (b1 == 0x89) sreg32(rm, lreg32(r));
+						else sreg32(r, lreg32(rm));
+					}
+					continue;
+				}
+				/* mod != 3: fall through to normal dispatch */
+			}
+			/* XCHG AX/EAX, r16/r32 (0x91-0x97) - 0x90 is NOP */
+			if (b1 >= 0x91 && b1 <= 0x97) {
+				if (!code16) {
+					/* 32-bit mode + 0x66 = XCHG AX, r16 */
+					u16 tmp = lreg16(0);
+					sreg16(0, lreg16(reg));
+					sreg16(reg, tmp);
+				} else {
+					/* 16-bit mode + 0x66 = XCHG EAX, r32 */
+					u32 tmp = lreg32(0);
+					sreg32(0, lreg32(reg));
+					sreg32(reg, tmp);
+				}
+				continue;
+			}
+			/* MOV r16/r32, imm16/imm32 (0xb8-0xbf) */
+			if (b1 >= 0xb8 && b1 <= 0xbf) {
+				if (!code16) {
+					u16 imm;
+					TRY(fetch16(cpu, &imm));
+					sreg16(reg, imm);
+				} else {
+					u32 imm;
+					TRY(fetch32(cpu, &imm));
+					sreg32(reg, imm);
+				}
+				continue;
+			}
+			/* Fallback to normal dispatch */
+			goto *pfxlabel[b1];
+		}
 		HANDLE_PREFIX(67, adsz16 = !code16)
 		HANDLE_PREFIX(f3, rep = 1) // REP
 		HANDLE_PREFIX(f2, rep = 2) // REPNE
@@ -5199,8 +5383,43 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 	return true;
 }
 
+#ifdef BUILD_ESP32
+/* Forward declaration */
+static void report_hot_opcodes(void);
+
+/* Report and reset instrumentation counters every ~5 seconds */
+static void report_cpu_stats(void)
+{
+	static uint32_t last_report = 0;
+	uint32_t now = get_uticks();
+
+	if (now - last_report >= 5000000) {  /* 5 seconds */
+		uint32_t total_tlb = tlb_hits + tlb_misses;
+		uint32_t total_seg = flat_accesses + nonflat_accesses;
+
+		/* Always print stats to diagnose */
+		fprintf(stderr, "CPU stats: TLB hit=%u%% (%u/%u), flat=%u%% (%u/%u)\n",
+			total_tlb ? (tlb_hits * 100) / total_tlb : 0, tlb_hits, total_tlb,
+			total_seg ? (flat_accesses * 100) / total_seg : 0, flat_accesses, total_seg);
+
+		report_hot_opcodes();
+
+		/* Reset counters */
+		tlb_hits = 0;
+		tlb_misses = 0;
+		flat_accesses = 0;
+		nonflat_accesses = 0;
+		last_report = now;
+	}
+}
+#endif
+
 void cpui386_step(CPUI386 *cpu, int stepcount)
 {
+#ifdef BUILD_ESP32
+	report_cpu_stats();
+#endif
+
 	if ((cpu->flags & IF) && cpu->intr) {
 		cpu->intr = false;
 		cpu->halt = false;
