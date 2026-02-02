@@ -13,6 +13,12 @@
 static const char *TAG = "storage";
 void *rawsd;
 static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
+static bool sd_mounted = false;
+
+bool storage_sd_mounted(void)
+{
+	return sd_mounted;
+}
 
 void storage_init(void)
 {
@@ -92,6 +98,7 @@ void storage_init(void)
 	} else {
 		ESP_LOGI(TAG, "Filesystem mounted");
 		sd_mount_ok = true;
+		sd_mounted = true;
 	}
 #else
 	sdmmc_card_t *card = malloc(sizeof(sdmmc_card_t));

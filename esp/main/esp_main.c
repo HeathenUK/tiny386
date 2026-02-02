@@ -20,6 +20,11 @@
 #include "../../pc.h"
 #include "../../vga.h"
 #include "common.h"
+#include <errno.h>
+#include <sys/stat.h>
+
+/* From storage.c */
+extern bool storage_sd_mounted(void);
 
 //
 #include "esp_private/system_internal.h"
@@ -132,6 +137,54 @@ static void stub(void *opaque)
 {
 }
 
+/* Default INI file content */
+static const char *default_ini_content =
+	"[pc]\n"
+	"bios = /sdcard/bios.bin\n"
+	"vga_bios = /sdcard/vgabios.bin\n"
+	"mem_size = 16M\n"
+	"vga_mem_size = 2M\n"
+	"fill_cmos = 1\n"
+	"; Uncomment and set paths to your disk images:\n"
+	"; hda = /sdcard/hdd.img\n"
+	"; cda = /sdcard/cdrom.iso\n"
+	"; fda = /sdcard/floppy.img\n"
+	"\n"
+	"[cpu]\n"
+	"gen = 5\n"
+	"fpu = 1\n"
+	"\n"
+	"[display]\n"
+	"width = 800\n"
+	"height = 480\n";
+
+/* Check if a file exists */
+static bool file_exists(const char *path)
+{
+	struct stat st;
+	return (stat(path, &st) == 0);
+}
+
+/* Create default INI file */
+static bool create_default_ini(const char *path)
+{
+	fprintf(stderr, "Creating default INI file: %s\n", path);
+	FILE *f = fopen(path, "w");
+	if (!f) {
+		fprintf(stderr, "ERROR: Failed to create %s\n", path);
+		return false;
+	}
+	size_t len = strlen(default_ini_content);
+	size_t written = fwrite(default_ini_content, 1, len, f);
+	fclose(f);
+	if (written != len) {
+		fprintf(stderr, "ERROR: Failed to write INI content\n");
+		return false;
+	}
+	fprintf(stderr, "Default INI file created successfully\n");
+	return true;
+}
+
 static int pc_main(const char *file)
 {
 	fprintf(stderr, "pc_main: start, file=%s\n", file ? file : "(null)");
@@ -151,16 +204,28 @@ static int pc_main(const char *file)
 
 	fprintf(stderr, "pc_main: parsing ini\n");
 	if (!file) {
-		fprintf(stderr, "ERROR: No INI file found!\n");
+		fprintf(stderr, "ERROR: No INI file path provided!\n");
 		return -1;
 	}
 	int err = ini_parse(file, parse_conf_ini, &conf);
-	if (err) {
-		printf("error %d\n", err);
+	if (err != 0) {
+		if (err == -1) {
+			fprintf(stderr, "ERROR: Cannot open INI file: %s\n", file);
+		} else if (err == -2) {
+			fprintf(stderr, "ERROR: Memory allocation failed parsing INI\n");
+		} else {
+			fprintf(stderr, "ERROR: INI parse error on line %d in %s\n", err, file);
+		}
 		return err;
 	}
 	conf.ini_path = file;  // Store ini path for saving settings
 
+	/* Validate mem_size - must be at least 1M */
+	if (conf.mem_size < 1024 * 1024) {
+		fprintf(stderr, "Warning: mem_size too small (%ld), using default 8M\n",
+		        conf.mem_size);
+		conf.mem_size = 8 * 1024 * 1024;
+	}
 #ifdef MAX_MEM_SIZE
 	// Cap mem_size to available PSRAM pool
 	if (conf.mem_size > MAX_MEM_SIZE) {
@@ -360,6 +425,18 @@ void app_main(void)
 	i2s_main();
 	storage_init();
 
+	/* Check if SD card mounted - required for operation */
+	if (!storage_sd_mounted()) {
+		fprintf(stderr, "\n");
+		fprintf(stderr, "==========================================\n");
+		fprintf(stderr, "ERROR: SD card not mounted!\n");
+		fprintf(stderr, "Please insert an SD card and restart.\n");
+		fprintf(stderr, "Resetting in 5 seconds...\n");
+		fprintf(stderr, "==========================================\n");
+		vTaskDelay(pdMS_TO_TICKS(5000));
+		esp_restart();
+	}
+
 	esp_psram_init();
 #ifndef PSRAM_ALLOC_LEN
 	// use the whole psram
@@ -371,18 +448,43 @@ void app_main(void)
 	psram = heap_caps_calloc(1, psram_len, MALLOC_CAP_SPIRAM);
 #endif
 
-	const static char *files[] = {
-		"/sdcard/tiny386.ini",
-		"/spiflash/tiny386.ini",
-		NULL,
-	};
+	/* INI file handling with fallback creation */
+	const char *ini_path = "/sdcard/tiny386.ini";
 	static struct esp_ini_config config;
-	for (int i = 0; files[i]; i++) {
-		if (ini_parse(files[i], parse_ini, &config) == 0) {
-			config.filename = files[i];
-			break;
+
+	if (!file_exists(ini_path)) {
+		fprintf(stderr, "INI file not found: %s\n", ini_path);
+		if (!create_default_ini(ini_path)) {
+			fprintf(stderr, "\n");
+			fprintf(stderr, "==========================================\n");
+			fprintf(stderr, "ERROR: Could not create default INI file!\n");
+			fprintf(stderr, "Check SD card is writable.\n");
+			fprintf(stderr, "Resetting in 5 seconds...\n");
+			fprintf(stderr, "==========================================\n");
+			vTaskDelay(pdMS_TO_TICKS(5000));
+			esp_restart();
 		}
 	}
+
+	int ini_err = ini_parse(ini_path, parse_ini, &config);
+	if (ini_err != 0) {
+		fprintf(stderr, "\n");
+		fprintf(stderr, "==========================================\n");
+		if (ini_err == -1) {
+			fprintf(stderr, "ERROR: Cannot open INI file: %s\n", ini_path);
+		} else if (ini_err == -2) {
+			fprintf(stderr, "ERROR: Memory allocation failed parsing INI\n");
+		} else {
+			fprintf(stderr, "ERROR: INI parse error on line %d\n", ini_err);
+			fprintf(stderr, "Please check %s for syntax errors.\n", ini_path);
+		}
+		fprintf(stderr, "Resetting in 5 seconds...\n");
+		fprintf(stderr, "==========================================\n");
+		vTaskDelay(pdMS_TO_TICKS(5000));
+		esp_restart();
+	}
+	config.filename = ini_path;
+
 #ifndef USE_BADGE_BSP
 	if (config.ssid[0]) {
 		wifi_main(config.ssid, config.pass);

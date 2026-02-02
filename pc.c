@@ -905,14 +905,25 @@ void pc_reset(PC *pc)
 
 static long parse_mem_size(const char *value)
 {
+	if (!value || !value[0]) return 0;
 	int len = strlen(value);
 	long a = atol(value);
+	/* atol returns 0 for non-numeric strings - check if input was actually "0" */
+	if (a == 0 && value[0] != '0') {
+		fprintf(stderr, "Warning: Invalid memory size '%s', using 0\n", value);
+		return 0;
+	}
 	if (len) {
 		switch (value[len - 1]) {
-		case 'G': a *= 1024 * 1024 * 1024; break;
-		case 'M': a *= 1024 * 1024; break;
-		case 'K': a *= 1024; break;
+		case 'G': case 'g': a *= 1024 * 1024 * 1024; break;
+		case 'M': case 'm': a *= 1024 * 1024; break;
+		case 'K': case 'k': a *= 1024; break;
 		}
+	}
+	/* Sanity check for negative or zero values */
+	if (a <= 0) {
+		fprintf(stderr, "Warning: Memory size '%s' resulted in %ld, using 0\n", value, a);
+		return 0;
 	}
 	return a;
 }
@@ -1023,7 +1034,12 @@ int parse_conf_ini(void* user, const char* section,
 		}
 	} else if (SEC("cpu")) {
 		if (NAME("gen")) {
-			conf->cpu_gen = atoi(value);
+			int gen = atoi(value);
+			if (gen < 3 || gen > 6) {
+				fprintf(stderr, "Warning: Invalid cpu gen '%s' (valid: 3-6), using 4\n", value);
+				gen = 4;
+			}
+			conf->cpu_gen = gen;
 		} else if (NAME("fpu")) {
 			conf->fpu = atoi(value);
 		}
