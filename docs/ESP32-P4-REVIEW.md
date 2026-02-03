@@ -854,10 +854,42 @@ void msc_event_callback(const msc_host_event_t *event, void *arg) {
   - 1MB+ RAM cost, high CPU, niche demand
 - **Rationale**: SB16 handles digital audio well; games wanting better music use digital samples anyway
 
+#### USB Host - DECIDED
+- **Enable State**: Always on (not opt-in)
+- **WiFi Keyboard**: Remove wifikbd, USB HID fully replaces it
+- **USB-C Port**: Power/UART/JTAG only - configured as USB_SERIAL_JTAG
+  - Used for: Console output, JTAG debugging, power input
+  - Cannot serve as second USB host port (would require hardware changes)
+- **USB-A Port**: Primary USB host via ESP32-P4 USB OTG
+  - 5V boost controlled via coprocessor (bsp_power_set_usb_host_boost_enabled)
+
+#### USB HID - DECIDED
+- **Keyboard**: Translate USB HID boot protocol to PS/2 scancode set 1
+- **Mouse**: Translate USB HID mouse reports to PS/2 mouse protocol
+- **OSD Interaction**: META key on USB keyboard toggles OSD
+- **Implementation**:
+  - Use ESP-IDF USB Host Library (not TinyUSB for host mode)
+  - Add espressif/usb_host_hid component
+  - Full USB HID to PS/2 translation table (see Section 6)
+  - Track key state for make/break codes
+
+#### USB Mass Storage - DECIDED
+- **Mode**: Direct guest access (Option B) - USB filesystem visible to guest OS
+- **IDE Channel**: Secondary slave (HDD) - avoids conflicts with primary HDD and CD-ROM
+- **Write Access**: Full read/write (not read-only)
+- **Implementation**:
+  - Add BlockDeviceUSB backend using existing BlockDevice abstraction in ide.c
+  - ide_attach on secondary slave channel when USB mass storage detected
+  - Toast notification on connect/disconnect
+- **Rationale**: IDE abstraction is clean integration point; BlockDevice struct already supports async read/write callbacks
+
+#### USB Hub Support - DECIDED
+- **Approach**: Enable hub support via CONFIG_USB_HOST_HUBS_SUPPORTED
+- **Rationale**: Allows multi-device setups (keyboard + mouse + storage)
+
 **Next Steps**:
-- Continue discussing remaining topics (sound, USB)
-- Finalize overall implementation plan
-- Begin implementation based on priorities
+- Finalize priority and implementation order
+- Begin implementation based on decisions
 
 **Key Files Examined**:
 - `esp/main/tanmatsu_osd.c` - OSD implementation
