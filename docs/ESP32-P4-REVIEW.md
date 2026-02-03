@@ -711,37 +711,40 @@ void msc_event_callback(const msc_host_event_t *event, void *arg) {
 
 ## 8. Implementation Priority
 
-### Priority Matrix
+### Priority Matrix (Updated per Session Decisions)
 
-| Feature | Difficulty | Impact | Memory | Priority |
-|---------|------------|--------|--------|----------|
-| OSD Status Panel | Low | Medium | ~1KB | **P1** |
-| OSD Screenshot | Low | Medium | ~2KB | **P1** |
-| OSD Help Screen | Low | Low | ~1KB | **P2** |
-| USB HID Keyboard | Medium | High | ~30KB | **P1** |
-| USB HID Mouse | Medium | High | Included | **P1** |
-| USB Mass Storage | Medium | High | ~40KB | **P2** |
-| OPL3 Upgrade | Medium | Medium | ~20KB | **P3** |
-| MPU-401 MIDI | Medium | Medium | ~2KB | **P3** |
-| GUS Emulation | High | Medium | ~1.1MB | **P4** |
+| Feature | Difficulty | Impact | Memory | Priority | Status |
+|---------|------------|--------|--------|----------|--------|
+| USB Host Framework | Medium | High | ~20KB | **P1** | Decided |
+| USB HID Keyboard | Medium | High | ~10KB | **P1** | Decided |
+| USB HID Mouse | Low | High | Included | **P1** | Decided |
+| OSD Stats Panel | Low | Medium | ~1KB | **P2** | Decided |
+| OSD Help Screen | Low | Low | ~0.5KB | **P2** | Decided |
+| Drive Activity LEDs | Low | Medium | ~0.2KB | **P2** | Decided |
+| Toast System | Low | Medium | ~0.5KB | **P2** | Decided |
+| USB Mass Storage | Medium | High | ~40KB | **P3** | Decided |
+| ~~OSD Screenshot~~ | - | - | - | - | **Rejected** |
+| ~~OPL3 Upgrade~~ | - | - | - | - | **Rejected** |
+| ~~GUS Emulation~~ | - | - | - | - | **Rejected** |
 
-### Suggested Implementation Order
+### Implementation Order
 
-**Phase 1: Quick Wins + USB HID**
-1. OSD Status Panel
-2. OSD Screenshot
-3. USB Host framework
-4. USB HID Keyboard
-5. USB HID Mouse
+**Phase 1: USB Foundation** (enables external keyboard/mouse)
+1. USB Host framework initialization
+2. USB HID keyboard with PS/2 translation
+3. USB HID mouse with PS/2 translation
+4. Remove wifikbd
 
-**Phase 2: Storage + Audio**
-1. USB Mass Storage
-2. OSD USB drive integration
-3. OPL3 upgrade (optional)
+**Phase 2: OSD Enhancements** (polish and usability)
+1. Toast notification system (needed by Phase 3)
+2. Drive activity LEDs
+3. OSD Stats Panel
+4. OSD Help Screen
 
-**Phase 3: Advanced Audio**
-1. MPU-401 MIDI interface
-2. GUS emulation (if demand exists)
+**Phase 3: USB Storage** (advanced feature)
+1. BlockDeviceUSB implementation
+2. IDE hot-attach for USB drives
+3. OSD integration (hide CDD, show USB status)
 
 ---
 
@@ -903,6 +906,1044 @@ void msc_event_callback(const msc_host_event_t *event, void *arg) {
 - `pc.c` - Mixer and peripheral integration
 - `sb16.c`, `adlib.c`, `fmopl.c` - Current audio
 - PR #4 - USB HID work in progress
+
+---
+
+## 11. Detailed Implementation Plans
+
+### 11.1 USB Host Framework
+
+**Goal**: Initialize USB host on ESP32-P4, enable 5V boost, prepare for HID and MSC drivers.
+
+**Files to Modify:**
+| File | Changes |
+|------|---------|
+| `esp/main/idf_component.yml` | Add USB host dependencies |
+| `esp/main/CMakeLists.txt` | Add new source files |
+| `esp/main/Kconfig.projbuild` | Add USB config options |
+| `sdkconfig_tanmatsu` | Enable USB host |
+| `esp/main/common.h` | Add USB state to globals |
+| **NEW** `esp/main/usb_host.c` | USB host task and initialization |
+| **NEW** `esp/main/usb_host.h` | Public USB API |
+
+**Step-by-Step Implementation:**
+
+**Step 1: Add Dependencies** (`esp/main/idf_component.yml`)
+```yaml
+dependencies:
+  espressif/usb_host_hid: "^1.0"
+  espressif/usb_host_msc: "^1.0"
+  espressif/usb_host_hub: "^1.0"  # For hub support
+```
+
+**Step 2: Kconfig Options** (`esp/main/Kconfig.projbuild`)
+```
+menu "USB Host Configuration"
+    config USB_HOST_ENABLED
+        bool "Enable USB Host"
+        default y
+        help
+            Enable USB host functionality for keyboard, mouse, and storage.
+
+    config USB_HOST_HID_ENABLED
+        bool "Enable USB HID (keyboard/mouse)"
+        default y
+        depends on USB_HOST_ENABLED
+
+    config USB_HOST_MSC_ENABLED
+        bool "Enable USB Mass Storage"
+        default y
+        depends on USB_HOST_ENABLED
+endmenu
+```
+
+**Step 3: sdkconfig Changes** (`sdkconfig_tanmatsu`)
+```
+CONFIG_USB_OTG_SUPPORTED=y
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
+CONFIG_USB_HOST_HW_BUFFER_BIAS_BALANCED=y
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+```
+
+**Step 4: USB Host Header** (`esp/main/usb_host.h`)
+```c
+#pragma once
+#include "esp_err.h"
+#include <stdbool.h>
+
+// Initialize USB host subsystem
+esp_err_t usb_host_init(void);
+
+// Check if USB keyboard is connected
+bool usb_host_keyboard_connected(void);
+
+// Check if USB mouse is connected
+bool usb_host_mouse_connected(void);
+
+// Check if USB storage is connected
+bool usb_host_storage_connected(void);
+
+// Get USB storage block device (for IDE integration)
+struct BlockDevice* usb_host_get_storage_device(void);
+```
+
+**Step 5: USB Host Implementation** (`esp/main/usb_host.c`)
+```c
+#include "usb_host.h"
+#include "bsp/power.h"
+#include "usb/usb_host.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static const char *TAG = "USB_HOST";
+
+static TaskHandle_t usb_host_task_handle = NULL;
+static bool usb_initialized = false;
+
+// USB Host Library task
+static void usb_host_lib_task(void *arg) {
+    while (1) {
+        uint32_t event_flags;
+        usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
+            // All clients deregistered
+        }
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
+            // All devices freed
+        }
+    }
+}
+
+esp_err_t usb_host_init(void) {
+    esp_err_t err;
+
+    // Enable 5V boost for USB-A port
+    err = bsp_power_set_usb_host_boost_enabled(true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable USB boost: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "USB 5V boost enabled");
+
+    // Small delay for power to stabilize
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Initialize USB Host Library
+    usb_host_config_t host_config = {
+        .skip_phy_setup = false,
+        .intr_flags = ESP_INTR_FLAG_LEVEL1,
+    };
+    err = usb_host_install(&host_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to install USB host: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Create USB host library task
+    xTaskCreatePinnedToCore(usb_host_lib_task, "usb_host_lib", 4096,
+                            NULL, 10, &usb_host_task_handle, 0);
+
+    usb_initialized = true;
+    ESP_LOGI(TAG, "USB Host initialized");
+    return ESP_OK;
+}
+```
+
+**Step 6: Integration in esp_main.c**
+```c
+// In app_main(), after BSP init but before emulator start:
+#if CONFIG_USB_HOST_ENABLED
+    #include "usb_host.h"
+    esp_err_t usb_err = usb_host_init();
+    if (usb_err != ESP_OK) {
+        ESP_LOGW(TAG, "USB host init failed, continuing without USB");
+    }
+#endif
+```
+
+**Dependencies**: None (this is the foundation)
+
+---
+
+### 11.2 USB HID Implementation
+
+**Goal**: Translate USB keyboard/mouse to PS/2 scancodes for i8042.
+
+**Files to Modify:**
+| File | Changes |
+|------|---------|
+| `esp/main/usb_host.c` | Add HID driver registration |
+| **NEW** `esp/main/usb_hid.c` | HID event handling and translation |
+| **NEW** `esp/main/usb_hid.h` | HID public API |
+| `esp/main/input_bsp.c` | Accept scancodes from USB HID |
+| `esp/main/common.h` | Add USB HID state |
+
+**Step 1: USB HID Header** (`esp/main/usb_hid.h`)
+```c
+#pragma once
+#include "esp_err.h"
+#include <stdint.h>
+
+// Initialize USB HID driver (call after usb_host_init)
+esp_err_t usb_hid_init(void);
+
+// Set callback for keyboard events (PS/2 scancodes)
+typedef void (*usb_hid_keyboard_cb_t)(uint8_t scancode, bool is_break);
+void usb_hid_set_keyboard_callback(usb_hid_keyboard_cb_t cb);
+
+// Set callback for mouse events (PS/2 packets)
+typedef void (*usb_hid_mouse_cb_t)(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel);
+void usb_hid_set_mouse_callback(usb_hid_mouse_cb_t cb);
+
+// Which key acts as META for OSD toggle (default: Left GUI / Windows key)
+#define USB_HID_META_KEY 0xE3  // Left GUI in USB HID usage
+```
+
+**Step 2: Full Translation Table** (`esp/main/usb_hid.c`)
+```c
+#include "usb_hid.h"
+#include "usb/hid_host.h"
+#include "usb/hid_usage_keyboard.h"
+#include "esp_log.h"
+#include <string.h>
+
+static const char *TAG = "USB_HID";
+
+// USB HID to PS/2 Scan Code Set 1 translation
+// Index = USB HID usage code, Value = PS/2 make code (0 = no mapping)
+// Keys needing E0 prefix have bit 7 set in a separate table
+static const uint8_t usb_to_ps2_base[256] = {
+    [0x00] = 0x00,  // Reserved (no event)
+    [0x01] = 0x00,  // ErrorRollOver
+    [0x02] = 0x00,  // POSTFail
+    [0x03] = 0x00,  // ErrorUndefined
+    [0x04] = 0x1E,  // A
+    [0x05] = 0x30,  // B
+    [0x06] = 0x2E,  // C
+    [0x07] = 0x20,  // D
+    [0x08] = 0x12,  // E
+    [0x09] = 0x21,  // F
+    [0x0A] = 0x22,  // G
+    [0x0B] = 0x23,  // H
+    [0x0C] = 0x17,  // I
+    [0x0D] = 0x24,  // J
+    [0x0E] = 0x25,  // K
+    [0x0F] = 0x26,  // L
+    [0x10] = 0x32,  // M
+    [0x11] = 0x31,  // N
+    [0x12] = 0x18,  // O
+    [0x13] = 0x19,  // P
+    [0x14] = 0x10,  // Q
+    [0x15] = 0x13,  // R
+    [0x16] = 0x1F,  // S
+    [0x17] = 0x14,  // T
+    [0x18] = 0x16,  // U
+    [0x19] = 0x2F,  // V
+    [0x1A] = 0x11,  // W
+    [0x1B] = 0x2D,  // X
+    [0x1C] = 0x15,  // Y
+    [0x1D] = 0x2C,  // Z
+    [0x1E] = 0x02,  // 1 !
+    [0x1F] = 0x03,  // 2 @
+    [0x20] = 0x04,  // 3 #
+    [0x21] = 0x05,  // 4 $
+    [0x22] = 0x06,  // 5 %
+    [0x23] = 0x07,  // 6 ^
+    [0x24] = 0x08,  // 7 &
+    [0x25] = 0x09,  // 8 *
+    [0x26] = 0x0A,  // 9 (
+    [0x27] = 0x0B,  // 0 )
+    [0x28] = 0x1C,  // Enter
+    [0x29] = 0x01,  // Escape
+    [0x2A] = 0x0E,  // Backspace
+    [0x2B] = 0x0F,  // Tab
+    [0x2C] = 0x39,  // Space
+    [0x2D] = 0x0C,  // - _
+    [0x2E] = 0x0D,  // = +
+    [0x2F] = 0x1A,  // [ {
+    [0x30] = 0x1B,  // ] }
+    [0x31] = 0x2B,  // \ |
+    [0x32] = 0x2B,  // Non-US # ~ (same as backslash for US)
+    [0x33] = 0x27,  // ; :
+    [0x34] = 0x28,  // ' "
+    [0x35] = 0x29,  // ` ~
+    [0x36] = 0x33,  // , <
+    [0x37] = 0x34,  // . >
+    [0x38] = 0x35,  // / ?
+    [0x39] = 0x3A,  // Caps Lock
+    [0x3A] = 0x3B,  // F1
+    [0x3B] = 0x3C,  // F2
+    [0x3C] = 0x3D,  // F3
+    [0x3D] = 0x3E,  // F4
+    [0x3E] = 0x3F,  // F5
+    [0x3F] = 0x40,  // F6
+    [0x40] = 0x41,  // F7
+    [0x41] = 0x42,  // F8
+    [0x42] = 0x43,  // F9
+    [0x43] = 0x44,  // F10
+    [0x44] = 0x57,  // F11
+    [0x45] = 0x58,  // F12
+    [0x46] = 0x37,  // Print Screen (special handling needed)
+    [0x47] = 0x46,  // Scroll Lock
+    [0x48] = 0x00,  // Pause (special handling needed)
+    [0x49] = 0x52,  // Insert (E0 prefix)
+    [0x4A] = 0x47,  // Home (E0 prefix)
+    [0x4B] = 0x49,  // Page Up (E0 prefix)
+    [0x4C] = 0x53,  // Delete (E0 prefix)
+    [0x4D] = 0x4F,  // End (E0 prefix)
+    [0x4E] = 0x51,  // Page Down (E0 prefix)
+    [0x4F] = 0x4D,  // Right Arrow (E0 prefix)
+    [0x50] = 0x4B,  // Left Arrow (E0 prefix)
+    [0x51] = 0x50,  // Down Arrow (E0 prefix)
+    [0x52] = 0x48,  // Up Arrow (E0 prefix)
+    [0x53] = 0x45,  // Num Lock
+    [0x54] = 0x35,  // Keypad /  (E0 prefix)
+    [0x55] = 0x37,  // Keypad *
+    [0x56] = 0x4A,  // Keypad -
+    [0x57] = 0x4E,  // Keypad +
+    [0x58] = 0x1C,  // Keypad Enter (E0 prefix)
+    [0x59] = 0x4F,  // Keypad 1 End
+    [0x5A] = 0x50,  // Keypad 2 Down
+    [0x5B] = 0x51,  // Keypad 3 PgDn
+    [0x5C] = 0x4B,  // Keypad 4 Left
+    [0x5D] = 0x4C,  // Keypad 5
+    [0x5E] = 0x4D,  // Keypad 6 Right
+    [0x5F] = 0x47,  // Keypad 7 Home
+    [0x60] = 0x48,  // Keypad 8 Up
+    [0x61] = 0x49,  // Keypad 9 PgUp
+    [0x62] = 0x52,  // Keypad 0 Ins
+    [0x63] = 0x53,  // Keypad . Del
+    [0x64] = 0x56,  // Non-US \ |
+    [0x65] = 0x5D,  // Application (E0 prefix) - context menu key
+    // Modifier keys (handled separately via modifier byte)
+    [0xE0] = 0x1D,  // Left Control
+    [0xE1] = 0x2A,  // Left Shift
+    [0xE2] = 0x38,  // Left Alt
+    [0xE3] = 0x5B,  // Left GUI (Windows) - E0 prefix - THIS IS META
+    [0xE4] = 0x1D,  // Right Control (E0 prefix)
+    [0xE5] = 0x36,  // Right Shift
+    [0xE6] = 0x38,  // Right Alt (E0 prefix)
+    [0xE7] = 0x5C,  // Right GUI (Windows) - E0 prefix
+};
+
+// Keys that need E0 prefix
+static const uint8_t usb_extended_keys[] = {
+    0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E,  // Ins, Home, PgUp, Del, End, PgDn
+    0x4F, 0x50, 0x51, 0x52,              // Arrow keys
+    0x54, 0x58,                           // Keypad / and Enter
+    0x65,                                 // Application key
+    0xE3, 0xE4, 0xE6, 0xE7,              // Right Ctrl, Right Alt, GUI keys
+};
+
+static bool needs_e0_prefix(uint8_t usb_code) {
+    for (size_t i = 0; i < sizeof(usb_extended_keys); i++) {
+        if (usb_extended_keys[i] == usb_code) return true;
+    }
+    return false;
+}
+
+// State tracking
+static uint8_t prev_keys[6] = {0};
+static uint8_t prev_modifiers = 0;
+static usb_hid_keyboard_cb_t keyboard_cb = NULL;
+static usb_hid_mouse_cb_t mouse_cb = NULL;
+
+// Send PS/2 scancode via callback
+static void send_ps2_key(uint8_t usb_code, bool is_break) {
+    if (!keyboard_cb) return;
+
+    uint8_t ps2_code = usb_to_ps2_base[usb_code];
+    if (ps2_code == 0) return;
+
+    if (needs_e0_prefix(usb_code)) {
+        keyboard_cb(0xE0, false);  // E0 prefix (not a break code)
+    }
+
+    if (is_break) {
+        keyboard_cb(ps2_code | 0x80, true);  // Break code
+    } else {
+        keyboard_cb(ps2_code, false);  // Make code
+    }
+}
+
+// Process modifier byte changes
+static void process_modifiers(uint8_t old_mods, uint8_t new_mods) {
+    // Bit 0: Left Ctrl, Bit 1: Left Shift, Bit 2: Left Alt, Bit 3: Left GUI
+    // Bit 4: Right Ctrl, Bit 5: Right Shift, Bit 6: Right Alt, Bit 7: Right GUI
+    static const uint8_t mod_usb_codes[] = {0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7};
+
+    for (int i = 0; i < 8; i++) {
+        bool was_pressed = (old_mods >> i) & 1;
+        bool is_pressed = (new_mods >> i) & 1;
+        if (was_pressed != is_pressed) {
+            send_ps2_key(mod_usb_codes[i], !is_pressed);
+        }
+    }
+}
+
+// Check if META key is pressed (for OSD toggle)
+bool usb_hid_is_meta_pressed(uint8_t modifiers) {
+    // Left GUI (bit 3) or Right GUI (bit 7)
+    return (modifiers & 0x88) != 0;
+}
+
+// Process keyboard report
+void usb_hid_process_keyboard(uint8_t *report) {
+    uint8_t modifiers = report[0];
+    // report[1] is reserved
+    uint8_t *keys = &report[2];
+
+    // Process modifier changes
+    process_modifiers(prev_modifiers, modifiers);
+    prev_modifiers = modifiers;
+
+    // Find released keys
+    for (int i = 0; i < 6; i++) {
+        uint8_t key = prev_keys[i];
+        if (key == 0) continue;
+        bool still_pressed = false;
+        for (int j = 0; j < 6; j++) {
+            if (keys[j] == key) { still_pressed = true; break; }
+        }
+        if (!still_pressed) {
+            send_ps2_key(key, true);  // Key released
+        }
+    }
+
+    // Find newly pressed keys
+    for (int i = 0; i < 6; i++) {
+        uint8_t key = keys[i];
+        if (key == 0) continue;
+        bool was_pressed = false;
+        for (int j = 0; j < 6; j++) {
+            if (prev_keys[j] == key) { was_pressed = true; break; }
+        }
+        if (!was_pressed) {
+            send_ps2_key(key, false);  // Key pressed
+        }
+    }
+
+    memcpy(prev_keys, keys, 6);
+}
+
+// Process mouse report
+void usb_hid_process_mouse(uint8_t *report, int len) {
+    if (!mouse_cb || len < 3) return;
+
+    uint8_t buttons = report[0];
+    int8_t dx = (int8_t)report[1];
+    int8_t dy = (int8_t)report[2];
+    int8_t wheel = (len > 3) ? (int8_t)report[3] : 0;
+
+    mouse_cb(buttons, dx, dy, wheel);
+}
+
+void usb_hid_set_keyboard_callback(usb_hid_keyboard_cb_t cb) {
+    keyboard_cb = cb;
+}
+
+void usb_hid_set_mouse_callback(usb_hid_mouse_cb_t cb) {
+    mouse_cb = cb;
+}
+```
+
+**Step 3: Integration with input_bsp.c**
+```c
+// Add to input_bsp.c
+
+#include "usb_hid.h"
+
+// Callback from USB HID - inject PS/2 scancode
+static void usb_keyboard_event(uint8_t scancode, bool is_break) {
+    // Check for META key (GUI/Windows key) to toggle OSD
+    // This is handled at USB level before translation
+    // ... existing OSD toggle logic ...
+
+    // Queue scancode for i8042
+    if (globals.i8042) {
+        i8042_queue_scancode(globals.i8042, scancode);
+    }
+}
+
+static void usb_mouse_event(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel) {
+    // Convert to PS/2 mouse packet format
+    if (globals.i8042) {
+        // PS/2 mouse packet: [status][dx][dy]
+        uint8_t status = 0x08;  // Always set bit 3
+        status |= (buttons & 0x01);        // Left button
+        status |= (buttons & 0x02);        // Right button
+        status |= (buttons & 0x04) >> 1;   // Middle button to bit 2
+        if (dx < 0) status |= 0x10;        // X sign bit
+        if (dy < 0) status |= 0x20;        // Y sign bit
+
+        i8042_queue_mouse_packet(globals.i8042, status, (uint8_t)dx, (uint8_t)(-dy));
+    }
+}
+
+// In input_init():
+#if CONFIG_USB_HOST_HID_ENABLED
+    usb_hid_set_keyboard_callback(usb_keyboard_event);
+    usb_hid_set_mouse_callback(usb_mouse_event);
+#endif
+```
+
+**Dependencies**: USB Host Framework (11.1)
+
+---
+
+### 11.3 Toast Notification System
+
+**Goal**: Display brief text notifications for non-visible confirmations.
+
+**Files to Modify:**
+| File | Changes |
+|------|---------|
+| `esp/main/common.h` | Add toast state to globals |
+| `esp/main/lcd_bsp.c` | Render toast overlay |
+| `esp/main/tanmatsu_osd.c` | Toast trigger function |
+| **NEW** `esp/main/toast.h` | Toast API |
+
+**Step 1: Toast Header** (`esp/main/toast.h`)
+```c
+#pragma once
+
+#define TOAST_MAX_LEN 48
+#define TOAST_DURATION_MS 2000
+
+// Show a toast notification
+void toast_show(const char *message);
+
+// Clear current toast (if any)
+void toast_clear(void);
+
+// Check if toast is currently visible
+bool toast_is_visible(void);
+
+// Get current toast message (for rendering)
+const char* toast_get_message(void);
+```
+
+**Step 2: Add to globals** (`esp/main/common.h`)
+```c
+// Add to globals struct:
+struct {
+    char toast_message[TOAST_MAX_LEN];
+    int64_t toast_start_time;  // esp_timer_get_time() when shown
+    bool toast_active;
+} toast;
+```
+
+**Step 3: Toast Implementation** (add to `esp/main/tanmatsu_osd.c` or new file)
+```c
+#include "toast.h"
+#include "esp_timer.h"
+#include <string.h>
+
+void toast_show(const char *message) {
+    strncpy(globals.toast.toast_message, message, TOAST_MAX_LEN - 1);
+    globals.toast.toast_message[TOAST_MAX_LEN - 1] = '\0';
+    globals.toast.toast_start_time = esp_timer_get_time();
+    globals.toast.toast_active = true;
+}
+
+void toast_clear(void) {
+    globals.toast.toast_active = false;
+}
+
+bool toast_is_visible(void) {
+    if (!globals.toast.toast_active) return false;
+
+    int64_t elapsed = esp_timer_get_time() - globals.toast.toast_start_time;
+    if (elapsed > TOAST_DURATION_MS * 1000) {
+        globals.toast.toast_active = false;
+        return false;
+    }
+    return true;
+}
+
+const char* toast_get_message(void) {
+    return globals.toast.toast_message;
+}
+```
+
+**Step 4: Render Toast** (add to `esp/main/lcd_bsp.c` in render loop)
+```c
+// After VGA framebuffer copy, before final display:
+if (toast_is_visible() && !globals.osd_enabled) {
+    const char *msg = toast_get_message();
+    int len = strlen(msg);
+    int x = (DISPLAY_WIDTH - len * 8) / 2;  // Center horizontally
+    int y = DISPLAY_HEIGHT - 32;            // Near bottom
+
+    // Draw semi-transparent background
+    draw_rect_alpha(fb, x - 8, y - 4, len * 8 + 16, 24, 0x0000, 128);
+
+    // Draw text
+    draw_text(fb, x, y, msg, 0xFFFF);  // White text
+}
+```
+
+**Step 5: Usage Examples**
+```c
+// In tanmatsu_osd.c SAVE_INI handler:
+if (save_ini_file() == ESP_OK) {
+    toast_show("Settings saved");
+} else {
+    toast_show("Save failed!");
+}
+
+// In usb_host.c on device connect:
+toast_show("USB drive attached as D:");
+
+// In usb_host.c on device disconnect:
+toast_show("USB drive removed");
+```
+
+**Dependencies**: None (can be implemented standalone)
+
+---
+
+### 11.4 Drive Activity LEDs
+
+**Goal**: Flash LEDs 4 and 5 on HDD/Floppy access.
+
+**Files to Modify:**
+| File | Changes |
+|------|---------|
+| `ide.c` | Add activity callback hook |
+| `emulink.c` | Add activity callback for floppy |
+| `esp/main/common.h` | Add LED state |
+| **NEW** `esp/main/led_activity.c` | LED management |
+| **NEW** `esp/main/led_activity.h` | LED API |
+
+**Step 1: LED Activity Header** (`esp/main/led_activity.h`)
+```c
+#pragma once
+#include <stdbool.h>
+
+// Initialize LED activity subsystem
+void led_activity_init(void);
+
+// Signal drive activity (call from IDE/floppy code)
+void led_activity_hdd(void);    // Flash LED 4 (red)
+void led_activity_floppy(void); // Flash LED 5 (green)
+
+// Must be called periodically to manage LED timeouts
+void led_activity_tick(void);
+```
+
+**Step 2: LED Activity Implementation** (`esp/main/led_activity.c`)
+```c
+#include "led_activity.h"
+#include "bsp/led.h"
+#include "esp_timer.h"
+
+#define LED_HDD_INDEX    4
+#define LED_FLOPPY_INDEX 5
+#define LED_TIMEOUT_US   100000  // 100ms
+
+static int64_t hdd_last_activity = 0;
+static int64_t floppy_last_activity = 0;
+static bool hdd_led_on = false;
+static bool floppy_led_on = false;
+
+void led_activity_init(void) {
+    // Take manual control of LEDs 4-5
+    bsp_led_set_mode(false);
+
+    // Ensure LEDs are off initially
+    bsp_led_set_pixel_rgb(LED_HDD_INDEX, 0, 0, 0);
+    bsp_led_set_pixel_rgb(LED_FLOPPY_INDEX, 0, 0, 0);
+    bsp_led_send();
+}
+
+void led_activity_hdd(void) {
+    hdd_last_activity = esp_timer_get_time();
+    if (!hdd_led_on) {
+        bsp_led_set_pixel_rgb(LED_HDD_INDEX, 255, 0, 0);  // Red
+        bsp_led_send();
+        hdd_led_on = true;
+    }
+}
+
+void led_activity_floppy(void) {
+    floppy_last_activity = esp_timer_get_time();
+    if (!floppy_led_on) {
+        bsp_led_set_pixel_rgb(LED_FLOPPY_INDEX, 0, 255, 0);  // Green
+        bsp_led_send();
+        floppy_led_on = true;
+    }
+}
+
+void led_activity_tick(void) {
+    int64_t now = esp_timer_get_time();
+    bool need_update = false;
+
+    if (hdd_led_on && (now - hdd_last_activity > LED_TIMEOUT_US)) {
+        bsp_led_set_pixel_rgb(LED_HDD_INDEX, 0, 0, 0);
+        hdd_led_on = false;
+        need_update = true;
+    }
+
+    if (floppy_led_on && (now - floppy_last_activity > LED_TIMEOUT_US)) {
+        bsp_led_set_pixel_rgb(LED_FLOPPY_INDEX, 0, 0, 0);
+        floppy_led_on = false;
+        need_update = true;
+    }
+
+    if (need_update) {
+        bsp_led_send();
+    }
+}
+```
+
+**Step 3: Hook into IDE** (`ide.c`)
+```c
+// Add near top of file:
+#ifdef TANMATSU_BUILD
+extern void led_activity_hdd(void);
+#define IDE_ACTIVITY() led_activity_hdd()
+#else
+#define IDE_ACTIVITY() ((void)0)
+#endif
+
+// In ide_read_async and ide_write_async, add at start:
+IDE_ACTIVITY();
+```
+
+**Step 4: Hook into Floppy** (`emulink.c`)
+```c
+// Similar pattern for floppy operations:
+#ifdef TANMATSU_BUILD
+extern void led_activity_floppy(void);
+#define FLOPPY_ACTIVITY() led_activity_floppy()
+#else
+#define FLOPPY_ACTIVITY() ((void)0)
+#endif
+```
+
+**Step 5: Tick from main loop** (`esp/main/esp_main.c`)
+```c
+// In emulator main loop:
+led_activity_tick();  // Call every frame or every few ms
+```
+
+**Dependencies**: None
+
+---
+
+### 11.5 OSD Stats Panel
+
+**Goal**: Display CPU%, VGA mode, batch size in OSD panel.
+
+**Files to Modify:**
+| File | Changes |
+|------|---------|
+| `pc.c` | Write stats to memory instead of fprintf |
+| `esp/main/common.h` | Add stats struct to globals |
+| `esp/main/tanmatsu_osd.c` | Add VIEW_STATUS and rendering |
+
+**Step 1: Stats Structure** (`esp/main/common.h`)
+```c
+// Add to globals struct:
+struct {
+    uint8_t cpu_percent;        // 0-100
+    uint8_t periph_percent;     // 0-100
+    uint16_t batch_size;        // Current batch size
+    uint32_t calls_per_sec;     // pc_step calls per second
+    char vga_mode[24];          // e.g., "640x480x16 VGA"
+} emu_stats;
+```
+
+**Step 2: Update pc.c**
+Replace fprintf stats output with memory writes:
+```c
+// In pc_step(), replace the fprintf block (~line 602-607) with:
+#ifdef TANMATSU_BUILD
+    extern struct globals globals;
+    if (stat_calls > 0) {
+        uint32_t total = stat_cpu_us + stat_periph_us;
+        if (total > 0) {
+            globals.emu_stats.cpu_percent = (stat_cpu_us * 100) / total;
+            globals.emu_stats.periph_percent = (stat_periph_us * 100) / total;
+        }
+        globals.emu_stats.batch_size = batch_size;
+        globals.emu_stats.calls_per_sec = stat_calls * 1000000 / stat_total_us;
+    }
+#else
+    fprintf(stderr, "pc_step stats: ..."); // Keep for non-Tanmatsu builds
+#endif
+```
+
+**Step 3: VGA Mode String** (`vga.c`)
+```c
+// Add function to get mode string:
+void vga_get_mode_string(VGAState *s, char *buf, size_t len) {
+    int w = vga_get_width(s);
+    int h = vga_get_height(s);
+    int bpp = vga_get_bpp(s);
+    const char *type = s->vbe_enabled ? "VESA" : "VGA";
+    snprintf(buf, len, "%dx%dx%d %s", w, h, bpp, type);
+}
+```
+
+**Step 4: OSD View** (`esp/main/tanmatsu_osd.c`)
+```c
+// Add to ViewMode enum:
+VIEW_STATUS,
+
+// Add menu item:
+MAIN_STATUS,
+
+// Add to main menu items array:
+{"STATUS", MAIN_STATUS},
+
+// Handle selection:
+case MAIN_STATUS:
+    osd->view = VIEW_STATUS;
+    break;
+
+// Render status view:
+static void render_status(OSD *osd, uint8_t *fb, int stride) {
+    char line[64];
+
+    draw_text(fb, 16, 40, "SYSTEM STATUS", 0xFFFF, stride);
+
+    snprintf(line, sizeof(line), "VGA Mode: %s", globals.emu_stats.vga_mode);
+    draw_text(fb, 16, 80, line, 0xFFFF, stride);
+
+    snprintf(line, sizeof(line), "CPU: %d%%  Periph: %d%%",
+             globals.emu_stats.cpu_percent,
+             globals.emu_stats.periph_percent);
+    draw_text(fb, 16, 104, line, 0xFFFF, stride);
+
+    snprintf(line, sizeof(line), "Batch: %d  Calls/s: %lu",
+             globals.emu_stats.batch_size,
+             (unsigned long)globals.emu_stats.calls_per_sec);
+    draw_text(fb, 16, 128, line, 0xFFFF, stride);
+
+    draw_text(fb, 16, 180, "[ESC] Back", 0x8410, stride);
+}
+```
+
+**Dependencies**: None
+
+---
+
+### 11.6 OSD Help Screen
+
+**Goal**: Show keyboard shortcuts in OSD.
+
+**Files to Modify:**
+| File | Changes |
+|------|---------|
+| `esp/main/tanmatsu_osd.c` | Add VIEW_HELP and content |
+
+**Implementation:**
+```c
+// Add to ViewMode enum:
+VIEW_HELP,
+
+// Add menu item:
+MAIN_HELP,
+
+// Add to main menu items array:
+{"HELP", MAIN_HELP},
+
+// Handle selection:
+case MAIN_HELP:
+    osd->view = VIEW_HELP;
+    break;
+
+// Render help view:
+static void render_help(OSD *osd, uint8_t *fb, int stride) {
+    draw_text(fb, 16, 40, "KEYBOARD SHORTCUTS", 0xFFFF, stride);
+
+    int y = 80;
+    draw_text(fb, 16, y, "META           Toggle OSD", 0xFFFF, stride); y += 20;
+    draw_text(fb, 16, y, "META+UP/DOWN   Volume", 0xFFFF, stride); y += 20;
+    draw_text(fb, 16, y, "META+LEFT/RIGHT  Brightness", 0xFFFF, stride); y += 20;
+    y += 20;
+    draw_text(fb, 16, y, "IN OSD:", 0x8410, stride); y += 20;
+    draw_text(fb, 16, y, "Arrows         Navigate", 0xFFFF, stride); y += 20;
+    draw_text(fb, 16, y, "Enter          Select", 0xFFFF, stride); y += 20;
+    draw_text(fb, 16, y, "Escape         Back/Close", 0xFFFF, stride); y += 20;
+
+    draw_text(fb, 16, 300, "[ESC] Back", 0x8410, stride);
+}
+```
+
+**Dependencies**: None
+
+---
+
+### 11.7 USB Mass Storage
+
+**Goal**: Expose USB storage as IDE secondary slave.
+
+**Files to Modify:**
+| File | Changes |
+|------|---------|
+| `ide.c` | Add BlockDeviceUSB, hot-attach API |
+| `ide.h` | Export hot-attach function |
+| `esp/main/usb_host.c` | MSC driver, BlockDevice creation |
+| `esp/main/tanmatsu_osd.c` | Hide CDD when USB attached |
+
+**Step 1: BlockDeviceUSB Structure** (`ide.c`)
+```c
+#ifdef TANMATSU_BUILD
+#include "usb/usb_host.h"
+#include "usb_host_msc.h"
+
+typedef struct {
+    BlockDevice base;
+    msc_host_device_handle_t msc_handle;
+    uint32_t block_size;
+    uint64_t block_count;
+} BlockDeviceUSB;
+
+static int64_t bd_usb_get_sector_count(BlockDevice *bs) {
+    BlockDeviceUSB *s = (BlockDeviceUSB *)bs;
+    return s->block_count;
+}
+
+static int bd_usb_read_async(BlockDevice *bs, uint64_t sector,
+                              uint8_t *buf, int n,
+                              BlockDeviceCompletionFunc *cb, void *opaque) {
+    BlockDeviceUSB *s = (BlockDeviceUSB *)bs;
+
+    // USB MSC reads are synchronous in ESP-IDF
+    esp_err_t err = msc_host_read_sector(s->msc_handle, sector, buf, n);
+    if (err == ESP_OK) {
+        if (cb) cb(opaque, 0);
+        return 0;
+    }
+    return -1;
+}
+
+static int bd_usb_write_async(BlockDevice *bs, uint64_t sector,
+                               uint8_t *buf, int n,
+                               BlockDeviceCompletionFunc *cb, void *opaque) {
+    BlockDeviceUSB *s = (BlockDeviceUSB *)bs;
+
+    esp_err_t err = msc_host_write_sector(s->msc_handle, sector, buf, n);
+    if (err == ESP_OK) {
+        if (cb) cb(opaque, 0);
+        return 0;
+    }
+    return -1;
+}
+
+BlockDevice *block_device_usb_create(msc_host_device_handle_t handle) {
+    BlockDeviceUSB *s = calloc(1, sizeof(BlockDeviceUSB));
+    s->msc_handle = handle;
+
+    // Get device info
+    msc_host_device_info_t info;
+    msc_host_get_device_info(handle, &info);
+    s->block_size = info.sector_size;
+    s->block_count = info.sector_count;
+
+    s->base.get_sector_count = bd_usb_get_sector_count;
+    s->base.read_async = bd_usb_read_async;
+    s->base.write_async = bd_usb_write_async;
+
+    return (BlockDevice *)s;
+}
+#endif
+```
+
+**Step 2: Hot-Attach API** (`ide.h`)
+```c
+// Add to ide.h:
+#ifdef TANMATSU_BUILD
+int ide_hot_attach(IDEIFState *s, int drive, BlockDevice *bs, bool is_cdrom);
+void ide_hot_detach(IDEIFState *s, int drive);
+#endif
+```
+
+**Step 3: Hot-Attach Implementation** (`ide.c`)
+```c
+#ifdef TANMATSU_BUILD
+int ide_hot_attach(IDEIFState *s, int drive, BlockDevice *bs, bool is_cdrom) {
+    if (drive < 0 || drive > 1) return -1;
+    if (s->drives[drive]) {
+        // Already attached - detach first
+        ide_hot_detach(s, drive);
+    }
+
+    if (is_cdrom) {
+        s->drives[drive] = ide_cddrive_init(s, bs);
+    } else {
+        s->drives[drive] = ide_hddrive_init(s, bs);
+    }
+    return 0;
+}
+
+void ide_hot_detach(IDEIFState *s, int drive) {
+    if (drive < 0 || drive > 1) return;
+    if (s->drives[drive]) {
+        // Free drive state
+        free(s->drives[drive]);
+        s->drives[drive] = NULL;
+    }
+}
+#endif
+```
+
+**Step 4: USB MSC Event Handler** (`esp/main/usb_host.c`)
+```c
+static void msc_event_handler(const msc_host_event_t *event, void *arg) {
+    switch (event->event) {
+        case MSC_DEVICE_CONNECTED: {
+            ESP_LOGI(TAG, "USB storage connected");
+
+            // Create block device
+            BlockDevice *bd = block_device_usb_create(event->device.handle);
+            if (!bd) {
+                ESP_LOGE(TAG, "Failed to create USB block device");
+                return;
+            }
+
+            // Attach to IDE secondary slave (slot 3)
+            if (globals.pc && globals.pc->ide2) {
+                ide_hot_attach(globals.pc->ide2, 1, bd, false);  // drive 1 = slave
+                globals.usb_storage_attached = true;
+                toast_show("USB drive attached as D:");
+            }
+            break;
+        }
+
+        case MSC_DEVICE_DISCONNECTED:
+            ESP_LOGI(TAG, "USB storage disconnected");
+
+            if (globals.pc && globals.pc->ide2) {
+                ide_hot_detach(globals.pc->ide2, 1);
+                globals.usb_storage_attached = false;
+                toast_show("USB drive removed");
+            }
+            break;
+    }
+}
+```
+
+**Step 5: OSD Integration** (`esp/main/tanmatsu_osd.c`)
+```c
+// In render_mounting(), for CDD entry:
+if (osd->mount_sel == MOUNT_CDD) {
+    if (globals.usb_storage_attached) {
+        draw_text(fb, x, y, "USB STORAGE", 0x07E0, stride);  // Green
+    } else {
+        draw_text(fb, x, y, "CDD: (empty)", 0xFFFF, stride);
+    }
+}
+
+// Skip CDD in navigation when USB attached:
+// In handle_mount_up/down, skip MOUNT_CDD if usb_storage_attached
+```
+
+**Dependencies**: USB Host Framework (11.1), Toast System (11.3)
 
 ---
 
