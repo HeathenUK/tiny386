@@ -439,7 +439,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
                          const char *cda, const char *cdb,
                          const char *cdc, const char *cdd,
                          int cpu_gen, int fpu, long mem_size,
-                         int brightness, int volume, int frame_skip)
+                         int brightness, int volume, int frame_skip,
+                         int double_buffer)
 {
 	if (!ini_path) return -1;
 	if (boot_order < 0 || boot_order >= BOOT_ORDER_COUNT)
@@ -458,8 +459,10 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	int line_count = 0;
 	int in_pc_section = 0;
 	int in_cpu_section = 0;
+	int in_display_section = 0;
 	int pc_section_end = -1;
 	int cpu_section_end = -1;
+	int display_section_end = -1;
 
 	// Track which settings we found
 	int found_boot_order = -1, found_fda = -1, found_fdb = -1;
@@ -467,30 +470,35 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	int found_mem_size = -1;
 	int found_gen = -1, found_fpu = -1;
 	int found_brightness = -1, found_volume = -1, found_frame_skip = -1;
+	int found_double_buffer = -1;
 
 	while (line_count < 64 && fgets(lines[line_count], 256, f)) {
 		// Check for section headers
 		if (strncmp(lines[line_count], "[pc]", 4) == 0) {
-			if (in_cpu_section && cpu_section_end < 0) {
-				cpu_section_end = line_count;
-			}
+			if (in_cpu_section && cpu_section_end < 0) cpu_section_end = line_count;
+			if (in_display_section && display_section_end < 0) display_section_end = line_count;
 			in_pc_section = 1;
 			in_cpu_section = 0;
+			in_display_section = 0;
 		} else if (strncmp(lines[line_count], "[cpu]", 5) == 0) {
-			if (in_pc_section && pc_section_end < 0) {
-				pc_section_end = line_count;
-			}
+			if (in_pc_section && pc_section_end < 0) pc_section_end = line_count;
+			if (in_display_section && display_section_end < 0) display_section_end = line_count;
 			in_pc_section = 0;
 			in_cpu_section = 1;
-		} else if (lines[line_count][0] == '[') {
-			if (in_pc_section && pc_section_end < 0) {
-				pc_section_end = line_count;
-			}
-			if (in_cpu_section && cpu_section_end < 0) {
-				cpu_section_end = line_count;
-			}
+			in_display_section = 0;
+		} else if (strncmp(lines[line_count], "[display]", 9) == 0) {
+			if (in_pc_section && pc_section_end < 0) pc_section_end = line_count;
+			if (in_cpu_section && cpu_section_end < 0) cpu_section_end = line_count;
 			in_pc_section = 0;
 			in_cpu_section = 0;
+			in_display_section = 1;
+		} else if (lines[line_count][0] == '[') {
+			if (in_pc_section && pc_section_end < 0) pc_section_end = line_count;
+			if (in_cpu_section && cpu_section_end < 0) cpu_section_end = line_count;
+			if (in_display_section && display_section_end < 0) display_section_end = line_count;
+			in_pc_section = 0;
+			in_cpu_section = 0;
+			in_display_section = 0;
 		}
 
 		// Check for existing settings in [pc] section
@@ -514,6 +522,11 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			else if (line_starts_with(lines[line_count], "fpu")) found_fpu = line_count;
 		}
 
+		// Check for existing settings in [display] section
+		if (in_display_section) {
+			if (line_starts_with(lines[line_count], "double_buffer")) found_double_buffer = line_count;
+		}
+
 		line_count++;
 	}
 	fclose(f);
@@ -524,6 +537,9 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	}
 	if (in_cpu_section && cpu_section_end < 0) {
 		cpu_section_end = line_count;
+	}
+	if (in_display_section && display_section_end < 0) {
+		display_section_end = line_count;
 	}
 
 	// Write back with updated settings
@@ -558,6 +574,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			fprintf(f, "volume = %d\n", volume);
 		} else if (i == found_frame_skip) {
 			fprintf(f, "frame_skip = %d\n", frame_skip);
+		} else if (i == found_double_buffer) {
+			fprintf(f, "double_buffer = %d\n", double_buffer);
 		} else if (i == found_gen) {
 			fprintf(f, "gen = %d\n", cpu_gen);
 		} else if (i == found_fpu) {
@@ -599,6 +617,12 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 				fprintf(f, "gen = %d\n", cpu_gen);
 			if (found_fpu < 0)
 				fprintf(f, "fpu = %d\n", fpu);
+		}
+
+		// Add new settings at end of [display] section
+		if (i == display_section_end - 1) {
+			if (found_double_buffer < 0)
+				fprintf(f, "double_buffer = %d\n", double_buffer);
 		}
 	}
 

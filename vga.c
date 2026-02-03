@@ -129,6 +129,9 @@ static int vga256_palette_valid = 0;
 /* Adaptive frame skipping - skip up to N frames when rendering is slow
  * When enabled, skips frames if previous render exceeded threshold */
 int vga_frame_skip_max = 0;  /* 0 = disabled, 1-10 = max frames to skip */
+
+/* Double buffering for tear-free rendering */
+int vga_double_buffer = 0;  /* 0 = disabled (default), 1 = enabled */
 static int vga_frame_skip_count = 0;  /* Consecutive frames skipped */
 static uint64_t vga_last_render_time = 0;  /* Time of last render (microseconds) */
 static uint64_t vga_last_render_duration = 0;  /* Duration of last render */
@@ -300,8 +303,10 @@ struct VGAState {
     int force_graphic_clear;  /* Force clear when switching to graphics mode */
 
     uint8_t *vga_ram;
+    uint8_t *render_vga_ram;  /* Snapshot for tear-free rendering */
+    uint64_t dirty_pages;     /* Bitmap: 1 bit per 4KB page (64 pages = 256KB) */
     int vga_ram_size;
-    
+
     uint8_t sr_index;
     uint8_t sr[8];
     uint8_t gr_index;
@@ -337,7 +342,14 @@ struct VGAState {
     int32_t bank_offset;
 
     uint32_t latch;
-    
+
+    /* Mode X optimization: cached state for fast-path writes */
+    uint8_t cached_plane_mask;    /* sr[VGA_SEQ_PLANE_WRITE] - which planes to write */
+    uint8_t cached_write_mode;    /* gr[VGA_GFX_MODE] & 3 - VGA write mode 0-3 */
+    uint8_t cached_chain4;        /* sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M */
+    uint8_t cached_memmap_mode;   /* (gr[VGA_GFX_MISC] >> 2) & 3 */
+    uint8_t cached_simple_write;  /* 0=slow, 1=wm1 fast, 2=wm0 fast */
+
     /* text mode state */
     uint32_t last_palette[16];
 #ifndef FULL_UPDATE
@@ -1114,7 +1126,8 @@ static void vga_text_refresh(VGAState *s,
 
     full_update = full_update || update_palette16(s, s->last_palette);
 
-    vga_ram = s->vga_ram;
+    /* Use render buffer for tear-free display (only if double buffering enabled) */
+    vga_ram = (s->render_vga_ram && vga_double_buffer) ? s->render_vga_ram : s->vga_ram;
 
     const uint8_t *font_base[2];
     uint32_t v = s->sr[0x3];
@@ -1551,7 +1564,8 @@ static void vga_graphic_refresh(VGAState *s,
 //        line_compare = 65535;
     }
     uint32_t addr1 = 4 * start_addr;
-    uint8_t *vram = s->vga_ram;
+    /* Use render buffer for tear-free display (only if double buffering enabled) */
+    uint8_t *vram = (s->render_vga_ram && vga_double_buffer) ? s->render_vga_ram : s->vga_ram;
     uint32_t palette[256];
     uint32_t palette_before[16];  /* For mid-frame palette switching (top) */
     uint32_t palette_after[16];   /* For mid-frame palette switching (bottom) */
@@ -2266,6 +2280,51 @@ int vga_step(VGAState *s)
 #endif
         }
     }
+
+    /* Double buffering: snapshot vga_ram for tear-free rendering.
+     * Uses dirty page tracking to only copy modified 4KB pages. */
+    if (ret && s->render_vga_ram && vga_double_buffer) {
+        uint64_t dirty = s->dirty_pages;
+        if (dirty) {
+            /* Determine max pages to copy based on VGA mode */
+            int max_pages;
+            int shift_control = (s->gr[VGA_GFX_MODE] >> 5) & 3;
+            int chain4 = (s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) ? 1 : 0;
+
+            if (!(s->gr[VGA_GFX_MISC] & 1)) {
+                /* Text mode - limit to ~32KB (8 pages) */
+                max_pages = 8;
+            } else if (chain4 && shift_control >= 2) {
+                /* Chain-4 mode (Mode 13h) - 64KB (16 pages) */
+                max_pages = 16;
+            } else {
+                /* Planar modes (Mode X) - 256KB (64 pages) */
+                max_pages = 64;
+            }
+
+            /* Cap to actual VRAM size */
+            int vram_pages = s->vga_ram_size >> 12;
+            if (max_pages > vram_pages)
+                max_pages = vram_pages;
+            if (max_pages > 64)
+                max_pages = 64;
+
+            /* Copy only dirty pages */
+            uint64_t mask = (max_pages < 64) ? ((1ULL << max_pages) - 1) : ~0ULL;
+            dirty &= mask;
+
+            while (dirty) {
+                int page = __builtin_ctzll(dirty);  /* Find lowest set bit */
+                uint32_t offset = page << 12;       /* Page to byte offset */
+                memcpy(s->render_vga_ram + offset, s->vga_ram + offset, 4096);
+                dirty &= dirty - 1;  /* Clear lowest set bit */
+            }
+
+            /* Clear dirty bits for copied region */
+            s->dirty_pages &= ~mask;
+        }
+    }
+
     return ret;
 }
 
@@ -2538,6 +2597,45 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
     return val;
 }
 
+/* Update cached VGA state for fast-path optimizations.
+ * Called when SR or GR registers change. */
+static inline void vga_update_cached_state(VGAState *s)
+{
+    s->cached_plane_mask = s->sr[VGA_SEQ_PLANE_WRITE];
+    s->cached_write_mode = s->gr[VGA_GFX_MODE] & 3;
+    s->cached_chain4 = (s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) ? 1 : 0;
+    s->cached_memmap_mode = (s->gr[VGA_GFX_MISC] >> 2) & 3;
+
+    /* Base conditions for any fast path:
+     * - Not chain-4 mode (Mode X uses unchained)
+     * - Not odd/even mode
+     * - Memory map mode 0 or 1 */
+    int base_ok = !s->cached_chain4 &&
+                  !(s->gr[VGA_GFX_MODE] & 0x10) &&
+                  (s->cached_memmap_mode <= 1);
+
+    /* cached_simple_write encodes which fast paths are available:
+     * 0 = no fast path
+     * 1 = write mode 1 fast path only (latch copy)
+     * 2 = write mode 0 fast path (simple byte write)
+     * 3 = both fast paths available */
+    s->cached_simple_write = 0;
+
+    if (base_ok) {
+        /* Write mode 1 (latch copy) ignores bit mask, rotation, set/reset */
+        if (s->cached_write_mode == 1) {
+            s->cached_simple_write = 1;
+        }
+        /* Write mode 0: simple if no rotation, no set/reset, no logic ops, full bit mask */
+        else if (s->cached_write_mode == 0 &&
+                 s->gr[VGA_GFX_DATA_ROTATE] == 0 &&
+                 s->gr[VGA_GFX_SR_ENABLE] == 0 &&
+                 s->gr[VGA_GFX_BIT_MASK] == 0xff) {
+            s->cached_simple_write = 2;
+        }
+    }
+}
+
 void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
 {
     int index;
@@ -2594,6 +2692,9 @@ void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
         printf("vga: write SR%x = 0x%02x\n", s->sr_index, val);
 #endif
         s->sr[s->sr_index] = val & sr_mask[s->sr_index];
+        /* Update cached state when plane mask or memory mode changes */
+        if (s->sr_index == VGA_SEQ_PLANE_WRITE || s->sr_index == VGA_SEQ_MEMORY_MODE)
+            vga_update_cached_state(s);
         break;
     case 0x3c7:
         s->dac_read_index = val;
@@ -2654,6 +2755,11 @@ void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
         printf("vga: write GR%x = 0x%02x\n", s->gr_index, val);
 #endif
         s->gr[s->gr_index] = val & gr_mask[s->gr_index];
+        /* Update cached state when write mode, misc, bit mask, rotate, or set/reset changes */
+        if (s->gr_index == VGA_GFX_MODE || s->gr_index == VGA_GFX_MISC ||
+            s->gr_index == VGA_GFX_BIT_MASK || s->gr_index == VGA_GFX_DATA_ROTATE ||
+            s->gr_index == VGA_GFX_SR_ENABLE)
+            vga_update_cached_state(s);
         break;
     case 0x3b4:
     case 0x3d4:
@@ -2733,8 +2839,12 @@ void vbe_write(VGAState *s, uint32_t offset, uint32_t val)
             vbe_update_vgaregs(s);
             /* clear the screen */
             if (!(val & VBE_DISPI_NOCLEARMEM)) {
-                memset(s->vga_ram, 0,
-                       s->vbe_regs[VBE_DISPI_INDEX_YRES] * s->vbe_line_offset);
+                uint32_t clear_size = s->vbe_regs[VBE_DISPI_INDEX_YRES] * s->vbe_line_offset;
+                memset(s->vga_ram, 0, clear_size);
+                /* Mark all affected pages dirty for double buffering */
+                uint32_t end_page = (clear_size - 1) >> 12;
+                for (uint32_t p = 0; p <= end_page && p < 64; p++)
+                    s->dirty_pages |= (1ULL << p);
             }
             break;
         case VBE_DISPI_INDEX_XRES:
@@ -2905,6 +3015,8 @@ void IRAM_ATTR vga_mem_write16(VGAState *s, uint32_t addr, uint16_t val16)
     plane = addr & 3;
     mask = (1 << plane);
     if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
+        /* Mark 4KB page dirty for double buffering (addr is byte offset) */
+        s->dirty_pages |= (1ULL << (addr >> 12));
         * (uint16_t *) &(s->vga_ram[addr]) = val;
     }
 }
@@ -2952,21 +3064,46 @@ void IRAM_ATTR vga_mem_write32(VGAState *s, uint32_t addr, uint32_t val)
     plane = addr & 3;
     mask = (1 << plane);
     if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
+        /* Mark 4KB page dirty for double buffering (addr is byte offset) */
+        s->dirty_pages |= (1ULL << (addr >> 12));
         * (uint32_t *) &(s->vga_ram[addr]) = val;
     }
 }
 
 bool IRAM_ATTR vga_mem_write_string(VGAState *s, uint32_t addr, uint8_t *buf, int len)
 {
-    if (!(s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M)) {
-        return false;
-    }
-
     int memory_map_mode, plane, mask;
 
-#ifdef DEBUG_VGA_MEM
-    printf("vga: [0x" TARGET_FMT_plx "] = 0x%02x\n", addr, val);
-#endif
+    /* Ultra-fast Mode X path - write mode 0 with single plane */
+    if (s->cached_simple_write == 2 && s->cached_memmap_mode == 1) {
+        uint8_t pmask = s->cached_plane_mask;
+        addr &= 0xffff;
+        addr += s->bank_offset;
+
+        /* Only handle single-plane writes for string operations */
+        if ((pmask & (pmask - 1)) == 0 && pmask != 0) {
+            int target_plane = __builtin_ctz(pmask);
+
+            /* Bounds check */
+            if ((addr + len) * 4 > s->vga_ram_size)
+                return false;
+
+            /* Mark dirty pages for double buffering (addr is dword offset) */
+            uint32_t start_page = addr >> 10;
+            uint32_t end_page = (addr + len - 1) >> 10;
+            for (uint32_t p = start_page; p <= end_page && p < 64; p++)
+                s->dirty_pages |= (1ULL << p);
+
+            /* Write each byte to the selected plane */
+            uint8_t *dst = s->vga_ram + addr * 4 + target_plane;
+            for (int i = 0; i < len; i++) {
+                *dst = buf[i];
+                dst += 4;
+            }
+            return true;
+        }
+    }
+
     /* convert to VGA memory offset */
     memory_map_mode = (s->gr[VGA_GFX_MISC] >> 2) & 3;
     addr &= 0x1ffff;
@@ -2991,13 +3128,50 @@ bool IRAM_ATTR vga_mem_write_string(VGAState *s, uint32_t addr, uint8_t *buf, in
         break;
     }
 
-    /* chain 4 mode : simplest access */
-    plane = addr & 3;
-    mask = (1 << plane);
-    if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
-        memcpy(s->vga_ram + addr, buf, len);
-        return true;
+    if (s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) {
+        /* chain 4 mode : simplest access */
+        plane = addr & 3;
+        mask = (1 << plane);
+        if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
+            /* Mark dirty pages for double buffering (addr is byte offset) */
+            uint32_t start_page = addr >> 12;
+            uint32_t end_page = (addr + len - 1) >> 12;
+            for (uint32_t p = start_page; p <= end_page && p < 64; p++)
+                s->dirty_pages |= (1ULL << p);
+            memcpy(s->vga_ram + addr, buf, len);
+            return true;
+        }
+        return false;
     }
+
+    /* Mode X fast path: write mode 0 with single plane enabled */
+    if (s->cached_simple_write == 2) {
+        uint8_t pmask = s->cached_plane_mask;
+
+        /* Only handle single-plane writes for string operations */
+        if ((pmask & (pmask - 1)) == 0 && pmask != 0) {
+            int target_plane = __builtin_ctz(pmask);
+
+            /* Bounds check */
+            if ((addr + len) * 4 > s->vga_ram_size)
+                return false;
+
+            /* Mark dirty pages for double buffering (addr is dword offset) */
+            uint32_t start_page = addr >> 10;
+            uint32_t end_page = (addr + len - 1) >> 10;
+            for (uint32_t p = start_page; p <= end_page && p < 64; p++)
+                s->dirty_pages |= (1ULL << p);
+
+            /* Write each byte to the selected plane */
+            uint8_t *dst = s->vga_ram + addr * 4 + target_plane;
+            for (int i = 0; i < len; i++) {
+                *dst = buf[i];
+                dst += 4;  /* Skip to next dword (same plane, next offset) */
+            }
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -3011,6 +3185,46 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
 #ifdef DEBUG_VGA_MEM
     printf("vga: [0x" TARGET_FMT_plx "] = 0x%02x\n", addr, val);
 #endif
+
+    /* Ultra-fast Mode X path - skip all mode checks when cached state is valid */
+    uint8_t fast = s->cached_simple_write;
+    if (fast && s->cached_memmap_mode == 1) {
+        addr &= 0xffff;  /* 64KB window */
+        addr += s->bank_offset;
+        if (fast == 1) {
+            /* Write mode 1: latch copy */
+            if (addr * 4 >= s->vga_ram_size)
+                return;
+            /* Mark 4KB page dirty for double buffering (addr is dword offset) */
+            s->dirty_pages |= (1ULL << (addr >> 10));
+            uint8_t pmask = s->cached_plane_mask;
+            if (pmask == 0x0f) {
+                ((uint32_t *)s->vga_ram)[addr] = s->latch;
+            } else {
+                uint32_t wmask = mask16[pmask];
+                uint32_t *p = &((uint32_t *)s->vga_ram)[addr];
+                *p = (*p & ~wmask) | (s->latch & wmask);
+            }
+            return;
+        } else {
+            /* Write mode 0: direct write all planes (fast == 2) */
+            if (addr * 4 + 3 >= s->vga_ram_size)
+                return;
+            /* Mark 4KB page dirty for double buffering (addr is dword offset) */
+            s->dirty_pages |= (1ULL << (addr >> 10));
+            uint32_t val32 = val | (val << 8) | (val << 16) | (val << 24);
+            uint8_t pmask = s->cached_plane_mask;
+            if (pmask == 0x0f) {
+                ((uint32_t *)s->vga_ram)[addr] = val32;
+            } else {
+                uint32_t wmask = mask16[pmask];
+                uint32_t *p = &((uint32_t *)s->vga_ram)[addr];
+                *p = (*p & ~wmask) | (val32 & wmask);
+            }
+            return;
+        }
+    }
+
     /* convert to VGA memory offset */
     memory_map_mode = (s->gr[VGA_GFX_MISC] >> 2) & 3;
     addr &= 0x1ffff;
@@ -3040,6 +3254,8 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
         plane = addr & 3;
         mask = (1 << plane);
         if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
+            /* Mark 4KB page dirty for double buffering */
+            s->dirty_pages |= (1ULL << (addr >> 12));
             s->vga_ram[addr] = val;
 #ifdef DEBUG_VGA_MEM
             printf("vga: chain4: [0x" TARGET_FMT_plx "]\n", addr);
@@ -3056,6 +3272,8 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
             if (addr >= s->vga_ram_size) {
                 return;
             }
+            /* Mark 4KB page dirty for double buffering */
+            s->dirty_pages |= (1ULL << (addr >> 12));
             s->vga_ram[addr] = val;
 #ifdef DEBUG_VGA_MEM
             printf("vga: odd/even: [0x" TARGET_FMT_plx "]\n", addr);
@@ -3064,7 +3282,69 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
 //            memory_region_set_dirty(&s->vram, addr, 1);
         }
     } else {
-        /* standard VGA latched access */
+        /* standard VGA latched access (Mode X / planar) */
+        uint8_t fast = s->cached_simple_write;
+
+        /* Fast path for write mode 1 (latch copy) - ignores bit mask */
+        if (fast == 1) {
+            uint8_t pmask = s->cached_plane_mask;
+
+            /* Bounds check: addr is the dword offset into vga_ram */
+            if (addr * 4 >= s->vga_ram_size)
+                return;
+
+            /* Mark 4KB page dirty for double buffering (addr is dword offset) */
+            s->dirty_pages |= (1ULL << (addr >> 10));
+
+            if (pmask == 0x0f) {
+                /* All 4 planes - direct 32-bit write */
+                ((uint32_t *)s->vga_ram)[addr] = s->latch;
+            } else {
+                /* Partial planes - masked write */
+                uint32_t wmask = mask16[pmask];
+                ((uint32_t *)s->vga_ram)[addr] =
+                    (((uint32_t *)s->vga_ram)[addr] & ~wmask) |
+                    (s->latch & wmask);
+            }
+            return;
+        }
+
+        /* Fast path for write mode 0 (simple byte write, no special features) */
+        if (fast == 2) {
+            uint8_t pmask = s->cached_plane_mask;
+
+            /* Bounds check: addr is the dword offset into vga_ram */
+            if (addr * 4 >= s->vga_ram_size)
+                return;
+
+            /* Mark 4KB page dirty for double buffering (addr is dword offset) */
+            s->dirty_pages |= (1ULL << (addr >> 10));
+
+            /* Replicate byte to 32 bits */
+            uint32_t val32 = val8 | (val8 << 8);
+            val32 |= val32 << 16;
+
+            if (pmask == 0x0f) {
+                /* All 4 planes - direct 32-bit write */
+                ((uint32_t *)s->vga_ram)[addr] = val32;
+            } else if ((pmask & (pmask - 1)) == 0 && pmask != 0) {
+                /* Single plane enabled (power of 2): direct byte write
+                 * This is the most common Mode X case for pixel drawing */
+                int plane = __builtin_ctz(pmask);  /* Count trailing zeros */
+                s->vga_ram[addr * 4 + plane] = val8;
+            } else {
+                /* Multiple (but not all) planes */
+                uint32_t wmask = mask16[pmask];
+                ((uint32_t *)s->vga_ram)[addr] =
+                    (((uint32_t *)s->vga_ram)[addr] & ~wmask) |
+                    (val32 & wmask);
+            }
+            return;
+        }
+
+        /* Slow path counter */
+
+        /* Slow path: full VGA latched write logic */
         write_mode = s->gr[VGA_GFX_MODE] & 3;
         switch(write_mode) {
         default:
@@ -3132,6 +3412,8 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
         if (addr * sizeof(uint32_t) >= s->vga_ram_size) {
             return;
         }
+        /* Mark 4KB page dirty for double buffering (addr is dword offset) */
+        s->dirty_pages |= (1ULL << (addr >> 10));
         ((uint32_t *)s->vga_ram)[addr] =
             (((uint32_t *)s->vga_ram)[addr] & ~write_mask) |
             (val & write_mask);
@@ -3143,10 +3425,34 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
     }
 }
 
-uint8_t vga_mem_read(VGAState *s, uint32_t addr)
+uint8_t IRAM_ATTR vga_mem_read(VGAState *s, uint32_t addr)
 {
     int memory_map_mode, plane;
     uint32_t ret;
+
+    /* Fast path for Mode X reads (read mode 0, unchained planar)
+     * Conditions: not chain4, not odd/even, memory map mode 0 or 1, read mode 0 */
+    if (!s->cached_chain4 &&
+        !(s->gr[VGA_GFX_MODE] & 0x10) &&  /* not odd/even */
+        !(s->gr[VGA_GFX_MODE] & 0x08) &&  /* read mode 0 */
+        s->cached_memmap_mode <= 1) {
+
+        addr &= 0x1ffff;
+        if (s->cached_memmap_mode == 1) {
+            if (addr >= 0x10000)
+                return 0xff;
+            addr += s->bank_offset;
+        }
+
+        /* Bounds check */
+        if (addr * 4 >= s->vga_ram_size)
+            return 0xff;
+
+        /* Load latch and return selected plane */
+        s->latch = ((uint32_t *)s->vga_ram)[addr];
+        plane = s->gr[VGA_GFX_PLANE_READ];
+        return GET_PLANE(s->latch, plane);
+    }
 
     /* convert to VGA memory offset */
     memory_map_mode = (s->gr[VGA_GFX_MISC] >> 2) & 3;
@@ -3268,11 +3574,163 @@ bool IRAM_ATTR vga_mem_read_string(VGAState *s, uint32_t addr, uint8_t *buf, int
         uint32_t phys_addr = addr + s->bank_offset;
         if (phys_addr + len <= s->vga_ram_size) {
             memcpy(buf, s->vga_ram + phys_addr, len);
-            return true;
+                return true;
         }
     }
 
+    /* Mode X fast path: read mode 0, unchained planar */
+    if (!s->cached_chain4 &&
+        !(s->gr[VGA_GFX_MODE] & 0x10) &&  /* not odd/even */
+        !(s->gr[VGA_GFX_MODE] & 0x08) &&  /* read mode 0 */
+        s->cached_memmap_mode <= 1) {
+
+        if (s->cached_memmap_mode == 1) {
+            if (addr + len > 0x10000)
+                return false;
+            addr += s->bank_offset;
+        }
+
+        /* Bounds check */
+        if ((addr + len) * 4 > s->vga_ram_size)
+            return false;
+
+        int plane = s->gr[VGA_GFX_PLANE_READ];
+        uint32_t *vram32 = (uint32_t *)s->vga_ram;
+
+        /* Read each byte from the selected plane, loading latch each time */
+        for (int i = 0; i < len; i++) {
+            s->latch = vram32[addr + i];
+            buf[i] = GET_PLANE(s->latch, plane);
+        }
+        return true;
+    }
+
     return false;  /* Use slow path */
+}
+
+/* Returns direct VGA RAM pointer if chain-4 mode is active, NULL otherwise.
+ * This allows bypassing callbacks for mode 13h memory access. */
+uint8_t *vga_get_direct_ptr(VGAState *s)
+{
+    int memory_map_mode = (s->gr[VGA_GFX_MISC] >> 2) & 3;
+
+    /* Only enable direct access for chain-4 mode with memory map mode 1
+     * (standard 64KB at A0000, as used by mode 13h) and bank offset 0 */
+    if ((s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) &&
+        memory_map_mode == 1 &&
+        s->bank_offset == 0) {
+        return (uint8_t *)s->vga_ram;
+    }
+    return NULL;
+}
+
+/* Debug: report why direct mode is disabled */
+void vga_debug_direct_conditions(VGAState *s)
+{
+    int memory_map_mode = (s->gr[VGA_GFX_MISC] >> 2) & 3;
+    int chain4 = (s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) ? 1 : 0;
+    fprintf(stderr, "VGA direct mode DISABLED: chain4=%d memmap=%d bank=%d\n",
+            chain4, memory_map_mode, s->bank_offset);
+}
+
+/* Bulk VGA-to-VGA copy for Mode X latch operations (scrolling/blitting)
+ * Performs: for each byte: read src (loads latch), write dst (copies latch) */
+bool IRAM_ATTR vga_mem_copy_string(VGAState *s, uint32_t dst, uint32_t src, int len)
+{
+    /* Only handle Mode X with write mode 1 (latch copy) */
+    if (s->cached_simple_write != 1)
+        return false;
+
+    int memory_map_mode = s->cached_memmap_mode;
+    if (memory_map_mode > 1)
+        return false;
+
+    /* Adjust addresses */
+    dst &= 0x1ffff;
+    src &= 0x1ffff;
+    if (memory_map_mode == 1) {
+        if (dst >= 0x10000 || src >= 0x10000)
+            return false;
+        dst += s->bank_offset;
+        src += s->bank_offset;
+    }
+
+    /* Bounds check */
+    if ((dst + len) * 4 > s->vga_ram_size || (src + len) * 4 > s->vga_ram_size)
+        return false;
+
+    /* Mark dirty pages for double buffering (dst is dword offset) */
+    uint32_t start_page = dst >> 10;
+    uint32_t end_page = (dst + len - 1) >> 10;
+    for (uint32_t p = start_page; p <= end_page && p < 64; p++)
+        s->dirty_pages |= (1ULL << p);
+
+    uint8_t pmask = s->cached_plane_mask;
+    uint32_t *vram32 = (uint32_t *)s->vga_ram;
+
+    if (pmask == 0x0f) {
+        /* All 4 planes - bulk 32-bit copy */
+        for (int i = 0; i < len; i++) {
+            vram32[dst + i] = vram32[src + i];
+        }
+    } else {
+        /* Partial planes - masked copy */
+        uint32_t wmask = ((pmask & 1) ? 0x000000ff : 0) |
+                         ((pmask & 2) ? 0x0000ff00 : 0) |
+                         ((pmask & 4) ? 0x00ff0000 : 0) |
+                         ((pmask & 8) ? 0xff000000 : 0);
+        for (int i = 0; i < len; i++) {
+            uint32_t latch = vram32[src + i];
+            vram32[dst + i] = (vram32[dst + i] & ~wmask) | (latch & wmask);
+        }
+    }
+
+    /* Update latch to final value (for subsequent operations) */
+    s->latch = vram32[src + len - 1];
+
+    return true;
+}
+
+/* Get Mode X state for CPU inline fast path
+ * Returns NULL for vga_modex_ram if Mode X inline is not possible */
+void vga_get_modex_state(VGAState *s, uint8_t **ram, uint32_t *ram_size,
+                         uint8_t *write_mode, uint8_t *plane_mask,
+                         uint8_t *read_plane, uint32_t **latch)
+{
+    /* DISABLED - inline Mode X causes graphics corruption.
+     * The VGA-to-VGA copy (iomem_copy_string) still works. */
+    (void)s;
+    *ram = NULL;
+    *ram_size = 0;
+    *write_mode = 0xFF;
+    *plane_mask = 0;
+    *read_plane = 0;
+    *latch = NULL;
+}
+
+/* Mark VGA lines dirty after direct write (addr is VGA-relative, 0-0xFFFF) */
+void vga_direct_mark_dirty(VGAState *s, uint32_t addr, int len)
+{
+    /* Mark 4KB pages dirty for double buffering (addr is byte offset) */
+    uint32_t start_page = addr >> 12;
+    uint32_t end_page = (addr + len - 1) >> 12;
+    for (uint32_t p = start_page; p <= end_page && p < 64; p++)
+        s->dirty_pages |= (1ULL << p);
+
+#ifdef TANMATSU_BUILD
+    /* For mode 13h: 320 pixels per line, addr / 320 = line number */
+    int line_start = addr / 320;
+    int line_end = (addr + len - 1) / 320;
+
+    /* Clamp to valid range */
+    if (line_start < 0) line_start = 0;
+    if (line_end >= VGA_MAX_LINES) line_end = VGA_MAX_LINES - 1;
+
+    /* Mark lines dirty using existing mechanism */
+    for (int y = line_start; y <= line_end; y++) {
+        vga_mark_line_dirty(y);
+    }
+#endif
 }
 
 static void vga_initmode(VGAState *s);
@@ -3309,6 +3767,16 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
     s->vga_ram = (uint8_t *) vga_ram;
     s->vga_ram_size = vga_ram_size;
 
+    /* Allocate render buffer for tear-free display */
+#ifdef BUILD_ESP32
+    s->render_vga_ram = heap_caps_malloc(vga_ram_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+    s->render_vga_ram = malloc(vga_ram_size);
+#endif
+    if (s->render_vga_ram) {
+        memcpy(s->render_vga_ram, vga_ram, vga_ram_size);
+    }
+
     s->vbe_regs[VBE_DISPI_INDEX_ID] = VBE_DISPI_ID5;
     s->vbe_regs[VBE_DISPI_INDEX_VIDEO_MEMORY_64K] = s->vga_ram_size >> 16;
 
@@ -3336,6 +3804,10 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
 #endif
 
     vga_initmode(s);
+
+    /* Initialize cached state for Mode X fast path */
+    vga_update_cached_state(s);
+
     return s;
 }
 

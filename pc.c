@@ -9,6 +9,8 @@
 #include <unistd.h>
 #ifdef BUILD_ESP32
 #include "common.h"
+#else
+#define IRAM_ATTR
 #endif
 
 #ifdef USEKVM
@@ -497,6 +499,30 @@ void pc_step(PC *pc)
 	int refresh = vga_step(pc->vga);
 #endif
 
+	/* Update VGA direct access pointer (detects mode changes) */
+	{
+		static u8 *last_direct = (u8*)1;  /* Invalid initial value to force first report */
+		u8 *new_direct = vga_get_direct_ptr(pc->vga);
+		if (new_direct != last_direct) {
+			if (new_direct) {
+				fprintf(stderr, "VGA direct mode ENABLED at %p\n", (void*)new_direct);
+			} else {
+				/* Debug: report why disabled */
+				vga_debug_direct_conditions(pc->vga);
+			}
+			last_direct = new_direct;
+		}
+		pc->cpu_cb->vga_direct = new_direct;
+
+		/* Update Mode X inline fast path state */
+		vga_get_modex_state(pc->vga, &pc->cpu_cb->vga_modex_ram,
+		                    &pc->cpu_cb->vga_modex_ram_size,
+		                    &pc->cpu_cb->vga_modex_write_mode,
+		                    &pc->cpu_cb->vga_modex_plane_mask,
+		                    &pc->cpu_cb->vga_modex_read_plane,
+		                    &pc->cpu_cb->vga_modex_latch);
+	}
+
 #ifdef BUILD_ESP32
 	/* Check if VGA mode changed - reset batch for new program */
 	if (globals.batch_reset_pending) {
@@ -506,14 +532,7 @@ void pc_step(PC *pc)
 		step_count = 0;
 	}
 
-	/* Instrumentation for monitoring */
-	static uint32_t stat_cpu_us = 0;
-	static uint32_t stat_periph_us = 0;
-	static uint32_t stat_calls = 0;
-	static uint32_t stat_last_report = 0;
-	uint32_t t0, t1, t2;
-
-	t0 = get_uticks();
+	uint32_t t0 = get_uticks();
 
 	/* Burst catch-up for high-frequency PIT interrupts.
 	 * When games program PIT for music timing (e.g., 6000+ Hz), we can't
@@ -562,12 +581,10 @@ void pc_step(PC *pc)
 	cpukvm_step(pc->cpu, 4096);
 #else
 #ifdef BUILD_ESP32
-	t1 = get_uticks();
 	cpui386_step(pc->cpu, batch_size);
-	t2 = get_uticks();
 
 	/* Track step timing for dynamic batch adjustment */
-	uint32_t step_time = t2 - t0;
+	uint32_t step_time = get_uticks() - t0;
 	step_time_accum += step_time;
 	step_count++;
 
@@ -576,9 +593,9 @@ void pc_step(PC *pc)
 		uint32_t avg_step_time = step_time_accum / step_count;
 
 		/* Hysteresis thresholds to prevent oscillation:
-		 * - Scale UP by 256 if avg < 800µs (fast steps, room to grow)
-		 * - Scale DOWN by 256 if avg > 2000µs (slow steps, reduce load)
-		 * - Dead zone 800-2000µs: hold current batch size
+		 * - Scale UP by 256 if avg < 800us (fast steps, room to grow)
+		 * - Scale DOWN by 256 if avg > 2000us (slow steps, reduce load)
+		 * - Dead zone 800-2000us: hold current batch size
 		 * Range: 512-4096, step size 256 (15 levels) */
 		if (avg_step_time < 800 && batch_size < 4096) {
 			batch_size += 256;
@@ -588,28 +605,6 @@ void pc_step(PC *pc)
 
 		step_time_accum = 0;
 		step_count = 0;
-	}
-
-	/* Instrumentation */
-	stat_periph_us += (t1 - t0);
-	stat_cpu_us += (t2 - t1);
-	stat_calls++;
-
-	/* Report every ~2 seconds */
-	if (t2 - stat_last_report >= 2000000) {
-		uint32_t total = stat_cpu_us + stat_periph_us;
-		if (total > 0) {
-			fprintf(stderr, "pc_step stats: %u calls, cpu=%u us (%u%%), periph=%u us (%u%%), avg=%u us/call, batch=%d\n",
-				stat_calls,
-				stat_cpu_us, (stat_cpu_us * 100) / total,
-				stat_periph_us, (stat_periph_us * 100) / total,
-				total / stat_calls,
-				batch_size);
-		}
-		stat_cpu_us = 0;
-		stat_periph_us = 0;
-		stat_calls = 0;
-		stat_last_report = t2;
 	}
 #else
 	cpui386_step(pc->cpu, 10240);
@@ -651,111 +646,131 @@ static void set_pci_vga_bar(void *opaque, int bar_num, uint32_t addr, bool enabl
 #endif
 }
 
-static u8 iomem_read8(void *iomem, uword addr)
+static u8 IRAM_ATTR iomem_read8(void *iomem, uword addr)
 {
 	PC *pc = iomem;
+	/* Fast path for legacy VGA (Mode X uses 0xA0000-0xAFFFF) */
+	if (addr < 0xc0000)
+		return vga_mem_read(pc->vga, addr - 0xa0000);
+	/* PCI VGA linear framebuffer (VBE modes) */
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		addr -= vga_addr2;
 		if (addr < pc->vga_mem_size)
 			return pc->vga_mem[addr];
-		else
-			return 0;
 	}
-	return vga_mem_read(pc->vga, addr - 0xa0000);
+	return 0;
 }
 
-static void iomem_write8(void *iomem, uword addr, u8 val)
+static void IRAM_ATTR iomem_write8(void *iomem, uword addr, u8 val)
 {
 	PC *pc = iomem;
+	/* Fast path for legacy VGA (Mode X uses 0xA0000-0xAFFFF) */
+	if (addr < 0xc0000) {
+		vga_mem_write(pc->vga, addr - 0xa0000, val);
+		return;
+	}
+	/* PCI VGA linear framebuffer (VBE modes) */
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		addr -= vga_addr2;
 		if (addr < pc->vga_mem_size)
 			pc->vga_mem[addr] = val;
-		return;
 	}
-	vga_mem_write(pc->vga, addr - 0xa0000, val);
 }
 
-static u16 iomem_read16(void *iomem, uword addr)
+static u16 IRAM_ATTR iomem_read16(void *iomem, uword addr)
 {
 	PC *pc = iomem;
+	/* Fast path for legacy VGA (Mode X) */
+	if (addr < 0xc0000)
+		return vga_mem_read16(pc->vga, addr - 0xa0000);
+	/* PCI VGA linear framebuffer */
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		addr -= vga_addr2;
 		if (addr + 1 < pc->vga_mem_size)
 			return *(uint16_t *)&(pc->vga_mem[addr]);
-		else
-			return 0;
 	}
-	return vga_mem_read16(pc->vga, addr - 0xa0000);
+	return 0;
 }
 
-static void iomem_write16(void *iomem, uword addr, u16 val)
+static void IRAM_ATTR iomem_write16(void *iomem, uword addr, u16 val)
 {
 	PC *pc = iomem;
-	// fast path for vga ram
+	/* Fast path for legacy VGA (Mode X) */
+	if (addr < 0xc0000) {
+		vga_mem_write16(pc->vga, addr - 0xa0000, val);
+		return;
+	}
+	/* PCI VGA linear framebuffer */
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		addr -= vga_addr2;
 		if (addr + 1 < pc->vga_mem_size)
 			*(uint16_t *)&(pc->vga_mem[addr]) = val;
-		return;
 	}
-	vga_mem_write16(pc->vga, addr - 0xa0000, val);
 }
 
-static u32 iomem_read32(void *iomem, uword addr)
+static u32 IRAM_ATTR iomem_read32(void *iomem, uword addr)
 {
 	PC *pc = iomem;
+	/* Fast path for legacy VGA (Mode X) */
+	if (addr < 0xc0000)
+		return vga_mem_read32(pc->vga, addr - 0xa0000);
+	/* PCI VGA linear framebuffer */
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		addr -= vga_addr2;
 		if (addr + 3 < pc->vga_mem_size)
 			return *(uint32_t *)&(pc->vga_mem[addr]);
-		else
-			return 0;
 	}
-	return vga_mem_read32(pc->vga, addr - 0xa0000);
+	return 0;
 }
 
-static void iomem_write32(void *iomem, uword addr, u32 val)
+static void IRAM_ATTR iomem_write32(void *iomem, uword addr, u32 val)
 {
 	PC *pc = iomem;
-	// fast path for vga ram
+	/* Fast path for legacy VGA (Mode X) */
+	if (addr < 0xc0000) {
+		vga_mem_write32(pc->vga, addr - 0xa0000, val);
+		return;
+	}
+	/* PCI VGA linear framebuffer */
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
-		uword vga_addr2 = pc->pci_vga_ram_addr;
 		addr -= vga_addr2;
 		if (addr + 3 < pc->vga_mem_size)
 			*(uint32_t *)&(pc->vga_mem[addr]) = val;
-		return;
 	}
 	vga_mem_write32(pc->vga, addr - 0xa0000, val);
 }
 
-static bool iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)
+static bool IRAM_ATTR iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)
 {
 	PC *pc = iomem;
-	// fast path for vga ram
+	/* Fast path for legacy VGA (Mode X) */
+	if (addr < 0xc0000)
+		return vga_mem_write_string(pc->vga, addr - 0xa0000, buf, len);
+	/* PCI VGA linear framebuffer */
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
-		uword vga_addr2 = pc->pci_vga_ram_addr;
 		addr -= vga_addr2;
 		if (addr + len < pc->vga_mem_size) {
 			memcpy(pc->vga_mem + addr, buf, len);
 			return true;
 		}
-		return false;
 	}
-	return vga_mem_write_string(pc->vga, addr - 0xa0000, buf, len);
+	return false;
 }
 
-static bool iomem_read_string(void *iomem, uword addr, uint8_t *buf, int len)
+static bool IRAM_ATTR iomem_read_string(void *iomem, uword addr, uint8_t *buf, int len)
 {
 	PC *pc = iomem;
-	// fast path for vga ram
+	/* Fast path for legacy VGA (Mode X) */
+	if (addr < 0xc0000)
+		return vga_mem_read_string(pc->vga, addr - 0xa0000, buf, len);
+	/* PCI VGA linear framebuffer */
 	uword vga_addr2 = pc->pci_vga_ram_addr;
 	if (addr >= vga_addr2) {
 		addr -= vga_addr2;
@@ -763,15 +778,31 @@ static bool iomem_read_string(void *iomem, uword addr, uint8_t *buf, int len)
 			memcpy(buf, pc->vga_mem + addr, len);
 			return true;
 		}
-		return false;
 	}
-	return vga_mem_read_string(pc->vga, addr - 0xa0000, buf, len);
+	return false;
+}
+
+static bool IRAM_ATTR iomem_copy_string(void *iomem, uword dst, uword src, int len)
+{
+	PC *pc = iomem;
+	/* Only handle VGA memory copies (Mode X latch operations) */
+	if (dst < 0xc0000 && src < 0xc0000)
+		return vga_mem_copy_string(pc->vga, dst - 0xa0000, src - 0xa0000, len);
+	return false;
 }
 
 static void pc_reset_request(void *p)
 {
 	PC *pc = p;
 	pc->reset_request = 1;
+}
+
+/* Callback for direct VGA writes - marks lines dirty for rendering */
+static void vga_direct_write_notify(void *iomem, uword addr, int len)
+{
+	PC *pc = iomem;
+	/* Convert from physical address (0xA0000+) to VGA-relative address */
+	vga_direct_mark_dirty(pc->vga, addr - 0xa0000, len);
 }
 
 PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
@@ -794,6 +825,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	if (conf->fpu)
 		cpui386_enable_fpu(pc->cpu);
 #endif
+	pc->cpu_cb = cb;
 	pc->bios = conf->bios;
 	pc->vga_bios = conf->vga_bios;
 	pc->linuxstart = conf->linuxstart;
@@ -894,6 +926,16 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	cb->iomem_write32 = iomem_write32;
 	cb->iomem_write_string = iomem_write_string;
 	cb->iomem_read_string = iomem_read_string;
+	cb->iomem_copy_string = iomem_copy_string;
+
+	/* Set up direct VGA access for chain-4 mode (mode 13h) */
+	cb->vga_direct = vga_get_direct_ptr(pc->vga);
+	cb->vga_direct_write_notify = vga_direct_write_notify;
+
+	/* Set up Mode X inline fast path (initially may be NULL) */
+	vga_get_modex_state(pc->vga, &cb->vga_modex_ram, &cb->vga_modex_ram_size,
+	                    &cb->vga_modex_write_mode, &cb->vga_modex_plane_mask,
+	                    &cb->vga_modex_read_plane, &cb->vga_modex_latch);
 
 	pc->redraw = redraw;
 	pc->redraw_data = redraw_data;
@@ -1147,6 +1189,8 @@ int parse_conf_ini(void* user, const char* section,
 			conf->frame_skip = atoi(value);
 			if (conf->frame_skip < 0) conf->frame_skip = 0;
 			if (conf->frame_skip > 10) conf->frame_skip = 10;
+		} else if (NAME("double_buffer")) {
+			conf->double_buffer = atoi(value) ? 1 : 0;
 		}
 	} else if (SEC("cpu")) {
 		if (NAME("gen")) {

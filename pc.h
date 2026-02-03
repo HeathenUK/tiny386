@@ -36,6 +36,7 @@ typedef CPUI386 CPU;
 
 typedef struct {
 	CPU *cpu;
+	CPU_CB *cpu_cb;  /* CPU callbacks, used for VGA direct mode updates */
 	PicState2 *pic;
 	PITState *pit;
 	U8250 *serial;
@@ -111,6 +112,7 @@ typedef struct {
 	int vga_force_8dm;
 	int boot_order;  // 0=HDD, 1=Floppy, 2=CD (see misc.h BOOT_ORDER_*)
 	int frame_skip;  // 0=disabled, 1-10=max frames to skip (adaptive)
+	int double_buffer;  // 0=disabled, 1=enabled (tear-free VGA rendering)
 	int brightness;  // 0-100 display brightness (ESP32 only)
 	int volume;      // 0-100 audio volume (ESP32 only)
 	const char *ini_path;  // Path to ini file for saving settings

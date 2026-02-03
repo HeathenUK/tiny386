@@ -40,6 +40,22 @@ typedef struct {
 	void (*iomem_write32)(void *, uword, u32);
 	bool (*iomem_write_string)(void *, uword, uint8_t *, int);
 	bool (*iomem_read_string)(void *, uword, uint8_t *, int);
+	/* VGA-to-VGA copy for Mode X latch operations (REP MOVSB scrolling) */
+	bool (*iomem_copy_string)(void *, uword dst, uword src, int len);
+
+	/* Direct VGA memory access for chain-4 mode (mode 13h)
+	 * When non-NULL, VGA reads/writes at 0xA0000-0xAFFFF bypass callbacks */
+	u8 *vga_direct;
+	void (*vga_direct_write_notify)(void *iomem, uword addr, int len);
+
+	/* Mode X fast path state (updated by VGA on register changes)
+	 * When non-NULL, CPU can inline Mode X read/write operations */
+	u8 *vga_modex_ram;           /* VGA RAM pointer for Mode X access */
+	u32 vga_modex_ram_size;      /* VGA RAM size in bytes */
+	u8 vga_modex_write_mode;     /* 0=fast wm0, 1=fast wm1, 0xFF=use callback */
+	u8 vga_modex_plane_mask;     /* Plane write mask (SR[2]) */
+	u8 vga_modex_read_plane;     /* Read plane (GR[4]) */
+	u32 *vga_modex_latch;        /* Pointer to latch register */
 } CPU_CB;
 
 CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb);

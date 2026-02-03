@@ -663,22 +663,10 @@ static bool IRAM_ATTR tlb_refill(CPUI386 *cpu, struct tlb_entry *ent, uword lpgn
 	return true;
 }
 
-#ifdef BUILD_ESP32
-/* Instrumentation counters for performance analysis */
-static uint32_t tlb_hits = 0;
-static uint32_t tlb_misses = 0;
-static uint32_t flat_accesses = 0;
-static uint32_t nonflat_accesses = 0;
-
-#endif
-
 static bool IRAM_ATTR translate_lpgno(CPUI386 *cpu, int rwm, uword lpgno, uword laddr, int cpl, uword *paddr)
 {
 	struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
 	if (ent->lpgno != lpgno) {
-#ifdef BUILD_ESP32
-		tlb_misses++;
-#endif
 		if (!tlb_refill(cpu, ent, lpgno)) {
 			cpu->cr2 = laddr;
 			cpu->excno = EX_PF;
@@ -690,11 +678,6 @@ static bool IRAM_ATTR translate_lpgno(CPUI386 *cpu, int rwm, uword lpgno, uword 
 			return false;
 		}
 	}
-#ifdef BUILD_ESP32
-	else {
-		tlb_hits++;
-	}
-#endif
 	if (ent->pte_lookup[cpl > 0][rwm > 1]) {
 		cpu->cr2 = laddr;
 		cpu->excno = EX_PF;
@@ -767,14 +750,8 @@ static bool IRAM_ATTR translate(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uw
 
 	/* Fast path for flat segments (base=0, limit=4GB): skip base addition and segcheck */
 	if (likely(SEG_IS_FLAT(cpu, seg))) {
-#ifdef BUILD_ESP32
-		flat_accesses++;
-#endif
 		laddr = addr;
 	} else {
-#ifdef BUILD_ESP32
-		nonflat_accesses++;
-#endif
 		laddr = cpu->seg[seg].base + addr;
 		TRYL(segcheck(cpu, rwm, seg, addr, size));
 	}
@@ -847,9 +824,27 @@ static inline bool in_iomem(uword addr)
 	return (addr >= 0xa0000 && addr < 0xc0000) || addr >= 0xe0000000;
 }
 
+/* Check if address is in VGA direct-access range (0xA0000-0xAFFFF, 64KB) */
+static inline bool in_vga_direct(uword addr)
+{
+	return addr >= 0xa0000 && addr < 0xb0000;
+}
+
 static u8 IRAM_ATTR load8(CPUI386 *cpu, OptAddr *res)
 {
 	uword addr = res->addr1;
+	/* Fast path for VGA direct access (chain-4 mode) */
+	if (cpu->cb.vga_direct && in_vga_direct(addr))
+		return cpu->cb.vga_direct[addr - 0xa0000];
+	/* Fast path for Mode X reads (inline to avoid callback overhead) */
+	if (cpu->cb.vga_modex_ram && in_vga_direct(addr)) {
+		uword vga_addr = addr - 0xa0000;
+		if (vga_addr * 4 < cpu->cb.vga_modex_ram_size) {
+			/* Load latch and return selected plane */
+			*cpu->cb.vga_modex_latch = ((u32 *)cpu->cb.vga_modex_ram)[vga_addr];
+			return (u8)(*cpu->cb.vga_modex_latch >> (cpu->cb.vga_modex_read_plane * 8));
+		}
+	}
 	if (in_iomem(addr) && cpu->cb.iomem_read8)
 		return cpu->cb.iomem_read8(cpu->cb.iomem, addr);
 	if (unlikely(addr >= cpu->phys_mem_size)) {
@@ -860,6 +855,9 @@ static u8 IRAM_ATTR load8(CPUI386 *cpu, OptAddr *res)
 
 static u16 IRAM_ATTR load16(CPUI386 *cpu, OptAddr *res)
 {
+	/* Fast path for VGA direct access (chain-4 mode) */
+	if (cpu->cb.vga_direct && in_vga_direct(res->addr1) && in_vga_direct(res->addr1 + 1))
+		return *(u16 *)(cpu->cb.vga_direct + res->addr1 - 0xa0000);
 	if (in_iomem(res->addr1) && cpu->cb.iomem_read16)
 		return cpu->cb.iomem_read16(cpu->cb.iomem, res->addr1);
 	if (unlikely(res->addr1 >= cpu->phys_mem_size)) {
@@ -873,6 +871,9 @@ static u16 IRAM_ATTR load16(CPUI386 *cpu, OptAddr *res)
 
 static u32 IRAM_ATTR load32(CPUI386 *cpu, OptAddr *res)
 {
+	/* Fast path for VGA direct access (chain-4 mode) */
+	if (cpu->cb.vga_direct && in_vga_direct(res->addr1) && in_vga_direct(res->addr1 + 3))
+		return *(u32 *)(cpu->cb.vga_direct + res->addr1 - 0xa0000);
 	if (in_iomem(res->addr1) && cpu->cb.iomem_read32)
 		return cpu->cb.iomem_read32(cpu->cb.iomem, res->addr1);
 	if (unlikely(res->addr1 >= cpu->phys_mem_size)) {
@@ -898,6 +899,65 @@ static u32 IRAM_ATTR load32(CPUI386 *cpu, OptAddr *res)
 static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 {
 	uword addr = res->addr1;
+	/* Fast path for VGA direct access (chain-4 mode) */
+	if (cpu->cb.vga_direct && in_vga_direct(addr)) {
+		cpu->cb.vga_direct[addr - 0xa0000] = val;
+		if (cpu->cb.vga_direct_write_notify)
+			cpu->cb.vga_direct_write_notify(cpu->cb.iomem, addr, 1);
+		return;
+	}
+	/* Fast path for Mode X writes (inline to avoid callback overhead) */
+	if (cpu->cb.vga_modex_ram && in_vga_direct(addr)) {
+		uword vga_addr = addr - 0xa0000;
+		if (vga_addr * 4 < cpu->cb.vga_modex_ram_size) {
+			u8 wm = cpu->cb.vga_modex_write_mode;
+			u8 pmask = cpu->cb.vga_modex_plane_mask;
+			u8 *vram = cpu->cb.vga_modex_ram;
+
+			if (wm == 1) {
+				/* Write mode 1: latch copy */
+				u32 latch = *cpu->cb.vga_modex_latch;
+				if (pmask == 0x0f) {
+					((u32 *)vram)[vga_addr] = latch;
+				} else {
+					u32 wmask = ((pmask & 1) ? 0x000000ff : 0) |
+					            ((pmask & 2) ? 0x0000ff00 : 0) |
+					            ((pmask & 4) ? 0x00ff0000 : 0) |
+					            ((pmask & 8) ? 0xff000000 : 0);
+					((u32 *)vram)[vga_addr] = (((u32 *)vram)[vga_addr] & ~wmask) |
+					                          (latch & wmask);
+				}
+				/* Notify for dirty page tracking (vga_addr is dword offset, convert to bytes) */
+				if (cpu->cb.vga_direct_write_notify)
+					cpu->cb.vga_direct_write_notify(cpu->cb.iomem, 0xa0000 + vga_addr * 4, 4);
+				return;
+			} else if (wm == 0) {
+				/* Write mode 0: simple byte write */
+				u32 val32 = val | (val << 8);
+				val32 |= val32 << 16;
+				if (pmask == 0x0f) {
+					((u32 *)vram)[vga_addr] = val32;
+				} else if ((pmask & (pmask - 1)) == 0 && pmask != 0) {
+					/* Single plane: direct byte write */
+					int plane = (pmask == 1) ? 0 : (pmask == 2) ? 1 :
+					            (pmask == 4) ? 2 : 3;
+					vram[vga_addr * 4 + plane] = val;
+				} else {
+					u32 wmask = ((pmask & 1) ? 0x000000ff : 0) |
+					            ((pmask & 2) ? 0x0000ff00 : 0) |
+					            ((pmask & 4) ? 0x00ff0000 : 0) |
+					            ((pmask & 8) ? 0xff000000 : 0);
+					((u32 *)vram)[vga_addr] = (((u32 *)vram)[vga_addr] & ~wmask) |
+					                          (val32 & wmask);
+				}
+				/* Notify for dirty page tracking (vga_addr is dword offset, convert to bytes) */
+				if (cpu->cb.vga_direct_write_notify)
+					cpu->cb.vga_direct_write_notify(cpu->cb.iomem, 0xa0000 + vga_addr * 4, 4);
+				return;
+			}
+			/* wm == 0xFF means use callback (complex VGA state) */
+		}
+	}
 	if (in_iomem(addr) && cpu->cb.iomem_write8) {
 		cpu->cb.iomem_write8(cpu->cb.iomem, addr, val);
 		return;
@@ -910,6 +970,13 @@ static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 
 static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 {
+	/* Fast path for VGA direct access (chain-4 mode) */
+	if (cpu->cb.vga_direct && in_vga_direct(res->addr1) && in_vga_direct(res->addr1 + 1)) {
+		*(u16 *)(cpu->cb.vga_direct + res->addr1 - 0xa0000) = val;
+		if (cpu->cb.vga_direct_write_notify)
+			cpu->cb.vga_direct_write_notify(cpu->cb.iomem, res->addr1, 2);
+		return;
+	}
 	if (in_iomem(res->addr1) && cpu->cb.iomem_write16) {
 		cpu->cb.iomem_write16(cpu->cb.iomem, res->addr1, val);
 		return;
@@ -927,6 +994,13 @@ static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 
 static void IRAM_ATTR store32(CPUI386 *cpu, OptAddr *res, u32 val)
 {
+	/* Fast path for VGA direct access (chain-4 mode) */
+	if (cpu->cb.vga_direct && in_vga_direct(res->addr1) && in_vga_direct(res->addr1 + 3)) {
+		*(u32 *)(cpu->cb.vga_direct + res->addr1 - 0xa0000) = val;
+		if (cpu->cb.vga_direct_write_notify)
+			cpu->cb.vga_direct_write_notify(cpu->cb.iomem, res->addr1, 4);
+		return;
+	}
 	if (in_iomem(res->addr1) && cpu->cb.iomem_write32) {
 		cpu->cb.iomem_write32(cpu->cb.iomem, res->addr1, val);
 		return;
@@ -3014,6 +3088,21 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 				continue; \
 			} \
 		} \
+		/* Fast path for VGA-to-VGA copy (Mode X scrolling/blitting) */ \
+		if (cpu->cb.iomem_copy_string && \
+		    in_iomem(memls.addr1) && in_iomem(memld.addr1) && \
+		    dir > 0 && \
+		    in_iomem(memls.addr1 + count - 1) && \
+		    in_iomem(memld.addr1 + count - 1)) { \
+			if (cpu->cb.iomem_copy_string( \
+				    cpu->cb.iomem, memld.addr1, memls.addr1, count)) { \
+				sreg ## ABIT(6, lreg ## ABIT(6) + count * dir); \
+				sreg ## ABIT(7, lreg ## ABIT(7) + count * dir); \
+				sreg ## ABIT(1, cx - count); \
+				cx = lreg ## ABIT(1); \
+				continue; \
+			} \
+		} \
 		for (uword i = 0; i <= count - 1; i++) { \
 			store ## BIT(cpu, &memld, load ## BIT(cpu, &memls)); \
 			memld.addr1 += dir; \
@@ -4130,40 +4219,6 @@ static bool verbose;
 #define C_16(_1, ...) CX(_1) C_15(__VA_ARGS__)
 #define C(...) PASTE(C_, ARGCOUNT(__VA_ARGS__))(__VA_ARGS__)
 
-#ifdef BUILD_ESP32
-/* Opcode frequency counter for profiling */
-static uint32_t opcode_freq[256];
-static uint32_t opcode_total = 0;
-
-static void report_hot_opcodes(void)
-{
-	/* Find top 5 opcodes */
-	uint8_t top[5] = {0};
-	for (int i = 0; i < 5; i++) {
-		uint32_t max = 0;
-		for (int j = 0; j < 256; j++) {
-			bool already = false;
-			for (int k = 0; k < i; k++) if (top[k] == j) already = true;
-			if (!already && opcode_freq[j] > max) {
-				max = opcode_freq[j];
-				top[i] = j;
-			}
-		}
-	}
-	if (opcode_total > 0) {
-		fprintf(stderr, "Hot opcodes: 0x%02x=%u%% 0x%02x=%u%% 0x%02x=%u%% 0x%02x=%u%% 0x%02x=%u%%\n",
-			top[0], (opcode_freq[top[0]] * 100) / opcode_total,
-			top[1], (opcode_freq[top[1]] * 100) / opcode_total,
-			top[2], (opcode_freq[top[2]] * 100) / opcode_total,
-			top[3], (opcode_freq[top[3]] * 100) / opcode_total,
-			top[4], (opcode_freq[top[4]] * 100) / opcode_total);
-	}
-	/* Reset */
-	for (int i = 0; i < 256; i++) opcode_freq[i] = 0;
-	opcode_total = 0;
-}
-#endif
-
 static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 {
 #ifndef I386_OPT2
@@ -4197,10 +4252,6 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	TRY(fetch8(cpu, &b1));
 	cpu->cycle++;
 	cpu->tsc++;  /* Base cycle for instruction fetch */
-#ifdef BUILD_ESP32
-	opcode_freq[b1]++;
-	opcode_total++;
-#endif
 
 #ifndef I386_OPT1
 	if (verbose) {
@@ -5445,43 +5496,8 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 	return true;
 }
 
-#ifdef BUILD_ESP32
-/* Forward declaration */
-static void report_hot_opcodes(void);
-
-/* Report and reset instrumentation counters every ~5 seconds */
-static void report_cpu_stats(void)
-{
-	static uint32_t last_report = 0;
-	uint32_t now = get_uticks();
-
-	if (now - last_report >= 5000000) {  /* 5 seconds */
-		uint32_t total_tlb = tlb_hits + tlb_misses;
-		uint32_t total_seg = flat_accesses + nonflat_accesses;
-
-		/* Always print stats to diagnose */
-		fprintf(stderr, "CPU stats: TLB hit=%u%% (%u/%u), flat=%u%% (%u/%u)\n",
-			total_tlb ? (tlb_hits * 100) / total_tlb : 0, tlb_hits, total_tlb,
-			total_seg ? (flat_accesses * 100) / total_seg : 0, flat_accesses, total_seg);
-
-		report_hot_opcodes();
-
-		/* Reset counters */
-		tlb_hits = 0;
-		tlb_misses = 0;
-		flat_accesses = 0;
-		nonflat_accesses = 0;
-		last_report = now;
-	}
-}
-#endif
-
 void cpui386_step(CPUI386 *cpu, int stepcount)
 {
-#ifdef BUILD_ESP32
-	report_cpu_stats();
-#endif
-
 	if ((cpu->flags & IF) && cpu->intr) {
 		cpu->intr = false;
 		cpu->halt = false;

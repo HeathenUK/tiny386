@@ -204,6 +204,7 @@ static int pc_main(const char *file)
 	conf.height = LCD_HEIGHT;
 	conf.cpu_gen = 4;
 	conf.fpu = 0;
+	conf.double_buffer = 0;  // Default disabled
 	conf.brightness = 30;  // Default brightness
 	conf.volume = 80;      // Default volume
 
@@ -259,6 +260,10 @@ static int pc_main(const char *file)
 	if (vga_frame_skip_max > 0) {
 		fprintf(stderr, "Frame skip enabled: max %d frames\n", vga_frame_skip_max);
 	}
+
+	/* Apply double buffer setting from config (default enabled) */
+	vga_double_buffer = conf.double_buffer;
+	fprintf(stderr, "Double buffering: %s\n", vga_double_buffer ? "enabled" : "disabled");
 
 #ifdef USE_BADGE_BSP
 	/* Store brightness/volume in globals for input_bsp and OSD to use */

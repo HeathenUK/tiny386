@@ -23,6 +23,9 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr);
 /* Adaptive frame skipping (0=disabled, 1-10=max frames to skip) */
 extern int vga_frame_skip_max;
 
+/* Double buffering for tear-free rendering (0=disabled, 1=enabled) */
+extern int vga_double_buffer;
+
 void vbe_write(VGAState *s, uint32_t offset, uint32_t val);
 uint32_t vbe_read(VGAState *s, uint32_t offset);
 
@@ -34,6 +37,19 @@ void vga_mem_write16(VGAState *s, uint32_t addr, uint16_t val);
 void vga_mem_write32(VGAState *s, uint32_t addr, uint32_t val);
 bool vga_mem_write_string(VGAState *s, uint32_t addr, uint8_t *buf, int len);
 bool vga_mem_read_string(VGAState *s, uint32_t addr, uint8_t *buf, int len);
+bool vga_mem_copy_string(VGAState *s, uint32_t dst, uint32_t src, int len);
+
+/* Mode X inline access support - returns state for CPU fast path */
+void vga_get_modex_state(VGAState *s, uint8_t **ram, uint32_t *ram_size,
+                         uint8_t *write_mode, uint8_t *plane_mask,
+                         uint8_t *read_plane, uint32_t **latch);
+
+/* Direct VGA memory access for chain-4 mode (mode 13h) */
+uint8_t *vga_get_direct_ptr(VGAState *s);
+void vga_direct_mark_dirty(VGAState *s, uint32_t addr, int len);
+
+/* Debug functions */
+void vga_debug_direct_conditions(VGAState *s);
 
 typedef struct PCIDevice PCIDevice;
 typedef struct PCIBus PCIBus;
