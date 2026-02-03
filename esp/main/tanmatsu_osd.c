@@ -36,6 +36,8 @@ typedef enum {
 	VIEW_MOUNTING,
 	VIEW_AUDIOVISUAL,
 	VIEW_SYSTEM,
+	VIEW_STATUS,
+	VIEW_HELP,
 	VIEW_FILEBROWSER
 } ViewMode;
 
@@ -44,6 +46,8 @@ typedef enum {
 	MAIN_MOUNTING = 0,
 	MAIN_AUDIOVISUAL,
 	MAIN_SYSTEM,
+	MAIN_STATUS,
+	MAIN_HELP,
 	MAIN_SEP1,
 	MAIN_BOOT_ORDER,
 	MAIN_SAVE_INI,
@@ -484,6 +488,8 @@ static void render_main_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ "Mounting", 0, 1, NULL },
 		{ "Audio/Visual", 0, 1, NULL },
 		{ "System", 0, 1, NULL },
+		{ "Status", 0, 1, NULL },
+		{ "Help", 0, 1, NULL },
 		{ NULL, 1, 0, NULL },  // SEP1
 		{ "Boot Order:", 0, 0, boot_order_val },
 		{ "Save Settings", 0, 0, NULL },
@@ -583,6 +589,127 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 
 	render_generic_menu(pixels, w, h, pitch, "System (restart req.)", entries, SYS_COUNT,
 	                    osd->sys_sel, "Left/Right:Adjust  Esc:Back");
+}
+
+// Render status panel (emulator stats)
+static void render_status(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
+{
+	char line[64];
+
+	// Panel dimensions
+	int panel_w = (w > 350) ? 320 : w - 20;
+	int panel_h = 220;
+	int panel_x = (w - panel_w) / 2;
+	int panel_y = (h - panel_h) / 2;
+	int line_y = panel_y + 10;
+	int line_h = 22;
+
+	// Background
+	draw_rect(pixels, w, h, pitch, panel_x, panel_y, panel_w, panel_h, COLOR_BG);
+
+	// Border
+	draw_rect(pixels, w, h, pitch, panel_x, panel_y, panel_w, 2, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, panel_x, panel_y + panel_h - 2, panel_w, 2, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, panel_x, panel_y, 2, panel_h, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, panel_x + panel_w - 2, panel_y, 2, panel_h, COLOR_BORDER);
+
+	// Title
+	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, "SYSTEM STATUS", COLOR_TITLE, 0);
+	line_y += line_h + 8;
+
+	// Separator
+	draw_rect(pixels, w, h, pitch, panel_x + 8, line_y - 4, panel_w - 16, 1, COLOR_SEP);
+
+	// VGA Mode
+	snprintf(line, sizeof(line), "VGA: %dx%d", globals.vga_mode_width, globals.vga_mode_height);
+	if (globals.vga_pixel_double > 1) {
+		char extra[16];
+		snprintf(extra, sizeof(extra), " (x%d)", globals.vga_pixel_double);
+		strncat(line, extra, sizeof(line) - strlen(line) - 1);
+	}
+	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, line, COLOR_TEXT, 0);
+	line_y += line_h;
+
+	// CPU/Peripheral time split
+	snprintf(line, sizeof(line), "CPU: %d%%   Periph: %d%%",
+	         globals.emu_cpu_percent, globals.emu_periph_percent);
+	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, line, COLOR_TEXT, 0);
+	line_y += line_h;
+
+	// Batch size and calls/sec
+	snprintf(line, sizeof(line), "Batch: %d   Calls/s: %lu",
+	         globals.emu_batch_size, (unsigned long)globals.emu_calls_per_sec);
+	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, line, COLOR_TEXT, 0);
+	line_y += line_h;
+
+	// Frame skip
+	if (osd->frame_skip == 0) {
+		snprintf(line, sizeof(line), "Frame Skip: Off");
+	} else {
+		snprintf(line, sizeof(line), "Frame Skip: Max %d", osd->frame_skip);
+	}
+	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, line, COLOR_TEXT, 0);
+	line_y += line_h + 8;
+
+	// Help text
+	draw_text(pixels, w, h, pitch, panel_x + 10, panel_y + panel_h - 24,
+	          "[Esc] Back", COLOR_MUTED, 0);
+}
+
+// Render help screen (keyboard shortcuts)
+static void render_help(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
+{
+	// Panel dimensions
+	int panel_w = (w > 380) ? 360 : w - 20;
+	int panel_h = 320;
+	int panel_x = (w - panel_w) / 2;
+	int panel_y = (h - panel_h) / 2;
+	int line_y = panel_y + 10;
+	int line_h = 20;
+
+	// Background
+	draw_rect(pixels, w, h, pitch, panel_x, panel_y, panel_w, panel_h, COLOR_BG);
+
+	// Border
+	draw_rect(pixels, w, h, pitch, panel_x, panel_y, panel_w, 2, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, panel_x, panel_y + panel_h - 2, panel_w, 2, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, panel_x, panel_y, 2, panel_h, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, panel_x + panel_w - 2, panel_y, 2, panel_h, COLOR_BORDER);
+
+	// Title
+	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, "KEYBOARD SHORTCUTS", COLOR_TITLE, 0);
+	line_y += line_h + 8;
+
+	// Separator
+	draw_rect(pixels, w, h, pitch, panel_x + 8, line_y - 4, panel_w - 16, 1, COLOR_SEP);
+
+	// Global shortcuts
+	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, "Global:", COLOR_VALUE, 0);
+	line_y += line_h;
+
+	draw_text(pixels, w, h, pitch, panel_x + 20, line_y, "META          Toggle OSD", COLOR_TEXT, 0);
+	line_y += line_h;
+	draw_text(pixels, w, h, pitch, panel_x + 20, line_y, "META+Up/Down  Volume", COLOR_TEXT, 0);
+	line_y += line_h;
+	draw_text(pixels, w, h, pitch, panel_x + 20, line_y, "META+L/R      Brightness", COLOR_TEXT, 0);
+	line_y += line_h + 10;
+
+	// OSD shortcuts
+	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, "In OSD:", COLOR_VALUE, 0);
+	line_y += line_h;
+
+	draw_text(pixels, w, h, pitch, panel_x + 20, line_y, "Up/Down       Navigate", COLOR_TEXT, 0);
+	line_y += line_h;
+	draw_text(pixels, w, h, pitch, panel_x + 20, line_y, "Enter         Select", COLOR_TEXT, 0);
+	line_y += line_h;
+	draw_text(pixels, w, h, pitch, panel_x + 20, line_y, "Escape        Back/Close", COLOR_TEXT, 0);
+	line_y += line_h;
+	draw_text(pixels, w, h, pitch, panel_x + 20, line_y, "Left/Right    Adjust value", COLOR_TEXT, 0);
+	line_y += line_h;
+
+	// Help text at bottom
+	draw_text(pixels, w, h, pitch, panel_x + 10, panel_y + panel_h - 24,
+	          "[Esc] Back", COLOR_MUTED, 0);
 }
 
 // Render file browser
@@ -781,6 +908,12 @@ static int handle_main_select(OSD *osd)
 	case MAIN_SYSTEM:
 		osd->view = VIEW_SYSTEM;
 		osd->sys_sel = SYS_CPU_GEN;
+		break;
+	case MAIN_STATUS:
+		osd->view = VIEW_STATUS;
+		break;
+	case MAIN_HELP:
+		osd->view = VIEW_HELP;
 		break;
 	case MAIN_BOOT_ORDER:
 		// Cycle boot order
@@ -1079,6 +1212,26 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 		}
 		break;
 
+	case VIEW_STATUS:
+		switch (keycode) {
+		case SC_ESC:
+		case SC_LEFT:
+		case SC_ENTER:
+			osd->view = VIEW_MAIN_MENU;
+			break;
+		}
+		break;
+
+	case VIEW_HELP:
+		switch (keycode) {
+		case SC_ESC:
+		case SC_LEFT:
+		case SC_ENTER:
+			osd->view = VIEW_MAIN_MENU;
+			break;
+		}
+		break;
+
 	case VIEW_FILEBROWSER:
 		switch (keycode) {
 		case SC_UP:
@@ -1141,6 +1294,12 @@ void osd_render(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		break;
 	case VIEW_SYSTEM:
 		render_sys_menu(osd, pixels, w, h, pitch);
+		break;
+	case VIEW_STATUS:
+		render_status(osd, pixels, w, h, pitch);
+		break;
+	case VIEW_HELP:
+		render_help(osd, pixels, w, h, pitch);
 		break;
 	case VIEW_FILEBROWSER:
 		render_browser(osd, pixels, w, h, pitch);

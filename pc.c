@@ -532,6 +532,14 @@ void pc_step(PC *pc)
 		step_count = 0;
 	}
 
+#ifdef USE_BADGE_BSP
+	/* Instrumentation for OSD stats display */
+	static uint32_t stat_cpu_us = 0;
+	static uint32_t stat_periph_us = 0;
+	static uint32_t stat_calls = 0;
+	static uint32_t stat_last_report = 0;
+#endif
+
 	uint32_t t0 = get_uticks();
 
 	/* Burst catch-up for high-frequency PIT interrupts.
@@ -581,7 +589,13 @@ void pc_step(PC *pc)
 	cpukvm_step(pc->cpu, 4096);
 #else
 #ifdef BUILD_ESP32
+#ifdef USE_BADGE_BSP
+	uint32_t t1 = get_uticks();  /* After peripherals */
+#endif
 	cpui386_step(pc->cpu, batch_size);
+#ifdef USE_BADGE_BSP
+	uint32_t t2 = get_uticks();  /* After CPU */
+#endif
 
 	/* Track step timing for dynamic batch adjustment */
 	uint32_t step_time = get_uticks() - t0;
@@ -606,6 +620,28 @@ void pc_step(PC *pc)
 		step_time_accum = 0;
 		step_count = 0;
 	}
+
+#ifdef USE_BADGE_BSP
+	/* Instrumentation for OSD stats */
+	stat_periph_us += (t1 - t0);
+	stat_cpu_us += (t2 - t1);
+	stat_calls++;
+
+	/* Update globals every ~2 seconds */
+	if (t2 - stat_last_report >= 2000000) {
+		uint32_t total = stat_cpu_us + stat_periph_us;
+		if (total > 0) {
+			globals.emu_cpu_percent = (stat_cpu_us * 100) / total;
+			globals.emu_periph_percent = (stat_periph_us * 100) / total;
+			globals.emu_batch_size = batch_size;
+			globals.emu_calls_per_sec = (stat_calls * 1000000ULL) / (t2 - stat_last_report);
+		}
+		stat_cpu_us = 0;
+		stat_periph_us = 0;
+		stat_calls = 0;
+		stat_last_report = t2;
+	}
+#endif
 #else
 	cpui386_step(pc->cpu, 10240);
 #endif

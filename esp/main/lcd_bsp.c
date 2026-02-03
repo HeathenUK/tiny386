@@ -27,6 +27,8 @@
 
 #include "common.h"
 #include "tanmatsu_osd.h"
+#include "toast.h"
+#include "led_activity.h"
 #include "esp_cache.h"
 
 static const char *TAG = "lcd_bsp";
@@ -390,6 +392,9 @@ void vga_task(void *arg)
 	ESP_ERROR_CHECK(ppa_init());
 	globals.panel = panel;
 
+	// Initialize drive activity LEDs
+	led_activity_init();
+
 	// Allocate framebuffers (after BSP init, like trackmatsu)
 	size_t fb_size = VGA_MAX_WIDTH * VGA_MAX_HEIGHT * sizeof(uint16_t);
 	uint16_t *fb = heap_caps_aligned_alloc(64, fb_size,
@@ -459,6 +464,7 @@ void vga_task(void *arg)
 			// Render brightness/volume overlay (if not showing full OSD)
 			if (!globals.osd_enabled) {
 				render_overlay_bar(fb_rot);
+				toast_render(fb_rot);
 			}
 
 			// Blit to display
@@ -486,6 +492,9 @@ void vga_task(void *arg)
 			prof_frame_count = 0;
 			prof_last_report = now;
 		}
+
+		// Update drive activity LEDs (turn off after timeout)
+		led_activity_tick();
 
 		vTaskDelay(10 / portTICK_PERIOD_MS);
 	}

@@ -7,6 +7,13 @@
 #include <errno.h>
 
 #include <stdio.h>
+
+#ifdef TANMATSU_BUILD
+#include "led_activity.h"
+#define FLOPPY_ACTIVITY() led_activity_floppy()
+#else
+#define FLOPPY_ACTIVITY() ((void)0)
+#endif
 #if !defined(_WIN32) && !defined(__wasm__)
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -826,6 +833,7 @@ int emulink_data_write_string(void *s, uint8_t *buf, int size, int count)
 			int len = size * count;
 			if (len > e->dataleft)
 				break;
+			FLOPPY_ACTIVITY();
 			int ret = fwrite(buf, 1, len, e->fdd[e->args[0]]);
 			if (ret != len)
 				break;
@@ -855,6 +863,7 @@ int emulink_data_read_string(void *s, uint8_t *buf, int size, int count)
 			int len = size * count;
 			if (len > e->dataleft)
 				break;
+			FLOPPY_ACTIVITY();
 			int ret = fread(buf, 1, len, e->fdd[e->args[0]]);
 			if (ret != len)
 				break;

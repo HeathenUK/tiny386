@@ -33,6 +33,10 @@
 
 #ifdef TANMATSU_BUILD
 //#define DEBUG_IDE
+#include "led_activity.h"
+#define IDE_ACTIVITY() led_activity_hdd()
+#else
+#define IDE_ACTIVITY() ((void)0)
 #endif
 //#define DEBUG_IDE_ATAPI
 
@@ -598,7 +602,8 @@ static void ide_sector_read(IDEState *s)
     printf("read sector=%" PRId64 " count=%d\n", sector_num, n);
 #endif
     s->io_nb_sectors = n;
-    ret = s->bs->read_async(s->bs, sector_num, s->io_buffer, n, 
+    IDE_ACTIVITY();
+    ret = s->bs->read_async(s->bs, sector_num, s->io_buffer, n,
                             ide_sector_read_cb, s);
     if (ret < 0) {
         /* error */
@@ -652,7 +657,8 @@ static void ide_sector_write_cb1(IDEState *s)
     printf("write sector=%" PRId64 "  count=%d\n",
            sector_num, s->io_nb_sectors);
 #endif
-    ret = s->bs->write_async(s->bs, sector_num, s->io_buffer, s->io_nb_sectors, 
+    IDE_ACTIVITY();
+    ret = s->bs->write_async(s->bs, sector_num, s->io_buffer, s->io_nb_sectors,
                              ide_sector_write_cb2, s);
     if (ret < 0) {
         /* error */
@@ -1020,6 +1026,7 @@ static int cd_read_sector(BlockDevice *bs, int lba, uint8_t *buf,
 
     if (!bs) return -1;  // No disc inserted
 
+    IDE_ACTIVITY();
     switch(sector_size) {
     case 2048:
         ret = bs->read_async(bs, (int64_t)lba << 2, buf, 4,
