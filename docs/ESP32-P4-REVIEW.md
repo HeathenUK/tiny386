@@ -786,9 +786,25 @@ void msc_event_callback(const msc_host_event_t *event, void *arg) {
 - Examined PR #4 for existing USB HID work
 - Created this document for future reference
 
+**Decisions Made**:
+
+#### OSD Stats Panel - DECIDED
+- **Approach**: Option A - Replace fprintf with memory writes, display via OSD
+- **Rationale**:
+  - Current fprintf blocks ~11ms every 2 seconds (0.5% CPU overhead)
+  - Stats collection itself (get_uticks calls) is cheap (~0.04% CPU)
+  - t0/t2 timer reads are essential for dynamic batch sizing anyway
+  - t1 read (CPU/peripheral split) adds only ~0.01-0.04% overhead
+- **Implementation**:
+  - Remove fprintf from pc.c:602-607
+  - Add stats struct to globals (cpu_pct, periph_pct, batch_size, etc.)
+  - Write stats to memory every 2 seconds (same timing, no serial I/O)
+  - New OSD VIEW_STATUS panel reads and displays these values
+  - Zero cost when not viewing, ~0.5ms render cost when panel open
+
 **Next Steps**:
-- User to review and prioritize features
-- Discuss each section in detail
+- Continue discussing remaining topics (sound, USB)
+- Finalize overall implementation plan
 - Begin implementation based on priorities
 
 **Key Files Examined**:
