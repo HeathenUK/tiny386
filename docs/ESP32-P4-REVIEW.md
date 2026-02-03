@@ -802,6 +802,43 @@ void msc_event_callback(const msc_host_event_t *event, void *arg) {
   - New OSD VIEW_STATUS panel reads and displays these values
   - Zero cost when not viewing, ~0.5ms render cost when panel open
 
+#### OSD Help Screen - DECIDED
+- **Approach**: Simple text menu showing available keyboard shortcuts
+- **Content**:
+  - META: Toggle OSD
+  - META+UP/DOWN: Volume adjust
+  - META+LEFT/RIGHT: Brightness adjust
+  - Future: META+F1 eject FDA, etc.
+- **Implementation**: New VIEW_HELP in tanmatsu_osd.c, accessible from main menu
+
+#### Drive Activity LEDs - DECIDED
+- **Approach**: Use hardware RGB LEDs instead of OSD overlay
+- **LED Assignment** (from Tanmatsu hardware docs):
+  - LED 4 (A): HDD activity - red flash
+  - LED 5 (B): Floppy activity - green/yellow flash
+  - LEDs 0-3 reserved for system (Power, Radio, Messages, Power Button)
+- **Implementation**:
+  - Add callbacks to ide.c and emulink.c for read/write operations
+  - Set LED on activity, clear after ~50-100ms timeout
+  - Use bsp_led_set_pixel_rgb() and bsp_led_send()
+  - Call bsp_led_set_mode(false) for manual control of LEDs 4-5
+
+#### Toast Notification System - DECIDED
+- **Approach**: Minimal, focused on non-visible confirmations only
+- **Use cases** (toast IS appropriate):
+  - "Settings saved" / "Save failed" after INI write
+  - Hotkey feedback when OSD not open (e.g., META+F1 eject → "Floppy A ejected")
+  - External events (USB disconnect, errors)
+- **NOT for** (already visible, redundant):
+  - Drive mounting via OSD file browser
+  - Boot order changes (visible in menu)
+  - Brightness/volume (already have bar overlay)
+- **Implementation**: Extend existing overlay_type enum, add overlay_text field to globals
+
+#### Screenshot Feature - DECIDED
+- **Decision**: NO - not implementing
+- **Rationale**: User indicated not needed
+
 **Next Steps**:
 - Continue discussing remaining topics (sound, USB)
 - Finalize overall implementation plan
