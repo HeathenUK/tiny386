@@ -839,6 +839,21 @@ void msc_event_callback(const msc_host_event_t *event, void *arg) {
 - **Decision**: NO - not implementing
 - **Rationale**: User indicated not needed
 
+#### Sound Card Enhancements - DECIDED
+- **Decision**: Keep current audio setup, no changes needed
+- **Current state**:
+  - SB16: Full PCM/digital audio (8/16-bit, stereo, DMA) - **MIT licensed** ✅
+  - OPL2: FM synthesis via fmopl.c - LGPL 2.1 (accepted)
+  - PC Speaker: Functional
+- **OPL3 upgrade**: Not pursuing
+  - Opal (public domain) lacks percussion mode
+  - ymfm (BSD) is C++ and performance unknown
+  - OPL2 + SB16 digital covers most games adequately
+- **GUS**: Not pursuing
+  - No MIT/BSD implementation exists
+  - 1MB+ RAM cost, high CPU, niche demand
+- **Rationale**: SB16 handles digital audio well; games wanting better music use digital samples anyway
+
 **Next Steps**:
 - Continue discussing remaining topics (sound, USB)
 - Finalize overall implementation plan
