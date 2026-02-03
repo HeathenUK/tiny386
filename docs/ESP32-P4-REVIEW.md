@@ -875,12 +875,16 @@ void msc_event_callback(const msc_host_event_t *event, void *arg) {
 
 #### USB Mass Storage - DECIDED
 - **Mode**: Direct guest access (Option B) - USB filesystem visible to guest OS
-- **IDE Channel**: Secondary slave (HDD) - avoids conflicts with primary HDD and CD-ROM
+- **IDE Channel**: Secondary slave (slot 3) - replaces CDD position
+  - Current layout: HDA(0), HDB(1), CDC(2), CDD(3)
+  - USB takes slot 3, so CDD becomes unavailable when USB attached
+  - Acceptable tradeoff: most setups only use one CD-ROM (CDC)
 - **Write Access**: Full read/write (not read-only)
 - **Implementation**:
   - Add BlockDeviceUSB backend using existing BlockDevice abstraction in ide.c
   - ide_attach on secondary slave channel when USB mass storage detected
-  - Toast notification on connect/disconnect
+  - OSD: Hide CDD option or show "USB" when USB storage attached
+  - Toast notification on connect/disconnect ("USB drive attached as D:")
 - **Rationale**: IDE abstraction is clean integration point; BlockDevice struct already supports async read/write callbacks
 
 #### USB Hub Support - DECIDED
