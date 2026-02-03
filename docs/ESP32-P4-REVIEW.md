@@ -1780,31 +1780,46 @@ static void render_help(OSD *osd, uint8_t *fb, int stride) {
 
 ### 11.7 USB Mass Storage
 
-**Goal**: Expose USB storage as IDE secondary slave.
+**Goal**: Expose USB storage as IDE secondary slave, always present but empty when no USB connected.
+
+**Design Rationale**:
+- Drive slot 3 (secondary slave) is **permanently** allocated to USB storage
+- CDD (second CD-ROM) is no longer available
+- BlockDeviceUSB is **always attached at boot** - no hot-attach needed
+- When USB disconnected: reports 0 sectors, reads return zeros, writes silently ignored
+- When USB connected: normal operation
+- No special drivers needed in DOS/Windows - just a standard IDE HDD
+- Reboot required to detect USB drive plugged in after boot (DOS limitation)
 
 **Files to Modify:**
 | File | Changes |
 |------|---------|
-| `ide.c` | Add BlockDeviceUSB, hot-attach API |
-| `ide.h` | Export hot-attach function |
-| `esp/main/usb_host.c` | MSC driver, BlockDevice creation |
-| `esp/main/tanmatsu_osd.c` | Hide CDD when USB attached |
+| `ide.c` | Add BlockDeviceUSB with disconnect-safe behavior |
+| `esp/main/usb_host.c` | MSC driver, update BlockDevice handle |
+| `esp/main/common.h` | USB storage state |
+| `esp/main/tanmatsu_osd.c` | Show "USB STORAGE" instead of CDD |
 
-**Step 1: BlockDeviceUSB Structure** (`ide.c`)
+**Step 1: BlockDeviceUSB Structure** (`esp/main/usb_storage.c`)
 ```c
-#ifdef TANMATSU_BUILD
+#include "usb_storage.h"
 #include "usb/usb_host.h"
 #include "usb_host_msc.h"
+#include <string.h>
 
 typedef struct {
     BlockDevice base;
-    msc_host_device_handle_t msc_handle;
+    msc_host_device_handle_t msc_handle;  // NULL when disconnected
     uint32_t block_size;
     uint64_t block_count;
 } BlockDeviceUSB;
 
+static BlockDeviceUSB usb_block_device = {0};
+
 static int64_t bd_usb_get_sector_count(BlockDevice *bs) {
     BlockDeviceUSB *s = (BlockDeviceUSB *)bs;
+    if (!s->msc_handle) {
+        return 0;  // No USB connected - report empty
+    }
     return s->block_count;
 }
 
@@ -1813,7 +1828,14 @@ static int bd_usb_read_async(BlockDevice *bs, uint64_t sector,
                               BlockDeviceCompletionFunc *cb, void *opaque) {
     BlockDeviceUSB *s = (BlockDeviceUSB *)bs;
 
-    // USB MSC reads are synchronous in ESP-IDF
+    if (!s->msc_handle) {
+        // No USB connected - return zeros silently
+        memset(buf, 0, n * 512);
+        if (cb) cb(opaque, 0);
+        return 0;
+    }
+
+    // Normal USB read
     esp_err_t err = msc_host_read_sector(s->msc_handle, sector, buf, n);
     if (err == ESP_OK) {
         if (cb) cb(opaque, 0);
@@ -1827,6 +1849,13 @@ static int bd_usb_write_async(BlockDevice *bs, uint64_t sector,
                                BlockDeviceCompletionFunc *cb, void *opaque) {
     BlockDeviceUSB *s = (BlockDeviceUSB *)bs;
 
+    if (!s->msc_handle) {
+        // No USB connected - silently discard write
+        if (cb) cb(opaque, 0);
+        return 0;
+    }
+
+    // Normal USB write
     esp_err_t err = msc_host_write_sector(s->msc_handle, sector, buf, n);
     if (err == ESP_OK) {
         if (cb) cb(opaque, 0);
@@ -1835,113 +1864,91 @@ static int bd_usb_write_async(BlockDevice *bs, uint64_t sector,
     return -1;
 }
 
-BlockDevice *block_device_usb_create(msc_host_device_handle_t handle) {
-    BlockDeviceUSB *s = calloc(1, sizeof(BlockDeviceUSB));
-    s->msc_handle = handle;
+// Called once at boot to get the BlockDevice for IDE attachment
+BlockDevice *usb_storage_get_block_device(void) {
+    usb_block_device.base.get_sector_count = bd_usb_get_sector_count;
+    usb_block_device.base.read_async = bd_usb_read_async;
+    usb_block_device.base.write_async = bd_usb_write_async;
+    usb_block_device.msc_handle = NULL;  // Initially disconnected
+    return (BlockDevice *)&usb_block_device;
+}
 
-    // Get device info
+// Called when USB storage connects
+void usb_storage_connect(msc_host_device_handle_t handle) {
     msc_host_device_info_t info;
     msc_host_get_device_info(handle, &info);
-    s->block_size = info.sector_size;
-    s->block_count = info.sector_count;
 
-    s->base.get_sector_count = bd_usb_get_sector_count;
-    s->base.read_async = bd_usb_read_async;
-    s->base.write_async = bd_usb_write_async;
+    usb_block_device.msc_handle = handle;
+    usb_block_device.block_size = info.sector_size;
+    usb_block_device.block_count = info.sector_count;
 
-    return (BlockDevice *)s;
-}
-#endif
-```
-
-**Step 2: Hot-Attach API** (`ide.h`)
-```c
-// Add to ide.h:
-#ifdef TANMATSU_BUILD
-int ide_hot_attach(IDEIFState *s, int drive, BlockDevice *bs, bool is_cdrom);
-void ide_hot_detach(IDEIFState *s, int drive);
-#endif
-```
-
-**Step 3: Hot-Attach Implementation** (`ide.c`)
-```c
-#ifdef TANMATSU_BUILD
-int ide_hot_attach(IDEIFState *s, int drive, BlockDevice *bs, bool is_cdrom) {
-    if (drive < 0 || drive > 1) return -1;
-    if (s->drives[drive]) {
-        // Already attached - detach first
-        ide_hot_detach(s, drive);
-    }
-
-    if (is_cdrom) {
-        s->drives[drive] = ide_cddrive_init(s, bs);
-    } else {
-        s->drives[drive] = ide_hddrive_init(s, bs);
-    }
-    return 0;
+    globals.usb_storage_attached = true;
+    toast_show("USB drive connected");
 }
 
-void ide_hot_detach(IDEIFState *s, int drive) {
-    if (drive < 0 || drive > 1) return;
-    if (s->drives[drive]) {
-        // Free drive state
-        free(s->drives[drive]);
-        s->drives[drive] = NULL;
-    }
+// Called when USB storage disconnects
+void usb_storage_disconnect(void) {
+    usb_block_device.msc_handle = NULL;
+    usb_block_device.block_count = 0;
+
+    globals.usb_storage_attached = false;
+    toast_show("USB drive removed");
 }
-#endif
 ```
 
-**Step 4: USB MSC Event Handler** (`esp/main/usb_host.c`)
+**Step 2: Attach at Boot** (`esp/main/esp_main.c` or `pc.c`)
 ```c
+// During PC initialization, after IDE controller setup:
+// Attach USB BlockDevice to secondary slave (slot 3)
+// This happens ONCE at boot, not on USB connect/disconnect
+
+BlockDevice *usb_bd = usb_storage_get_block_device();
+ide_attach_block_device(pc->ide2, 1, usb_bd);  // drive 1 = slave
+```
+
+**Step 3: USB MSC Event Handler** (`esp/main/usb_host.c`)
+```c
+// Simplified - no hot-attach/detach of IDE, just update the handle
 static void msc_event_handler(const msc_host_event_t *event, void *arg) {
     switch (event->event) {
-        case MSC_DEVICE_CONNECTED: {
+        case MSC_DEVICE_CONNECTED:
             ESP_LOGI(TAG, "USB storage connected");
-
-            // Create block device
-            BlockDevice *bd = block_device_usb_create(event->device.handle);
-            if (!bd) {
-                ESP_LOGE(TAG, "Failed to create USB block device");
-                return;
-            }
-
-            // Attach to IDE secondary slave (slot 3)
-            if (globals.pc && globals.pc->ide2) {
-                ide_hot_attach(globals.pc->ide2, 1, bd, false);  // drive 1 = slave
-                globals.usb_storage_attached = true;
-                toast_show("USB drive attached as D:");
-            }
+            usb_storage_connect(event->device.handle);
             break;
-        }
 
         case MSC_DEVICE_DISCONNECTED:
             ESP_LOGI(TAG, "USB storage disconnected");
-
-            if (globals.pc && globals.pc->ide2) {
-                ide_hot_detach(globals.pc->ide2, 1);
-                globals.usb_storage_attached = false;
-                toast_show("USB drive removed");
-            }
+            usb_storage_disconnect();
             break;
     }
 }
 ```
 
-**Step 5: OSD Integration** (`esp/main/tanmatsu_osd.c`)
+**Step 4: OSD Integration** (`esp/main/tanmatsu_osd.c`)
 ```c
-// In render_mounting(), for CDD entry:
-if (osd->mount_sel == MOUNT_CDD) {
-    if (globals.usb_storage_attached) {
-        draw_text(fb, x, y, "USB STORAGE", 0x07E0, stride);  // Green
-    } else {
-        draw_text(fb, x, y, "CDD: (empty)", 0xFFFF, stride);
-    }
+// Replace CDD menu item with USB status
+// In render_mounting():
+// Instead of "CDD: (empty)" show:
+
+if (globals.usb_storage_attached) {
+    draw_text(fb, x, y, "USB: Connected", 0x07E0, stride);  // Green
+} else {
+    draw_text(fb, x, y, "USB: (empty)", 0x8410, stride);    // Gray
 }
 
-// Skip CDD in navigation when USB attached:
-// In handle_mount_up/down, skip MOUNT_CDD if usb_storage_attached
+// CDD mount option is removed entirely - slot is USB only
+// Remove MOUNT_CDD from menu navigation
 ```
+
+**Behavior Summary:**
+
+| USB State | get_sector_count | read() | write() | DOS sees |
+|-----------|------------------|--------|---------|----------|
+| Connected | Actual size | Normal data | Normal write | Working D: drive |
+| Disconnected | 0 | Returns zeros | Silently ignored | Empty/unformatted D: |
+| Unplugged mid-use | 0 | Returns zeros | Silently ignored | Read errors / corrupt data |
+
+**Note**: For best results, users should connect USB before boot. Hot-plugging after DOS has booted won't be detected until reboot.
 
 **Dependencies**: USB Host Framework (11.1), Toast System (11.3)
 
