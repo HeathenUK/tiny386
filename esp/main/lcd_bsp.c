@@ -464,8 +464,10 @@ void vga_task(void *arg)
 			// Render brightness/volume overlay (if not showing full OSD)
 			if (!globals.osd_enabled) {
 				render_overlay_bar(fb_rot);
-				toast_render(fb_rot);
 			}
+
+			// Toast renders on top of everything (including OSD)
+			toast_render(fb_rot);
 
 			// Blit to display
 			bsp_display_blit(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, fb_rot);

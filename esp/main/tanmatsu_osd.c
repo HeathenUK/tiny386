@@ -28,6 +28,7 @@
 #include "../../vga.h"
 #include "../../misc.h"
 #include "../../ide.h"
+#include "toast.h"
 #include "../../pc.h"
 
 // View modes
@@ -167,6 +168,7 @@ struct OSD {
 #define COLOR_EJECT   0xFB20  // Orange-red for eject
 #define COLOR_VALUE   0x87FF  // Light cyan for values
 #define COLOR_DIM     0x8410  // Dim gray for inactive items
+#define COLOR_MUTED   0x6B4D  // Muted gray for help text
 
 // Forward declarations
 static void populate_drive_paths(OSD *osd);
@@ -818,6 +820,7 @@ static int handle_file_select(OSD *osd)
 
 	if (f->is_dir == FILE_TYPE_EJECT) {
 		// Eject the drive
+		const char *drive_names[] = {"A:", "B:", "CD0:", "CD1:", "CD2:", "CD3:"};
 		if (osd->browser_target < 2) {
 			// Floppy
 			if (osd->emulink) emulink_attach_floppy(osd->emulink, osd->browser_target, NULL);
@@ -826,6 +829,9 @@ static int handle_file_select(OSD *osd)
 			IDEIFState *ide = (osd->browser_target < 4) ? osd->ide : osd->ide2;
 			if (ide) ide_change_cd(ide, (osd->browser_target - 2) % 2, "");
 		}
+		char msg[32];
+		snprintf(msg, sizeof(msg), "%s ejected", drive_names[osd->browser_target]);
+		toast_show(msg);
 		populate_drive_paths(osd);
 		osd->view = VIEW_MOUNTING;
 		return 0;
@@ -860,6 +866,16 @@ static int handle_file_select(OSD *osd)
 		IDEIFState *ide = (osd->browser_target < 4) ? osd->ide : osd->ide2;
 		if (ide) ide_change_cd(ide, (osd->browser_target - 2) % 2, fullpath);
 	}
+
+	// Show toast with filename (truncate if too long)
+	char msg[48];
+	const char *filename = f->name;
+	if (strlen(filename) > 28) {
+		snprintf(msg, sizeof(msg), "Mounted ...%s", filename + strlen(filename) - 25);
+	} else {
+		snprintf(msg, sizeof(msg), "Mounted %s", filename);
+	}
+	toast_show(msg);
 
 	populate_drive_paths(osd);
 	osd->view = VIEW_MOUNTING;
@@ -934,9 +950,11 @@ static int handle_main_select(OSD *osd)
 			                     osd->cpu_gen, osd->fpu, osd_get_mem_size_bytes(osd),
 			                     osd->brightness, osd->volume, osd->frame_skip,
 			                     osd->double_buffer);
+			toast_show("Settings saved");
 		}
 		break;
 	case MAIN_CTRLALTDEL:
+		toast_show("Ctrl+Alt+Del sent");
 		globals.reset_pending = true;  // Signal soft reset
 		return 1;  // Close OSD
 	case MAIN_RESET:

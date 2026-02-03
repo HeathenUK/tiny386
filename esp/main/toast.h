@@ -2,6 +2,7 @@
 #define TOAST_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 // Toast notification duration in milliseconds
 #define TOAST_DURATION_MS 2000
