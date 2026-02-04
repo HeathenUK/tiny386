@@ -68,7 +68,6 @@ int load_rom(void *phys_mem, const char *file, uword addr, int backward)
 		assert(fp);
 		fseek(fp, 0, SEEK_END);
 		int len = ftell(fp);
-		fprintf(stderr, "%s len %d\n", file, len);
 		rewind(fp);
 		if (backward)
 			fread(phys_mem + addr - len, 1, len, fp);
@@ -83,7 +82,6 @@ int load_rom(void *phys_mem, const char *file, uword addr, int backward)
 					 file);
 	assert(part);
 	int len = part->size;
-	fprintf(stderr, "%s len %d\n", file, len);
 	if (backward)
 		esp_partition_read(part, 0, phys_mem + addr - len, len);
 	else
@@ -105,17 +103,16 @@ typedef struct {
 Console *console_init(int width, int height)
 {
 	Console *c = malloc(sizeof(Console));
-	c->fb1 = fbmalloc(LCD_WIDTH * LCD_HEIGHT / NN * 2);
 #ifdef USE_LCD_BSP
+	c->fb1 = NULL;  /* Not used for BSP backend */
 	// For BSP backend, fb is allocated in vga_task after BSP init
 	// Use atomic load for cross-core visibility
 	c->fb = atomic_load(&globals.fb);
-	fprintf(stderr, "console_init: fb=%p\n", c->fb);
 	if (!c->fb) {
-		fprintf(stderr, "ERROR: globals.fb is NULL!\n");
 		abort();
 	}
 #else
+	c->fb1 = fbmalloc(LCD_WIDTH * LCD_HEIGHT / NN * 2);
 	c->fb = bigmalloc(LCD_WIDTH * LCD_HEIGHT * 2);
 #endif
 	return c;
@@ -125,6 +122,15 @@ void lcd_draw(int x_start, int y_start, int x_end, int y_end, void *src);
 static void redraw(void *opaque,
 		   int x, int y, int w, int h)
 {
+#ifdef USE_LCD_BSP
+	/* For BSP backend, lcd_bsp.c handles full-frame rotation via PPA.
+	 * The callback is a no-op - rendering is already done to fb_data. */
+	(void)opaque;
+	(void)x;
+	(void)y;
+	(void)w;
+	(void)h;
+#else
 	Console *s = opaque;
 	for (int i = 0; i < NN; i++) {
 		uint16_t *src = (uint16_t *) s->fb;
@@ -136,6 +142,7 @@ static void redraw(void *opaque,
 		vga_step(s->pc->vga);
 		usleep(900);
 	}
+#endif
 }
 
 static void stub(void *opaque)
@@ -192,7 +199,6 @@ static bool create_default_ini(const char *path)
 
 static int pc_main(const char *file)
 {
-	fprintf(stderr, "pc_main: start, file=%s\n", file ? file : "(null)");
 	PCConfig conf;
 	memset(&conf, 0, sizeof(conf));
 	conf.linuxstart = "linuxstart.bin";
@@ -208,7 +214,6 @@ static int pc_main(const char *file)
 	conf.brightness = 30;  // Default brightness
 	conf.volume = 80;      // Default volume
 
-	fprintf(stderr, "pc_main: parsing ini\n");
 	if (!file) {
 		fprintf(stderr, "ERROR: No INI file path provided!\n");
 		return -1;
@@ -240,9 +245,6 @@ static int pc_main(const char *file)
 		conf.mem_size = MAX_MEM_SIZE;
 	}
 #endif
-	fprintf(stderr, "pc_main: ini parsed, width=%d height=%d mem=%ldM\n",
-	        conf.width, conf.height, conf.mem_size / (1024 * 1024));
-
 #ifdef USE_LCD_BSP
 	// Tell LCD backend the actual VGA dimensions for PPA scaling
 	lcd_set_vga_dimensions(conf.width, conf.height);
@@ -255,30 +257,15 @@ static int pc_main(const char *file)
 	globals.kbd = pc->kbd;
 	globals.mouse = pc->mouse;
 
-	/* Apply frame skip setting from config */
+	/* Apply settings from config */
 	vga_frame_skip_max = conf.frame_skip;
-	if (vga_frame_skip_max > 0) {
-		fprintf(stderr, "Frame skip enabled: max %d frames\n", vga_frame_skip_max);
-	}
-
-	/* Apply double buffer setting from config (default enabled) */
 	vga_double_buffer = conf.double_buffer;
-	fprintf(stderr, "Double buffering: %s\n", vga_double_buffer ? "enabled" : "disabled");
-
-	/* Apply batch size setting from config */
 	pc_batch_size_setting = conf.batch_size;
-	if (pc_batch_size_setting > 0) {
-		fprintf(stderr, "Batch size: fixed at %d\n", pc_batch_size_setting);
-	} else {
-		fprintf(stderr, "Batch size: auto (dynamic)\n");
-	}
 
 #ifdef USE_BADGE_BSP
 	/* Store brightness/volume in globals for input_bsp and OSD to use */
 	globals.brightness = conf.brightness;
 	globals.volume = conf.volume;
-	fprintf(stderr, "Audio/Visual: brightness=%d%%, volume=%d%%\n",
-	        globals.brightness, globals.volume);
 #endif
 #ifndef USE_LCD_BSP
 	// For non-BSP backends, console allocates fb - store it globally
@@ -357,9 +344,8 @@ static void i386_task(void *arg)
 			    pdFALSE,
 			    portMAX_DELAY);
 	void *fb_check = atomic_load(&globals.fb);
-	fprintf(stderr, "Display ready, fb=%p, starting PC emulator\n", fb_check);
 	if (!fb_check) {
-		fprintf(stderr, "ERROR: globals.fb is NULL after BIT1!\n");
+		fprintf(stderr, "ERROR: globals.fb is NULL!\n");
 		vTaskDelay(1000 / portTICK_PERIOD_MS);
 	}
 #endif

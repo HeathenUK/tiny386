@@ -432,24 +432,14 @@ void vga_task(void *arg)
 
 	ESP_LOGI(TAG, "Starting display loop");
 
-	// Profiling stats
-	uint32_t prof_vga_total = 0, prof_rotate_total = 0;
-	uint32_t prof_frame_count = 0;
-	uint32_t prof_last_report = esp_log_timestamp();
-
 	while (1) {
-		uint32_t t0, t1, t2, t3;
-
-		// Step the VGA emulator (this calls the redraw callback internally)
-		t0 = esp_log_timestamp();
+		// Step the VGA emulator (vga_step + vga_refresh)
 		pc_vga_step(globals.pc);
-		t1 = esp_log_timestamp();
 
 		// Rotate, render OSD, and blit using alternating buffers
 		if (globals.fb) {
 			int write_idx = atomic_load(&rotate_write_idx);
 			uint16_t *fb_rot = fb_rotated_buffers[write_idx];
-			t2 = esp_log_timestamp();
 
 			// Rotate VGA content to display buffer
 			rotate_vga_to_display((uint16_t *)globals.fb, fb_rot);
@@ -472,33 +462,15 @@ void vga_task(void *arg)
 			// Blit to display
 			bsp_display_blit(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, fb_rot);
 
-			t3 = esp_log_timestamp();
 			// Swap to next buffer for next frame
 			atomic_store(&rotate_write_idx, (write_idx + 1) % NUM_ROTATE_BUFFERS);
-
-			prof_vga_total += (t1 - t0);
-			prof_rotate_total += (t3 - t2);
-			prof_frame_count++;
-		}
-
-		// Report profiling stats every 5 seconds
-		uint32_t now = esp_log_timestamp();
-		if (now - prof_last_report >= 5000 && prof_frame_count > 0) {
-			ESP_LOGI(TAG, "PERF: %lu frames, vga=%lums/f, rotate=%lums/f, fps=%.1f",
-			         prof_frame_count,
-			         prof_vga_total / prof_frame_count,
-			         prof_rotate_total / prof_frame_count,
-			         (float)prof_frame_count * 1000.0f / (now - prof_last_report));
-			prof_vga_total = 0;
-			prof_rotate_total = 0;
-			prof_frame_count = 0;
-			prof_last_report = now;
 		}
 
 		// Update drive activity LEDs (turn off after timeout)
 		led_activity_tick();
 
-		vTaskDelay(10 / portTICK_PERIOD_MS);
+		// Yield to other tasks - 1 tick minimum to avoid starving lower priority tasks
+		vTaskDelay(1);
 	}
 }
 #endif
