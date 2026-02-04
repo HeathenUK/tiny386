@@ -38,6 +38,20 @@ static const char *TAG = "input_bsp";
 #define SC_ARROW_LEFT  0x4B
 #define SC_ARROW_RIGHT 0x4D
 
+// Function key scancodes (for META+F1-F6 -> F7-F12 mapping)
+#define SC_F1  0x3B
+#define SC_F2  0x3C
+#define SC_F3  0x3D
+#define SC_F4  0x3E
+#define SC_F5  0x3F
+#define SC_F6  0x40
+#define SC_F7  0x41
+#define SC_F8  0x42
+#define SC_F9  0x43
+#define SC_F10 0x44
+#define SC_F11 0x57
+#define SC_F12 0x58
+
 // META key state for META+arrow shortcuts
 static bool meta_held = false;
 static bool meta_consumed = false;  // Set if META+arrow was used
@@ -217,6 +231,12 @@ static void input_task(void *arg)
 					uint8_t code = scancode & 0xFF;
 					int is_down = !(code & BSP_INPUT_SCANCODE_RELEASE_MODIFIER);
 					code &= ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
+
+					// META+F1-F6 -> F7-F12 (Tanmatsu only has F1-F6 keys)
+					if (meta_held && code >= SC_F1 && code <= SC_F6) {
+						code = (code - SC_F1) + SC_F7;  // Map F1-F6 to F7-F12
+						meta_consumed = true;
+					}
 
 					handle_scancode(code, is_down);
 				}
