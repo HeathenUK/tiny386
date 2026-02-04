@@ -910,6 +910,13 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	pc->ide2 = ide_allocate(15, pc->pic, set_irq);
 	const char **disks = conf->disks;
 	for (int i = 0; i < 4; i++) {
+#ifdef TANMATSU_BUILD
+		// Slot 3 (secondary slave) is reserved for USB storage on Tanmatsu
+		if (i == 3) {
+			ide_attach_usb(pc->ide2, 1);
+			continue;
+		}
+#endif
 		if (!disks[i] || disks[i][0] == 0)
 			continue;
 		int ret;

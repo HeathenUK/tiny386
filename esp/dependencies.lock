@@ -122,6 +122,28 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 3.0.2
+  espressif/usb_host_msc:
+    component_hash: 865a651c08d0bf2ce255a369778375e493df588dfb0720c3d97e12bfdcc4c0f9
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4.1'
+    - name: espressif/usb
+      registry_url: https://components.espressif.com
+      require: public
+      rules:
+      - if: idf_version >=6.0
+      - if: target not in ["linux"]
+      version: ^1.0.0
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    - esp32h4
+    version: 1.1.4
   idf:
     source:
       type: idf
@@ -230,6 +252,7 @@ direct_dependencies:
 - espressif/esp_lcd_ili9341
 - espressif/esp_lcd_st7701
 - espressif/led_strip
+- espressif/usb_host_msc
 - idf
 - nicolaielectronics/bmi270
 - nicolaielectronics/es8156
@@ -237,6 +260,6 @@ direct_dependencies:
 - nicolaielectronics/mpr121
 - nicolaielectronics/ssd1619
 - nicolaielectronics/tanmatsu_coprocessor
-manifest_hash: bbb4c27824890fed5a8c2ec662212da32c2ff46aaa7ac6f6fd8dd3dd526e03c6
+manifest_hash: c0d212bbc82a69fac18a5b0dfacd9ac4d6b83ebf117b904ded4fdef0b7edc2db
 target: esp32p4
 version: 2.0.0

@@ -512,14 +512,20 @@ static void render_main_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
 	char fda_val[32], fdb_val[32];
-	char cda_val[32], cdb_val[32], cdc_val[32], cdd_val[32];
+	char cda_val[32], cdb_val[32], cdc_val[32], usb_val[32];
 
 	snprintf(fda_val, sizeof(fda_val), "%.20s", basename_ptr(osd->drive_paths[0]));
 	snprintf(fdb_val, sizeof(fdb_val), "%.20s", basename_ptr(osd->drive_paths[1]));
 	snprintf(cda_val, sizeof(cda_val), "%.20s", basename_ptr(osd->drive_paths[2]));
 	snprintf(cdb_val, sizeof(cdb_val), "%.20s", basename_ptr(osd->drive_paths[3]));
 	snprintf(cdc_val, sizeof(cdc_val), "%.20s", basename_ptr(osd->drive_paths[4]));
-	snprintf(cdd_val, sizeof(cdd_val), "%.20s", basename_ptr(osd->drive_paths[5]));
+
+	// USB storage status (read from globals - managed by usb_host.c)
+	if (globals.usb_storage_connected) {
+		snprintf(usb_val, sizeof(usb_val), "Connected");
+	} else {
+		snprintf(usb_val, sizeof(usb_val), "(empty)");
+	}
 
 	MenuEntry entries[MOUNT_COUNT] = {
 		{ "Floppy A:", 0, 0, fda_val },
@@ -528,7 +534,7 @@ static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pi
 		{ "CD-ROM A:", 0, 0, cda_val },
 		{ "CD-ROM B:", 0, 0, cdb_val },
 		{ "CD-ROM C:", 0, 0, cdc_val },
-		{ "CD-ROM D:", 0, 0, cdd_val },
+		{ "USB Storage:", 0, 0, usb_val },
 		{ NULL, 1, 0, NULL },  // SEP2
 		{ "< Back", 0, 0, NULL },
 	};
@@ -906,11 +912,14 @@ static int handle_mount_select(OSD *osd)
 	case MOUNT_CDA:
 	case MOUNT_CDB:
 	case MOUNT_CDC:
-	case MOUNT_CDD:
-		osd->browser_target = (osd->mount_sel - MOUNT_CDA) + 2;  // 2-5
+		osd->browser_target = (osd->mount_sel - MOUNT_CDA) + 2;  // 2-4
 		strcpy(osd->browser_path, "/sdcard");
 		scan_directory(osd);
 		osd->view = VIEW_FILEBROWSER;
+		break;
+	case MOUNT_CDD:
+		// USB Storage - slot 5 is managed by USB host, not user-mountable
+		// Do nothing - just show current status
 		break;
 	case MOUNT_BACK:
 		osd->view = VIEW_MAIN_MENU;

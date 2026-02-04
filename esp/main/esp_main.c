@@ -350,6 +350,15 @@ static void i386_task(void *arg)
 	}
 #endif
 
+#ifdef USE_BADGE_BSP
+	// Initialize USB host subsystem (needs BSP ready for power control)
+	extern esp_err_t usb_host_init(void);
+	esp_err_t usb_err = usb_host_init();
+	if (usb_err != ESP_OK) {
+		fprintf(stderr, "USB host init failed: %d\n", usb_err);
+	}
+#endif
+
 	pc_main(config->filename);
 	vTaskDelete(NULL);
 }

@@ -34,6 +34,7 @@
 #ifdef TANMATSU_BUILD
 //#define DEBUG_IDE
 #include "led_activity.h"
+#include "usb_host.h"
 #define IDE_ACTIVITY() led_activity_hdd()
 #else
 #define IDE_ACTIVITY() ((void)0)
@@ -2437,6 +2438,78 @@ static BlockDevice *block_device_init_espsd(int64_t start_sector, int64_t nb_sec
 }
 #endif
 
+#ifdef TANMATSU_BUILD
+/*
+ * USB Mass Storage BlockDevice
+ * Returns 0 sectors when no USB device is connected.
+ * Reads return zeros and writes are silently discarded when disconnected.
+ */
+typedef struct BlockDeviceUSB {
+    int dummy;  // Placeholder - state is in usb_host.c
+} BlockDeviceUSB;
+
+static int64_t usbmsc_get_sector_count(BlockDevice *bs)
+{
+    (void)bs;
+    return usb_host_msc_get_sector_count();
+}
+
+static int usbmsc_read_async(BlockDevice *bs,
+                              uint64_t sector_num, uint8_t *buf, int n,
+                              BlockDeviceCompletionFunc *cb, void *opaque)
+{
+    (void)bs;
+    IDE_ACTIVITY();
+
+    if (!usb_host_msc_connected()) {
+        // No USB connected - return zeros silently
+        memset(buf, 0, n * 512);
+        if (cb) cb(opaque, 0);
+        return 0;
+    }
+
+    int ret = usb_host_msc_read(sector_num, buf, n);
+    if (cb) cb(opaque, ret);
+    return ret;
+}
+
+static int usbmsc_write_async(BlockDevice *bs,
+                               uint64_t sector_num, const uint8_t *buf, int n,
+                               BlockDeviceCompletionFunc *cb, void *opaque)
+{
+    (void)bs;
+    IDE_ACTIVITY();
+
+    if (!usb_host_msc_connected()) {
+        // No USB connected - silently discard write
+        if (cb) cb(opaque, 0);
+        return 0;
+    }
+
+    int ret = usb_host_msc_write(sector_num, buf, n);
+    if (cb) cb(opaque, ret);
+    return ret;
+}
+
+static BlockDevice *block_device_init_usb(void)
+{
+    BlockDevice *bs;
+    BlockDeviceUSB *bf;
+
+    bs = pcmalloc(sizeof(*bs));
+    bf = pcmalloc(sizeof(*bf));
+    memset(bs, 0, sizeof(*bs));
+    memset(bf, 0, sizeof(*bf));
+
+    bs->opaque = bf;
+    bs->get_sector_count = usbmsc_get_sector_count;
+    bs->get_chs = NULL;
+    bs->read_async = usbmsc_read_async;
+    bs->write_async = usbmsc_write_async;
+    return bs;
+}
+#endif
+
 IDEIFState *ide_allocate(int irq, void *pic, void (*set_irq)(void *pic, int irq, int level))
 {
     IDEIFState *s;
@@ -2483,6 +2556,20 @@ int ide_attach_cd(IDEIFState *s, int drive, const char *filename)
     s->drives[drive] = ide_cddrive_init(s, bs);
     return 0;
 }
+
+#ifdef TANMATSU_BUILD
+int ide_attach_usb(IDEIFState *s, int drive)
+{
+    // Create USB BlockDevice - always present but reports 0 sectors when
+    // no USB storage is connected. This avoids IDE hot-attach complexity.
+    BlockDevice *bs = block_device_init_usb();
+    if (!bs) {
+        return -1;
+    }
+    s->drives[drive] = ide_hddrive_init(s, bs);
+    return 0;
+}
+#endif
 
 static void block_device_reinit(BlockDevice *bs, const char *filename)
 {

@@ -47,6 +47,8 @@ struct Globals {
 	uint8_t emu_periph_percent;   // Peripheral time percentage (0-100)
 	uint16_t emu_batch_size;      // Current instruction batch size
 	uint32_t emu_calls_per_sec;   // pc_step calls per second
+	// USB storage state
+	bool usb_storage_connected;   // True when USB mass storage is attached
 #endif
 };
 
