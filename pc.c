@@ -13,6 +13,9 @@
 #define IRAM_ATTR
 #endif
 
+// Batch size setting: 0=auto (dynamic), or fixed value 512-4096
+int pc_batch_size_setting = 0;
+
 #ifdef USEKVM
 #define cpu_raise_irq cpukvm_raise_irq
 #define cpu_get_cycle cpukvm_get_cycle
@@ -475,12 +478,19 @@ void pc_vga_step(void *o)
 void pc_step(PC *pc)
 {
 #ifdef BUILD_ESP32
-	/* Dynamic batch sizing: adjust instruction count based on step time.
-	 * Scale up when steps are fast, scale down when slow.
-	 * Uses hysteresis to prevent oscillation. */
-	static int batch_size = 512;           /* Current batch: 512-4096 */
-	static uint32_t step_time_accum = 0;   /* Accumulated step time */
+	/* Batch sizing: fixed if pc_batch_size_setting > 0, else dynamic.
+	 * Dynamic mode adjusts instruction count based on step time,
+	 * scaling up when fast and down when slow, with hysteresis. */
+	static int batch_size = 0;             /* Current batch: 512-4096 */
+	static uint32_t step_time_accum = 0;   /* Accumulated step time (dynamic mode) */
 	static uint32_t step_count = 0;        /* Steps since last evaluation */
+
+	/* Initialize batch_size on first call or when setting changes */
+	if (batch_size == 0 || (pc_batch_size_setting > 0 && batch_size != pc_batch_size_setting)) {
+		batch_size = (pc_batch_size_setting > 0) ? pc_batch_size_setting : 512;
+		step_time_accum = 0;
+		step_count = 0;
+	}
 #endif
 
 #ifndef USEKVM
@@ -488,7 +498,9 @@ void pc_step(PC *pc)
 		pc->reset_request = 0;
 #ifdef BUILD_ESP32
 		/* Reset batch size on reboot - hardware detection is timing-sensitive */
-		batch_size = 512;
+		if (pc_batch_size_setting == 0) {
+			batch_size = 512;  /* Only reset if in dynamic mode */
+		}
 		step_time_accum = 0;
 		step_count = 0;
 #endif
@@ -524,10 +536,12 @@ void pc_step(PC *pc)
 	}
 
 #ifdef BUILD_ESP32
-	/* Check if VGA mode changed - reset batch for new program */
+	/* Check if VGA mode changed - reset batch for new program (dynamic mode only) */
 	if (globals.batch_reset_pending) {
 		globals.batch_reset_pending = false;
-		batch_size = 512;
+		if (pc_batch_size_setting == 0) {
+			batch_size = 512;
+		}
 		step_time_accum = 0;
 		step_count = 0;
 	}
@@ -599,28 +613,30 @@ void pc_step(PC *pc)
 	if (collecting) t2 = get_uticks();  /* After CPU */
 #endif
 
-	/* Track step timing for dynamic batch adjustment */
-	uint32_t step_time = get_uticks() - t0;
-	step_time_accum += step_time;
-	step_count++;
+	/* Dynamic batch adjustment (only when pc_batch_size_setting == 0) */
+	if (pc_batch_size_setting == 0) {
+		uint32_t step_time = get_uticks() - t0;
+		step_time_accum += step_time;
+		step_count++;
 
-	/* Evaluate and adjust batch size every 100 steps */
-	if (step_count >= 100) {
-		uint32_t avg_step_time = step_time_accum / step_count;
+		/* Evaluate and adjust batch size every 100 steps */
+		if (step_count >= 100) {
+			uint32_t avg_step_time = step_time_accum / step_count;
 
-		/* Hysteresis thresholds to prevent oscillation:
-		 * - Scale UP by 256 if avg < 800us (fast steps, room to grow)
-		 * - Scale DOWN by 256 if avg > 2000us (slow steps, reduce load)
-		 * - Dead zone 800-2000us: hold current batch size
-		 * Range: 512-4096, step size 256 (15 levels) */
-		if (avg_step_time < 800 && batch_size < 4096) {
-			batch_size += 256;
-		} else if (avg_step_time > 2000 && batch_size > 512) {
-			batch_size -= 256;
+			/* Hysteresis thresholds to prevent oscillation:
+			 * - Scale UP by 256 if avg < 800us (fast steps, room to grow)
+			 * - Scale DOWN by 256 if avg > 2000us (slow steps, reduce load)
+			 * - Dead zone 800-2000us: hold current batch size
+			 * Range: 512-4096, step size 256 (15 levels) */
+			if (avg_step_time < 800 && batch_size < 4096) {
+				batch_size += 256;
+			} else if (avg_step_time > 2000 && batch_size > 512) {
+				batch_size -= 256;
+			}
+
+			step_time_accum = 0;
+			step_count = 0;
 		}
-
-		step_time_accum = 0;
-		step_count = 0;
 	}
 
 #ifdef USE_BADGE_BSP
@@ -1243,6 +1259,14 @@ int parse_conf_ini(void* user, const char* section,
 			conf->cpu_gen = gen;
 		} else if (NAME("fpu")) {
 			conf->fpu = atoi(value);
+		} else if (NAME("batch_size")) {
+			int bs = atoi(value);
+			// Validate: 0 (auto) or 512-4096
+			if (bs != 0 && (bs < 512 || bs > 4096)) {
+				fprintf(stderr, "Warning: Invalid batch_size '%s' (valid: 0 or 512-4096), using auto\n", value);
+				bs = 0;
+			}
+			conf->batch_size = bs;
 		}
 	}
 #undef SEC

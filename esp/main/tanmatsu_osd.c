@@ -90,6 +90,7 @@ typedef enum {
 	SYS_CPU_GEN = 0,
 	SYS_FPU,
 	SYS_MEMSIZE,
+	SYS_BATCH,
 	SYS_SEP1,
 	SYS_BACK,
 	SYS_COUNT
@@ -136,6 +137,7 @@ struct OSD {
 	int cpu_gen;     // 3=386, 4=486, 5=586
 	int fpu;         // 0=disabled, 1=enabled
 	int mem_size_mb; // Memory in MB (1 to 24)
+	int batch_size;  // 0=auto, or fixed value (512-4096 in 256 increments)
 
 	// File browser state
 	int browser_target;  // Which drive slot we're browsing for
@@ -567,7 +569,7 @@ static const char *cpu_gen_names[] = { "i386", "i486", "i586" };
 // Render system settings submenu
 static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	char cpu_val[16], fpu_val[16], mem_val[16];
+	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16];
 
 	// CPU generation (3=386, 4=486, 5=586)
 	int gen_idx = osd->cpu_gen - 3;
@@ -581,10 +583,18 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	// Memory size
 	snprintf(mem_val, sizeof(mem_val), "%d MB", osd->mem_size_mb);
 
+	// Batch size
+	if (osd->batch_size == 0) {
+		snprintf(batch_val, sizeof(batch_val), "Auto");
+	} else {
+		snprintf(batch_val, sizeof(batch_val), "%d", osd->batch_size);
+	}
+
 	MenuEntry entries[SYS_COUNT] = {
 		{ "CPU:", 0, 0, cpu_val },
 		{ "FPU:", 0, 0, fpu_val },
 		{ "Memory:", 0, 0, mem_val },
+		{ "Batch:", 0, 0, batch_val },
 		{ NULL, 1, 0, NULL },  // SEP1
 		{ "< Back (restart to apply)", 0, 0, NULL },
 	};
@@ -950,7 +960,7 @@ static int handle_main_select(OSD *osd)
 			                     osd->drive_paths[4], osd->drive_paths[5],
 			                     osd->cpu_gen, osd->fpu, osd_get_mem_size_bytes(osd),
 			                     osd->brightness, osd->volume, osd->frame_skip,
-			                     osd->double_buffer);
+			                     osd->double_buffer, osd->batch_size);
 			toast_show("Settings saved");
 		}
 		break;
@@ -1014,6 +1024,19 @@ static void handle_sys_adjust(OSD *osd, int delta)
 		if (osd->mem_size_mb < 1) osd->mem_size_mb = 1;
 		if (osd->mem_size_mb > 24) osd->mem_size_mb = 24;
 		break;
+	case SYS_BATCH:
+		// Cycle: Auto(0), 512, 768, 1024, ... 4096 in 256 increments
+		if (osd->batch_size == 0) {
+			// Auto -> first fixed value or wrap to max
+			osd->batch_size = (delta > 0) ? 512 : 4096;
+		} else {
+			osd->batch_size += delta * 256;
+			if (osd->batch_size < 512) osd->batch_size = 0;  // Wrap to Auto
+			if (osd->batch_size > 4096) osd->batch_size = 0; // Wrap to Auto
+		}
+		// Apply immediately (takes effect next pc_step)
+		pc_batch_size_setting = osd->batch_size;
+		break;
 	}
 }
 
@@ -1033,6 +1056,7 @@ OSD *osd_init(void)
 	osd->volume = globals.volume;
 	osd->frame_skip = vga_frame_skip_max;  // Load from config
 	osd->double_buffer = vga_double_buffer;  // Load from config
+	osd->batch_size = pc_batch_size_setting;  // Load from config (0=auto)
 
 	// Default system settings
 	osd->cpu_gen = 4;      // i486

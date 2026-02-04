@@ -447,7 +447,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
                          const char *cdc, const char *cdd,
                          int cpu_gen, int fpu, long mem_size,
                          int brightness, int volume, int frame_skip,
-                         int double_buffer)
+                         int double_buffer, int batch_size)
 {
 	if (!ini_path) return -1;
 	if (boot_order < 0 || boot_order >= BOOT_ORDER_COUNT)
@@ -475,7 +475,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	int found_boot_order = -1, found_fda = -1, found_fdb = -1;
 	int found_cda = -1, found_cdb = -1, found_cdc = -1, found_cdd = -1;
 	int found_mem_size = -1;
-	int found_gen = -1, found_fpu = -1;
+	int found_gen = -1, found_fpu = -1, found_batch_size = -1;
 	int found_brightness = -1, found_volume = -1, found_frame_skip = -1;
 	int found_double_buffer = -1;
 
@@ -527,6 +527,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 		if (in_cpu_section) {
 			if (line_starts_with(lines[line_count], "gen")) found_gen = line_count;
 			else if (line_starts_with(lines[line_count], "fpu")) found_fpu = line_count;
+			else if (line_starts_with(lines[line_count], "batch_size")) found_batch_size = line_count;
 		}
 
 		// Check for existing settings in [display] section
@@ -587,6 +588,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			fprintf(f, "gen = %d\n", cpu_gen);
 		} else if (i == found_fpu) {
 			fprintf(f, "fpu = %d\n", fpu);
+		} else if (i == found_batch_size) {
+			fprintf(f, "batch_size = %d\n", batch_size);
 		} else {
 			fputs(lines[i], f);
 		}
@@ -624,6 +627,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 				fprintf(f, "gen = %d\n", cpu_gen);
 			if (found_fpu < 0)
 				fprintf(f, "fpu = %d\n", fpu);
+			if (found_batch_size < 0)
+				fprintf(f, "batch_size = %d\n", batch_size);
 		}
 
 		// Add new settings at end of [display] section

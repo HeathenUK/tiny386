@@ -265,6 +265,14 @@ static int pc_main(const char *file)
 	vga_double_buffer = conf.double_buffer;
 	fprintf(stderr, "Double buffering: %s\n", vga_double_buffer ? "enabled" : "disabled");
 
+	/* Apply batch size setting from config */
+	pc_batch_size_setting = conf.batch_size;
+	if (pc_batch_size_setting > 0) {
+		fprintf(stderr, "Batch size: fixed at %d\n", pc_batch_size_setting);
+	} else {
+		fprintf(stderr, "Batch size: auto (dynamic)\n");
+	}
+
 #ifdef USE_BADGE_BSP
 	/* Store brightness/volume in globals for input_bsp and OSD to use */
 	globals.brightness = conf.brightness;

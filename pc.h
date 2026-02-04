@@ -113,6 +113,7 @@ typedef struct {
 	int boot_order;  // 0=HDD, 1=Floppy, 2=CD (see misc.h BOOT_ORDER_*)
 	int frame_skip;  // 0=disabled, 1-10=max frames to skip (adaptive)
 	int double_buffer;  // 0=disabled, 1=enabled (tear-free VGA rendering)
+	int batch_size;  // 0=auto, or fixed value 512-4096 (ESP32 only)
 	int brightness;  // 0-100 display brightness (ESP32 only)
 	int volume;      // 0-100 audio volume (ESP32 only)
 	const char *ini_path;  // Path to ini file for saving settings
@@ -127,6 +128,9 @@ void pc_vga_step(void *o);
 void pc_step(PC *pc);
 
 void mixer_callback(void *opaque, uint8_t *stream, int free);
+
+// Batch size setting (ESP32 only): 0=auto, or fixed value 512-4096
+extern int pc_batch_size_setting;
 
 int parse_conf_ini(void* user, const char* section,
 		   const char* name, const char* value);
