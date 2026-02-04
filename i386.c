@@ -3012,7 +3012,7 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 #define MOVS_helper2(BIT, ABIT) \
 	OptAddr memls, memld; \
 	uword cx = lreg ## ABIT(1); \
-	/* Fast path: entire REP fits in single pages, forward, RAM-only */ \
+	/* Fast path: entire REP fits in single pages, forward, RAM-only, non-overlapping */ \
 	if (cx > 0 && dir > 0 && curr_seg == SEG_DS) { \
 		uword src_log = lreg ## ABIT(6); \
 		uword dst_log = lreg ## ABIT(7); \
@@ -3026,12 +3026,19 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 			if (!in_iomem(memls.addr1) && !in_iomem(memld.addr1) && \
 			    memls.addr1 + bytes <= cpu->phys_mem_size && \
 			    memld.addr1 + bytes <= cpu->phys_mem_size) { \
-				memmove(cpu->phys_mem + memld.addr1, \
-				        cpu->phys_mem + memls.addr1, bytes); \
-				sreg ## ABIT(6, src_log + bytes); \
-				sreg ## ABIT(7, dst_log + bytes); \
-				sreg ## ABIT(1, 0); \
-				cx = 0; \
+				/* Check for overlapping forward copy (dst > src but dst < src+bytes). \
+				 * x86 REP MOVSB forward with overlap creates a "fill" pattern - \
+				 * memmove would incorrectly preserve source data by copying backward. \
+				 * Only use fast path for non-overlapping copies. */ \
+				if (memld.addr1 >= memls.addr1 + bytes || memls.addr1 >= memld.addr1 + bytes) { \
+					memcpy(cpu->phys_mem + memld.addr1, \
+					       cpu->phys_mem + memls.addr1, bytes); \
+					sreg ## ABIT(6, src_log + bytes); \
+					sreg ## ABIT(7, dst_log + bytes); \
+					sreg ## ABIT(1, 0); \
+					cx = 0; \
+				} \
+				/* If overlapping, fall through to byte-by-byte loop */ \
 			} \
 		} \
 	} \
@@ -5518,6 +5525,15 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		case EX_PF:
 			pusherr = true;
 		}
+#ifdef DEBUG_CPU_EXCEPTIONS
+		{
+			static const char *exc_names[] = {"DE","DB","NMI","BP","OF","BR","UD","NM","DF","?","TS","NP","SS","GP","PF"};
+			const char *name = (cpu->excno < 15) ? exc_names[cpu->excno] : "??";
+			fprintf(stderr, "CPU EXCEPTION: #%s (%d) err=%lx at CS:IP=%04x:%08lx\n",
+			        name, cpu->excno, (unsigned long)cpu->excerr,
+			        cpu->seg[SEG_CS].sel, (unsigned long)cpu->ip);
+		}
+#endif
 		cpu->next_ip = cpu->ip;
 
 		TRY1(call_isr(cpu, cpu->excno, pusherr, 1));

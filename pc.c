@@ -911,9 +911,10 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	const char **disks = conf->disks;
 	for (int i = 0; i < 4; i++) {
 #ifdef TANMATSU_BUILD
-		// Slot 3 (secondary slave) is reserved for USB storage on Tanmatsu
-		if (i == 3) {
-			ide_attach_usb(pc->ide2, 1);
+		// Slot 2 (secondary master) is reserved for USB storage on Tanmatsu
+		// Must be master, not slave - DOS won't see slave without a master present
+		if (i == 2) {
+			ide_attach_usb(pc->ide2, 0);
 			continue;
 		}
 #endif

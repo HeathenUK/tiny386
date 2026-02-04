@@ -78,14 +78,14 @@ static void usb_host_client_event_cb(const usb_host_client_event_msg_t *event_ms
 
     switch (event_msg->event) {
     case USB_HOST_CLIENT_EVENT_NEW_DEV:
-        ESP_LOGI(TAG, "New USB device connected, addr=%d", event_msg->new_dev.address);
+        fprintf(stderr, "USB: New device connected, addr=%d\n", event_msg->new_dev.address);
         evt.type = USB_EVENT_DEVICE_CONNECTED;
         evt.dev_addr = event_msg->new_dev.address;
         xQueueSend(usb_event_queue, &evt, 0);
         break;
 
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
-        ESP_LOGI(TAG, "USB device disconnected");
+        fprintf(stderr, "USB: Device disconnected\n");
         evt.type = USB_EVENT_DEVICE_DISCONNECTED;
         evt.dev_addr = 0;
         xQueueSend(usb_event_queue, &evt, 0);
@@ -118,26 +118,30 @@ static void msc_event_cb(const msc_host_event_t *event, void *arg)
  */
 static void handle_device_connected(uint8_t dev_addr)
 {
+    fprintf(stderr, "USB: Handling device connect, addr=%d\n", dev_addr);
+
     if (msc_connected) {
-        ESP_LOGW(TAG, "MSC device already connected, ignoring new device");
+        fprintf(stderr, "USB: MSC already connected, ignoring\n");
         return;
     }
 
+    fprintf(stderr, "USB: Installing MSC device...\n");
     esp_err_t err = msc_host_install_device(dev_addr, &msc_device);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Device at addr %d is not MSC: %s", dev_addr, esp_err_to_name(err));
+        fprintf(stderr, "USB: Not MSC or install failed: %s\n", esp_err_to_name(err));
         return;
     }
 
+    fprintf(stderr, "USB: Getting device info...\n");
     err = msc_host_get_device_info(msc_device, &msc_info);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get device info: %s", esp_err_to_name(err));
+        fprintf(stderr, "USB: Failed to get info: %s\n", esp_err_to_name(err));
         msc_host_uninstall_device(msc_device);
         msc_device = NULL;
         return;
     }
 
-    ESP_LOGI(TAG, "USB storage: %lu sectors x %lu bytes = %lu MB",
+    fprintf(stderr, "USB: Storage %lu sectors x %lu bytes = %lu MB\n",
              (unsigned long)msc_info.sector_count,
              (unsigned long)msc_info.sector_size,
              (unsigned long)(msc_info.sector_count * msc_info.sector_size / (1024 * 1024)));
@@ -179,7 +183,7 @@ static void handle_device_disconnected(void)
  */
 static void msc_task(void *arg)
 {
-    ESP_LOGI(TAG, "MSC task started");
+    fprintf(stderr, "USB: MSC task starting...\n");
 
     // Register USB host client
     usb_host_client_config_t client_config = {
@@ -194,10 +198,11 @@ static void msc_task(void *arg)
     usb_host_client_handle_t client_handle;
     esp_err_t err = usb_host_client_register(&client_config, &client_handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to register USB host client: %s", esp_err_to_name(err));
+        fprintf(stderr, "USB: Failed to register client: %s\n", esp_err_to_name(err));
         vTaskDelete(NULL);
         return;
     }
+    fprintf(stderr, "USB: Client registered\n");
 
     // Install MSC class driver
     const msc_host_driver_config_t msc_config = {
@@ -209,13 +214,13 @@ static void msc_task(void *arg)
 
     err = msc_host_install(&msc_config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to install MSC driver: %s", esp_err_to_name(err));
+        fprintf(stderr, "USB: Failed to install MSC driver: %s\n", esp_err_to_name(err));
         usb_host_client_deregister(client_handle);
         vTaskDelete(NULL);
         return;
     }
 
-    ESP_LOGI(TAG, "MSC driver installed, waiting for devices...");
+    fprintf(stderr, "USB: MSC driver installed, waiting for devices...\n");
 
     // Main event loop
     usb_event_t evt;
@@ -241,7 +246,7 @@ esp_err_t usb_host_init(void)
 {
     esp_err_t err;
 
-    ESP_LOGI(TAG, "Initializing USB host subsystem");
+    fprintf(stderr, "USB: Initializing USB host subsystem\n");
 
     // Create mutex for MSC access
     msc_mutex = xSemaphoreCreateMutex();
@@ -258,17 +263,19 @@ esp_err_t usb_host_init(void)
     }
 
     // Enable 5V boost for USB-A port
+    fprintf(stderr, "USB: Enabling 5V boost...\n");
     err = bsp_power_set_usb_host_boost_enabled(true);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable USB boost: %s", esp_err_to_name(err));
+        fprintf(stderr, "USB: Failed to enable boost: %s\n", esp_err_to_name(err));
         return err;
     }
-    ESP_LOGI(TAG, "USB 5V boost enabled");
+    fprintf(stderr, "USB: 5V boost enabled\n");
 
     // Wait for power to stabilize
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Install USB host library
+    fprintf(stderr, "USB: Installing USB host library...\n");
     usb_host_config_t host_config = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
@@ -276,20 +283,23 @@ esp_err_t usb_host_init(void)
 
     err = usb_host_install(&host_config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to install USB host: %s", esp_err_to_name(err));
+        fprintf(stderr, "USB: Failed to install host: %s\n", esp_err_to_name(err));
         bsp_power_set_usb_host_boost_enabled(false);
         return err;
     }
+    fprintf(stderr, "USB: Host library installed\n");
 
     // Create USB host library task
     xTaskCreatePinnedToCore(usb_host_lib_task, "usb_host_lib", 4096,
                             NULL, 10, &usb_host_task_handle, 0);
+    fprintf(stderr, "USB: Host lib task created\n");
 
     // Create MSC task
     xTaskCreatePinnedToCore(msc_task, "msc_task", 4096,
                             NULL, 5, &msc_task_handle, 0);
+    fprintf(stderr, "USB: MSC task created\n");
 
-    ESP_LOGI(TAG, "USB host initialized");
+    fprintf(stderr, "USB: Initialization complete\n");
     return ESP_OK;
 }
 

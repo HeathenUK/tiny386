@@ -353,9 +353,36 @@ static void i386_task(void *arg)
 #ifdef USE_BADGE_BSP
 	// Initialize USB host subsystem (needs BSP ready for power control)
 	extern esp_err_t usb_host_init(void);
+	extern bool usb_host_msc_connected(void);
 	esp_err_t usb_err = usb_host_init();
 	if (usb_err != ESP_OK) {
 		fprintf(stderr, "USB host init failed: %d\n", usb_err);
+	} else {
+		// Wait up to 2 seconds for USB device to enumerate
+		// This allows USB drives to be detected before BIOS runs
+		fprintf(stderr, "USB: Waiting for device enumeration...\n");
+		for (int i = 0; i < 20; i++) {
+			vTaskDelay(pdMS_TO_TICKS(100));
+			if (usb_host_msc_connected()) {
+				fprintf(stderr, "USB: Device ready\n");
+				// Debug: read and dump sector 0 (MBR)
+				extern int usb_host_msc_read(uint64_t sector, uint8_t *buf, int count);
+				uint8_t mbr[512];
+				int ret = usb_host_msc_read(0, mbr, 1);
+				fprintf(stderr, "USB: Read sector 0 returned %d\n", ret);
+				if (ret == 0) {
+					fprintf(stderr, "USB: MBR signature: %02X %02X (should be 55 AA)\n",
+					        mbr[510], mbr[511]);
+					fprintf(stderr, "USB: Partition 1 type: %02X\n", mbr[0x1BE + 4]);
+					fprintf(stderr, "USB: First bytes: %02X %02X %02X %02X\n",
+					        mbr[0], mbr[1], mbr[2], mbr[3]);
+				}
+				break;
+			}
+		}
+		if (!usb_host_msc_connected()) {
+			fprintf(stderr, "USB: No device found (continuing)\n");
+		}
 	}
 #endif
 

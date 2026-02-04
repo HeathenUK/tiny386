@@ -707,6 +707,47 @@ void msc_event_callback(const msc_host_event_t *event, void *arg) {
 
 **Safety**: Must handle mid-operation disconnect gracefully
 
+### 7.5 Future Enhancement: Virtual FAT16 Translation Layer
+
+**Problem**: DOS 6.22 and other older OSes don't support FAT32. Most modern USB drives are formatted as FAT32 or exFAT, making them inaccessible to DOS guests.
+
+**Proposed Solution**: A virtual FAT16 translation layer that:
+1. Mounts USB natively using ESP-IDF's VFS (which supports FAT32)
+2. Builds virtual FAT16 structures in RAM based on the file listing
+3. Translates sector reads:
+   - Boot sector → synthetic FAT16 boot sector
+   - FAT area → dynamically generated FAT16 table
+   - Root directory → synthetic directory entries from real files
+   - Data clusters → read actual file content from mounted VFS
+
+**Limitations**:
+- Read-only initially (writes are complex to translate)
+- ~2GB max visible size (FAT16 limit)
+- Flat directory structure easiest (subdirectories add complexity)
+- Some RAM overhead for FAT tables and file mapping (~10-50KB)
+
+**Implementation Sketch**:
+```c
+typedef struct {
+    uint32_t total_sectors;
+    uint8_t *fat_table;           // In-memory FAT16 table
+    uint8_t *root_dir;            // In-memory root directory
+    struct {
+        char dos_name[11];        // 8.3 format
+        char real_path[256];      // VFS path
+        uint32_t size;
+        uint16_t first_cluster;
+    } *file_map;
+    int file_count;
+    char mount_path[32];          // e.g., "/usb"
+} VirtualFAT16;
+
+// On USB mount: scan files, build FAT16 structures
+// On sector read: return synthetic data or real file content
+```
+
+**Status**: Idea logged, not planned for implementation
+
 ---
 
 ## 8. Implementation Priority

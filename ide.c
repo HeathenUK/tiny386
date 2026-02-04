@@ -595,12 +595,19 @@ static void ide_sector_read(IDEState *s)
 
     sector_num = ide_get_sector(s);
     n = s->nsector;
-    if (n == 0) 
+    if (n == 0)
         n = 256;
     if (n > s->req_nb_sectors)
         n = s->req_nb_sectors;
 #if defined(DEBUG_IDE)
     printf("read sector=%" PRId64 " count=%d\n", sector_num, n);
+#endif
+#if defined(DEBUG_USB_IDE)
+    /* Debug USB drive reads - check if this is the USB drive (secondary master) */
+    if (s->ide_if && s->ide_if->irq == 15 && s == s->ide_if->drives[0]) {
+        fprintf(stderr, "USB IDE read: sector=%lld count=%d nb_sectors=%lld\n",
+                (long long)sector_num, n, (long long)s->nb_sectors);
+    }
 #endif
     s->io_nb_sectors = n;
     IDE_ACTIVITY();
@@ -625,8 +632,26 @@ static void ide_sector_read_cb(void *opaque, int ret)
     IDEState *s = opaque;
     int n;
     EndTransferFunc *func;
-    
+
     n = s->io_nb_sectors;
+#if defined(DEBUG_USB_IDE)
+    /* For USB drive, dump data when reading from USB */
+    if (s->ide_if && s->ide_if->irq == 15 && s == s->ide_if->drives[0]) {
+        int64_t cur_sector = ide_get_sector(s);  /* sector we just read */
+        uint8_t *buf = s->io_buffer;
+        fprintf(stderr, "USB read done sector=%lld: %02x %02x %02x %02x %02x %02x %02x %02x ... %02x %02x\n",
+                (long long)cur_sector,
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                buf[510], buf[511]);
+        if (cur_sector == 0) {
+            /* Dump MBR partition table entry 1 */
+            fprintf(stderr, "  MBR part1: boot=%02x type=%02x LBA_start=%u size=%u\n",
+                    buf[446+0], buf[446+4],
+                    buf[446+8] | (buf[446+9]<<8) | (buf[446+10]<<16) | (buf[446+11]<<24),
+                    buf[446+12] | (buf[446+13]<<8) | (buf[446+14]<<16) | (buf[446+15]<<24));
+        }
+    }
+#endif
     ide_set_sector(s, ide_get_sector(s) + n);
     s->nsector = (s->nsector - n) & 0xff;
     if (s->nsector == 0)
@@ -663,6 +688,7 @@ static void ide_sector_write_cb1(IDEState *s)
                              ide_sector_write_cb2, s);
     if (ret < 0) {
         /* error */
+        fprintf(stderr, "IDE: write FAILED sector=%lld\n", (long long)sector_num);
         ide_abort_command(s);
         ide_set_irq(s);
     } else if (ret == 0) {
@@ -2459,18 +2485,19 @@ static int usbmsc_read_async(BlockDevice *bs,
                               BlockDeviceCompletionFunc *cb, void *opaque)
 {
     (void)bs;
+    (void)cb;
+    (void)opaque;
     IDE_ACTIVITY();
 
     if (!usb_host_msc_connected()) {
         // No USB connected - return zeros silently
         memset(buf, 0, n * 512);
-        if (cb) cb(opaque, 0);
-        return 0;
+        return 0;  // Synchronous - ide_sector_read will call callback
     }
 
     int ret = usb_host_msc_read(sector_num, buf, n);
-    if (cb) cb(opaque, ret);
-    return ret;
+    // Return 0 for success - ide_sector_read handles callback for synchronous case
+    return (ret < 0) ? ret : 0;
 }
 
 static int usbmsc_write_async(BlockDevice *bs,
@@ -2478,17 +2505,18 @@ static int usbmsc_write_async(BlockDevice *bs,
                                BlockDeviceCompletionFunc *cb, void *opaque)
 {
     (void)bs;
+    (void)cb;
+    (void)opaque;
     IDE_ACTIVITY();
 
     if (!usb_host_msc_connected()) {
         // No USB connected - silently discard write
-        if (cb) cb(opaque, 0);
-        return 0;
+        return 0;  // Synchronous - ide_sector_write handles callback
     }
 
     int ret = usb_host_msc_write(sector_num, buf, n);
-    if (cb) cb(opaque, ret);
-    return ret;
+    // Return 0 for success - ide_sector_write handles callback for synchronous case
+    return (ret < 0) ? ret : 0;
 }
 
 static BlockDevice *block_device_init_usb(void)
@@ -2567,6 +2595,15 @@ int ide_attach_usb(IDEIFState *s, int drive)
         return -1;
     }
     s->drives[drive] = ide_hddrive_init(s, bs);
+#ifdef DEBUG_USB_IDE
+    if (s->drives[drive]) {
+        fprintf(stderr, "USB IDE attached: nb_sectors=%lld cyl=%d heads=%d sectors=%d\n",
+                (long long)s->drives[drive]->nb_sectors,
+                s->drives[drive]->cylinders,
+                s->drives[drive]->heads,
+                s->drives[drive]->sectors);
+    }
+#endif
     return 0;
 }
 #endif
