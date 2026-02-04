@@ -602,6 +602,11 @@ static void command (SB16State *s, uint8_t cmd)
             s->needed_bytes = 1;
             break;
 
+        case 0xe5:
+            /* Poll/identify ASP/CSP chip - return 0x00 (no ASP present) */
+            dsp_out_data (s, 0x00);
+            break;
+
         case 0xe7:
             qemu_log_mask(LOG_UNIMP, "Attempt to probe for ESS (0xe7)?\n");
             break;
@@ -1571,6 +1576,69 @@ static int resample_u8s(int16_t *out, int olen, int os,
     return i;
 }
 
+static int resample_s8m(int16_t *out, int olen, int os,
+                        int8_t *in, int ip, int ilen, int itlen, int is)
+{
+    /* Linear interpolation resampler for signed 8-bit mono */
+    if (ilen < 2) return 0;
+
+    int j = 0;
+    /* Fixed-point position in input, 16 bits fractional */
+    uint32_t pos = 0;
+    uint32_t step = ((uint32_t)is << 16) / os;
+
+    while (j + 1 < olen) {
+        int i = pos >> 16;
+        if (i + 1 >= ilen) break;
+
+        /* Get two adjacent samples (already signed) */
+        int s0 = in[(ip + i) % itlen];
+        int s1 = in[(ip + i + 1) % itlen];
+
+        /* Linear interpolation */
+        int frac = (pos >> 8) & 0xFF;
+        int sample = s0 + ((s1 - s0) * frac >> 8);
+
+        /* Scale to 16-bit and output as stereo */
+        int16_t out_sample = (int16_t)(sample << 8);
+        out[j] = out_sample;
+        out[j + 1] = out_sample;
+        j += 2;
+
+        pos += step;
+    }
+
+    return pos >> 16;
+}
+
+static int resample_s8s(int16_t *out, int olen, int os,
+                        int8_t *in, int ip, int ilen, int itlen, int is)
+{
+    int g = gcd(os, is);
+    os = os / g;
+    is = is / g;
+    int uc = os;
+    int dc = is;
+    int i = 0;
+    int j = 0;
+    while (i + 1 < ilen && j + 1 < olen) {
+        dc--;
+        if (dc == 0) {
+            dc = is;
+            /* Input is already signed */
+            out[j] = in[(ip + i) % itlen] << 8;
+            out[j + 1] = in[(ip + i + 1) % itlen] << 8;
+            j += 2;
+        }
+        uc--;
+        if (uc == 0) {
+            uc = os;
+            i += 2;
+        }
+    }
+    return i;
+}
+
 void sb16_audio_callback (void *opaque, uint8_t *stream, int free)
 {
     SB16State *s = opaque;
@@ -1622,6 +1690,16 @@ void sb16_audio_callback (void *opaque, uint8_t *stream, int free)
         } else {
             i = resample_u8m((int16_t *) stream, free / 2, 44100,
                              s->audio_buf, p, len, AUDIO_BUF_LEN, s->freq);
+        }
+        s->audio_p += i;
+        break;
+    case AUDIO_FORMAT_S8:
+        if (s->fmt_stereo) {
+            i = resample_s8s((int16_t *) stream, free / 2, 44100,
+                             (int8_t *) s->audio_buf, p, len, AUDIO_BUF_LEN, s->freq);
+        } else {
+            i = resample_s8m((int16_t *) stream, free / 2, 44100,
+                             (int8_t *) s->audio_buf, p, len, AUDIO_BUF_LEN, s->freq);
         }
         s->audio_p += i;
         break;

@@ -1,7 +1,6 @@
 set(COMMON_SRCS
     "esp_main.c"
     "../../adlib.c"
-    "../../fmopl.c"
     "../../fpu.c"
     "../../i386.c"
     "../../i8042.c"
@@ -19,6 +18,15 @@ set(COMMON_SRCS
     "../../pcspk.c"
     "i2s.c"
     "storage.c"
+)
+
+# ymfm OPL emulation (replaces fmopl.c)
+set(YMFM_SRCS
+    "../../ymfm_wrapper.cpp"
+    "../../thirdparty/ymfm/src/ymfm_opl.cpp"
+    "../../thirdparty/ymfm/src/ymfm_adpcm.cpp"
+    "../../thirdparty/ymfm/src/ymfm_pcm.cpp"
+    "../../thirdparty/ymfm/src/ymfm_ssg.cpp"
 )
 
 # Board-specific sources based on DEVICE variable
@@ -46,8 +54,8 @@ else()
     endif()
 endif()
 
-idf_component_register(SRCS ${COMMON_SRCS} ${BOARD_SRCS}
-                       INCLUDE_DIRS ".")
+idf_component_register(SRCS ${COMMON_SRCS} ${YMFM_SRCS} ${BOARD_SRCS}
+                       INCLUDE_DIRS "." "../../")
 
 add_definitions(-include ${CMAKE_CURRENT_SOURCE_DIR}/${BOARD_HEADER})
 
@@ -61,9 +69,15 @@ set_source_files_properties("../../i8259.c" PROPERTIES COMPILE_FLAGS "-Wno-all -
 
 # Audio: -O3 for OPL/SB16 performance
 set_source_files_properties("../../adlib.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
-set_source_files_properties("../../fmopl.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -ffast-math -fsingle-precision-constant")
 set_source_files_properties("../../sb16.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("../../pcspk.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
+
+# ymfm OPL emulation: -O3 with C++ flags
+set_source_files_properties("../../ymfm_wrapper.cpp" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-exceptions -fno-rtti")
+set_source_files_properties("../../thirdparty/ymfm/src/ymfm_opl.cpp" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-exceptions -fno-rtti")
+set_source_files_properties("../../thirdparty/ymfm/src/ymfm_adpcm.cpp" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-exceptions -fno-rtti")
+set_source_files_properties("../../thirdparty/ymfm/src/ymfm_pcm.cpp" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-exceptions -fno-rtti")
+set_source_files_properties("../../thirdparty/ymfm/src/ymfm_ssg.cpp" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-exceptions -fno-rtti")
 
 # Graphics: -O3 with fast-math for VGA rendering
 set_source_files_properties("../../vga.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -funroll-loops -ffast-math")
@@ -83,6 +97,4 @@ set_source_files_properties("../../osd/osd.c" PROPERTIES COMPILE_FLAGS "-Wno-all
 set_source_files_properties("../../osd/microui.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("tanmatsu_osd.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../fmopl.inc")
-    message(FATAL_ERROR "Please run `make prepare` first")
-endif()
+# ymfm has no lookup tables to generate, no preparation needed
