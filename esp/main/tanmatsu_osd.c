@@ -927,6 +927,7 @@ static int handle_main_select(OSD *osd)
 		break;
 	case MAIN_STATUS:
 		osd->view = VIEW_STATUS;
+		globals.stats_collecting = true;  // Start collecting stats
 		break;
 	case MAIN_HELP:
 		osd->view = VIEW_HELP;
@@ -1235,6 +1236,7 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 		case SC_ESC:
 		case SC_LEFT:
 		case SC_ENTER:
+			globals.stats_collecting = false;  // Stop collecting stats
 			osd->view = VIEW_MAIN_MENU;
 			break;
 		}

@@ -590,11 +590,13 @@ void pc_step(PC *pc)
 #else
 #ifdef BUILD_ESP32
 #ifdef USE_BADGE_BSP
-	uint32_t t1 = get_uticks();  /* After peripherals */
+	uint32_t t1 = 0, t2 = 0;
+	bool collecting = globals.stats_collecting;
+	if (collecting) t1 = get_uticks();  /* After peripherals */
 #endif
 	cpui386_step(pc->cpu, batch_size);
 #ifdef USE_BADGE_BSP
-	uint32_t t2 = get_uticks();  /* After CPU */
+	if (collecting) t2 = get_uticks();  /* After CPU */
 #endif
 
 	/* Track step timing for dynamic batch adjustment */
@@ -622,25 +624,28 @@ void pc_step(PC *pc)
 	}
 
 #ifdef USE_BADGE_BSP
-	/* Instrumentation for OSD stats */
-	stat_periph_us += (t1 - t0);
-	stat_cpu_us += (t2 - t1);
-	stat_calls++;
+	/* Lazy instrumentation - only when Status panel is open */
+	if (collecting) {
+		stat_periph_us += (t1 - t0);
+		stat_cpu_us += (t2 - t1);
+		stat_calls++;
 
-	/* Update globals every ~2 seconds */
-	if (t2 - stat_last_report >= 2000000) {
-		uint32_t total = stat_cpu_us + stat_periph_us;
-		if (total > 0) {
-			globals.emu_cpu_percent = (stat_cpu_us * 100) / total;
-			globals.emu_periph_percent = (stat_periph_us * 100) / total;
-			globals.emu_batch_size = batch_size;
-			globals.emu_calls_per_sec = (stat_calls * 1000000ULL) / (t2 - stat_last_report);
+		/* Update globals every ~2 seconds */
+		if (t2 - stat_last_report >= 2000000) {
+			uint32_t total = stat_cpu_us + stat_periph_us;
+			if (total > 0) {
+				globals.emu_cpu_percent = (stat_cpu_us * 100) / total;
+				globals.emu_periph_percent = (stat_periph_us * 100) / total;
+				globals.emu_calls_per_sec = (stat_calls * 1000000ULL) / (t2 - stat_last_report);
+			}
+			stat_cpu_us = 0;
+			stat_periph_us = 0;
+			stat_calls = 0;
+			stat_last_report = t2;
 		}
-		stat_cpu_us = 0;
-		stat_periph_us = 0;
-		stat_calls = 0;
-		stat_last_report = t2;
 	}
+	/* Batch size is always available (tracked for dynamic batching) */
+	globals.emu_batch_size = batch_size;
 #endif
 #else
 	cpui386_step(pc->cpu, 10240);

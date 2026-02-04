@@ -41,7 +41,8 @@ struct Globals {
 	// Toast notification system
 	char toast_message[48];      // Current toast message
 	uint32_t toast_hide_time;    // Timestamp when toast should hide (0 = not active)
-	// Emulator stats for OSD display
+	// Emulator stats for OSD display (lazy - only collected when viewing)
+	bool stats_collecting;        // Set true when Status panel is open
 	uint8_t emu_cpu_percent;      // CPU time percentage (0-100)
 	uint8_t emu_periph_percent;   // Peripheral time percentage (0-100)
 	uint16_t emu_batch_size;      // Current instruction batch size
