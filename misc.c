@@ -442,6 +442,7 @@ static int line_starts_with(const char *line, const char *key)
 
 // Save all settings to ini file
 int save_settings_to_ini(const char *ini_path, int boot_order,
+                         const char *hda,
                          const char *fda, const char *fdb,
                          const char *cda, const char *cdb,
                          const char *cdc, const char *cdd,
@@ -472,7 +473,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	int display_section_end = -1;
 
 	// Track which settings we found
-	int found_boot_order = -1, found_fda = -1, found_fdb = -1;
+	int found_boot_order = -1, found_hda = -1, found_fda = -1, found_fdb = -1;
 	int found_cda = -1, found_cdb = -1, found_cdc = -1, found_cdd = -1;
 	int found_mem_size = -1;
 	int found_gen = -1, found_fpu = -1, found_batch_size = -1;
@@ -511,6 +512,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 		// Check for existing settings in [pc] section
 		if (in_pc_section) {
 			if (line_starts_with(lines[line_count], "boot_order")) found_boot_order = line_count;
+			else if (line_starts_with(lines[line_count], "hda")) found_hda = line_count;
 			else if (line_starts_with(lines[line_count], "fda")) found_fda = line_count;
 			else if (line_starts_with(lines[line_count], "fdb")) found_fdb = line_count;
 			else if (line_starts_with(lines[line_count], "cda")) found_cda = line_count;
@@ -562,6 +564,9 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 		// Replace existing lines
 		if (i == found_boot_order) {
 			fprintf(f, "boot_order = %s\n", boot_order_names[boot_order]);
+		} else if (i == found_hda) {
+			if (hda && hda[0]) fprintf(f, "hda = %s\n", hda);
+			// else skip line (remove setting)
 		} else if (i == found_fda) {
 			if (fda && fda[0]) fprintf(f, "fda = %s\n", fda);
 			// else skip line (remove setting)
@@ -601,6 +606,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 		if (i == pc_section_end - 1) {
 			if (found_boot_order < 0)
 				fprintf(f, "boot_order = %s\n", boot_order_names[boot_order]);
+			if (found_hda < 0 && hda && hda[0])
+				fprintf(f, "hda = %s\n", hda);
 			if (found_fda < 0 && fda && fda[0])
 				fprintf(f, "fda = %s\n", fda);
 			if (found_fdb < 0 && fdb && fdb[0])

@@ -15,6 +15,7 @@ void osd_attach_ide(OSD *osd, void *ide, void *ide2);
 void osd_attach_pc(OSD *osd, void *pc);
 void osd_attach_console(OSD *osd, void *console);
 void osd_set_system_config(OSD *osd, int cpu_gen, int fpu, long mem_size);
+void osd_set_hda_path(OSD *osd, const char *hda_path);
 long osd_get_mem_size_bytes(OSD *osd);
 void osd_refresh(OSD *osd);
 

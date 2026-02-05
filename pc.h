@@ -76,6 +76,7 @@ typedef struct {
 
 	const char *bios;
 	const char *vga_bios;
+	const char *hda_path;  // HDA path for OSD (stored for runtime access)
 
 	u8 port92;
 	int shutdown_state;

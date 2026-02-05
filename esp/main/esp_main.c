@@ -307,6 +307,29 @@ static int pc_main(const char *file)
 			pc_reset(pc);
 			pc->boot_start_time = get_uticks();
 		}
+
+		// Check for emulator restart request (e.g., HDD change)
+		if (globals.emu_restart_pending) {
+			globals.emu_restart_pending = false;
+			// Change HDD if new path was provided
+			if (globals.emu_new_hda_path[0]) {
+				fprintf(stderr, "Restart: changing HDD to %s\n", globals.emu_new_hda_path);
+				ide_change_hdd(pc->ide, 0, globals.emu_new_hda_path);
+				// Update PC's stored hda_path
+				pc->hda_path = strdup(globals.emu_new_hda_path);
+			}
+			// Clear VGA framebuffers
+			if (globals.fb && globals.vga_width > 0 && globals.vga_height > 0) {
+				memset(globals.fb, 0, globals.vga_width * globals.vga_height * sizeof(uint16_t));
+			}
+			if (globals.fb_rotated) {
+				memset(globals.fb_rotated, 0, 480 * 800 * sizeof(uint16_t));
+			}
+			// Full reset
+			pc_reset(pc);
+			pc->boot_start_time = get_uticks();
+			fprintf(stderr, "Restart: done\n");
+		}
 #endif
 		pc_step(pc);
 		// CRITICAL: Use vTaskDelay() not taskYIELD() to let IDLE task run.

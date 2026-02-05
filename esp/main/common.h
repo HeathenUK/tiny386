@@ -23,6 +23,8 @@ struct Globals {
 	void *osd;         // OSD context
 	bool osd_enabled;  // OSD visible
 	bool reset_pending; // Soft reset requested from OSD
+	bool emu_restart_pending; // Full emulator restart (reload config, reinit PC)
+	char emu_new_hda_path[256]; // New HDA path for restart (set by OSD)
 	bool vga_force_redraw; // Force full VGA redraw (e.g., after OSD closes)
 	bool batch_reset_pending; // Reset dynamic batch size (on VGA mode change)
 	uint8_t key_pressed[KEYCODE_MAX];  // Key state tracking

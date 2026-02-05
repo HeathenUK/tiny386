@@ -30,6 +30,7 @@ int cmos_get_boot_order(CMOS *cmos);
 
 // Save all settings to ini file
 int save_settings_to_ini(const char *ini_path, int boot_order,
+                         const char *hda,
                          const char *fda, const char *fdb,
                          const char *cda, const char *cdb,
                          const char *cdc, const char *cdd,

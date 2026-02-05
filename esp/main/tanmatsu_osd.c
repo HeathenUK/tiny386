@@ -64,7 +64,8 @@ typedef enum {
 	MAIN_SAVE_INI,
 	MAIN_SEP2,
 	MAIN_CTRLALTDEL,
-	MAIN_RESET,
+	MAIN_RESTART_EMU,
+	MAIN_EXIT_LAUNCHER,
 	MAIN_COUNT
 } MainMenuItem;
 
@@ -73,6 +74,7 @@ typedef enum {
 	MOUNT_FDA = 0,
 	MOUNT_FDB,
 	MOUNT_SEP1,
+	MOUNT_HDA,     // Hard drive (requires restart)
 	MOUNT_CD,      // Single CD-ROM slot (primary slave)
 	MOUNT_USB,     // USB storage (secondary master) - read-only status
 	MOUNT_SEP2,
@@ -84,6 +86,7 @@ typedef enum {
 
 // Special browser_target values
 #define BROWSER_TARGET_CREATE_HDD 100
+#define BROWSER_TARGET_HDA 101
 
 // Audio/Visual submenu items
 typedef enum {
@@ -145,6 +148,7 @@ struct OSD {
 
 	// Drive paths
 	char drive_paths[6][MAX_PATH_LEN];  // FDA, FDB, CDA-CDD
+	char hda_path[MAX_PATH_LEN];        // Hard drive (from INI, changeable)
 
 	// Audio/Visual settings
 	int brightness;  // 0-100
@@ -557,6 +561,7 @@ static void render_main_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ "Save Settings", 0, 0, NULL },
 		{ NULL, 1, 0, NULL },  // SEP2
 		{ "Ctrl+Alt+Del", 0, 0, NULL },
+		{ "Restart Emulator", 0, 0, NULL },
 		{ "Exit to Launcher", 0, 0, NULL },
 	};
 
@@ -567,10 +572,11 @@ static void render_main_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 // Render mounting submenu
 static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	char fda_val[32], fdb_val[32], cd_val[32], usb_val[32];
+	char fda_val[32], fdb_val[32], hda_val[32], cd_val[32], usb_val[32];
 
 	snprintf(fda_val, sizeof(fda_val), "%.20s", basename_ptr(osd->drive_paths[0]));
 	snprintf(fdb_val, sizeof(fdb_val), "%.20s", basename_ptr(osd->drive_paths[1]));
+	snprintf(hda_val, sizeof(hda_val), "%.20s", basename_ptr(osd->hda_path));
 	snprintf(cd_val, sizeof(cd_val), "%.20s", basename_ptr(osd->drive_paths[3]));  // slot 1 = primary slave
 
 	// USB storage status - shows connection state only
@@ -584,6 +590,7 @@ static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pi
 		{ "Floppy A:", 0, 0, fda_val },
 		{ "Floppy B:", 0, 0, fdb_val },
 		{ NULL, 1, 0, NULL },  // SEP1
+		{ "HDD:", 0, 0, hda_val },
 		{ "CD-ROM:", 0, 0, cd_val },
 		{ "USB Storage:", 0, 0, usb_val },
 		{ NULL, 1, 0, NULL },  // SEP2
@@ -991,7 +998,21 @@ static int handle_file_select(OSD *osd)
 		return 0;  // Stay in browser
 	}
 
-	if (osd->browser_target < 2) {
+	if (osd->browser_target == BROWSER_TARGET_HDA) {
+		// Hard drive selection - save path, user can use Restart Emulator to apply
+		strncpy(osd->hda_path, fullpath, MAX_PATH_LEN - 1);
+		osd->hda_path[MAX_PATH_LEN - 1] = '\0';
+		char msg[64];
+		const char *filename = f->name;
+		if (strlen(filename) > 24) {
+			snprintf(msg, sizeof(msg), "HDD: ...%s", filename + strlen(filename) - 21);
+		} else {
+			snprintf(msg, sizeof(msg), "HDD: %s", filename);
+		}
+		toast_show(msg);
+		osd->view = VIEW_MOUNTING;
+		return 0;
+	} else if (osd->browser_target < 2) {
 		// Floppy
 		if (osd->emulink) emulink_attach_floppy(osd->emulink, osd->browser_target, fullpath);
 	} else {
@@ -1022,6 +1043,13 @@ static int handle_mount_select(OSD *osd)
 	case MOUNT_FDA:
 	case MOUNT_FDB:
 		osd->browser_target = osd->mount_sel;  // 0 or 1
+		strcpy(osd->browser_path, "/sdcard");
+		scan_directory(osd);
+		osd->view = VIEW_FILEBROWSER;
+		break;
+	case MOUNT_HDA:
+		// Hard drive - browse for .img or .vhd files (requires restart)
+		osd->browser_target = BROWSER_TARGET_HDA;
 		strcpy(osd->browser_path, "/sdcard");
 		scan_directory(osd);
 		osd->view = VIEW_FILEBROWSER;
@@ -1095,6 +1123,7 @@ static int handle_main_select(OSD *osd)
 		if (osd->pc && osd->pc->ini_path) {
 			int boot_order = osd->pc->cmos ? cmos_get_boot_order(osd->pc->cmos) : 0;
 			save_settings_to_ini(osd->pc->ini_path, boot_order,
+			                     osd->hda_path,
 			                     osd->drive_paths[0], osd->drive_paths[1],
 			                     osd->drive_paths[2], osd->drive_paths[3],
 			                     osd->drive_paths[4], osd->drive_paths[5],
@@ -1108,7 +1137,14 @@ static int handle_main_select(OSD *osd)
 		toast_show("Ctrl+Alt+Del sent");
 		globals.reset_pending = true;  // Signal soft reset
 		return 1;  // Close OSD
-	case MAIN_RESET:
+	case MAIN_RESTART_EMU:
+		toast_show("Restarting emulator...");
+		// Copy new HDA path to globals for esp_main to use
+		strncpy(globals.emu_new_hda_path, osd->hda_path, sizeof(globals.emu_new_hda_path) - 1);
+		globals.emu_new_hda_path[sizeof(globals.emu_new_hda_path) - 1] = '\0';
+		globals.emu_restart_pending = true;  // Signal emulator restart (reload config)
+		return 1;  // Close OSD
+	case MAIN_EXIT_LAUNCHER:
 		i2s_shutdown();  // Silence audio before restart
 		esp_restart();
 		break;
@@ -1404,6 +1440,14 @@ void osd_attach_ide(OSD *osd, void *ide, void *ide2)
 void osd_attach_pc(OSD *osd, void *pc)
 {
 	osd->pc = pc;
+	// Initialize hda_path from PC config if not already set by user
+	if (osd->hda_path[0] == '\0') {
+		PC *p = (PC *)pc;
+		if (p->hda_path && p->hda_path[0]) {
+			strncpy(osd->hda_path, p->hda_path, MAX_PATH_LEN - 1);
+			osd->hda_path[MAX_PATH_LEN - 1] = '\0';
+		}
+	}
 }
 
 void osd_attach_console(OSD *osd, void *console)
@@ -1419,6 +1463,16 @@ void osd_set_system_config(OSD *osd, int cpu_gen, int fpu, long mem_size)
 	osd->mem_size_mb = (int)(mem_size / (1024 * 1024));
 	if (osd->mem_size_mb < 1) osd->mem_size_mb = 1;
 	if (osd->mem_size_mb > 24) osd->mem_size_mb = 24;
+}
+
+void osd_set_hda_path(OSD *osd, const char *hda_path)
+{
+	if (hda_path && hda_path[0]) {
+		strncpy(osd->hda_path, hda_path, MAX_PATH_LEN - 1);
+		osd->hda_path[MAX_PATH_LEN - 1] = '\0';
+	} else {
+		osd->hda_path[0] = '\0';
+	}
 }
 
 // Get system memory size in bytes for saving

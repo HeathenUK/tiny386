@@ -918,6 +918,9 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	if (disks[0] && disks[0][0]) {
 		int ret = ide_attach(pc->ide, 0, disks[0]);
 		assert(ret == 0);
+		pc->hda_path = disks[0];  // Store for OSD access
+	} else {
+		pc->hda_path = NULL;
 	}
 	// Always create CD-ROM on slot 1 for hot-mounting
 	{

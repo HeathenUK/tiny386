@@ -2044,6 +2044,19 @@ static int bf_read_async(BlockDevice *bs,
     if (!bf->f)
         return -1;
 
+    /* Bounds checking: return zeros for sectors beyond disk size */
+    if (sector_num >= bf->nb_sectors) {
+        memset(buf, 0, n * SECTOR_SIZE);
+        return 0;
+    }
+    /* Clamp read count to not exceed disk size */
+    if (sector_num + n > bf->nb_sectors) {
+        int valid_sectors = bf->nb_sectors - sector_num;
+        /* Zero the out-of-bounds portion */
+        memset(buf + valid_sectors * SECTOR_SIZE, 0, (n - valid_sectors) * SECTOR_SIZE);
+        n = valid_sectors;
+    }
+
     /* VHD files use special read path */
     if (bf->is_vhd) {
         return vhd_read_sectors(bf, sector_num, buf, n);
@@ -2771,6 +2784,20 @@ static int usbmsc_read_async(BlockDevice *bs,
         return 0;  // Synchronous - ide_sector_read will call callback
     }
 
+    // Bounds checking for CHS/LBA geometry mismatch (fixes ScanDisk errors)
+    int64_t nb_sectors = usb_host_msc_get_sector_count();
+    if ((int64_t)sector_num >= nb_sectors) {
+        // Request starts beyond end of disk - return zeros
+        memset(buf, 0, n * SECTOR_SIZE);
+        return 0;
+    }
+    if ((int64_t)(sector_num + n) > nb_sectors) {
+        // Request partially extends beyond end - read valid part, zero the rest
+        int valid_sectors = nb_sectors - sector_num;
+        memset(buf + valid_sectors * SECTOR_SIZE, 0, (n - valid_sectors) * SECTOR_SIZE);
+        n = valid_sectors;
+    }
+
     int ret = usb_host_msc_read(sector_num, buf, n);
     // Return 0 for success - ide_sector_read handles callback for synchronous case
     return (ret < 0) ? ret : 0;
@@ -2987,6 +3014,116 @@ const char *ide_get_cd_path(IDEIFState *sif, int drive)
         return NULL;
     BlockDeviceFile *bf = s->bs->opaque;
     return bf->path;
+}
+
+const char *ide_get_hdd_path(IDEIFState *sif, int drive)
+{
+    if (!sif || drive < 0 || drive > 1)
+        return NULL;
+    IDEState *s = sif->drives[drive];
+    if (!s || s->drive_kind != IDE_HD || !s->bs)
+        return NULL;
+    if (s->bs->get_sector_count != bf_get_sector_count)
+        return NULL;
+    BlockDeviceFile *bf = s->bs->opaque;
+    return bf->path;
+}
+
+int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
+{
+    fprintf(stderr, "ide_change_hdd: sif=%p drive=%d file=%s\n",
+            (void*)sif, drive, filename ? filename : "(null)");
+
+    if (!sif) {
+        fprintf(stderr, "ide_change_hdd: sif is NULL!\n");
+        return -1;
+    }
+
+    IDEState *s = sif->drives[drive];
+    if (!s || s->drive_kind != IDE_HD || !s->bs) {
+        fprintf(stderr, "ide_change_hdd: not an HDD drive (s=%p, kind=%d)\n",
+                (void*)s, s ? s->drive_kind : -1);
+        return -1;
+    }
+
+    if (s->bs->get_sector_count != bf_get_sector_count) {
+        fprintf(stderr, "ide_change_hdd: unsupported block device type\n");
+        return -1;
+    }
+
+    BlockDeviceFile *bf = s->bs->opaque;
+
+    /* Close old file and free VHD resources */
+    if (bf->f) {
+        fclose(bf->f);
+        bf->f = NULL;
+    }
+    if (bf->vhd_bat) {
+        free(bf->vhd_bat);
+        bf->vhd_bat = NULL;
+    }
+    bf->is_vhd = 0;
+    bf->nb_sectors = 0;
+    bf->start_offset = 0;
+#ifdef BUILD_ESP32
+    bf->cache_start = -1;
+    bf->cache_count = 0;
+#endif
+
+    /* Handle eject (empty filename) */
+    if (!filename || !filename[0]) {
+        bf->path[0] = '\0';
+        s->nb_sectors = 0;
+        return 0;
+    }
+
+    /* Open new file */
+    FILE *f = fopen(filename, "r+b");
+    if (!f) {
+        fprintf(stderr, "ide_change_hdd: open failed: %s\n", filename);
+        bf->path[0] = '\0';
+        return -1;
+    }
+
+    /* Check for magic header */
+    char buf[8];
+    int start_offset = 0;
+    fread(buf, 1, 8, f);
+    if (memcmp(buf, ide_magic, 8) == 0)
+        start_offset = 1024;
+
+    fseeko(f, 0, SEEK_END);
+    int64_t file_size = ftello(f) - start_offset;
+
+    bf->f = f;
+    bf->mode = BF_MODE_RW;
+    bf->nb_sectors = file_size / 512;
+    bf->start_offset = start_offset;
+    strncpy(bf->path, filename, sizeof(bf->path) - 1);
+    bf->path[sizeof(bf->path) - 1] = '\0';
+
+    /* Try to parse as VHD */
+    if (!start_offset && vhd_try_parse(bf)) {
+        fprintf(stderr, "ide_change_hdd: VHD detected, %lld sectors\n",
+                (long long)bf->nb_sectors);
+    }
+
+    /* Update IDE drive state */
+    s->nb_sectors = bf->nb_sectors;
+
+    /* Recalculate CHS geometry (same as ide_hddrive_init) */
+    uint32_t cyls = bf->nb_sectors / (16 * 63);
+    if (cyls > 16383)
+        cyls = 16383;
+    else if (cyls < 2)
+        cyls = 2;
+    s->cylinders = cyls;
+    s->heads = 16;
+    s->sectors = 63;
+
+    fprintf(stderr, "ide_change_hdd: done, sectors=%lld cyl=%d heads=%d secs=%d\n",
+            (long long)s->nb_sectors, s->cylinders, s->heads, s->sectors);
+    return 0;
 }
 #endif
 
