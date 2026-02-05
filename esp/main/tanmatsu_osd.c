@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "../../vga.h"  // For vga_frame_skip_max
 
@@ -1043,26 +1044,19 @@ static void handle_av_adjust(OSD *osd, int delta)
 // Returns 0 on success, -1 on error
 static int create_hdd_image(int size_mb)
 {
-	// Generate filename based on size
+	// Generate filename with timestamp for uniqueness
 	char filename[64];
-	if (size_mb >= 1024) {
-		snprintf(filename, sizeof(filename), "/sdcard/hdd_%dgb.img", size_mb / 1024);
-	} else {
-		snprintf(filename, sizeof(filename), "/sdcard/hdd_%dmb.img", size_mb);
-	}
+	time_t now = time(NULL);
+	struct tm *t = localtime(&now);
 
-	// Check if file already exists
-	struct stat st;
-	if (stat(filename, &st) == 0) {
-		// File exists - try with numbered suffix
-		for (int i = 2; i <= 99; i++) {
-			if (size_mb >= 1024) {
-				snprintf(filename, sizeof(filename), "/sdcard/hdd_%dgb_%d.img", size_mb / 1024, i);
-			} else {
-				snprintf(filename, sizeof(filename), "/sdcard/hdd_%dmb_%d.img", size_mb, i);
-			}
-			if (stat(filename, &st) != 0) break;
-		}
+	if (size_mb >= 1024) {
+		snprintf(filename, sizeof(filename), "/sdcard/hdd_%dgb_%04d%02d%02d_%02d%02d%02d.img",
+		         size_mb / 1024, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+		         t->tm_hour, t->tm_min, t->tm_sec);
+	} else {
+		snprintf(filename, sizeof(filename), "/sdcard/hdd_%dmb_%04d%02d%02d_%02d%02d%02d.img",
+		         size_mb, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+		         t->tm_hour, t->tm_min, t->tm_sec);
 	}
 
 	// Create sparse file using truncate (instant, no actual disk write)
