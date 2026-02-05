@@ -62,4 +62,25 @@ int usb_host_msc_read(uint64_t sector, uint8_t *buf, int count);
  */
 int usb_host_msc_write(uint64_t sector, const uint8_t *buf, int count);
 
+/**
+ * @brief Mount USB storage as VFS filesystem at /usb
+ *
+ * @return ESP_OK on success, error code on failure
+ */
+esp_err_t usb_host_vfs_mount(void);
+
+/**
+ * @brief Unmount USB storage VFS filesystem
+ *
+ * @return ESP_OK on success, error code on failure
+ */
+esp_err_t usb_host_vfs_unmount(void);
+
+/**
+ * @brief Check if USB storage is mounted as VFS
+ *
+ * @return true if mounted at /usb
+ */
+bool usb_host_vfs_mounted(void);
+
 #endif /* USE_BADGE_BSP */

@@ -31,6 +31,7 @@
 #include "../../ide.h"
 #include "toast.h"
 #include "mouse_emu.h"
+#include "usb_host.h"
 #include "../../pc.h"
 
 // View modes
@@ -112,11 +113,12 @@ static const int hdd_size_preset_count = 5;
 
 typedef struct {
 	char name[MAX_FILENAME];
-	int is_dir;  // 1=directory, 0=file, -1=special (eject)
+	int is_dir;  // 1=directory, 0=file, -1=special (eject), -2=special (switch storage)
 } FileEntry;
 
-// Special file entry type
+// Special file entry types
 #define FILE_TYPE_EJECT -1
+#define FILE_TYPE_SWITCH_STORAGE -2
 
 struct OSD {
 	EMULINK *emulink;
@@ -263,8 +265,23 @@ static void scan_directory(OSD *osd)
 		osd->file_count++;
 	}
 
+	// Add storage switch option when USB is VFS mounted and at root of a mount point
+	if (globals.usb_mode == USB_MODE_VFS) {
+		if (strcmp(osd->browser_path, "/sdcard") == 0) {
+			strcpy(osd->files[osd->file_count].name, "[USB Storage]");
+			osd->files[osd->file_count].is_dir = FILE_TYPE_SWITCH_STORAGE;
+			osd->file_count++;
+		} else if (strcmp(osd->browser_path, "/usb") == 0) {
+			strcpy(osd->files[osd->file_count].name, "[SD Card]");
+			osd->files[osd->file_count].is_dir = FILE_TYPE_SWITCH_STORAGE;
+			osd->file_count++;
+		}
+	}
+
 	// Add parent directory option
-	if (strlen(osd->browser_path) > 1) {
+	if (strlen(osd->browser_path) > 1 &&
+	    strcmp(osd->browser_path, "/sdcard") != 0 &&
+	    strcmp(osd->browser_path, "/usb") != 0) {
 		strcpy(osd->files[osd->file_count].name, "..");
 		osd->files[osd->file_count].is_dir = 1;
 		osd->file_count++;
@@ -294,9 +311,20 @@ static void scan_directory(OSD *osd)
 	}
 	closedir(dir);
 
-	// Sort (keep eject and .. at top)
-	int sort_start = (osd->browser_target >= 0) ? 1 : 0;
-	if (strlen(osd->browser_path) > 1) sort_start++;
+	// Sort (keep special entries at top: eject, storage switch, ..)
+	int sort_start = 0;
+	// Count special entries we added
+	if (osd->browser_target >= 0 && osd->browser_target < 6) sort_start++;  // [Eject]
+	if (globals.usb_mode == USB_MODE_VFS &&
+	    (strcmp(osd->browser_path, "/sdcard") == 0 || strcmp(osd->browser_path, "/usb") == 0)) {
+		sort_start++;  // [USB Storage] or [SD Card]
+	}
+	// ".." was only added if not at mount point root
+	if (strlen(osd->browser_path) > 1 &&
+	    strcmp(osd->browser_path, "/sdcard") != 0 &&
+	    strcmp(osd->browser_path, "/usb") != 0) {
+		sort_start++;  // ".."
+	}
 	if (osd->file_count > sort_start) {
 		qsort(&osd->files[sort_start], osd->file_count - sort_start,
 		      sizeof(FileEntry), compare_files);
@@ -531,9 +559,22 @@ static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pi
 	snprintf(cdb_val, sizeof(cdb_val), "%.20s", basename_ptr(osd->drive_paths[3]));
 	snprintf(cdc_val, sizeof(cdc_val), "%.20s", basename_ptr(osd->drive_paths[4]));
 
-	// USB storage status (read from globals - managed by usb_host.c)
+	// USB storage status - show current mode
 	if (globals.usb_storage_connected) {
-		snprintf(usb_val, sizeof(usb_val), "Connected");
+		switch (globals.usb_mode) {
+		case USB_MODE_IDE:
+			snprintf(usb_val, sizeof(usb_val), "IDE");
+			break;
+		case USB_MODE_VFS:
+			snprintf(usb_val, sizeof(usb_val), "Mounted");
+			break;
+		case USB_MODE_DISCONNECTED:
+			snprintf(usb_val, sizeof(usb_val), "Disabled");
+			break;
+		default:
+			snprintf(usb_val, sizeof(usb_val), "Connected");
+			break;
+		}
 	} else {
 		snprintf(usb_val, sizeof(usb_val), "(empty)");
 	}
@@ -551,7 +592,7 @@ static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pi
 	};
 
 	render_generic_menu(pixels, w, h, pitch, "Mounting", entries, MOUNT_COUNT,
-	                    osd->mount_sel, "Enter:Browse  Esc:Back");
+	                    osd->mount_sel, "Enter:Browse L/R:USB Mode Esc:Back");
 }
 
 // Render audio/visual submenu
@@ -815,6 +856,9 @@ static void render_browser(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		if (osd->files[i].is_dir == FILE_TYPE_EJECT) {
 			snprintf(line, sizeof(line), "  %s", osd->files[i].name);
 			color = COLOR_EJECT;
+		} else if (osd->files[i].is_dir == FILE_TYPE_SWITCH_STORAGE) {
+			snprintf(line, sizeof(line), "  %s", osd->files[i].name);
+			color = COLOR_VALUE;  // Light cyan for storage switch
 		} else if (osd->files[i].is_dir) {
 			snprintf(line, sizeof(line), "[%s]", osd->files[i].name);
 			color = COLOR_DIR;
@@ -878,6 +922,17 @@ static int handle_file_select(OSD *osd)
 		return 0;
 	}
 
+	if (f->is_dir == FILE_TYPE_SWITCH_STORAGE) {
+		// Switch between /sdcard and /usb
+		if (strcmp(osd->browser_path, "/sdcard") == 0) {
+			strcpy(osd->browser_path, "/usb");
+		} else {
+			strcpy(osd->browser_path, "/sdcard");
+		}
+		scan_directory(osd);
+		return 0;
+	}
+
 	if (f->is_dir) {
 		// Navigate into directory
 		if (strcmp(f->name, "..") == 0) {
@@ -898,6 +953,19 @@ static int handle_file_select(OSD *osd)
 	// Mount the file
 	char fullpath[MAX_PATH_LEN];
 	snprintf(fullpath, sizeof(fullpath), "%s/%s", osd->browser_path, f->name);
+
+	// If browser_target is -1, we're just browsing (e.g., USB in VFS mode)
+	// Show the path but don't mount - user needs to go to a specific drive to mount
+	if (osd->browser_target < 0) {
+		char msg[48];
+		if (strlen(f->name) > 30) {
+			snprintf(msg, sizeof(msg), "...%s", f->name + strlen(f->name) - 27);
+		} else {
+			snprintf(msg, sizeof(msg), "%s", f->name);
+		}
+		toast_show(msg);
+		return 0;  // Stay in browser
+	}
 
 	if (osd->browser_target < 2) {
 		// Floppy
@@ -1269,11 +1337,76 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 				if (osd->mount_sel >= MOUNT_COUNT) osd->mount_sel = 0;
 			} while (is_mount_separator(osd->mount_sel));
 			break;
-		case SC_ENTER:
-		case SC_RIGHT:
-			return handle_mount_select(osd);
-		case SC_ESC:
 		case SC_LEFT:
+			if (osd->mount_sel == MOUNT_CDD && globals.usb_storage_connected) {
+				// Cycle USB mode backwards: IDE -> Disabled -> VFS -> IDE
+				switch (globals.usb_mode) {
+				case USB_MODE_IDE:
+					usb_host_vfs_unmount();
+					globals.usb_mode = USB_MODE_DISCONNECTED;
+					toast_show("USB: Disabled");
+					break;
+				case USB_MODE_VFS:
+					usb_host_vfs_unmount();
+					globals.usb_mode = USB_MODE_IDE;
+					toast_show("USB: IDE mode");
+					break;
+				case USB_MODE_DISCONNECTED:
+					if (usb_host_vfs_mount() == ESP_OK) {
+						globals.usb_mode = USB_MODE_VFS;
+						toast_show("USB: Mounted at /usb");
+					} else {
+						toast_show("USB: Mount failed");
+					}
+					break;
+				default:
+					break;
+				}
+			} else if (osd->mount_sel == MOUNT_BACK) {
+				osd->view = VIEW_MAIN_MENU;
+			}
+			break;
+		case SC_RIGHT:
+			if (osd->mount_sel == MOUNT_CDD && globals.usb_storage_connected) {
+				// Cycle USB mode forwards: IDE -> VFS -> Disabled -> IDE
+				switch (globals.usb_mode) {
+				case USB_MODE_IDE:
+					if (usb_host_vfs_mount() == ESP_OK) {
+						globals.usb_mode = USB_MODE_VFS;
+						toast_show("USB: Mounted at /usb");
+					} else {
+						toast_show("USB: Mount failed");
+					}
+					break;
+				case USB_MODE_VFS:
+					usb_host_vfs_unmount();
+					globals.usb_mode = USB_MODE_DISCONNECTED;
+					toast_show("USB: Disabled");
+					break;
+				case USB_MODE_DISCONNECTED:
+					globals.usb_mode = USB_MODE_IDE;
+					toast_show("USB: IDE mode");
+					break;
+				default:
+					break;
+				}
+			} else {
+				return handle_mount_select(osd);
+			}
+			break;
+		case SC_ENTER:
+			if (osd->mount_sel == MOUNT_CDD && globals.usb_storage_connected &&
+			    globals.usb_mode == USB_MODE_VFS) {
+				// Browse USB when in VFS mode
+				strcpy(osd->browser_path, "/usb");
+				osd->browser_target = -1;  // Special: browsing only, can't mount USB itself
+				scan_directory(osd);
+				osd->view = VIEW_FILEBROWSER;
+			} else {
+				return handle_mount_select(osd);
+			}
+			break;
+		case SC_ESC:
 			osd->view = VIEW_MAIN_MENU;
 			break;
 		}

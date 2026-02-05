@@ -18,14 +18,21 @@
 #include "bsp/power.h"
 #include "usb/usb_host.h"
 #include "usb/msc_host.h"
+#include "usb/msc_host_vfs.h"
+#include "esp_vfs_fat.h"
 
 static const char *TAG = "usb_host";
+
+// VFS mount point
+#define USB_VFS_PATH "/usb"
 
 // MSC device state
 static msc_host_device_handle_t msc_device = NULL;
 static msc_host_device_info_t msc_info = {0};
 static SemaphoreHandle_t msc_mutex = NULL;
 static volatile bool msc_connected = false;
+static volatile bool vfs_mounted = false;
+static msc_host_vfs_handle_t vfs_handle = NULL;
 
 // USB host task handles
 static TaskHandle_t usb_host_task_handle = NULL;
@@ -149,6 +156,7 @@ static void handle_device_connected(uint8_t dev_addr)
     xSemaphoreTake(msc_mutex, portMAX_DELAY);
     msc_connected = true;
     globals.usb_storage_connected = true;
+    globals.usb_mode = USB_MODE_IDE;  // Default to IDE mode
     xSemaphoreGive(msc_mutex);
 
     toast_show("USB storage connected");
@@ -163,9 +171,17 @@ static void handle_device_disconnected(void)
         return;
     }
 
+    // Unmount VFS first if it was mounted
+    if (vfs_mounted && vfs_handle) {
+        msc_host_vfs_unregister(vfs_handle);
+        vfs_handle = NULL;
+        vfs_mounted = false;
+    }
+
     xSemaphoreTake(msc_mutex, portMAX_DELAY);
     msc_connected = false;
     globals.usb_storage_connected = false;
+    globals.usb_mode = USB_MODE_NONE;
     xSemaphoreGive(msc_mutex);
 
     if (msc_device) {
@@ -362,6 +378,68 @@ int usb_host_msc_write(uint64_t sector, const uint8_t *buf, int count)
     xSemaphoreGive(msc_mutex);
 
     return (err == ESP_OK) ? 0 : -1;
+}
+
+esp_err_t usb_host_vfs_mount(void)
+{
+    if (!msc_connected || !msc_device) {
+        ESP_LOGW(TAG, "No USB device to mount");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (vfs_mounted) {
+        ESP_LOGW(TAG, "USB VFS already mounted");
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(msc_mutex, portMAX_DELAY);
+
+    const esp_vfs_fat_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 0,  // Use default
+    };
+
+    esp_err_t err = msc_host_vfs_register(msc_device, USB_VFS_PATH, &mount_config, &vfs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount USB VFS: %s", esp_err_to_name(err));
+        xSemaphoreGive(msc_mutex);
+        return err;
+    }
+
+    vfs_mounted = true;
+    xSemaphoreGive(msc_mutex);
+
+    ESP_LOGI(TAG, "USB mounted at %s", USB_VFS_PATH);
+    return ESP_OK;
+}
+
+esp_err_t usb_host_vfs_unmount(void)
+{
+    if (!vfs_mounted || !vfs_handle) {
+        return ESP_OK;  // Already unmounted
+    }
+
+    xSemaphoreTake(msc_mutex, portMAX_DELAY);
+
+    esp_err_t err = msc_host_vfs_unregister(vfs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to unmount USB VFS: %s", esp_err_to_name(err));
+        xSemaphoreGive(msc_mutex);
+        return err;
+    }
+
+    vfs_handle = NULL;
+    vfs_mounted = false;
+    xSemaphoreGive(msc_mutex);
+
+    ESP_LOGI(TAG, "USB unmounted from %s", USB_VFS_PATH);
+    return ESP_OK;
+}
+
+bool usb_host_vfs_mounted(void)
+{
+    return vfs_mounted;
 }
 
 #endif /* USE_BADGE_BSP */
