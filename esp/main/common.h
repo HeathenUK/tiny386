@@ -11,14 +11,6 @@
 
 #define KEYCODE_MAX 0x80
 
-// USB storage modes
-typedef enum {
-	USB_MODE_NONE = 0,    // No USB device connected (not user-selectable)
-	USB_MODE_DISCONNECTED, // USB device connected but disabled by user choice
-	USB_MODE_IDE,          // USB device used as IDE drive (default)
-	USB_MODE_VFS,          // USB device mounted as filesystem at /usb
-} USBMode;
-
 struct Globals {
 	void *pc;
 	void *kbd;
@@ -57,7 +49,7 @@ struct Globals {
 	uint32_t emu_calls_per_sec;   // pc_step calls per second
 	// USB storage state
 	bool usb_storage_connected;   // True when USB mass storage is attached
-	USBMode usb_mode;             // Current USB mode (IDE, VFS, or Disconnected)
+	bool usb_vfs_mounted;         // True when USB VFS is mounted at /usb
 	// Mouse emulation settings
 	int mouse_speed;              // Mouse speed setting (1-10, default 5)
 #endif

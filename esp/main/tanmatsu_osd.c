@@ -265,8 +265,8 @@ static void scan_directory(OSD *osd)
 		osd->file_count++;
 	}
 
-	// Add storage switch option when USB is VFS mounted and at root of a mount point
-	if (globals.usb_mode == USB_MODE_VFS) {
+	// Add storage switch option when USB is mounted and at root of a mount point
+	if (globals.usb_vfs_mounted) {
 		if (strcmp(osd->browser_path, "/sdcard") == 0) {
 			strcpy(osd->files[osd->file_count].name, "[USB Storage]");
 			osd->files[osd->file_count].is_dir = FILE_TYPE_SWITCH_STORAGE;
@@ -315,7 +315,7 @@ static void scan_directory(OSD *osd)
 	int sort_start = 0;
 	// Count special entries we added
 	if (osd->browser_target >= 0 && osd->browser_target < 6) sort_start++;  // [Eject]
-	if (globals.usb_mode == USB_MODE_VFS &&
+	if (globals.usb_vfs_mounted &&
 	    (strcmp(osd->browser_path, "/sdcard") == 0 || strcmp(osd->browser_path, "/usb") == 0)) {
 		sort_start++;  // [USB Storage] or [SD Card]
 	}
@@ -559,22 +559,9 @@ static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pi
 	snprintf(cdb_val, sizeof(cdb_val), "%.20s", basename_ptr(osd->drive_paths[3]));
 	snprintf(cdc_val, sizeof(cdc_val), "%.20s", basename_ptr(osd->drive_paths[4]));
 
-	// USB storage status - show current mode
+	// USB storage status - shows connection state only (always IDE + VFS when connected)
 	if (globals.usb_storage_connected) {
-		switch (globals.usb_mode) {
-		case USB_MODE_IDE:
-			snprintf(usb_val, sizeof(usb_val), "IDE");
-			break;
-		case USB_MODE_VFS:
-			snprintf(usb_val, sizeof(usb_val), "Mounted");
-			break;
-		case USB_MODE_DISCONNECTED:
-			snprintf(usb_val, sizeof(usb_val), "Disabled");
-			break;
-		default:
-			snprintf(usb_val, sizeof(usb_val), "Connected");
-			break;
-		}
+		snprintf(usb_val, sizeof(usb_val), "Connected");
 	} else {
 		snprintf(usb_val, sizeof(usb_val), "(empty)");
 	}
@@ -592,7 +579,7 @@ static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pi
 	};
 
 	render_generic_menu(pixels, w, h, pitch, "Mounting", entries, MOUNT_COUNT,
-	                    osd->mount_sel, "Enter:Browse L/R:USB Mode Esc:Back");
+	                    osd->mount_sel, "Enter:Browse  Esc:Back");
 }
 
 // Render audio/visual submenu
@@ -1338,66 +1325,15 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 			} while (is_mount_separator(osd->mount_sel));
 			break;
 		case SC_LEFT:
-			if (osd->mount_sel == MOUNT_CDD && globals.usb_storage_connected) {
-				// Cycle USB mode backwards: IDE -> Disabled -> VFS -> IDE
-				switch (globals.usb_mode) {
-				case USB_MODE_IDE:
-					usb_host_vfs_unmount();
-					globals.usb_mode = USB_MODE_DISCONNECTED;
-					toast_show("USB: Disabled");
-					break;
-				case USB_MODE_VFS:
-					usb_host_vfs_unmount();
-					globals.usb_mode = USB_MODE_IDE;
-					toast_show("USB: IDE mode");
-					break;
-				case USB_MODE_DISCONNECTED:
-					if (usb_host_vfs_mount() == ESP_OK) {
-						globals.usb_mode = USB_MODE_VFS;
-						toast_show("USB: Mounted at /usb");
-					} else {
-						toast_show("USB: Mount failed");
-					}
-					break;
-				default:
-					break;
-				}
-			} else if (osd->mount_sel == MOUNT_BACK) {
+			if (osd->mount_sel == MOUNT_BACK) {
 				osd->view = VIEW_MAIN_MENU;
 			}
 			break;
 		case SC_RIGHT:
-			if (osd->mount_sel == MOUNT_CDD && globals.usb_storage_connected) {
-				// Cycle USB mode forwards: IDE -> VFS -> Disabled -> IDE
-				switch (globals.usb_mode) {
-				case USB_MODE_IDE:
-					if (usb_host_vfs_mount() == ESP_OK) {
-						globals.usb_mode = USB_MODE_VFS;
-						toast_show("USB: Mounted at /usb");
-					} else {
-						toast_show("USB: Mount failed");
-					}
-					break;
-				case USB_MODE_VFS:
-					usb_host_vfs_unmount();
-					globals.usb_mode = USB_MODE_DISCONNECTED;
-					toast_show("USB: Disabled");
-					break;
-				case USB_MODE_DISCONNECTED:
-					globals.usb_mode = USB_MODE_IDE;
-					toast_show("USB: IDE mode");
-					break;
-				default:
-					break;
-				}
-			} else {
-				return handle_mount_select(osd);
-			}
-			break;
+			return handle_mount_select(osd);
 		case SC_ENTER:
-			if (osd->mount_sel == MOUNT_CDD && globals.usb_storage_connected &&
-			    globals.usb_mode == USB_MODE_VFS) {
-				// Browse USB when in VFS mode
+			if (osd->mount_sel == MOUNT_CDD && globals.usb_vfs_mounted) {
+				// Browse USB storage (VFS is auto-mounted when connected)
 				strcpy(osd->browser_path, "/usb");
 				osd->browser_target = -1;  // Special: browsing only, can't mount USB itself
 				scan_directory(osd);

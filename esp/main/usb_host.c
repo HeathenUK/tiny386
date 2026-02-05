@@ -156,10 +156,17 @@ static void handle_device_connected(uint8_t dev_addr)
     xSemaphoreTake(msc_mutex, portMAX_DELAY);
     msc_connected = true;
     globals.usb_storage_connected = true;
-    globals.usb_mode = USB_MODE_IDE;  // Default to IDE mode
     xSemaphoreGive(msc_mutex);
 
-    toast_show("USB storage connected");
+    // Auto-mount VFS so OSD can browse USB contents
+    esp_err_t mount_err = usb_host_vfs_mount();
+    if (mount_err == ESP_OK) {
+        globals.usb_vfs_mounted = true;
+        toast_show("USB storage connected");
+    } else {
+        globals.usb_vfs_mounted = false;
+        toast_show("USB connected (mount failed)");
+    }
 }
 
 /**
@@ -181,7 +188,7 @@ static void handle_device_disconnected(void)
     xSemaphoreTake(msc_mutex, portMAX_DELAY);
     msc_connected = false;
     globals.usb_storage_connected = false;
-    globals.usb_mode = USB_MODE_NONE;
+    globals.usb_vfs_mounted = false;
     xSemaphoreGive(msc_mutex);
 
     if (msc_device) {
@@ -408,6 +415,7 @@ esp_err_t usb_host_vfs_mount(void)
     }
 
     vfs_mounted = true;
+    globals.usb_vfs_mounted = true;
     xSemaphoreGive(msc_mutex);
 
     ESP_LOGI(TAG, "USB mounted at %s", USB_VFS_PATH);
@@ -431,6 +439,7 @@ esp_err_t usb_host_vfs_unmount(void)
 
     vfs_handle = NULL;
     vfs_mounted = false;
+    globals.usb_vfs_mounted = false;
     xSemaphoreGive(msc_mutex);
 
     ESP_LOGI(TAG, "USB unmounted from %s", USB_VFS_PATH);
