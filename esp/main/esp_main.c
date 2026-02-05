@@ -26,6 +26,7 @@
 #ifdef USE_BADGE_BSP
 #include "bsp/device.h"
 #include "bsp/display.h"
+#include "mouse_emu.h"
 #endif
 
 /* From storage.c */
@@ -213,6 +214,7 @@ static int pc_main(const char *file)
 	conf.double_buffer = 0;  // Default disabled
 	conf.brightness = 30;  // Default brightness
 	conf.volume = 80;      // Default volume
+	conf.mouse_speed = 5;  // Default mouse speed (1-10)
 
 	if (!file) {
 		fprintf(stderr, "ERROR: No INI file path provided!\n");
@@ -263,9 +265,11 @@ static int pc_main(const char *file)
 	pc_batch_size_setting = conf.batch_size;
 
 #ifdef USE_BADGE_BSP
-	/* Store brightness/volume in globals for input_bsp and OSD to use */
+	/* Store brightness/volume/mouse_speed in globals for input_bsp and OSD to use */
 	globals.brightness = conf.brightness;
 	globals.volume = conf.volume;
+	globals.mouse_speed = conf.mouse_speed;
+	mouse_emu_set_speed(conf.mouse_speed);
 #endif
 #ifndef USE_LCD_BSP
 	// For non-BSP backends, console allocates fb - store it globally
@@ -277,8 +281,18 @@ static int pc_main(const char *file)
 
 	pc->boot_start_time = get_uticks();
 	uint32_t last_delay_time = get_uticks();
+#ifdef USE_BADGE_BSP
+	uint32_t last_mouse_tick = get_uticks();
+#endif
 	for (; pc->shutdown_state != 8;) {
 #ifdef USE_BADGE_BSP
+		// Mouse emulation tick at ~60Hz
+		uint32_t now_mouse = get_uticks();
+		if (now_mouse - last_mouse_tick >= 16667) {  // ~60Hz
+			last_mouse_tick = now_mouse;
+			mouse_emu_tick();
+		}
+
 		// Check for soft reset request from OSD
 		if (globals.reset_pending) {
 			globals.reset_pending = false;

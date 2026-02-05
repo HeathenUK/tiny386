@@ -16,6 +16,7 @@
 #include "common.h"
 #include "../../i8042.h"
 #include "tanmatsu_osd.h"
+#include "mouse_emu.h"
 #include "../../pc.h"
 #include "bsp/display.h"
 #include "bsp/audio.h"
@@ -137,10 +138,11 @@ static void input_task(void *arg)
 
 	globals.input_queue = input_queue;
 
-	// Initialize OSD
+	// Initialize OSD and mouse emulation
 	globals.osd = osd_init();
 	globals.osd_enabled = false;
 	memset(globals.key_pressed, 0, sizeof(globals.key_pressed));
+	mouse_emu_init();
 
 	// Wait for PC to be initialized
 	xEventGroupWaitBits(global_event_group,
@@ -191,6 +193,16 @@ static void input_task(void *arg)
 					int is_down = !(code & BSP_INPUT_SCANCODE_RELEASE_MODIFIER);
 					code &= ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
 
+					// Block arrow keys when mouse mode is active
+					// (mouse_emu handles them via navigation events)
+					if (mouse_emu_is_active() && !globals.osd_enabled) {
+						if (code == SC_ARROW_UP || code == SC_ARROW_DOWN ||
+						    code == SC_ARROW_LEFT || code == SC_ARROW_RIGHT) {
+							vTaskDelay(5 / portTICK_PERIOD_MS);
+							continue;
+						}
+					}
+
 					// Check for META+arrow shortcuts (only on key down)
 					if (meta_held && is_down) {
 						bool handled = false;
@@ -232,6 +244,15 @@ static void input_task(void *arg)
 					int is_down = !(code & BSP_INPUT_SCANCODE_RELEASE_MODIFIER);
 					code &= ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
 
+					// Block space key when mouse mode is active
+					// (mouse_emu handles L/M/R sections via navigation events)
+					if (mouse_emu_is_active() && !globals.osd_enabled) {
+						if (code == BSP_INPUT_SCANCODE_SPACE) {
+							vTaskDelay(5 / portTICK_PERIOD_MS);
+							continue;
+						}
+					}
+
 					// META+F1-F6 -> F7-F12 (Tanmatsu only has F1-F6 keys)
 					if (meta_held && code >= SC_F1 && code <= SC_F6) {
 						code = (code - SC_F1) + SC_F7;  // Map F1-F6 to F7-F12
@@ -241,6 +262,25 @@ static void input_task(void *arg)
 					handle_scancode(code, is_down);
 				}
 
+				vTaskDelay(5 / portTICK_PERIOD_MS);
+			}
+			else if (event.type == INPUT_EVENT_TYPE_NAVIGATION) {
+				// Handle navigation events for mouse emulation
+				// (gives us separate space L/M/R sections)
+				uint8_t nav_key = event.args_navigation.key;
+				bool pressed = event.args_navigation.pressed;
+
+				// Don't process mouse input when OSD is open
+				if (!globals.osd_enabled) {
+					// Let mouse_emu handle navigation keys
+					// Returns true if consumed (mouse mode active or F6 toggle)
+					if (mouse_emu_handle_nav_key(nav_key, pressed)) {
+						vTaskDelay(5 / portTICK_PERIOD_MS);
+						continue;
+					}
+				}
+				// If not consumed by mouse_emu, navigation events are
+				// redundant with scancodes, so we can ignore them
 				vTaskDelay(5 / portTICK_PERIOD_MS);
 			}
 		}

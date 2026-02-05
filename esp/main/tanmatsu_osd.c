@@ -29,6 +29,7 @@
 #include "../../misc.h"
 #include "../../ide.h"
 #include "toast.h"
+#include "mouse_emu.h"
 #include "../../pc.h"
 
 // View modes
@@ -91,6 +92,7 @@ typedef enum {
 	SYS_FPU,
 	SYS_MEMSIZE,
 	SYS_BATCH,
+	SYS_MOUSE_SPEED,
 	SYS_SEP1,
 	SYS_BACK,
 	SYS_COUNT
@@ -138,6 +140,7 @@ struct OSD {
 	int fpu;         // 0=disabled, 1=enabled
 	int mem_size_mb; // Memory in MB (1 to 24)
 	int batch_size;  // 0=auto, or fixed value (512-4096 in 256 increments)
+	int mouse_speed; // 1-10, mouse emulation speed
 
 	// File browser state
 	int browser_target;  // Which drive slot we're browsing for
@@ -575,7 +578,7 @@ static const char *cpu_gen_names[] = { "i386", "i486", "i586" };
 // Render system settings submenu
 static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16];
+	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], mouse_val[16];
 
 	// CPU generation (3=386, 4=486, 5=586)
 	int gen_idx = osd->cpu_gen - 3;
@@ -596,11 +599,15 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		snprintf(batch_val, sizeof(batch_val), "%d", osd->batch_size);
 	}
 
+	// Mouse speed (1-10)
+	snprintf(mouse_val, sizeof(mouse_val), "%d", osd->mouse_speed);
+
 	MenuEntry entries[SYS_COUNT] = {
 		{ "CPU:", 0, 0, cpu_val },
 		{ "FPU:", 0, 0, fpu_val },
 		{ "Memory:", 0, 0, mem_val },
 		{ "Batch:", 0, 0, batch_val },
+		{ "Mouse Speed:", 0, 0, mouse_val },
 		{ NULL, 1, 0, NULL },  // SEP1
 		{ "< Back (restart to apply)", 0, 0, NULL },
 	};
@@ -969,7 +976,7 @@ static int handle_main_select(OSD *osd)
 			                     osd->drive_paths[4], osd->drive_paths[5],
 			                     osd->cpu_gen, osd->fpu, osd_get_mem_size_bytes(osd),
 			                     osd->brightness, osd->volume, osd->frame_skip,
-			                     osd->double_buffer, osd->batch_size);
+			                     osd->double_buffer, osd->batch_size, osd->mouse_speed);
 			toast_show("Settings saved");
 		}
 		break;
@@ -1046,6 +1053,14 @@ static void handle_sys_adjust(OSD *osd, int delta)
 		// Apply immediately (takes effect next pc_step)
 		pc_batch_size_setting = osd->batch_size;
 		break;
+	case SYS_MOUSE_SPEED:
+		osd->mouse_speed += delta;
+		if (osd->mouse_speed < 1) osd->mouse_speed = 10;  // Wrap
+		if (osd->mouse_speed > 10) osd->mouse_speed = 1;
+		// Apply immediately
+		mouse_emu_set_speed(osd->mouse_speed);
+		globals.mouse_speed = osd->mouse_speed;
+		break;
 	}
 }
 
@@ -1066,6 +1081,7 @@ OSD *osd_init(void)
 	osd->frame_skip = vga_frame_skip_max;  // Load from config
 	osd->double_buffer = vga_double_buffer;  // Load from config
 	osd->batch_size = pc_batch_size_setting;  // Load from config (0=auto)
+	osd->mouse_speed = globals.mouse_speed > 0 ? globals.mouse_speed : 5;  // Load from config, default 5
 
 	// Default system settings
 	osd->cpu_gen = 4;      // i486

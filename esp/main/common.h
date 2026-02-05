@@ -49,6 +49,8 @@ struct Globals {
 	uint32_t emu_calls_per_sec;   // pc_step calls per second
 	// USB storage state
 	bool usb_storage_connected;   // True when USB mass storage is attached
+	// Mouse emulation settings
+	int mouse_speed;              // Mouse speed setting (1-10, default 5)
 #endif
 };
 

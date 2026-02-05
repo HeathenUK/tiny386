@@ -1244,6 +1244,10 @@ int parse_conf_ini(void* user, const char* section,
 			conf->frame_skip = atoi(value);
 			if (conf->frame_skip < 0) conf->frame_skip = 0;
 			if (conf->frame_skip > 10) conf->frame_skip = 10;
+		} else if (NAME("mouse_speed")) {
+			conf->mouse_speed = atoi(value);
+			if (conf->mouse_speed < 1) conf->mouse_speed = 1;
+			if (conf->mouse_speed > 10) conf->mouse_speed = 10;
 		}
 	} else if (SEC("display")) {
 		if (NAME("width")) {

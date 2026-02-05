@@ -447,7 +447,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
                          const char *cdc, const char *cdd,
                          int cpu_gen, int fpu, long mem_size,
                          int brightness, int volume, int frame_skip,
-                         int double_buffer, int batch_size)
+                         int double_buffer, int batch_size, int mouse_speed)
 {
 	if (!ini_path) return -1;
 	if (boot_order < 0 || boot_order >= BOOT_ORDER_COUNT)
@@ -477,7 +477,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	int found_mem_size = -1;
 	int found_gen = -1, found_fpu = -1, found_batch_size = -1;
 	int found_brightness = -1, found_volume = -1, found_frame_skip = -1;
-	int found_double_buffer = -1;
+	int found_double_buffer = -1, found_mouse_speed = -1;
 
 	while (line_count < 64 && fgets(lines[line_count], 256, f)) {
 		// Check for section headers
@@ -521,6 +521,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			else if (line_starts_with(lines[line_count], "brightness")) found_brightness = line_count;
 			else if (line_starts_with(lines[line_count], "volume")) found_volume = line_count;
 			else if (line_starts_with(lines[line_count], "frame_skip")) found_frame_skip = line_count;
+			else if (line_starts_with(lines[line_count], "mouse_speed")) found_mouse_speed = line_count;
 		}
 
 		// Check for existing settings in [cpu] section
@@ -582,6 +583,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			fprintf(f, "volume = %d\n", volume);
 		} else if (i == found_frame_skip) {
 			fprintf(f, "frame_skip = %d\n", frame_skip);
+		} else if (i == found_mouse_speed) {
+			fprintf(f, "mouse_speed = %d\n", mouse_speed);
 		} else if (i == found_double_buffer) {
 			fprintf(f, "double_buffer = %d\n", double_buffer);
 		} else if (i == found_gen) {
@@ -619,6 +622,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 				fprintf(f, "volume = %d\n", volume);
 			if (found_frame_skip < 0)
 				fprintf(f, "frame_skip = %d\n", frame_skip);
+			if (found_mouse_speed < 0)
+				fprintf(f, "mouse_speed = %d\n", mouse_speed);
 		}
 
 		// Add new settings at end of [cpu] section

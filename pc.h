@@ -116,6 +116,7 @@ typedef struct {
 	int batch_size;  // 0=auto, or fixed value 512-4096 (ESP32 only)
 	int brightness;  // 0-100 display brightness (ESP32 only)
 	int volume;      // 0-100 audio volume (ESP32 only)
+	int mouse_speed; // 1-10 mouse emulation speed (ESP32 only)
 	const char *ini_path;  // Path to ini file for saving settings
 } PCConfig;
 
