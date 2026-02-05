@@ -94,9 +94,15 @@ typedef enum {
 	SYS_BATCH,
 	SYS_MOUSE_SPEED,
 	SYS_SEP1,
+	SYS_CREATE_HDD,
+	SYS_SEP2,
 	SYS_BACK,
 	SYS_COUNT
 } SysMenuItem;
+
+// HDD size presets (in MB) - IDE limit is ~504MB without LBA, 2GB practical max
+static const int hdd_size_presets[] = { 104, 256, 504, 1024, 2048 };
+static const int hdd_size_preset_count = 5;
 
 // File entry for browser
 #define MAX_FILES 256
@@ -125,6 +131,7 @@ struct OSD {
 	int mount_sel;
 	int av_sel;
 	int sys_sel;
+	int hdd_size_sel;  // Index into hdd_size_presets for HDD creation
 
 	// Drive paths
 	char drive_paths[6][MAX_PATH_LEN];  // FDA, FDB, CDA-CDD
@@ -193,7 +200,7 @@ static int is_av_separator(int item) {
 }
 
 static int is_sys_separator(int item) {
-	return item == SYS_SEP1;
+	return item == SYS_SEP1 || item == SYS_SEP2;
 }
 
 // Get just the filename from a path
@@ -578,7 +585,7 @@ static const char *cpu_gen_names[] = { "i386", "i486", "i586" };
 // Render system settings submenu
 static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], mouse_val[16];
+	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], mouse_val[16], hdd_val[32];
 
 	// CPU generation (3=386, 4=486, 5=586)
 	int gen_idx = osd->cpu_gen - 3;
@@ -602,6 +609,14 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	// Mouse speed (1-10)
 	snprintf(mouse_val, sizeof(mouse_val), "%d", osd->mouse_speed);
 
+	// HDD size for creation
+	int size_mb = hdd_size_presets[osd->hdd_size_sel];
+	if (size_mb >= 1024) {
+		snprintf(hdd_val, sizeof(hdd_val), "%d GB", size_mb / 1024);
+	} else {
+		snprintf(hdd_val, sizeof(hdd_val), "%d MB", size_mb);
+	}
+
 	MenuEntry entries[SYS_COUNT] = {
 		{ "CPU:", 0, 0, cpu_val },
 		{ "FPU:", 0, 0, fpu_val },
@@ -609,11 +624,13 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ "Batch:", 0, 0, batch_val },
 		{ "Mouse Speed:", 0, 0, mouse_val },
 		{ NULL, 1, 0, NULL },  // SEP1
+		{ "Create HDD:", 0, 0, hdd_val },
+		{ NULL, 1, 0, NULL },  // SEP2
 		{ "< Back (restart to apply)", 0, 0, NULL },
 	};
 
-	render_generic_menu(pixels, w, h, pitch, "System (restart req.)", entries, SYS_COUNT,
-	                    osd->sys_sel, "Left/Right:Adjust  Esc:Back");
+	render_generic_menu(pixels, w, h, pitch, "System", entries, SYS_COUNT,
+	                    osd->sys_sel, "L/R:Adjust Enter:Create Esc:Back");
 }
 
 // Render status panel (emulator stats)
@@ -1022,6 +1039,65 @@ static void handle_av_adjust(OSD *osd, int delta)
 	}
 }
 
+// Create sparse HDD image file
+// Returns 0 on success, -1 on error
+static int create_hdd_image(int size_mb)
+{
+	// Generate filename based on size
+	char filename[64];
+	if (size_mb >= 1024) {
+		snprintf(filename, sizeof(filename), "/sdcard/hdd_%dgb.img", size_mb / 1024);
+	} else {
+		snprintf(filename, sizeof(filename), "/sdcard/hdd_%dmb.img", size_mb);
+	}
+
+	// Check if file already exists
+	struct stat st;
+	if (stat(filename, &st) == 0) {
+		// File exists - try with numbered suffix
+		for (int i = 2; i <= 99; i++) {
+			if (size_mb >= 1024) {
+				snprintf(filename, sizeof(filename), "/sdcard/hdd_%dgb_%d.img", size_mb / 1024, i);
+			} else {
+				snprintf(filename, sizeof(filename), "/sdcard/hdd_%dmb_%d.img", size_mb, i);
+			}
+			if (stat(filename, &st) != 0) break;
+		}
+	}
+
+	// Create sparse file using truncate (instant, no actual disk write)
+	FILE *f = fopen(filename, "wb");
+	if (!f) {
+		return -1;
+	}
+
+	// Calculate size in bytes
+	long long size_bytes = (long long)size_mb * 1024 * 1024;
+
+	// Use fseek + fwrite to create sparse file
+	// This creates a file with the specified size but only allocates
+	// disk blocks as they're actually written
+	if (fseek(f, size_bytes - 1, SEEK_SET) != 0) {
+		fclose(f);
+		return -1;
+	}
+
+	// Write a single byte to establish file size
+	if (fwrite("", 1, 1, f) != 1) {
+		fclose(f);
+		return -1;
+	}
+
+	fclose(f);
+
+	// Show success toast with filename
+	char msg[64];
+	snprintf(msg, sizeof(msg), "Created %s", filename + 8);  // Skip "/sdcard/"
+	toast_show(msg);
+
+	return 0;
+}
+
 // Handle system settings adjustment with left/right
 static void handle_sys_adjust(OSD *osd, int delta)
 {
@@ -1061,6 +1137,12 @@ static void handle_sys_adjust(OSD *osd, int delta)
 		mouse_emu_set_speed(osd->mouse_speed);
 		globals.mouse_speed = osd->mouse_speed;
 		break;
+	case SYS_CREATE_HDD:
+		// Cycle HDD size presets
+		osd->hdd_size_sel += delta;
+		if (osd->hdd_size_sel < 0) osd->hdd_size_sel = hdd_size_preset_count - 1;
+		if (osd->hdd_size_sel >= hdd_size_preset_count) osd->hdd_size_sel = 0;
+		break;
 	}
 }
 
@@ -1075,6 +1157,7 @@ OSD *osd_init(void)
 	osd->mount_sel = MOUNT_FDA;
 	osd->av_sel = AV_BRIGHTNESS;
 	osd->sys_sel = SYS_CPU_GEN;
+	osd->hdd_size_sel = 2;  // Default to 504 MB (index 2)
 	// Load brightness/volume from globals (set from INI in esp_main.c)
 	osd->brightness = globals.brightness;
 	osd->volume = globals.volume;
@@ -1272,6 +1355,12 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 		case SC_ENTER:
 			if (osd->sys_sel == SYS_BACK) {
 				osd->view = VIEW_MAIN_MENU;
+			} else if (osd->sys_sel == SYS_CREATE_HDD) {
+				// Create the HDD image
+				int size_mb = hdd_size_presets[osd->hdd_size_sel];
+				if (create_hdd_image(size_mb) != 0) {
+					toast_show("Error creating HDD image");
+				}
 			}
 			break;
 		case SC_ESC:

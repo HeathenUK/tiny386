@@ -29,7 +29,7 @@ all: build
 # Preparation
 
 .PHONY: prepare
-prepare: submodules sdk fmopl
+prepare: submodules sdk
 
 .PHONY: submodules
 submodules:
@@ -78,14 +78,7 @@ sdk:
 		cd "$(IDF_PATH)"; bash install.sh all; \
 	fi
 
-.PHONY: fmopl
-fmopl:
-	@if [ ! -f ../fmopl.inc ]; then \
-		echo "Generating fmopl.inc lookup tables..."; \
-		cd .. && make prepare; \
-	else \
-		echo "fmopl.inc already exists, skipping..."; \
-	fi
+# Note: fmopl.inc is no longer needed - ymfm replaced fmopl for OPL emulation
 
 .PHONY: patch_idf
 patch_idf:
@@ -133,7 +126,6 @@ fullclean: clean
 checkbuildenv:
 	@if [ -z "$(IDF_PATH)" ]; then echo "IDF_PATH is not set!"; exit 1; fi
 	@if [ -z "$(IDF_TOOLS_PATH)" ]; then echo "IDF_TOOLS_PATH is not set!"; exit 1; fi
-	@if [ ! -f ../fmopl.inc ]; then echo "fmopl.inc not found! Run 'make prepare' first."; exit 1; fi
 
 # Building
 
