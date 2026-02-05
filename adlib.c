@@ -35,7 +35,7 @@
 
 #define ADLIB_KILL_TIMERS 1
 
-#define ADLIB_DESC "Yamaha YM3812 (OPL2)"
+#define ADLIB_DESC "Yamaha YMF262 (OPL3)"
 
 #ifdef DEBUG
 #include "qemu/timer.h"
@@ -162,7 +162,7 @@ AdlibState *adlib_new()
     AdlibState *s = malloc(sizeof(AdlibState));
     memset(s, 0, sizeof(AdlibState));
     s->freq = 44100;
-    s->opl = OPLCreate (3579545, s->freq);
+    s->opl = OPLCreate (14318180, s->freq);  /* OPL3 clock */
     if (!s->opl) {
         return NULL;
     }

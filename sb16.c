@@ -67,6 +67,10 @@ typedef enum {
     AUDIO_FORMAT_S8,
     AUDIO_FORMAT_U16,
     AUDIO_FORMAT_S16,
+    AUDIO_FORMAT_ADPCM4,      /* 4-bit Creative ADPCM */
+    AUDIO_FORMAT_ADPCM4_REF,  /* 4-bit Creative ADPCM with reference byte */
+    AUDIO_FORMAT_ADPCM26,     /* 2.6-bit Creative ADPCM */
+    AUDIO_FORMAT_ADPCM26_REF, /* 2.6-bit Creative ADPCM with reference byte */
 } AudioFormat;
 
 static const char e3[] = "COPYRIGHT (C) CREATIVE TECHNOLOGY LTD, 1992.";
@@ -142,6 +146,11 @@ struct SB16State {
     uint64_t dac_last_time;      /* Timestamp of last Direct DAC write (microseconds) */
     int dac_sample_count;        /* Samples since last rate update */
     int dac_estimated_freq;      /* Current estimated frequency */
+
+    /* ADPCM decoder state */
+    int adpcm_reference;         /* Current reference sample (0-255) */
+    int adpcm_step;              /* Current step index */
+    int adpcm_have_ref;          /* Flag: have we read the reference byte? */
 };
 
 static void AUD_set_active_out (SB16State *s, int i)
@@ -239,6 +248,155 @@ static void aux_timer (void *opaque)
 #define DMA8_AUTO 1
 #define DMA8_HIGH 2
 
+/*
+ * Creative ADPCM decoder
+ *
+ * 4-bit ADPCM: Each nibble encodes a delta from the previous sample.
+ * The step size adapts based on the nibble value.
+ *
+ * 2.6-bit ADPCM: Packs 3 samples into each byte (2+2+2 bits + 2 bits shift).
+ */
+
+/* Step size adjustment table for 4-bit ADPCM */
+static const int adpcm4_step_adjust[8] = {
+    -1, -1, -1, -1, 2, 4, 6, 8
+};
+
+/* Step sizes for 4-bit ADPCM (8 levels) */
+static const int adpcm4_step_size[49] = {
+    16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55,
+    60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173,
+    190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494,
+    544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552
+};
+
+/* Decode a single 4-bit ADPCM nibble */
+static int decode_adpcm4_nibble(SB16State *s, int nibble)
+{
+    int step = adpcm4_step_size[s->adpcm_step];
+    int delta;
+
+    /* Calculate delta: lower 3 bits determine magnitude */
+    int magnitude = nibble & 7;
+    delta = (step * magnitude) / 4 + step / 8;
+
+    /* Bit 3 determines sign */
+    if (nibble & 8) {
+        s->adpcm_reference -= delta;
+    } else {
+        s->adpcm_reference += delta;
+    }
+
+    /* Clamp to 8-bit range */
+    if (s->adpcm_reference < 0) s->adpcm_reference = 0;
+    if (s->adpcm_reference > 255) s->adpcm_reference = 255;
+
+    /* Adjust step size */
+    s->adpcm_step += adpcm4_step_adjust[magnitude];
+    if (s->adpcm_step < 0) s->adpcm_step = 0;
+    if (s->adpcm_step > 48) s->adpcm_step = 48;
+
+    return s->adpcm_reference;
+}
+
+/* Decode 4-bit ADPCM data into PCM samples
+ * Each byte contains 2 nibbles = 2 samples
+ * Returns number of PCM bytes written */
+static int decode_adpcm4(SB16State *s, uint8_t *out, int out_len,
+                         const uint8_t *in, int in_len, int has_ref)
+{
+    int out_pos = 0;
+    int in_pos = 0;
+
+    /* Handle reference byte if present */
+    if (has_ref && !s->adpcm_have_ref && in_len > 0) {
+        s->adpcm_reference = in[in_pos++];
+        s->adpcm_step = 0;
+        s->adpcm_have_ref = 1;
+        /* Output the reference sample */
+        if (out_pos < out_len) {
+            out[out_pos++] = s->adpcm_reference;
+        }
+    }
+
+    /* Decode nibbles */
+    while (in_pos < in_len && out_pos + 1 < out_len) {
+        uint8_t byte = in[in_pos++];
+        /* High nibble first, then low nibble */
+        out[out_pos++] = decode_adpcm4_nibble(s, (byte >> 4) & 0x0F);
+        out[out_pos++] = decode_adpcm4_nibble(s, byte & 0x0F);
+    }
+
+    return out_pos;
+}
+
+/* Step sizes for 2.6-bit ADPCM */
+static const int adpcm26_step_size[4] = { 1, 2, 4, 8 };
+
+/* Decode 2.6-bit ADPCM data
+ * Format: Each byte encodes 3 samples with 2 bits each + scale factor
+ * Bits 7-6: scale (shift amount)
+ * Bits 5-4: sample 1 delta
+ * Bits 3-2: sample 2 delta
+ * Bits 1-0: sample 3 delta */
+static int decode_adpcm26(SB16State *s, uint8_t *out, int out_len,
+                          const uint8_t *in, int in_len, int has_ref)
+{
+    int out_pos = 0;
+    int in_pos = 0;
+
+    /* Handle reference byte if present */
+    if (has_ref && !s->adpcm_have_ref && in_len > 0) {
+        s->adpcm_reference = in[in_pos++];
+        s->adpcm_have_ref = 1;
+        if (out_pos < out_len) {
+            out[out_pos++] = s->adpcm_reference;
+        }
+    }
+
+    /* Decode packed samples */
+    while (in_pos < in_len && out_pos + 2 < out_len) {
+        uint8_t byte = in[in_pos++];
+        int scale = (byte >> 6) & 3;
+        int step = adpcm26_step_size[scale];
+        int delta;
+
+        /* Sample 1 (bits 5-4) */
+        delta = ((byte >> 4) & 3) * step;
+        if ((byte >> 4) & 2) delta = -delta;  /* Sign bit */
+        s->adpcm_reference += delta;
+        if (s->adpcm_reference < 0) s->adpcm_reference = 0;
+        if (s->adpcm_reference > 255) s->adpcm_reference = 255;
+        out[out_pos++] = s->adpcm_reference;
+
+        /* Sample 2 (bits 3-2) */
+        delta = ((byte >> 2) & 3) * step;
+        if ((byte >> 2) & 2) delta = -delta;
+        s->adpcm_reference += delta;
+        if (s->adpcm_reference < 0) s->adpcm_reference = 0;
+        if (s->adpcm_reference > 255) s->adpcm_reference = 255;
+        out[out_pos++] = s->adpcm_reference;
+
+        /* Sample 3 (bits 1-0) */
+        delta = (byte & 3) * step;
+        if (byte & 2) delta = -delta;
+        s->adpcm_reference += delta;
+        if (s->adpcm_reference < 0) s->adpcm_reference = 0;
+        if (s->adpcm_reference > 255) s->adpcm_reference = 255;
+        out[out_pos++] = s->adpcm_reference;
+    }
+
+    return out_pos;
+}
+
+/* Reset ADPCM decoder state */
+static void reset_adpcm(SB16State *s)
+{
+    s->adpcm_reference = 128;  /* Center of 8-bit range */
+    s->adpcm_step = 0;
+    s->adpcm_have_ref = 0;
+}
+
 static void continue_dma8 (SB16State *s)
 {
     if (s->freq > 0) {
@@ -282,7 +440,7 @@ static void dma_cmd8 (SB16State *s, int mask, int dma_len)
     s->freq >>= s->fmt_stereo;
     s->left_till_irq = s->block_size;
     s->bytes_per_second = (s->freq << s->fmt_stereo);
-    /* s->highspeed = (mask & DMA8_HIGH) != 0; */
+    s->highspeed = (mask & DMA8_HIGH) != 0;
     s->dma_auto = (mask & DMA8_AUTO) != 0;
     s->align = (1 << s->fmt_stereo) - 1;
 
@@ -297,6 +455,40 @@ static void dma_cmd8 (SB16State *s, int mask, int dma_len)
 
     continue_dma8 (s);
     speaker (s, 1);
+}
+
+/* ADPCM DMA command - sets up DMA for ADPCM playback */
+static void dma_cmd_adpcm(SB16State *s, int adpcm_type, int dma_len, int auto_init)
+{
+    s->fmt = adpcm_type;
+    s->use_hdma = 0;
+    s->fmt_bits = 8;  /* Output is 8-bit PCM */
+    s->fmt_signed = 0;
+    s->fmt_stereo = 0;  /* ADPCM is always mono */
+
+    if (-1 == s->time_const) {
+        if (s->freq <= 0)
+            s->freq = 11025;
+    } else {
+        int tmp = (256 - s->time_const);
+        s->freq = (1000000 + (tmp / 2)) / tmp;
+    }
+
+    s->block_size = dma_len;
+    s->left_till_irq = s->block_size;
+    s->bytes_per_second = s->freq;
+    s->dma_auto = auto_init;
+    s->highspeed = 0;
+    s->align = 0;
+
+    /* Reset ADPCM state for reference variants */
+    reset_adpcm(s);
+
+    dolog("ADPCM DMA: type=%d freq=%d block=%d auto=%d\n",
+          adpcm_type, s->freq, s->block_size, s->dma_auto);
+
+    continue_dma8(s);
+    speaker(s, 1);
 }
 
 static void dma_cmd (SB16State *s, uint8_t cmd, uint8_t d0, int dma_len)
@@ -498,40 +690,28 @@ static void command (SB16State *s, uint8_t cmd)
             s->needed_bytes = 2;
             break;
 
-        case 0x74:
-            s->needed_bytes = 2; /* DMA DAC, 4-bit ADPCM */
-            qemu_log_mask(LOG_UNIMP, "0x75 - DMA DAC, 4-bit ADPCM not"
-                          " implemented\n");
+        case 0x74:              /* DMA DAC, 4-bit ADPCM */
+            s->needed_bytes = 2;
             break;
 
         case 0x75:              /* DMA DAC, 4-bit ADPCM Reference */
             s->needed_bytes = 2;
-            qemu_log_mask(LOG_UNIMP, "0x74 - DMA DAC, 4-bit ADPCM Reference not"
-                          " implemented\n");
             break;
 
         case 0x76:              /* DMA DAC, 2.6-bit ADPCM */
             s->needed_bytes = 2;
-            qemu_log_mask(LOG_UNIMP, "0x74 - DMA DAC, 2.6-bit ADPCM not"
-                          " implemented\n");
             break;
 
         case 0x77:              /* DMA DAC, 2.6-bit ADPCM Reference */
             s->needed_bytes = 2;
-            qemu_log_mask(LOG_UNIMP, "0x74 - DMA DAC, 2.6-bit ADPCM Reference"
-                          " not implemented\n");
             break;
 
-        case 0x7d:
-            qemu_log_mask(LOG_UNIMP, "0x7d - Autio-Initialize DMA DAC, 4-bit"
-                          " ADPCM Reference\n");
-            qemu_log_mask(LOG_UNIMP, "not implemented\n");
+        case 0x7d:              /* Auto-Initialize DMA DAC, 4-bit ADPCM Reference */
+            dma_cmd_adpcm(s, AUDIO_FORMAT_ADPCM4_REF, s->block_size, 1);
             break;
 
-        case 0x7f:
-            qemu_log_mask(LOG_UNIMP, "0x7d - Autio-Initialize DMA DAC, 2.6-bit"
-                          " ADPCM Reference\n");
-            qemu_log_mask(LOG_UNIMP, "not implemented\n");
+        case 0x7f:              /* Auto-Initialize DMA DAC, 2.6-bit ADPCM Reference */
+            dma_cmd_adpcm(s, AUDIO_FORMAT_ADPCM26_REF, s->block_size, 1);
             break;
 
         case 0x80:
@@ -862,11 +1042,20 @@ static void complete (SB16State *s)
             ldebug ("set dma block len %d\n", s->block_size);
             break;
 
-        case 0x74:
-        case 0x75:
-        case 0x76:
-        case 0x77:
-            /* ADPCM stuff, ignore */
+        case 0x74:  /* DMA DAC, 4-bit ADPCM */
+            dma_cmd_adpcm(s, AUDIO_FORMAT_ADPCM4, dsp_get_lohi(s) + 1, 0);
+            break;
+
+        case 0x75:  /* DMA DAC, 4-bit ADPCM Reference */
+            dma_cmd_adpcm(s, AUDIO_FORMAT_ADPCM4_REF, dsp_get_lohi(s) + 1, 0);
+            break;
+
+        case 0x76:  /* DMA DAC, 2.6-bit ADPCM */
+            dma_cmd_adpcm(s, AUDIO_FORMAT_ADPCM26, dsp_get_lohi(s) + 1, 0);
+            break;
+
+        case 0x77:  /* DMA DAC, 2.6-bit ADPCM Reference */
+            dma_cmd_adpcm(s, AUDIO_FORMAT_ADPCM26_REF, dsp_get_lohi(s) + 1, 0);
             break;
 
         case 0x80:
@@ -1032,8 +1221,10 @@ void sb16_dsp_write(void *opaque, uint32_t nport, uint32_t val)
         break;
 
     case 0x0c:                  /* write data or command | write status */
-/*         if (s->highspeed) */
-/*             break; */
+        if (s->highspeed) {
+            /* In high-speed mode, ignore all commands until reset */
+            break;
+        }
 
         if (s->needed_bytes == 0) {
             command (s, val);
@@ -1279,8 +1470,10 @@ static int write_audio (SB16State *s, int nchan, int dma_pos,
     int temp, net;
 #ifdef BUILD_ESP32
     uint8_t tmpbuf[512];
+    uint8_t pcmbuf[1024];  /* Decoded PCM buffer (ADPCM expands ~2-3x) */
 #else
     uint8_t tmpbuf[4096];
+    uint8_t pcmbuf[8192];
 #endif
 
     temp = len;
@@ -1300,23 +1493,36 @@ static int write_audio (SB16State *s, int nchan, int dma_pos,
 
         copied = i8257_dma_read_memory(isa_dma, nchan, tmpbuf, dma_pos, to_copy);
 
-        unsigned int len = AUDIO_BUF_LEN - (s->audio_q - s->audio_p);
-        if (len > AUDIO_BUF_LEN)
-            len = 0;
-        if (copied < len)
-            len = copied;
-        if (len) {
+        /* Check if we need to decode ADPCM */
+        uint8_t *out_data = tmpbuf;
+        int out_len = copied;
+
+        if (s->fmt == AUDIO_FORMAT_ADPCM4 || s->fmt == AUDIO_FORMAT_ADPCM4_REF) {
+            int has_ref = (s->fmt == AUDIO_FORMAT_ADPCM4_REF);
+            out_len = decode_adpcm4(s, pcmbuf, sizeof(pcmbuf), tmpbuf, copied, has_ref);
+            out_data = pcmbuf;
+        } else if (s->fmt == AUDIO_FORMAT_ADPCM26 || s->fmt == AUDIO_FORMAT_ADPCM26_REF) {
+            int has_ref = (s->fmt == AUDIO_FORMAT_ADPCM26_REF);
+            out_len = decode_adpcm26(s, pcmbuf, sizeof(pcmbuf), tmpbuf, copied, has_ref);
+            out_data = pcmbuf;
+        }
+
+        unsigned int avail = AUDIO_BUF_LEN - (s->audio_q - s->audio_p);
+        if (avail > AUDIO_BUF_LEN)
+            avail = 0;
+        if ((unsigned int)out_len > avail)
+            out_len = avail;
+        if (out_len) {
             unsigned int q = s->audio_q % AUDIO_BUF_LEN;
-            if (q + len < AUDIO_BUF_LEN) {
-                memcpy(s->audio_buf + q, tmpbuf, len);
+            if (q + out_len <= AUDIO_BUF_LEN) {
+                memcpy(s->audio_buf + q, out_data, out_len);
             } else {
                 unsigned int r = AUDIO_BUF_LEN - q;
-                memcpy(s->audio_buf + q, tmpbuf, r);
-                memcpy(s->audio_buf, tmpbuf + r, len - r);
+                memcpy(s->audio_buf + q, out_data, r);
+                memcpy(s->audio_buf, out_data + r, out_len - r);
             }
-            s->audio_q += len;
+            s->audio_q += out_len;
         }
-        copied = len;
 
         temp -= copied;
         dma_pos = (dma_pos + copied) % dma_len;
@@ -1701,6 +1907,15 @@ void sb16_audio_callback (void *opaque, uint8_t *stream, int free)
             i = resample_s8m((int16_t *) stream, free / 2, 44100,
                              (int8_t *) s->audio_buf, p, len, AUDIO_BUF_LEN, s->freq);
         }
+        s->audio_p += i;
+        break;
+    case AUDIO_FORMAT_ADPCM4:
+    case AUDIO_FORMAT_ADPCM4_REF:
+    case AUDIO_FORMAT_ADPCM26:
+    case AUDIO_FORMAT_ADPCM26_REF:
+        /* ADPCM is decoded to unsigned 8-bit PCM in write_audio, always mono */
+        i = resample_u8m((int16_t *) stream, free / 2, 44100,
+                         s->audio_buf, p, len, AUDIO_BUF_LEN, s->freq);
         s->audio_p += i;
         break;
     default:

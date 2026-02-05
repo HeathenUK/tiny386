@@ -104,4 +104,5 @@ unsigned char OPLRead(FM_OPL *OPL,int a);
 int OPLTimerOver(FM_OPL *OPL,int c);
 
 void YM3812UpdateOne(FM_OPL *OPL, int16_t *buffer, int length);
+void YMF262UpdateOne(FM_OPL *OPL, int16_t *buffer, int length);  /* Stereo output for OPL3 */
 #endif
