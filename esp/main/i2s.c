@@ -105,6 +105,28 @@ void i2s_main()
 	// Just create the task here - it will wait for BSP init
 	xTaskCreatePinnedToCore(i2s_bsp_task, "i2s_task", 4096, NULL, 0, NULL, 0);
 }
+
+// Silence and disable audio before restart to avoid crackling
+void i2s_shutdown(void)
+{
+	if (!tx_chan) return;
+
+	// Disable amplifier first to cut output
+	bsp_audio_set_amplifier(false);
+
+	// Write silence to flush any pending audio data
+	int16_t silence[256] = {0};
+	size_t bwritten;
+	for (int i = 0; i < 4; i++) {
+		i2s_channel_write(tx_chan, silence, sizeof(silence), &bwritten, pdMS_TO_TICKS(50));
+	}
+
+	// Small delay to let silence play out
+	vTaskDelay(pdMS_TO_TICKS(50));
+
+	// Disable the I2S channel
+	i2s_channel_disable(tx_chan);
+}
 #else
 void i2s_main()
 {

@@ -1969,7 +1969,21 @@ typedef enum {
 
 #define SECTOR_SIZE 512
 
-typedef struct BlockDeviceFile {
+/* VHD Dynamic Disk Format Support */
+#define VHD_COOKIE "conectix"
+#define VHD_DYN_COOKIE "cxsparse"
+#define VHD_BLOCK_SIZE (2 * 1024 * 1024)  /* 2MB blocks */
+#define VHD_SECTOR_SIZE 512
+#define VHD_BAT_UNUSED 0xFFFFFFFF
+
+typedef struct BlockDeviceFile BlockDeviceFile;
+
+/* Forward declarations for VHD functions */
+static int vhd_read_sectors(BlockDeviceFile *bf, uint64_t sector_num, uint8_t *buf, int n);
+static int vhd_write_sectors(BlockDeviceFile *bf, uint64_t sector_num, const uint8_t *buf, int n);
+static int vhd_try_parse(BlockDeviceFile *bf);
+
+struct BlockDeviceFile {
     FILE *f;
     int start_offset;
     int cylinders, heads, sectors;
@@ -1986,7 +2000,15 @@ typedef struct BlockDeviceFile {
     int cache_count;           /* Number of valid sectors in cache */
 #define DISK_CACHE_SECTORS 64  /* Cache 64 sectors = 32KB per disk */
 #endif
-} BlockDeviceFile;
+    /* VHD support */
+    int is_vhd;                /* 1 if this is a VHD file */
+    uint32_t vhd_block_size;   /* Block size (typically 2MB) */
+    uint32_t vhd_max_bat;      /* Number of BAT entries */
+    uint32_t *vhd_bat;         /* Block Allocation Table */
+    int64_t vhd_bat_offset;    /* Offset to BAT in file */
+    int64_t vhd_data_offset;   /* Offset where data blocks start */
+    int vhd_bitmap_sectors;    /* Sectors per block bitmap */
+};
 
 static int64_t bf_get_sector_count(BlockDevice *bs)
 {
@@ -2021,6 +2043,12 @@ static int bf_read_async(BlockDevice *bs,
 #endif
     if (!bf->f)
         return -1;
+
+    /* VHD files use special read path */
+    if (bf->is_vhd) {
+        return vhd_read_sectors(bf, sector_num, buf, n);
+    }
+
     if (bf->mode == BF_MODE_SNAPSHOT) {
         int i;
         for(i = 0; i < n; i++) {
@@ -2090,6 +2118,13 @@ static int bf_write_async(BlockDevice *bs,
     }
 #endif
 
+    /* VHD files use special write path */
+    if (bf->is_vhd) {
+        if (bf->mode == BF_MODE_RO)
+            return -1;
+        return vhd_write_sectors(bf, sector_num, buf, n);
+    }
+
     switch(bf->mode) {
     case BF_MODE_RO:
         ret = -1; /* error */
@@ -2120,6 +2155,201 @@ static int bf_write_async(BlockDevice *bs,
     }
 
     return ret;
+}
+
+/* VHD Helper Functions */
+static uint32_t vhd_read_be32(const uint8_t *p)
+{
+    return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+}
+
+static uint64_t vhd_read_be64(const uint8_t *p)
+{
+    return ((uint64_t)vhd_read_be32(p) << 32) | vhd_read_be32(p + 4);
+}
+
+static void vhd_write_be32(uint8_t *p, uint32_t v)
+{
+    p[0] = (v >> 24) & 0xff;
+    p[1] = (v >> 16) & 0xff;
+    p[2] = (v >> 8) & 0xff;
+    p[3] = v & 0xff;
+}
+
+/* Read sectors from VHD, returns 0 on success */
+static int vhd_read_sectors(BlockDeviceFile *bf, uint64_t sector_num,
+                            uint8_t *buf, int n)
+{
+    while (n > 0) {
+        /* Calculate which VHD block this sector is in */
+        uint32_t sectors_per_block = bf->vhd_block_size / VHD_SECTOR_SIZE;
+        uint32_t block_idx = sector_num / sectors_per_block;
+        uint32_t sector_in_block = sector_num % sectors_per_block;
+
+        if (block_idx >= bf->vhd_max_bat) {
+            /* Beyond disk size - return zeros */
+            memset(buf, 0, VHD_SECTOR_SIZE);
+        } else {
+            uint32_t bat_entry = bf->vhd_bat[block_idx];
+            if (bat_entry == VHD_BAT_UNUSED) {
+                /* Block not allocated - return zeros */
+                memset(buf, 0, VHD_SECTOR_SIZE);
+            } else {
+                /* Block allocated - read from file */
+                /* Skip bitmap at start of block */
+                int64_t file_offset = (int64_t)bat_entry * VHD_SECTOR_SIZE +
+                                      bf->vhd_bitmap_sectors * VHD_SECTOR_SIZE +
+                                      sector_in_block * VHD_SECTOR_SIZE;
+                fseeko(bf->f, file_offset, SEEK_SET);
+                if (fread(buf, 1, VHD_SECTOR_SIZE, bf->f) != VHD_SECTOR_SIZE) {
+                    /* Read error - return zeros */
+                    memset(buf, 0, VHD_SECTOR_SIZE);
+                }
+            }
+        }
+        sector_num++;
+        buf += VHD_SECTOR_SIZE;
+        n--;
+    }
+    return 0;
+}
+
+/* Write sectors to VHD, allocating blocks as needed */
+static int vhd_write_sectors(BlockDeviceFile *bf, uint64_t sector_num,
+                             const uint8_t *buf, int n)
+{
+    while (n > 0) {
+        uint32_t sectors_per_block = bf->vhd_block_size / VHD_SECTOR_SIZE;
+        uint32_t block_idx = sector_num / sectors_per_block;
+        uint32_t sector_in_block = sector_num % sectors_per_block;
+
+        if (block_idx >= bf->vhd_max_bat) {
+            return -1;  /* Beyond disk size */
+        }
+
+        uint32_t bat_entry = bf->vhd_bat[block_idx];
+        if (bat_entry == VHD_BAT_UNUSED) {
+            /* Need to allocate new block */
+            /* Find end of file (before footer) */
+            fseeko(bf->f, 0, SEEK_END);
+            int64_t file_end = ftello(bf->f) - VHD_SECTOR_SIZE;  /* Before footer */
+
+            /* New block goes at current end */
+            uint32_t new_block_sector = file_end / VHD_SECTOR_SIZE;
+
+            /* Write block bitmap (all 1s = all sectors present) */
+            uint8_t bitmap[VHD_SECTOR_SIZE];
+            memset(bitmap, 0xff, sizeof(bitmap));
+            fseeko(bf->f, file_end, SEEK_SET);
+            for (int i = 0; i < bf->vhd_bitmap_sectors; i++) {
+                fwrite(bitmap, 1, VHD_SECTOR_SIZE, bf->f);
+            }
+
+            /* Write zero-filled block data */
+            uint8_t zeros[VHD_SECTOR_SIZE];
+            memset(zeros, 0, sizeof(zeros));
+            for (uint32_t i = 0; i < sectors_per_block; i++) {
+                fwrite(zeros, 1, VHD_SECTOR_SIZE, bf->f);
+            }
+
+            /* Rewrite footer at new end */
+            uint8_t footer[VHD_SECTOR_SIZE];
+            fseeko(bf->f, 0, SEEK_SET);  /* Footer copy at start */
+            fread(footer, 1, VHD_SECTOR_SIZE, bf->f);
+            fseeko(bf->f, 0, SEEK_END);
+            fwrite(footer, 1, VHD_SECTOR_SIZE, bf->f);
+
+            /* Update BAT entry */
+            bf->vhd_bat[block_idx] = new_block_sector;
+
+            /* Write updated BAT entry to file */
+            uint8_t bat_bytes[4];
+            vhd_write_be32(bat_bytes, new_block_sector);
+            fseeko(bf->f, bf->vhd_bat_offset + block_idx * 4, SEEK_SET);
+            fwrite(bat_bytes, 1, 4, bf->f);
+
+            bat_entry = new_block_sector;
+        }
+
+        /* Write sector data */
+        int64_t file_offset = (int64_t)bat_entry * VHD_SECTOR_SIZE +
+                              bf->vhd_bitmap_sectors * VHD_SECTOR_SIZE +
+                              sector_in_block * VHD_SECTOR_SIZE;
+        fseeko(bf->f, file_offset, SEEK_SET);
+        fwrite(buf, 1, VHD_SECTOR_SIZE, bf->f);
+
+        sector_num++;
+        buf += VHD_SECTOR_SIZE;
+        n--;
+    }
+    fflush(bf->f);
+    return 0;
+}
+
+/* Try to parse file as VHD, returns 1 if successful */
+static int vhd_try_parse(BlockDeviceFile *bf)
+{
+    uint8_t footer[VHD_SECTOR_SIZE];
+    uint8_t header[1024];
+
+    /* Read footer from end of file */
+    fseeko(bf->f, -VHD_SECTOR_SIZE, SEEK_END);
+    if (fread(footer, 1, VHD_SECTOR_SIZE, bf->f) != VHD_SECTOR_SIZE)
+        return 0;
+
+    /* Check for VHD cookie */
+    if (memcmp(footer, VHD_COOKIE, 8) != 0)
+        return 0;
+
+    /* Check disk type - must be dynamic (3) or differencing (4) */
+    uint32_t disk_type = vhd_read_be32(footer + 60);
+    if (disk_type != 3) {
+        fprintf(stderr, "VHD: unsupported disk type %d (only dynamic supported)\n", disk_type);
+        return 0;
+    }
+
+    /* Get virtual disk size */
+    uint64_t disk_size = vhd_read_be64(footer + 48);  /* Current Size field */
+    bf->nb_sectors = disk_size / VHD_SECTOR_SIZE;
+
+    /* Get dynamic header offset */
+    uint64_t header_offset = vhd_read_be64(footer + 16);  /* Data Offset field */
+
+    /* Read dynamic header */
+    fseeko(bf->f, header_offset, SEEK_SET);
+    if (fread(header, 1, 1024, bf->f) != 1024)
+        return 0;
+
+    /* Verify dynamic header cookie */
+    if (memcmp(header, VHD_DYN_COOKIE, 8) != 0) {
+        fprintf(stderr, "VHD: invalid dynamic header\n");
+        return 0;
+    }
+
+    /* Get BAT offset and block size */
+    bf->vhd_bat_offset = vhd_read_be64(header + 16);
+    bf->vhd_max_bat = vhd_read_be32(header + 28);
+    bf->vhd_block_size = vhd_read_be32(header + 32);
+
+    /* Calculate bitmap sectors per block */
+    bf->vhd_bitmap_sectors = (bf->vhd_block_size / VHD_SECTOR_SIZE / 8 + VHD_SECTOR_SIZE - 1) / VHD_SECTOR_SIZE;
+
+    /* Allocate and read BAT */
+    bf->vhd_bat = pcmalloc(bf->vhd_max_bat * sizeof(uint32_t));
+    fseeko(bf->f, bf->vhd_bat_offset, SEEK_SET);
+    for (uint32_t i = 0; i < bf->vhd_max_bat; i++) {
+        uint8_t entry[4];
+        fread(entry, 1, 4, bf->f);
+        bf->vhd_bat[i] = vhd_read_be32(entry);
+    }
+
+    bf->is_vhd = 1;
+    fprintf(stderr, "VHD: dynamic disk, %lld MB, %d blocks of %d KB\n",
+            (long long)(disk_size / (1024*1024)),
+            bf->vhd_max_bat,
+            bf->vhd_block_size / 1024);
+
+    return 1;
 }
 
 static BlockDevice *block_device_init(const char *filename,
@@ -2161,10 +2391,17 @@ static BlockDevice *block_device_init(const char *filename,
     bf->nb_sectors = file_size / 512;
     bf->f = f;
     bf->start_offset = start_offset;
+    bf->is_vhd = 0;
+    bf->vhd_bat = NULL;
 #ifdef TANMATSU_BUILD
     strncpy(bf->path, filename, sizeof(bf->path) - 1);
     bf->path[sizeof(bf->path) - 1] = '\0';
 #endif
+
+    /* Try to parse as VHD (updates nb_sectors if successful) */
+    if (!start_offset && vhd_try_parse(bf)) {
+        /* VHD detected and parsed - nb_sectors now reflects virtual size */
+    }
 
     if (mode == BF_MODE_SNAPSHOT) {
         bf->sector_table = pcmalloc(sizeof(bf->sector_table[0]) *
@@ -2192,6 +2429,45 @@ static BlockDevice *block_device_init(const char *filename,
         bs->get_chs = bf_get_chs;
         fseeko(f, 0, SEEK_END);
     }
+    bs->read_async = bf_read_async;
+    bs->write_async = bf_write_async;
+    return bs;
+}
+
+/**
+ * Create an empty read-only BlockDevice (for CD-ROM without disc)
+ * Allocates structures from pcram but cache from heap to save pcram space.
+ */
+static BlockDevice *block_device_init_empty_ro(void)
+{
+    BlockDevice *bs;
+    BlockDeviceFile *bf;
+
+    bs = pcmalloc(sizeof(*bs));
+    bf = pcmalloc(sizeof(*bf));
+    memset(bs, 0, sizeof(*bs));
+    memset(bf, 0, sizeof(*bf));
+
+    bf->mode = BF_MODE_RO;
+    bf->nb_sectors = 0;
+    bf->f = NULL;
+    bf->start_offset = 0;
+    bf->is_vhd = 0;
+    bf->vhd_bat = NULL;
+#ifdef TANMATSU_BUILD
+    bf->path[0] = '\0';
+#endif
+#ifdef BUILD_ESP32
+    /* Allocate cache from heap (not pcram) since CD is read-only and
+     * heap/PSRAM is abundant on ESP32-P4 */
+    bf->cache_buf = malloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
+    bf->cache_start = -1;
+    bf->cache_count = 0;
+#endif
+
+    bs->opaque = bf;
+    bs->get_sector_count = bf_get_sector_count;
+    bs->get_chs = NULL;
     bs->read_async = bf_read_async;
     bs->write_async = bf_write_async;
     return bs;
@@ -2575,12 +2851,14 @@ int ide_attach(IDEIFState *s, int drive, const char *filename)
 int ide_attach_cd(IDEIFState *s, int drive, const char *filename)
 {
     assert(MAX_MULT_SECTORS >= 4);
-    BlockDevice *bs = NULL;
+    BlockDevice *bs;
     if (filename && filename[0]) {
         bs = block_device_init(filename, BF_MODE_RO);
+    } else {
+        // Always allocate BlockDevice (with cache) at startup
+        // This avoids runtime pcram allocation when mounting CDs via OSD
+        bs = block_device_init_empty_ro();
     }
-    // Always create the CD-ROM drive, even without a disc
-    // This allows hot-mounting CDs at runtime via OSD
     s->drives[drive] = ide_cddrive_init(s, bs);
     return 0;
 }
@@ -2621,6 +2899,24 @@ static void block_device_reinit(BlockDevice *bs, const char *filename)
         return;
     }
 
+    // Handle eject (empty filename)
+    if (!filename || !filename[0]) {
+        if (bf->f) {
+            fclose(bf->f);
+            bf->f = NULL;
+        }
+        bf->nb_sectors = 0;
+        bf->start_offset = 0;
+#ifdef TANMATSU_BUILD
+        bf->path[0] = '\0';
+#endif
+#ifdef BUILD_ESP32
+        bf->cache_start = -1;
+        bf->cache_count = 0;
+#endif
+        return;
+    }
+
     int64_t file_size;
     FILE *f;
     const char *mode_str = "rb";
@@ -2643,23 +2939,39 @@ static void block_device_reinit(BlockDevice *bs, const char *filename)
     strncpy(bf->path, filename, sizeof(bf->path) - 1);
     bf->path[sizeof(bf->path) - 1] = '\0';
 #endif
+#ifdef BUILD_ESP32
+    bf->cache_start = -1;
+    bf->cache_count = 0;
+#endif
 }
 
 void ide_change_cd(IDEIFState *sif, int drive, const char *filename)
 {
+    fprintf(stderr, "ide_change_cd: sif=%p drive=%d file=%s\n",
+            (void*)sif, drive, filename ? filename : "(null)");
+
+    if (!sif) {
+        fprintf(stderr, "ide_change_cd: sif is NULL!\n");
+        return;
+    }
+
     IDEState *s = sif->drives[drive];
-    if (s && s->drive_kind == IDE_CD) {
-        if (s->bs) {
-            // Existing disc - reinitialize with new image
-            block_device_reinit(s->bs, filename);
-        } else {
-            // No disc was mounted - create new BlockDevice
-            s->bs = block_device_init(filename, BF_MODE_RO);
-        }
+    fprintf(stderr, "ide_change_cd: s=%p\n", (void*)s);
+
+    if (s && s->drive_kind == IDE_CD && s->bs) {
+        fprintf(stderr, "ide_change_cd: drive is CD, bs=%p\n", (void*)s->bs);
+        // Reinitialize with new image (or eject if filename is empty)
+        block_device_reinit(s->bs, filename);
+        fprintf(stderr, "ide_change_cd: sectors=%lld\n",
+                (long long)s->bs->get_sector_count(s->bs));
         s->sense_key = SENSE_UNIT_ATTENTION;
         s->asc = ASC_MEDIUM_MAY_HAVE_CHANGED;
         s->cdrom_changed = 1;
         ide_set_irq(s);
+        fprintf(stderr, "ide_change_cd: done\n");
+    } else {
+        fprintf(stderr, "ide_change_cd: not a CD drive (s=%p, kind=%d)\n",
+                (void*)s, s ? s->drive_kind : -1);
     }
 }
 

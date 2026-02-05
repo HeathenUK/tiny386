@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 
 #include "../../vga.h"  // For vga_frame_skip_max
 
@@ -18,6 +19,8 @@
 #define FONT_HEIGHT 16
 #include <dirent.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "esp_system.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -34,6 +37,9 @@
 #include "usb_host.h"
 #include "../../pc.h"
 
+// Audio shutdown for clean exit
+extern void i2s_shutdown(void);
+
 // View modes
 typedef enum {
 	VIEW_MAIN_MENU,
@@ -42,7 +48,8 @@ typedef enum {
 	VIEW_SYSTEM,
 	VIEW_STATUS,
 	VIEW_HELP,
-	VIEW_FILEBROWSER
+	VIEW_FILEBROWSER,
+	VIEW_HDD_SIZE
 } ViewMode;
 
 // Main menu items
@@ -66,14 +73,17 @@ typedef enum {
 	MOUNT_FDA = 0,
 	MOUNT_FDB,
 	MOUNT_SEP1,
-	MOUNT_CDA,
-	MOUNT_CDB,
-	MOUNT_CDC,
-	MOUNT_CDD,
+	MOUNT_CD,      // Single CD-ROM slot (primary slave)
+	MOUNT_USB,     // USB storage (secondary master) - read-only status
 	MOUNT_SEP2,
+	MOUNT_CREATE_HDD,
+	MOUNT_SEP3,
 	MOUNT_BACK,
 	MOUNT_COUNT
 } MountMenuItem;
+
+// Special browser_target values
+#define BROWSER_TARGET_CREATE_HDD 100
 
 // Audio/Visual submenu items
 typedef enum {
@@ -94,14 +104,12 @@ typedef enum {
 	SYS_BATCH,
 	SYS_MOUSE_SPEED,
 	SYS_SEP1,
-	SYS_CREATE_HDD,
-	SYS_SEP2,
 	SYS_BACK,
 	SYS_COUNT
 } SysMenuItem;
 
-// HDD size presets (in MB) - IDE limit is ~504MB without LBA, 2GB practical max
-static const int hdd_size_presets[] = { 104, 256, 504, 1024, 2048 };
+// HDD size presets (in MB) - VHD format is sparse so these create instantly
+static const int hdd_size_presets[] = { 128, 256, 504, 1024, 2048 };
 static const int hdd_size_preset_count = 5;
 
 // File entry for browser
@@ -117,6 +125,7 @@ typedef struct {
 // Special file entry types
 #define FILE_TYPE_EJECT -1
 #define FILE_TYPE_SWITCH_STORAGE -2
+#define FILE_TYPE_CREATE_HDD_HERE -3
 
 struct OSD {
 	EMULINK *emulink;
@@ -193,7 +202,7 @@ static int is_main_separator(int item) {
 }
 
 static int is_mount_separator(int item) {
-	return item == MOUNT_SEP1 || item == MOUNT_SEP2;
+	return item == MOUNT_SEP1 || item == MOUNT_SEP2 || item == MOUNT_SEP3;
 }
 
 static int is_av_separator(int item) {
@@ -201,7 +210,7 @@ static int is_av_separator(int item) {
 }
 
 static int is_sys_separator(int item) {
-	return item == SYS_SEP1 || item == SYS_SEP2;
+	return item == SYS_SEP1;
 }
 
 // Get just the filename from a path
@@ -255,6 +264,13 @@ static void scan_directory(OSD *osd)
 	osd->file_count = 0;
 	osd->file_sel = 0;
 	osd->file_scroll = 0;
+
+	// Add "Create HDD Here" option when in HDD creation mode
+	if (osd->browser_target == BROWSER_TARGET_CREATE_HDD) {
+		strcpy(osd->files[osd->file_count].name, "[Create HDD Image Here]");
+		osd->files[osd->file_count].is_dir = FILE_TYPE_CREATE_HDD_HERE;
+		osd->file_count++;
+	}
 
 	// Add "eject" option at top if drive has something mounted
 	if (osd->browser_target >= 0 && osd->browser_target < 6 &&
@@ -312,9 +328,10 @@ static void scan_directory(OSD *osd)
 	}
 	closedir(dir);
 
-	// Sort (keep special entries at top: eject, storage switch, ..)
+	// Sort (keep special entries at top: create hdd, eject, storage switch, ..)
 	int sort_start = 0;
 	// Count special entries we added
+	if (osd->browser_target == BROWSER_TARGET_CREATE_HDD) sort_start++;  // [Create HDD Here]
 	if (osd->browser_target >= 0 && osd->browser_target < 6 &&
 	    osd->drive_paths[osd->browser_target][0] != '\0') sort_start++;  // [Eject ...]
 	if (globals.usb_vfs_mounted &&
@@ -550,16 +567,13 @@ static void render_main_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 // Render mounting submenu
 static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	char fda_val[32], fdb_val[32];
-	char cda_val[32], cdb_val[32], cdc_val[32], usb_val[32];
+	char fda_val[32], fdb_val[32], cd_val[32], usb_val[32];
 
 	snprintf(fda_val, sizeof(fda_val), "%.20s", basename_ptr(osd->drive_paths[0]));
 	snprintf(fdb_val, sizeof(fdb_val), "%.20s", basename_ptr(osd->drive_paths[1]));
-	snprintf(cda_val, sizeof(cda_val), "%.20s", basename_ptr(osd->drive_paths[2]));
-	snprintf(cdb_val, sizeof(cdb_val), "%.20s", basename_ptr(osd->drive_paths[3]));
-	snprintf(cdc_val, sizeof(cdc_val), "%.20s", basename_ptr(osd->drive_paths[4]));
+	snprintf(cd_val, sizeof(cd_val), "%.20s", basename_ptr(osd->drive_paths[3]));  // slot 1 = primary slave
 
-	// USB storage status - shows connection state only (always IDE + VFS when connected)
+	// USB storage status - shows connection state only
 	if (globals.usb_storage_connected) {
 		snprintf(usb_val, sizeof(usb_val), "Connected");
 	} else {
@@ -570,16 +584,16 @@ static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pi
 		{ "Floppy A:", 0, 0, fda_val },
 		{ "Floppy B:", 0, 0, fdb_val },
 		{ NULL, 1, 0, NULL },  // SEP1
-		{ "CD-ROM A:", 0, 0, cda_val },
-		{ "CD-ROM B:", 0, 0, cdb_val },
-		{ "CD-ROM C:", 0, 0, cdc_val },
+		{ "CD-ROM:", 0, 0, cd_val },
 		{ "USB Storage:", 0, 0, usb_val },
 		{ NULL, 1, 0, NULL },  // SEP2
+		{ "Create HDD Image...", 0, 0, NULL },
+		{ NULL, 1, 0, NULL },  // SEP3
 		{ "< Back", 0, 0, NULL },
 	};
 
 	render_generic_menu(pixels, w, h, pitch, "Mounting", entries, MOUNT_COUNT,
-	                    osd->mount_sel, "Enter:Browse  Esc:Back");
+	                    osd->mount_sel, "Enter:Select  Esc:Back");
 }
 
 // Render audio/visual submenu
@@ -614,7 +628,7 @@ static const char *cpu_gen_names[] = { "i386", "i486", "i586" };
 // Render system settings submenu
 static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], mouse_val[16], hdd_val[32];
+	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], mouse_val[16];
 
 	// CPU generation (3=386, 4=486, 5=586)
 	int gen_idx = osd->cpu_gen - 3;
@@ -638,14 +652,6 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	// Mouse speed (1-10)
 	snprintf(mouse_val, sizeof(mouse_val), "%d", osd->mouse_speed);
 
-	// HDD size for creation
-	int size_mb = hdd_size_presets[osd->hdd_size_sel];
-	if (size_mb >= 1024) {
-		snprintf(hdd_val, sizeof(hdd_val), "%d GB", size_mb / 1024);
-	} else {
-		snprintf(hdd_val, sizeof(hdd_val), "%d MB", size_mb);
-	}
-
 	MenuEntry entries[SYS_COUNT] = {
 		{ "CPU:", 0, 0, cpu_val },
 		{ "FPU:", 0, 0, fpu_val },
@@ -653,13 +659,36 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ "Batch:", 0, 0, batch_val },
 		{ "Mouse Speed:", 0, 0, mouse_val },
 		{ NULL, 1, 0, NULL },  // SEP1
-		{ "Create HDD:", 0, 0, hdd_val },
-		{ NULL, 1, 0, NULL },  // SEP2
 		{ "< Back (restart to apply)", 0, 0, NULL },
 	};
 
 	render_generic_menu(pixels, w, h, pitch, "System", entries, SYS_COUNT,
-	                    osd->sys_sel, "L/R:Adjust Enter:Create Esc:Back");
+	                    osd->sys_sel, "L/R:Adjust Esc:Back");
+}
+
+// Render HDD size picker
+static void render_hdd_size(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
+{
+	char size_val[32];
+	int size_mb = hdd_size_presets[osd->hdd_size_sel];
+	if (size_mb >= 1024) {
+		snprintf(size_val, sizeof(size_val), "< %d GB >", size_mb / 1024);
+	} else {
+		snprintf(size_val, sizeof(size_val), "< %d MB >", size_mb);
+	}
+
+	// Show location and size
+	char title[64];
+	snprintf(title, sizeof(title), "Create HDD in: %.30s", osd->browser_path);
+
+	MenuEntry entries[3] = {
+		{ "Size:", 0, 0, size_val },
+		{ NULL, 1, 0, NULL },  // separator
+		{ "Press Enter to create, Esc to cancel", 0, 0, NULL },
+	};
+
+	render_generic_menu(pixels, w, h, pitch, title, entries, 3,
+	                    0, "L/R:Size Enter:Create Esc:Cancel");
 }
 
 // Render status panel (emulator stats)
@@ -922,6 +951,12 @@ static int handle_file_select(OSD *osd)
 		return 0;
 	}
 
+	if (f->is_dir == FILE_TYPE_CREATE_HDD_HERE) {
+		// Go to HDD size picker, will create in current browser_path
+		osd->view = VIEW_HDD_SIZE;
+		return 0;
+	}
+
 	if (f->is_dir) {
 		// Navigate into directory
 		if (strcmp(f->name, "..") == 0) {
@@ -991,17 +1026,31 @@ static int handle_mount_select(OSD *osd)
 		scan_directory(osd);
 		osd->view = VIEW_FILEBROWSER;
 		break;
-	case MOUNT_CDA:
-	case MOUNT_CDB:
-	case MOUNT_CDC:
-		osd->browser_target = (osd->mount_sel - MOUNT_CDA) + 2;  // 2-4
+	case MOUNT_CD:
+		// CD-ROM is on slot 1 (primary slave), stored at drive_paths[3]
+		// browser_target 3 maps to: ide primary, drive (3-2)%2 = 1 (slave)
+		osd->browser_target = 3;
 		strcpy(osd->browser_path, "/sdcard");
 		scan_directory(osd);
 		osd->view = VIEW_FILEBROWSER;
 		break;
-	case MOUNT_CDD:
-		// USB Storage - slot 5 is managed by USB host, not user-mountable
-		// Do nothing - just show current status
+	case MOUNT_USB:
+		// USB Storage - managed by USB host, not user-mountable via browser
+		// Just show status (or could browse USB contents if mounted)
+		if (globals.usb_vfs_mounted) {
+			// Browse USB storage contents
+			strcpy(osd->browser_path, "/usb");
+			osd->browser_target = -1;  // Browse-only mode
+			scan_directory(osd);
+			osd->view = VIEW_FILEBROWSER;
+		}
+		break;
+	case MOUNT_CREATE_HDD:
+		// Open file browser to pick location for HDD image
+		osd->browser_target = BROWSER_TARGET_CREATE_HDD;
+		strcpy(osd->browser_path, "/sdcard");
+		scan_directory(osd);
+		osd->view = VIEW_FILEBROWSER;
 		break;
 	case MOUNT_BACK:
 		osd->view = VIEW_MAIN_MENU;
@@ -1060,6 +1109,7 @@ static int handle_main_select(OSD *osd)
 		globals.reset_pending = true;  // Signal soft reset
 		return 1;  // Close OSD
 	case MAIN_RESET:
+		i2s_shutdown();  // Silence audio before restart
 		esp_restart();
 		break;
 	}
@@ -1095,56 +1145,175 @@ static void handle_av_adjust(OSD *osd, int delta)
 	}
 }
 
-// Create sparse HDD image file
+// VHD helper functions for image creation
+static void vhd_write_be32(uint8_t *p, uint32_t v) {
+	p[0] = (v >> 24) & 0xff;
+	p[1] = (v >> 16) & 0xff;
+	p[2] = (v >> 8) & 0xff;
+	p[3] = v & 0xff;
+}
+
+static void vhd_write_be64(uint8_t *p, uint64_t v) {
+	vhd_write_be32(p, v >> 32);
+	vhd_write_be32(p + 4, v & 0xffffffff);
+}
+
+static uint32_t vhd_checksum(const uint8_t *data, int len) {
+	uint32_t sum = 0;
+	for (int i = 0; i < len; i++)
+		sum += data[i];
+	return ~sum;
+}
+
+// Calculate CHS geometry for VHD (Microsoft algorithm)
+static void vhd_calc_geometry(uint64_t total_sectors, int *c, int *h, int *s) {
+	int cyls, heads, spt;
+
+	if (total_sectors > 65535 * 16 * 255)
+		total_sectors = 65535 * 16 * 255;
+
+	if (total_sectors >= 65535 * 16 * 63) {
+		spt = 255;
+		heads = 16;
+		cyls = total_sectors / (heads * spt);
+	} else {
+		spt = 17;
+		cyls = (total_sectors + spt - 1) / spt;
+		heads = (cyls + 1023) / 1024;
+		if (heads < 4) heads = 4;
+		if (cyls >= (heads * 1024) || heads > 16) {
+			spt = 31;
+			heads = 16;
+			cyls = (total_sectors + spt - 1) / spt;
+		}
+		if (cyls >= (heads * 1024)) {
+			spt = 63;
+			heads = 16;
+			cyls = (total_sectors + spt - 1) / spt;
+		}
+		cyls = total_sectors / (heads * spt);
+	}
+	*c = cyls;
+	*h = heads;
+	*s = spt;
+}
+
+// Create VHD dynamic disk image (sparse, grows on write)
 // Returns 0 on success, -1 on error
-static int create_hdd_image(int size_mb)
+static int create_hdd_image(const char *dir_path, int size_mb)
 {
-	// Generate filename with timestamp for uniqueness
-	char filename[64];
+	char filename[MAX_PATH_LEN];
 	time_t now = time(NULL);
 	struct tm *t = localtime(&now);
 
-	if (size_mb >= 1024) {
-		snprintf(filename, sizeof(filename), "/sdcard/hdd_%dgb_%04d%02d%02d_%02d%02d%02d.img",
-		         size_mb / 1024, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-		         t->tm_hour, t->tm_min, t->tm_sec);
-	} else {
-		snprintf(filename, sizeof(filename), "/sdcard/hdd_%dmb_%04d%02d%02d_%02d%02d%02d.img",
-		         size_mb, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-		         t->tm_hour, t->tm_min, t->tm_sec);
-	}
+	// Use .VHD extension for VHD format
+	snprintf(filename, sizeof(filename), "%s/DISK%02d%02d.VHD",
+	         dir_path, t->tm_hour, t->tm_min);
 
-	// Create sparse file using truncate (instant, no actual disk write)
+	fprintf(stderr, "osd: creating VHD image %s (%d MB)\n", filename, size_mb);
+
 	FILE *f = fopen(filename, "wb");
 	if (!f) {
+		fprintf(stderr, "osd: fopen failed: %s (errno=%d)\n", strerror(errno), errno);
 		return -1;
 	}
 
-	// Calculate size in bytes
-	long long size_bytes = (long long)size_mb * 1024 * 1024;
+	uint64_t disk_size = (uint64_t)size_mb * 1024 * 1024;
+	uint32_t block_size = 2 * 1024 * 1024;  // 2MB blocks
+	uint32_t max_bat_entries = (disk_size + block_size - 1) / block_size;
 
-	// Use fseek + fwrite to create sparse file
-	// This creates a file with the specified size but only allocates
-	// disk blocks as they're actually written
-	if (fseek(f, size_bytes - 1, SEEK_SET) != 0) {
-		fclose(f);
-		return -1;
+	// Round BAT to sector boundary
+	uint32_t bat_sectors = (max_bat_entries * 4 + 511) / 512;
+	uint32_t bat_bytes = bat_sectors * 512;
+
+	// File layout:
+	// 0: Footer copy (512 bytes)
+	// 512: Dynamic header (1024 bytes)
+	// 1536: BAT (bat_bytes)
+	// 1536+bat_bytes: Data blocks (added on write)
+	// EOF-512: Footer
+
+	uint8_t footer[512];
+	uint8_t header[1024];
+	memset(footer, 0, sizeof(footer));
+	memset(header, 0, sizeof(header));
+
+	// Calculate geometry
+	int cyls, heads, spt;
+	vhd_calc_geometry(disk_size / 512, &cyls, &heads, &spt);
+
+	// Build footer
+	memcpy(footer, "conectix", 8);           // Cookie
+	vhd_write_be32(footer + 8, 0x00000002);  // Features (reserved bit)
+	vhd_write_be32(footer + 12, 0x00010000); // Version 1.0
+	vhd_write_be64(footer + 16, 512);        // Data offset (dynamic header)
+	vhd_write_be32(footer + 24, (uint32_t)(now - 946684800)); // Timestamp (since 2000)
+	memcpy(footer + 28, "tiny", 4);          // Creator app
+	vhd_write_be32(footer + 32, 0x00010000); // Creator version
+	memcpy(footer + 36, "Wi2k", 4);          // Creator host OS
+	vhd_write_be64(footer + 40, disk_size);  // Original size
+	vhd_write_be64(footer + 48, disk_size);  // Current size
+	footer[56] = (cyls >> 8) & 0xff;         // Geometry
+	footer[57] = cyls & 0xff;
+	footer[58] = heads;
+	footer[59] = spt;
+	vhd_write_be32(footer + 60, 3);          // Disk type: dynamic
+	// Checksum at offset 64, computed after UUID
+	// UUID at offset 68 (16 bytes) - use timestamp-based
+	vhd_write_be32(footer + 68, (uint32_t)now);
+	vhd_write_be32(footer + 72, size_mb);
+	vhd_write_be32(footer + 76, 0x12345678);
+	vhd_write_be32(footer + 80, 0x9ABCDEF0);
+	footer[84] = 0; // Saved state: no
+	// Compute checksum
+	vhd_write_be32(footer + 64, vhd_checksum(footer, 512));
+
+	// Build dynamic header
+	memcpy(header, "cxsparse", 8);           // Cookie
+	vhd_write_be64(header + 8, 0xFFFFFFFFFFFFFFFFULL); // Data offset (unused)
+	vhd_write_be64(header + 16, 1536);       // Table offset (BAT location)
+	vhd_write_be32(header + 24, 0x00010000); // Header version
+	vhd_write_be32(header + 28, max_bat_entries); // Max table entries
+	vhd_write_be32(header + 32, block_size); // Block size
+	// Checksum at offset 36
+	vhd_write_be32(header + 36, vhd_checksum(header, 1024));
+
+	// Write footer copy at start
+	if (fwrite(footer, 1, 512, f) != 512) goto write_error;
+	// Write dynamic header
+	if (fwrite(header, 1, 1024, f) != 1024) goto write_error;
+
+	// Write BAT (all entries = 0xFFFFFFFF = unallocated)
+	uint8_t bat_entry[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+	for (uint32_t i = 0; i < max_bat_entries; i++) {
+		if (fwrite(bat_entry, 1, 4, f) != 4) goto write_error;
+	}
+	// Pad BAT to sector boundary
+	uint8_t zero = 0;
+	uint32_t bat_written = max_bat_entries * 4;
+	while (bat_written < bat_bytes) {
+		if (fwrite(&zero, 1, 1, f) != 1) goto write_error;
+		bat_written++;
 	}
 
-	// Write a single byte to establish file size
-	if (fwrite("", 1, 1, f) != 1) {
-		fclose(f);
-		return -1;
-	}
+	// Write footer at end
+	if (fwrite(footer, 1, 512, f) != 512) goto write_error;
 
 	fclose(f);
+	fprintf(stderr, "osd: VHD created successfully (initial size: %u bytes)\n",
+	        (unsigned)(512 + 1024 + bat_bytes + 512));
 
-	// Show success toast with filename
 	char msg[64];
-	snprintf(msg, sizeof(msg), "Created %s", filename + 8);  // Skip "/sdcard/"
+	const char *base = strrchr(filename, '/');
+	snprintf(msg, sizeof(msg), "Created %s", base ? base + 1 : filename);
 	toast_show(msg);
-
 	return 0;
+
+write_error:
+	fprintf(stderr, "osd: write failed: %s\n", strerror(errno));
+	fclose(f);
+	unlink(filename);
+	return -1;
 }
 
 // Handle system settings adjustment with left/right
@@ -1185,12 +1354,6 @@ static void handle_sys_adjust(OSD *osd, int delta)
 		// Apply immediately
 		mouse_emu_set_speed(osd->mouse_speed);
 		globals.mouse_speed = osd->mouse_speed;
-		break;
-	case SYS_CREATE_HDD:
-		// Cycle HDD size presets
-		osd->hdd_size_sel += delta;
-		if (osd->hdd_size_sel < 0) osd->hdd_size_sel = hdd_size_preset_count - 1;
-		if (osd->hdd_size_sel >= hdd_size_preset_count) osd->hdd_size_sel = 0;
 		break;
 	}
 }
@@ -1332,15 +1495,7 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 		case SC_RIGHT:
 			return handle_mount_select(osd);
 		case SC_ENTER:
-			if (osd->mount_sel == MOUNT_CDD && globals.usb_vfs_mounted) {
-				// Browse USB storage (VFS is auto-mounted when connected)
-				strcpy(osd->browser_path, "/usb");
-				osd->browser_target = -1;  // Special: browsing only, can't mount USB itself
-				scan_directory(osd);
-				osd->view = VIEW_FILEBROWSER;
-			} else {
-				return handle_mount_select(osd);
-			}
+			return handle_mount_select(osd);
 			break;
 		case SC_ESC:
 			osd->view = VIEW_MAIN_MENU;
@@ -1418,16 +1573,36 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 		case SC_ENTER:
 			if (osd->sys_sel == SYS_BACK) {
 				osd->view = VIEW_MAIN_MENU;
-			} else if (osd->sys_sel == SYS_CREATE_HDD) {
-				// Create the HDD image
-				int size_mb = hdd_size_presets[osd->hdd_size_sel];
-				if (create_hdd_image(size_mb) != 0) {
-					toast_show("Error creating HDD image");
-				}
 			}
 			break;
 		case SC_ESC:
 			osd->view = VIEW_MAIN_MENU;
+			break;
+		}
+		break;
+
+	case VIEW_HDD_SIZE:
+		switch (keycode) {
+		case SC_LEFT:
+			osd->hdd_size_sel--;
+			if (osd->hdd_size_sel < 0) osd->hdd_size_sel = hdd_size_preset_count - 1;
+			break;
+		case SC_RIGHT:
+			osd->hdd_size_sel++;
+			if (osd->hdd_size_sel >= hdd_size_preset_count) osd->hdd_size_sel = 0;
+			break;
+		case SC_ENTER:
+			{
+				int size_mb = hdd_size_presets[osd->hdd_size_sel];
+				if (create_hdd_image(osd->browser_path, size_mb) != 0) {
+					toast_show("Error creating HDD image");
+				}
+				osd->view = VIEW_MOUNTING;
+			}
+			break;
+		case SC_ESC:
+			// Go back to file browser
+			osd->view = VIEW_FILEBROWSER;
 			break;
 		}
 		break;
@@ -1524,6 +1699,9 @@ void osd_render(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		break;
 	case VIEW_FILEBROWSER:
 		render_browser(osd, pixels, w, h, pitch);
+		break;
+	case VIEW_HDD_SIZE:
+		render_hdd_size(osd, pixels, w, h, pitch);
 		break;
 	}
 }

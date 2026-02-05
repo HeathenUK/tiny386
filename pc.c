@@ -873,7 +873,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	extern char *pcram;
 	extern long pcram_len;
 	pcram = mem + 0xa0000;
-	pcram_len = 0xc0000 - 0xa0000;
+	pcram_len = 0xc0000 - 0xa0000;  // 128KB
 #endif
 #ifdef USEKVM
 	pc->cpu = cpukvm_new(mem, conf->mem_size, &cb);
@@ -909,32 +909,49 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	pc->ide = ide_allocate(14, pc->pic, set_irq);
 	pc->ide2 = ide_allocate(15, pc->pic, set_irq);
 	const char **disks = conf->disks;
-	for (int i = 0; i < 4; i++) {
 #ifdef TANMATSU_BUILD
-		// Slot 2 (secondary master) is reserved for USB storage on Tanmatsu
-		// Must be master, not slave - DOS won't see slave without a master present
-		if (i == 2) {
-			ide_attach_usb(pc->ide2, 0);
-			continue;
-		}
-#endif
-		if (!disks[i] || disks[i][0] == 0)
-			continue;
+	// Tanmatsu fixed layout:
+	// Slot 0 (primary master): HDA - main hard drive
+	// Slot 1 (primary slave): CD-ROM - always created for hot-mounting
+	// Slot 2 (secondary master): USB storage
+	// Slot 3 (secondary slave): unused
+	if (disks[0] && disks[0][0]) {
+		int ret = ide_attach(pc->ide, 0, disks[0]);
+		assert(ret == 0);
+	}
+	// Always create CD-ROM on slot 1 for hot-mounting
+	{
+		const char *cd_path = (disks[1] && disks[1][0]) ? disks[1] : NULL;
+		int ret = ide_attach_cd(pc->ide, 1, cd_path);
+		assert(ret == 0);
+	}
+	// USB on slot 2
+	ide_attach_usb(pc->ide2, 0);
+#else
+	for (int i = 0; i < 4; i++) {
 		int ret;
+		int has_disk = disks[i] && disks[i][0] != 0;
+
 		if (i < 2) {
-			if (conf->iscd[i])
-				ret = ide_attach_cd(pc->ide, i, disks[i]);
-			else
+			if (conf->iscd[i]) {
+				// CD-ROM drive - create even without disc for hot-mounting
+				ret = ide_attach_cd(pc->ide, i, has_disk ? disks[i] : NULL);
+				assert(ret == 0);
+			} else if (has_disk) {
 				ret = ide_attach(pc->ide, i, disks[i]);
-			assert(ret == 0);
+				assert(ret == 0);
+			}
 		} else {
-			if (conf->iscd[i])
-				ret = ide_attach_cd(pc->ide2, i - 2, disks[i]);
-			else
+			if (conf->iscd[i]) {
+				ret = ide_attach_cd(pc->ide2, i - 2, has_disk ? disks[i] : NULL);
+				assert(ret == 0);
+			} else if (has_disk) {
 				ret = ide_attach(pc->ide2, i - 2, disks[i]);
-			assert(ret == 0);
+				assert(ret == 0);
+			}
 		}
 	}
+#endif
 
 	if (conf->fill_cmos)
 		ide_fill_cmos(pc->ide, pc->cmos, cmos_set);

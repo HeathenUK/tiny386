@@ -125,7 +125,8 @@ static void msc_event_cb(const msc_host_event_t *event, void *arg)
  */
 static void handle_device_connected(uint8_t dev_addr)
 {
-    fprintf(stderr, "USB: Handling device connect, addr=%d\n", dev_addr);
+    fprintf(stderr, "USB: Handling device connect, addr=%d, msc_connected=%d\n",
+            dev_addr, msc_connected);
 
     if (msc_connected) {
         fprintf(stderr, "USB: MSC already connected, ignoring\n");
@@ -174,7 +175,11 @@ static void handle_device_connected(uint8_t dev_addr)
  */
 static void handle_device_disconnected(void)
 {
+    fprintf(stderr, "USB: Handling disconnect, msc_connected=%d, vfs_mounted=%d\n",
+            msc_connected, vfs_mounted);
+
     if (!msc_connected) {
+        fprintf(stderr, "USB: Not connected, ignoring disconnect\n");
         return;
     }
 
