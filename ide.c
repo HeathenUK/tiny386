@@ -2423,8 +2423,8 @@ static BlockDevice *block_device_init(const char *filename,
                sizeof(bf->sector_table[0]) * bf->nb_sectors);
     }
 #ifdef BUILD_ESP32
-    /* Allocate read-ahead cache buffer */
-    bf->cache_buf = pcmalloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
+    /* Allocate read-ahead cache buffer from heap to avoid pcram exhaustion */
+    bf->cache_buf = malloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
     bf->cache_start = -1;
     bf->cache_count = 0;
 #endif
