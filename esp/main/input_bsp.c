@@ -279,7 +279,7 @@ static void input_task(void *arg)
 				// Handle navigation events for mouse emulation
 				// (gives us separate space L/M/R sections)
 				uint8_t nav_key = event.args_navigation.key;
-				bool pressed = event.args_navigation.pressed;
+				bool pressed = event.args_navigation.state;
 
 				// Don't process mouse input when OSD is open
 				if (!globals.osd_enabled) {
