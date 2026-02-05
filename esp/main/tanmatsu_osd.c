@@ -58,8 +58,6 @@ typedef enum {
 	MAIN_SEP2,
 	MAIN_CTRLALTDEL,
 	MAIN_RESET,
-	MAIN_SEP3,
-	MAIN_EXIT,
 	MAIN_COUNT
 } MainMenuItem;
 
@@ -191,7 +189,7 @@ static void scan_directory(OSD *osd);
 
 // Separator checks for each menu
 static int is_main_separator(int item) {
-	return item == MAIN_SEP1 || item == MAIN_SEP2 || item == MAIN_SEP3;
+	return item == MAIN_SEP1 || item == MAIN_SEP2;
 }
 
 static int is_mount_separator(int item) {
@@ -258,9 +256,12 @@ static void scan_directory(OSD *osd)
 	osd->file_sel = 0;
 	osd->file_scroll = 0;
 
-	// Add "eject" option at top for drives that support it
-	if (osd->browser_target >= 0 && osd->browser_target < 6) {
-		strcpy(osd->files[osd->file_count].name, "[Eject]");
+	// Add "eject" option at top if drive has something mounted
+	if (osd->browser_target >= 0 && osd->browser_target < 6 &&
+	    osd->drive_paths[osd->browser_target][0] != '\0') {
+		// Show [Eject filename] with truncated filename
+		const char *filename = basename_ptr(osd->drive_paths[osd->browser_target]);
+		snprintf(osd->files[osd->file_count].name, MAX_FILENAME, "[Eject %.50s]", filename);
 		osd->files[osd->file_count].is_dir = FILE_TYPE_EJECT;
 		osd->file_count++;
 	}
@@ -314,7 +315,8 @@ static void scan_directory(OSD *osd)
 	// Sort (keep special entries at top: eject, storage switch, ..)
 	int sort_start = 0;
 	// Count special entries we added
-	if (osd->browser_target >= 0 && osd->browser_target < 6) sort_start++;  // [Eject]
+	if (osd->browser_target >= 0 && osd->browser_target < 6 &&
+	    osd->drive_paths[osd->browser_target][0] != '\0') sort_start++;  // [Eject ...]
 	if (globals.usb_vfs_mounted &&
 	    (strcmp(osd->browser_path, "/sdcard") == 0 || strcmp(osd->browser_path, "/usb") == 0)) {
 		sort_start++;  // [USB Storage] or [SD Card]
@@ -539,8 +541,6 @@ static void render_main_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ NULL, 1, 0, NULL },  // SEP2
 		{ "Ctrl+Alt+Del", 0, 0, NULL },
 		{ "Exit to Launcher", 0, 0, NULL },
-		{ NULL, 1, 0, NULL },  // SEP3
-		{ "Exit", 0, 0, NULL },
 	};
 
 	render_generic_menu(pixels, w, h, pitch, "tiny386", entries, MAIN_COUNT,
@@ -1062,8 +1062,6 @@ static int handle_main_select(OSD *osd)
 	case MAIN_RESET:
 		esp_restart();
 		break;
-	case MAIN_EXIT:
-		return 1;  // Close OSD
 	}
 	return 0;
 }
