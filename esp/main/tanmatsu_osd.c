@@ -732,7 +732,7 @@ static void render_help(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
 	// Panel dimensions
 	int panel_w = (w > 380) ? 360 : w - 20;
-	int panel_h = 320;
+	int panel_h = 340;
 	int panel_x = (w - panel_w) / 2;
 	int panel_y = (h - panel_h) / 2;
 	int line_y = panel_y + 10;
@@ -763,6 +763,8 @@ static void render_help(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	draw_text(pixels, w, h, pitch, panel_x + 20, line_y, "META+Up/Down  Volume", COLOR_TEXT, 0);
 	line_y += line_h;
 	draw_text(pixels, w, h, pitch, panel_x + 20, line_y, "META+L/R      Brightness", COLOR_TEXT, 0);
+	line_y += line_h;
+	draw_text(pixels, w, h, pitch, panel_x + 20, line_y, "META+Ctrl     Mouse Mode", COLOR_TEXT, 0);
 	line_y += line_h + 10;
 
 	// OSD shortcuts

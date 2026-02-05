@@ -55,7 +55,10 @@ static const char *TAG = "input_bsp";
 
 // META key state for META+arrow shortcuts
 static bool meta_held = false;
-static bool meta_consumed = false;  // Set if META+arrow was used
+static bool meta_consumed = false;  // Set if META+combo was used
+
+// Ctrl key scancode
+#define SC_LEFT_CTRL  0x1D
 
 static void handle_scancode(uint8_t code, int is_down)
 {
@@ -257,6 +260,14 @@ static void input_task(void *arg)
 					if (meta_held && code >= SC_F1 && code <= SC_F6) {
 						code = (code - SC_F1) + SC_F7;  // Map F1-F6 to F7-F12
 						meta_consumed = true;
+					}
+
+					// META+Ctrl -> Toggle mouse emulation mode
+					if (meta_held && is_down && code == SC_LEFT_CTRL) {
+						mouse_emu_toggle();
+						meta_consumed = true;
+						vTaskDelay(5 / portTICK_PERIOD_MS);
+						continue;  // Don't pass Ctrl to emulator
 					}
 
 					handle_scancode(code, is_down);

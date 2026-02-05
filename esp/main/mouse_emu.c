@@ -6,7 +6,7 @@
  *   Space Left: Left click
  *   Space Middle: Middle click
  *   Space Right: Right click
- *   F6: Toggle mouse mode on/off
+ *   META+Ctrl: Toggle mouse mode on/off (handled by input_bsp.c)
  */
 
 #ifdef USE_BADGE_BSP
@@ -86,11 +86,7 @@ bool mouse_emu_is_active(void)
 bool mouse_emu_handle_nav_key(uint8_t nav_key, bool pressed)
 {
     if (!mouse_active) {
-        // Only handle F6 to toggle on
-        if (nav_key == BSP_INPUT_NAVIGATION_KEY_F6 && pressed) {
-            mouse_emu_toggle();
-            return true;
-        }
+        // Toggle is now handled by META+Ctrl in input_bsp.c
         return false;
     }
 
@@ -126,12 +122,6 @@ bool mouse_emu_handle_nav_key(uint8_t nav_key, bool pressed)
 
     case BSP_INPUT_NAVIGATION_KEY_SPACE_R:
         btn_right_held = pressed;
-        return true;
-
-    case BSP_INPUT_NAVIGATION_KEY_F6:
-        if (pressed) {
-            mouse_emu_toggle();
-        }
         return true;
 
     default:
