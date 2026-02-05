@@ -677,7 +677,7 @@ static void command (SB16State *s, uint8_t cmd)
             s->freq = -1;
             s->time_const = -1;
             s->needed_bytes = 2;
-            goto warn;
+            break;
 
         case 0x45:
             dsp_out_data (s, 0xaa);
