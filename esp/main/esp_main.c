@@ -178,6 +178,9 @@ static bool file_exists(const char *path)
 	return (stat(path, &st) == 0);
 }
 
+#ifdef USE_BADGE_BSP
+#endif
+
 /* Create default INI file */
 static bool create_default_ini(const char *path)
 {
@@ -215,6 +218,7 @@ static int pc_main(const char *file)
 	conf.brightness = 30;  // Default brightness
 	conf.volume = 80;      // Default volume
 	conf.mouse_speed = 5;  // Default mouse speed (1-10)
+	conf.usb_passthru = 1; // Default USB passthrough enabled
 
 	if (!file) {
 		fprintf(stderr, "ERROR: No INI file path provided!\n");
@@ -269,6 +273,7 @@ static int pc_main(const char *file)
 	globals.brightness = conf.brightness;
 	globals.volume = conf.volume;
 	globals.mouse_speed = conf.mouse_speed;
+	globals.usb_passthru = conf.usb_passthru;
 	mouse_emu_set_speed(conf.mouse_speed);
 #endif
 #ifndef USE_LCD_BSP
@@ -281,6 +286,7 @@ static int pc_main(const char *file)
 
 	pc->boot_start_time = get_uticks();
 	uint32_t last_delay_time = get_uticks();
+	uint32_t last_sync_time = get_uticks();
 #ifdef USE_BADGE_BSP
 	uint32_t last_mouse_tick = get_uticks();
 #endif
@@ -311,6 +317,8 @@ static int pc_main(const char *file)
 		// Check for emulator restart request (e.g., HDD change)
 		if (globals.emu_restart_pending) {
 			globals.emu_restart_pending = false;
+			// Flush all disk data before restart
+			ide_sync(pc->ide, pc->ide2);
 			// Change HDD if new path was provided
 			if (globals.emu_new_hda_path[0]) {
 				fprintf(stderr, "Restart: changing HDD to %s\n", globals.emu_new_hda_path);
@@ -341,7 +349,15 @@ static int pc_main(const char *file)
 			last_delay_time = now;
 			vTaskDelay(1);
 		}
+		/* Sync disk files to SD card every 5 seconds to limit data loss
+		 * if the device is powered off unexpectedly. */
+		if (now - last_sync_time >= 30000000) {  // 30s
+			last_sync_time = now;
+			ide_sync(pc->ide, pc->ide2);
+		}
 	}
+	/* Final sync on emulator exit */
+	ide_sync(pc->ide, pc->ide2);
 	return 0;
 }
 
@@ -574,7 +590,7 @@ void app_main(void)
 #endif
 
 	if (psram) {
-		xTaskCreatePinnedToCore(i386_task, "i386_main", 4096, &config, 3, NULL, 1);
+		xTaskCreatePinnedToCore(i386_task, "i386_main", 8192, &config, 3, NULL, 1);
 		xTaskCreatePinnedToCore(vga_task, "vga_task", 4096, NULL, 0, NULL, 0);
 #ifdef USE_BADGE_BSP
 		// Start input task after vga_task (which initializes BSP)

@@ -53,7 +53,7 @@ CONFIG_ESP_SYSTEM_HW_STACK_GUARD=n
 # Disable assertions in release builds for performance
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
 
-# Reduce log level to ERROR only (less serial output overhead)
+# Log level ERROR for performance
 CONFIG_LOG_DEFAULT_LEVEL_ERROR=y
 
 # Disable dynamic log level control (~10x faster logging)

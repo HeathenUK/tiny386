@@ -302,7 +302,7 @@ void input_bsp_init(void)
 {
 	// Create input processing task
 	// The task itself will wait for BSP initialization (BIT1)
-	xTaskCreatePinnedToCore(input_task, "input_task", 4096, NULL, 1, NULL, 0);
+	xTaskCreatePinnedToCore(input_task, "input_task", 8192, NULL, 1, NULL, 0);
 }
 
 // Called by OSD to send keypresses to emulator
