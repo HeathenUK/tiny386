@@ -27,6 +27,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include <assert.h>
+#include <unistd.h>
 
 //#include "cutils.h"
 #include "ide.h"
@@ -39,6 +40,7 @@
 #else
 #define IDE_ACTIVITY() ((void)0)
 #endif
+
 //#define DEBUG_IDE_ATAPI
 
 /* Bits of HD_STATUS */
@@ -424,17 +426,29 @@ static void ide_identify(IDEState *s)
 {
     uint16_t *tab;
     uint32_t oldsize;
-    
+    uint32_t cyls, heads, secs;
+
     tab = (uint16_t *)s->io_buffer;
 
     memset(tab, 0, 512 * 2);
 
+    /* Use geometry that doesn't exceed actual disk size */
+    cyls = s->cylinders;
+    heads = s->heads;
+    secs = s->sectors;
+
+    /* Reduce cylinders if CHS product exceeds actual sectors */
+    while (cyls > 1 && (uint64_t)cyls * heads * secs > s->nb_sectors) {
+        cyls--;
+    }
+    oldsize = cyls * heads * secs;
+
     stw(tab + 0, 0x0040);
-    stw(tab + 1, s->cylinders); 
-    stw(tab + 3, s->heads);
-    stw(tab + 4, 512 * s->sectors); /* sectors */
+    stw(tab + 1, cyls);
+    stw(tab + 3, heads);
+    stw(tab + 4, 512 * secs); /* sectors */
     stw(tab + 5, 512); /* sector size */
-    stw(tab + 6, s->sectors); 
+    stw(tab + 6, secs);
     stw(tab + 20, 3); /* buffer type */
     stw(tab + 21, 512); /* cache size in sectors */
     stw(tab + 22, 4); /* ecc bytes */
@@ -446,10 +460,9 @@ static void ide_identify(IDEState *s)
     stw(tab + 52, 0x200); /* DMA transfer cycle */
     stw(tab + 63, 0x07);  /* Multiword DMA modes 0-2 supported */
     stw(tab + 88, 0x3f);  /* Ultra DMA modes 0-5 supported */
-    stw(tab + 54, s->cylinders);
-    stw(tab + 55, s->heads);
-    stw(tab + 56, s->sectors);
-    oldsize = s->cylinders * s->heads * s->sectors;
+    stw(tab + 54, cyls);
+    stw(tab + 55, heads);
+    stw(tab + 56, secs);
     stw(tab + 57, oldsize);
     stw(tab + 58, oldsize >> 16);
     if (s->mult_sectors)
@@ -1969,19 +1982,7 @@ typedef enum {
 
 #define SECTOR_SIZE 512
 
-/* VHD Dynamic Disk Format Support */
-#define VHD_COOKIE "conectix"
-#define VHD_DYN_COOKIE "cxsparse"
-#define VHD_BLOCK_SIZE (2 * 1024 * 1024)  /* 2MB blocks */
-#define VHD_SECTOR_SIZE 512
-#define VHD_BAT_UNUSED 0xFFFFFFFF
-
 typedef struct BlockDeviceFile BlockDeviceFile;
-
-/* Forward declarations for VHD functions */
-static int vhd_read_sectors(BlockDeviceFile *bf, uint64_t sector_num, uint8_t *buf, int n);
-static int vhd_write_sectors(BlockDeviceFile *bf, uint64_t sector_num, const uint8_t *buf, int n);
-static int vhd_try_parse(BlockDeviceFile *bf);
 
 struct BlockDeviceFile {
     FILE *f;
@@ -2000,14 +2001,7 @@ struct BlockDeviceFile {
     int cache_count;           /* Number of valid sectors in cache */
 #define DISK_CACHE_SECTORS 64  /* Cache 64 sectors = 32KB per disk */
 #endif
-    /* VHD support */
-    int is_vhd;                /* 1 if this is a VHD file */
-    uint32_t vhd_block_size;   /* Block size (typically 2MB) */
-    uint32_t vhd_max_bat;      /* Number of BAT entries */
-    uint32_t *vhd_bat;         /* Block Allocation Table */
-    int64_t vhd_bat_offset;    /* Offset to BAT in file */
-    int64_t vhd_data_offset;   /* Offset where data blocks start */
-    int vhd_bitmap_sectors;    /* Sectors per block bitmap */
+    int dirty;                 /* Set on write, cleared on sync */
 };
 
 static int64_t bf_get_sector_count(BlockDevice *bs)
@@ -2055,11 +2049,6 @@ static int bf_read_async(BlockDevice *bs,
         /* Zero the out-of-bounds portion */
         memset(buf + valid_sectors * SECTOR_SIZE, 0, (n - valid_sectors) * SECTOR_SIZE);
         n = valid_sectors;
-    }
-
-    /* VHD files use special read path */
-    if (bf->is_vhd) {
-        return vhd_read_sectors(bf, sector_num, buf, n);
     }
 
     if (bf->mode == BF_MODE_SNAPSHOT) {
@@ -2131,13 +2120,6 @@ static int bf_write_async(BlockDevice *bs,
     }
 #endif
 
-    /* VHD files use special write path */
-    if (bf->is_vhd) {
-        if (bf->mode == BF_MODE_RO)
-            return -1;
-        return vhd_write_sectors(bf, sector_num, buf, n);
-    }
-
     switch(bf->mode) {
     case BF_MODE_RO:
         ret = -1; /* error */
@@ -2145,6 +2127,7 @@ static int bf_write_async(BlockDevice *bs,
     case BF_MODE_RW:
         fseeko(bf->f, bf->start_offset + sector_num * SECTOR_SIZE, SEEK_SET);
         fwrite(buf, 1, n * SECTOR_SIZE, bf->f);
+        bf->dirty = 1;
         ret = 0;
         break;
     case BF_MODE_SNAPSHOT:
@@ -2170,200 +2153,6 @@ static int bf_write_async(BlockDevice *bs,
     return ret;
 }
 
-/* VHD Helper Functions */
-static uint32_t vhd_read_be32(const uint8_t *p)
-{
-    return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
-}
-
-static uint64_t vhd_read_be64(const uint8_t *p)
-{
-    return ((uint64_t)vhd_read_be32(p) << 32) | vhd_read_be32(p + 4);
-}
-
-static void vhd_write_be32(uint8_t *p, uint32_t v)
-{
-    p[0] = (v >> 24) & 0xff;
-    p[1] = (v >> 16) & 0xff;
-    p[2] = (v >> 8) & 0xff;
-    p[3] = v & 0xff;
-}
-
-/* Read sectors from VHD, returns 0 on success */
-static int vhd_read_sectors(BlockDeviceFile *bf, uint64_t sector_num,
-                            uint8_t *buf, int n)
-{
-    while (n > 0) {
-        /* Calculate which VHD block this sector is in */
-        uint32_t sectors_per_block = bf->vhd_block_size / VHD_SECTOR_SIZE;
-        uint32_t block_idx = sector_num / sectors_per_block;
-        uint32_t sector_in_block = sector_num % sectors_per_block;
-
-        if (block_idx >= bf->vhd_max_bat) {
-            /* Beyond disk size - return zeros */
-            memset(buf, 0, VHD_SECTOR_SIZE);
-        } else {
-            uint32_t bat_entry = bf->vhd_bat[block_idx];
-            if (bat_entry == VHD_BAT_UNUSED) {
-                /* Block not allocated - return zeros */
-                memset(buf, 0, VHD_SECTOR_SIZE);
-            } else {
-                /* Block allocated - read from file */
-                /* Skip bitmap at start of block */
-                int64_t file_offset = (int64_t)bat_entry * VHD_SECTOR_SIZE +
-                                      bf->vhd_bitmap_sectors * VHD_SECTOR_SIZE +
-                                      sector_in_block * VHD_SECTOR_SIZE;
-                fseeko(bf->f, file_offset, SEEK_SET);
-                if (fread(buf, 1, VHD_SECTOR_SIZE, bf->f) != VHD_SECTOR_SIZE) {
-                    /* Read error - return zeros */
-                    memset(buf, 0, VHD_SECTOR_SIZE);
-                }
-            }
-        }
-        sector_num++;
-        buf += VHD_SECTOR_SIZE;
-        n--;
-    }
-    return 0;
-}
-
-/* Write sectors to VHD, allocating blocks as needed */
-static int vhd_write_sectors(BlockDeviceFile *bf, uint64_t sector_num,
-                             const uint8_t *buf, int n)
-{
-    while (n > 0) {
-        uint32_t sectors_per_block = bf->vhd_block_size / VHD_SECTOR_SIZE;
-        uint32_t block_idx = sector_num / sectors_per_block;
-        uint32_t sector_in_block = sector_num % sectors_per_block;
-
-        if (block_idx >= bf->vhd_max_bat) {
-            return -1;  /* Beyond disk size */
-        }
-
-        uint32_t bat_entry = bf->vhd_bat[block_idx];
-        if (bat_entry == VHD_BAT_UNUSED) {
-            /* Need to allocate new block */
-            /* Find end of file (before footer) */
-            fseeko(bf->f, 0, SEEK_END);
-            int64_t file_end = ftello(bf->f) - VHD_SECTOR_SIZE;  /* Before footer */
-
-            /* New block goes at current end */
-            uint32_t new_block_sector = file_end / VHD_SECTOR_SIZE;
-
-            /* Write block bitmap (all 1s = all sectors present) */
-            uint8_t bitmap[VHD_SECTOR_SIZE];
-            memset(bitmap, 0xff, sizeof(bitmap));
-            fseeko(bf->f, file_end, SEEK_SET);
-            for (int i = 0; i < bf->vhd_bitmap_sectors; i++) {
-                fwrite(bitmap, 1, VHD_SECTOR_SIZE, bf->f);
-            }
-
-            /* Write zero-filled block data */
-            uint8_t zeros[VHD_SECTOR_SIZE];
-            memset(zeros, 0, sizeof(zeros));
-            for (uint32_t i = 0; i < sectors_per_block; i++) {
-                fwrite(zeros, 1, VHD_SECTOR_SIZE, bf->f);
-            }
-
-            /* Rewrite footer at new end */
-            uint8_t footer[VHD_SECTOR_SIZE];
-            fseeko(bf->f, 0, SEEK_SET);  /* Footer copy at start */
-            fread(footer, 1, VHD_SECTOR_SIZE, bf->f);
-            fseeko(bf->f, 0, SEEK_END);
-            fwrite(footer, 1, VHD_SECTOR_SIZE, bf->f);
-
-            /* Update BAT entry */
-            bf->vhd_bat[block_idx] = new_block_sector;
-
-            /* Write updated BAT entry to file */
-            uint8_t bat_bytes[4];
-            vhd_write_be32(bat_bytes, new_block_sector);
-            fseeko(bf->f, bf->vhd_bat_offset + block_idx * 4, SEEK_SET);
-            fwrite(bat_bytes, 1, 4, bf->f);
-
-            bat_entry = new_block_sector;
-        }
-
-        /* Write sector data */
-        int64_t file_offset = (int64_t)bat_entry * VHD_SECTOR_SIZE +
-                              bf->vhd_bitmap_sectors * VHD_SECTOR_SIZE +
-                              sector_in_block * VHD_SECTOR_SIZE;
-        fseeko(bf->f, file_offset, SEEK_SET);
-        fwrite(buf, 1, VHD_SECTOR_SIZE, bf->f);
-
-        sector_num++;
-        buf += VHD_SECTOR_SIZE;
-        n--;
-    }
-    fflush(bf->f);
-    return 0;
-}
-
-/* Try to parse file as VHD, returns 1 if successful */
-static int vhd_try_parse(BlockDeviceFile *bf)
-{
-    uint8_t footer[VHD_SECTOR_SIZE];
-    uint8_t header[1024];
-
-    /* Read footer from end of file */
-    fseeko(bf->f, -VHD_SECTOR_SIZE, SEEK_END);
-    if (fread(footer, 1, VHD_SECTOR_SIZE, bf->f) != VHD_SECTOR_SIZE)
-        return 0;
-
-    /* Check for VHD cookie */
-    if (memcmp(footer, VHD_COOKIE, 8) != 0)
-        return 0;
-
-    /* Check disk type - must be dynamic (3) or differencing (4) */
-    uint32_t disk_type = vhd_read_be32(footer + 60);
-    if (disk_type != 3) {
-        fprintf(stderr, "VHD: unsupported disk type %d (only dynamic supported)\n", disk_type);
-        return 0;
-    }
-
-    /* Get virtual disk size */
-    uint64_t disk_size = vhd_read_be64(footer + 48);  /* Current Size field */
-    bf->nb_sectors = disk_size / VHD_SECTOR_SIZE;
-
-    /* Get dynamic header offset */
-    uint64_t header_offset = vhd_read_be64(footer + 16);  /* Data Offset field */
-
-    /* Read dynamic header */
-    fseeko(bf->f, header_offset, SEEK_SET);
-    if (fread(header, 1, 1024, bf->f) != 1024)
-        return 0;
-
-    /* Verify dynamic header cookie */
-    if (memcmp(header, VHD_DYN_COOKIE, 8) != 0) {
-        fprintf(stderr, "VHD: invalid dynamic header\n");
-        return 0;
-    }
-
-    /* Get BAT offset and block size */
-    bf->vhd_bat_offset = vhd_read_be64(header + 16);
-    bf->vhd_max_bat = vhd_read_be32(header + 28);
-    bf->vhd_block_size = vhd_read_be32(header + 32);
-
-    /* Calculate bitmap sectors per block */
-    bf->vhd_bitmap_sectors = (bf->vhd_block_size / VHD_SECTOR_SIZE / 8 + VHD_SECTOR_SIZE - 1) / VHD_SECTOR_SIZE;
-
-    /* Allocate and read BAT */
-    bf->vhd_bat = pcmalloc(bf->vhd_max_bat * sizeof(uint32_t));
-    fseeko(bf->f, bf->vhd_bat_offset, SEEK_SET);
-    for (uint32_t i = 0; i < bf->vhd_max_bat; i++) {
-        uint8_t entry[4];
-        fread(entry, 1, 4, bf->f);
-        bf->vhd_bat[i] = vhd_read_be32(entry);
-    }
-
-    bf->is_vhd = 1;
-    fprintf(stderr, "VHD: dynamic disk, %lld MB, %d blocks of %d KB\n",
-            (long long)(disk_size / (1024*1024)),
-            bf->vhd_max_bat,
-            bf->vhd_block_size / 1024);
-
-    return 1;
-}
 
 static BlockDevice *block_device_init(const char *filename,
                                       BlockDeviceModeEnum mode)
@@ -2404,17 +2193,14 @@ static BlockDevice *block_device_init(const char *filename,
     bf->nb_sectors = file_size / 512;
     bf->f = f;
     bf->start_offset = start_offset;
-    bf->is_vhd = 0;
-    bf->vhd_bat = NULL;
+#ifdef BUILD_ESP32
+    if (mode == BF_MODE_RW)
+        setvbuf(f, NULL, _IOFBF, 32768);
+#endif
 #ifdef TANMATSU_BUILD
     strncpy(bf->path, filename, sizeof(bf->path) - 1);
     bf->path[sizeof(bf->path) - 1] = '\0';
 #endif
-
-    /* Try to parse as VHD (updates nb_sectors if successful) */
-    if (!start_offset && vhd_try_parse(bf)) {
-        /* VHD detected and parsed - nb_sectors now reflects virtual size */
-    }
 
     if (mode == BF_MODE_SNAPSHOT) {
         bf->sector_table = pcmalloc(sizeof(bf->sector_table[0]) *
@@ -2465,8 +2251,6 @@ static BlockDevice *block_device_init_empty_ro(void)
     bf->nb_sectors = 0;
     bf->f = NULL;
     bf->start_offset = 0;
-    bf->is_vhd = 0;
-    bf->vhd_bat = NULL;
 #ifdef TANMATSU_BUILD
     bf->path[0] = '\0';
 #endif
@@ -2485,6 +2269,38 @@ static BlockDevice *block_device_init_empty_ro(void)
     bs->write_async = bf_write_async;
     return bs;
 }
+
+#ifdef TANMATSU_BUILD
+/* Create empty RW block device for HDD hot-mounting */
+static BlockDevice *block_device_init_empty_rw(void)
+{
+    BlockDevice *bs;
+    BlockDeviceFile *bf;
+
+    bs = pcmalloc(sizeof(*bs));
+    bf = pcmalloc(sizeof(*bf));
+    memset(bs, 0, sizeof(*bs));
+    memset(bf, 0, sizeof(*bf));
+
+    bf->mode = BF_MODE_RW;
+    bf->nb_sectors = 0;
+    bf->f = NULL;
+    bf->start_offset = 0;
+    bf->path[0] = '\0';
+#ifdef BUILD_ESP32
+    bf->cache_buf = malloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
+    bf->cache_start = -1;
+    bf->cache_count = 0;
+#endif
+
+    bs->opaque = bf;
+    bs->get_sector_count = bf_get_sector_count;
+    bs->get_chs = bf_get_chs;  /* HDD needs CHS geometry */
+    bs->read_async = bf_read_async;
+    bs->write_async = bf_write_async;
+    return bs;
+}
+#endif
 
 #ifdef BUILD_ESP32
 #include "sdmmc_cmd.h"
@@ -2759,9 +2575,19 @@ static BlockDevice *block_device_init_espsd(int64_t start_sector, int64_t nb_sec
  * Returns 0 sectors when no USB device is connected.
  * Reads return zeros and writes are silently discarded when disconnected.
  */
+
+/* USB cache for faster repeated reads (FAT tables, directory scans) */
+#define USB_CACHE_SECTORS 64
+#define USB_PREFETCH_SECTORS 32
+
 typedef struct BlockDeviceUSB {
-    int dummy;  // Placeholder - state is in usb_host.c
+    uint8_t *cache_buf;
+    int64_t cache_start;
+    int cache_count;
+    int64_t last_read_end;  /* For sequential detection */
 } BlockDeviceUSB;
+
+static BlockDeviceUSB *usb_bf = NULL;  /* Global for cache access */
 
 static int64_t usbmsc_get_sector_count(BlockDevice *bs)
 {
@@ -2773,33 +2599,69 @@ static int usbmsc_read_async(BlockDevice *bs,
                               uint64_t sector_num, uint8_t *buf, int n,
                               BlockDeviceCompletionFunc *cb, void *opaque)
 {
-    (void)bs;
     (void)cb;
     (void)opaque;
     IDE_ACTIVITY();
 
+    BlockDeviceUSB *bf = bs->opaque;
+
     if (!usb_host_msc_connected()) {
-        // No USB connected - return zeros silently
         memset(buf, 0, n * 512);
-        return 0;  // Synchronous - ide_sector_read will call callback
+        return 0;
     }
 
-    // Bounds checking for CHS/LBA geometry mismatch (fixes ScanDisk errors)
     int64_t nb_sectors = usb_host_msc_get_sector_count();
     if ((int64_t)sector_num >= nb_sectors) {
-        // Request starts beyond end of disk - return zeros
         memset(buf, 0, n * SECTOR_SIZE);
         return 0;
     }
     if ((int64_t)(sector_num + n) > nb_sectors) {
-        // Request partially extends beyond end - read valid part, zero the rest
         int valid_sectors = nb_sectors - sector_num;
         memset(buf + valid_sectors * SECTOR_SIZE, 0, (n - valid_sectors) * SECTOR_SIZE);
         n = valid_sectors;
     }
 
-    int ret = usb_host_msc_read(sector_num, buf, n);
-    // Return 0 for success - ide_sector_read handles callback for synchronous case
+    /* Check cache first */
+    if (bf->cache_buf && bf->cache_count > 0) {
+        int64_t cache_end = bf->cache_start + bf->cache_count;
+        if ((int64_t)sector_num >= bf->cache_start && (int64_t)(sector_num + n) <= cache_end) {
+            /* Fully cached */
+            int offset = (sector_num - bf->cache_start) * SECTOR_SIZE;
+            memcpy(buf, bf->cache_buf + offset, n * SECTOR_SIZE);
+            bf->last_read_end = sector_num + n;
+            return 0;
+        }
+    }
+
+    /* Determine how many sectors to read (with prefetch for sequential access) */
+    int read_count = n;
+    int is_sequential = (bf->last_read_end > 0 && (int64_t)sector_num == bf->last_read_end);
+
+    if (bf->cache_buf && is_sequential) {
+        /* Sequential read - prefetch extra sectors */
+        read_count = n + USB_PREFETCH_SECTORS;
+        if ((int64_t)(sector_num + read_count) > nb_sectors)
+            read_count = nb_sectors - sector_num;
+        if (read_count > USB_CACHE_SECTORS)
+            read_count = USB_CACHE_SECTORS;
+    }
+
+    /* Read from USB */
+    int ret;
+    if (bf->cache_buf && read_count > n) {
+        /* Read into cache, then copy to buffer */
+        ret = usb_host_msc_read(sector_num, bf->cache_buf, read_count);
+        if (ret == 0) {
+            bf->cache_start = sector_num;
+            bf->cache_count = read_count;
+            memcpy(buf, bf->cache_buf, n * SECTOR_SIZE);
+        }
+    } else {
+        /* Direct read */
+        ret = usb_host_msc_read(sector_num, buf, n);
+    }
+
+    bf->last_read_end = sector_num + n;
     return (ret < 0) ? ret : 0;
 }
 
@@ -2807,19 +2669,68 @@ static int usbmsc_write_async(BlockDevice *bs,
                                uint64_t sector_num, const uint8_t *buf, int n,
                                BlockDeviceCompletionFunc *cb, void *opaque)
 {
-    (void)bs;
     (void)cb;
     (void)opaque;
     IDE_ACTIVITY();
 
+    BlockDeviceUSB *bf = bs->opaque;
+
+    /* Invalidate cache on write */
+    if (bf->cache_buf)
+        bf->cache_count = 0;
+
     if (!usb_host_msc_connected()) {
-        // No USB connected - silently discard write
-        return 0;  // Synchronous - ide_sector_write handles callback
+        return 0;
     }
 
     int ret = usb_host_msc_write(sector_num, buf, n);
-    // Return 0 for success - ide_sector_write handles callback for synchronous case
     return (ret < 0) ? ret : 0;
+}
+
+/* Read CHS geometry from FAT BPB on USB drive */
+static int usbmsc_get_chs(BlockDevice *bs, int *cyls, int *heads, int *secs)
+{
+    (void)bs;
+    uint8_t bpb[512];
+
+    if (!usb_host_msc_connected()) {
+        return 0;  /* Keep default geometry */
+    }
+
+    /* Try to read MBR to find partition */
+    if (usb_host_msc_read(0, bpb, 1) != 0) {
+        return 0;
+    }
+
+    /* Check for MBR signature */
+    if (bpb[510] == 0x55 && bpb[511] == 0xAA && bpb[0] != 0xEB && bpb[0] != 0xE9) {
+        /* This is an MBR, find first partition */
+        uint32_t part_start = bpb[446+8] | (bpb[446+9]<<8) | (bpb[446+10]<<16) | (bpb[446+11]<<24);
+        if (part_start > 0 && usb_host_msc_read(part_start, bpb, 1) != 0) {
+            return 0;
+        }
+    }
+
+    /* Check for FAT BPB signature */
+    if ((bpb[0] != 0xEB && bpb[0] != 0xE9) || bpb[510] != 0x55 || bpb[511] != 0xAA) {
+        return 0;  /* Not a valid BPB */
+    }
+
+    /* Read geometry from BPB */
+    int bpb_secs = bpb[0x18] | (bpb[0x19] << 8);  /* Sectors per track */
+    int bpb_heads = bpb[0x1A] | (bpb[0x1B] << 8); /* Number of heads */
+
+    if (bpb_secs > 0 && bpb_secs <= 63 && bpb_heads > 0 && bpb_heads <= 255) {
+        *secs = bpb_secs;
+        *heads = bpb_heads;
+        /* Recalculate cylinders based on disk size and new H/S */
+        uint64_t total = usb_host_msc_get_sector_count();
+        int c = total / (bpb_heads * bpb_secs);
+        if (c > 16383) c = 16383;
+        if (c < 2) c = 2;
+        *cyls = c;
+    }
+    return 0;
 }
 
 static BlockDevice *block_device_init_usb(void)
@@ -2832,9 +2743,16 @@ static BlockDevice *block_device_init_usb(void)
     memset(bs, 0, sizeof(*bs));
     memset(bf, 0, sizeof(*bf));
 
+    /* Allocate read cache from heap (not pcram) */
+    bf->cache_buf = malloc(USB_CACHE_SECTORS * SECTOR_SIZE);
+    bf->cache_start = -1;
+    bf->cache_count = 0;
+    bf->last_read_end = -1;
+    usb_bf = bf;  /* Save for global access */
+
     bs->opaque = bf;
     bs->get_sector_count = usbmsc_get_sector_count;
-    bs->get_chs = NULL;
+    bs->get_chs = usbmsc_get_chs;
     bs->read_async = usbmsc_read_async;
     bs->write_async = usbmsc_write_async;
     return bs;
@@ -2891,6 +2809,23 @@ int ide_attach_cd(IDEIFState *s, int drive, const char *filename)
 }
 
 #ifdef TANMATSU_BUILD
+/* Attach HDD, creating empty slot if filename is NULL for hot-mounting */
+int ide_attach_hdd(IDEIFState *s, int drive, const char *filename)
+{
+    BlockDevice *bs;
+    if (filename && filename[0]) {
+        bs = block_device_init(filename, BF_MODE_RW);
+        if (!bs) {
+            return -1;
+        }
+    } else {
+        // Create empty HDD slot for hot-mounting via OSD
+        bs = block_device_init_empty_rw();
+    }
+    s->drives[drive] = ide_hddrive_init(s, bs);
+    return 0;
+}
+
 int ide_attach_usb(IDEIFState *s, int drive)
 {
     // Create USB BlockDevice - always present but reports 0 sectors when
@@ -3040,7 +2975,24 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
     }
 
     IDEState *s = sif->drives[drive];
-    if (!s || s->drive_kind != IDE_HD || !s->bs) {
+
+    /* If no drive exists yet, create one (for hot-mounting via OSD) */
+    if (!s) {
+        fprintf(stderr, "ide_change_hdd: creating new HDD drive structure\n");
+        BlockDevice *bs = block_device_init_empty_rw();
+        if (!bs) {
+            fprintf(stderr, "ide_change_hdd: failed to create block device\n");
+            return -1;
+        }
+        sif->drives[drive] = ide_hddrive_init(sif, bs);
+        s = sif->drives[drive];
+        if (!s) {
+            fprintf(stderr, "ide_change_hdd: failed to create drive\n");
+            return -1;
+        }
+    }
+
+    if (s->drive_kind != IDE_HD || !s->bs) {
         fprintf(stderr, "ide_change_hdd: not an HDD drive (s=%p, kind=%d)\n",
                 (void*)s, s ? s->drive_kind : -1);
         return -1;
@@ -3053,16 +3005,11 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
 
     BlockDeviceFile *bf = s->bs->opaque;
 
-    /* Close old file and free VHD resources */
+    /* Close old file */
     if (bf->f) {
         fclose(bf->f);
         bf->f = NULL;
     }
-    if (bf->vhd_bat) {
-        free(bf->vhd_bat);
-        bf->vhd_bat = NULL;
-    }
-    bf->is_vhd = 0;
     bf->nb_sectors = 0;
     bf->start_offset = 0;
 #ifdef BUILD_ESP32
@@ -3099,14 +3046,11 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
     bf->mode = BF_MODE_RW;
     bf->nb_sectors = file_size / 512;
     bf->start_offset = start_offset;
+#ifdef BUILD_ESP32
+    setvbuf(f, NULL, _IOFBF, 32768);
+#endif
     strncpy(bf->path, filename, sizeof(bf->path) - 1);
     bf->path[sizeof(bf->path) - 1] = '\0';
-
-    /* Try to parse as VHD */
-    if (!start_offset && vhd_try_parse(bf)) {
-        fprintf(stderr, "ide_change_hdd: VHD detected, %lld sectors\n",
-                (long long)bf->nb_sectors);
-    }
 
     /* Update IDE drive state */
     s->nb_sectors = bf->nb_sectors;
@@ -3120,6 +3064,16 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
     s->cylinders = cyls;
     s->heads = 16;
     s->sectors = 63;
+
+    /* Use old-format geometry if available */
+    if (start_offset) {
+        s->bs->get_chs = bf_get_chs;
+        if (bf->cylinders && bf->heads && bf->sectors) {
+            s->cylinders = bf->cylinders;
+            s->heads = bf->heads;
+            s->sectors = bf->sectors;
+        }
+    }
 
     fprintf(stderr, "ide_change_hdd: done, sectors=%lld cyl=%d heads=%d secs=%d\n",
             (long long)s->nb_sectors, s->cylinders, s->heads, s->sectors);
@@ -3163,4 +3117,26 @@ void ide_fill_cmos(IDEIFState *s, void *cmos,
         set(cmos, 0x2c, s->drives[1]->sectors);
     }
     set(cmos, 0x12, d_0x12);
+}
+
+/* Sync all open disk files to physical media.
+ * Call periodically to limit data loss on unexpected power-off. */
+static void ide_sync_if(IDEIFState *s)
+{
+    if (!s) return;
+    for (int i = 0; i < 2; i++) {
+        if (!s->drives[i] || !s->drives[i]->bs) continue;
+        BlockDeviceFile *bf = s->drives[i]->bs->opaque;
+        if (bf && bf->f && bf->mode == BF_MODE_RW && bf->dirty) {
+            fflush(bf->f);
+            fsync(fileno(bf->f));
+            bf->dirty = 0;
+        }
+    }
+}
+
+void ide_sync(IDEIFState *ide, IDEIFState *ide2)
+{
+    ide_sync_if(ide);
+    ide_sync_if(ide2);
 }

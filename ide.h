@@ -36,6 +36,7 @@ void ide_change_cd(IDEIFState *sif, int drive, const char *filename);
 const char *ide_get_cd_path(IDEIFState *sif, int drive);
 const char *ide_get_hdd_path(IDEIFState *sif, int drive);
 int ide_change_hdd(IDEIFState *sif, int drive, const char *filename);
+int ide_attach_hdd(IDEIFState *s, int drive, const char *filename);
 int ide_attach_usb(IDEIFState *s, int drive);
 #endif
 
@@ -59,4 +60,6 @@ PCIDevice *piix3_ide_init(PCIBus *pci_bus, int devfn);
 
 void ide_fill_cmos(IDEIFState *s, void *cmos,
                    uint8_t (*set)(void *cmos, int addr, uint8_t val));
+
+void ide_sync(IDEIFState *ide, IDEIFState *ide2);
 #endif /* IDE_H */
