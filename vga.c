@@ -305,6 +305,7 @@ struct VGAState {
     uint8_t *vga_ram;
     uint8_t *render_vga_ram;  /* Snapshot for tear-free rendering */
     uint64_t dirty_pages;     /* Bitmap: 1 bit per 4KB page (64 pages = 256KB) */
+    uint64_t render_dirty_pages; /* Pages that changed in last double-buffer copy */
     int vga_ram_size;
 
     uint8_t sr_index;
@@ -1725,38 +1726,78 @@ static void vga_graphic_refresh(VGAState *s,
          */
 #if BPP == 16 && !defined(SCALE_3_2) && !defined(SWAPXY)
         if (shift_control == 0 && (s->cr[0x17] & 3) == 3) {
-            /* Debug: trace fast path usage (only on first scanline of first frame) */
             if (y == 0 && !ega_fast_logged) {
-                fprintf(stderr, "VGA: EGA fast path active (w=%d xdiv=%d cpe=0x%x)\n",
+                fprintf(stderr, "VGA: planar fast path active (w=%d xdiv=%d cpe=0x%x)\n",
                         w, xdiv, s->ar[0x12] & 0x0f);
                 ega_fast_logged = 1;
             }
             int cpe_mask = s->ar[0x12] & 0x0f;
             uint16_t *fb_row = (uint16_t *)(fb_dev->fb_data + i0 + y * fb_dev->stride);
             int src_bytes = (w / xdiv) >> 3;  /* source bytes to process */
+            int vram_line_bytes = src_bytes * 4; /* 4 VRAM bytes per source byte (planar) */
 
-            /* Process 2 bytes (16 pixels) per iteration when possible */
+#ifdef TANMATSU_BUILD
+            /* OPT 1: Page-dirty coarse skip - if no VRAM pages for this line
+             * were modified, skip without even hashing (zero PSRAM reads) */
+            if (y < VGA_MAX_LINES && s->render_vga_ram && vga_double_buffer) {
+                uint32_t page_start = addr >> 12;
+                uint32_t page_end = (addr + vram_line_bytes - 1) >> 12;
+                uint64_t page_mask = 0;
+                for (uint32_t p = page_start; p <= page_end && p < 64; p++)
+                    page_mask |= (1ULL << p);
+                if (!(s->render_dirty_pages & page_mask) &&
+                    vga_prev_line_hash[y] != 0) {
+                    goto next_line;
+                }
+            }
+
+            /* OPT 2: Copy VRAM line into SRAM buffer - one sequential PSRAM read
+             * instead of scattered reads during hash + render */
+            uint8_t linebuf[400];  /* Max: 800px / 8 * 4 planes = 400 bytes */
+            const uint8_t *src_line;
+            if (vram_line_bytes <= (int)sizeof(linebuf)) {
+                memcpy(linebuf, vram + addr, vram_line_bytes);
+                src_line = linebuf;
+            } else {
+                src_line = vram + addr;
+            }
+
+            /* OPT 1b: Hash-based dirty skip from SRAM buffer (fast) */
+            if (y < VGA_MAX_LINES) {
+                uint32_t line_hash = vga_hash_line(src_line, vram_line_bytes);
+                if (line_hash == vga_prev_line_hash[y] && !vga_is_line_dirty(y)) {
+                    goto next_line;
+                }
+                vga_prev_line_hash[y] = line_hash;
+            }
+#else
+            const uint8_t *src_line = vram + addr;
+#endif
+
+            /* OPT 3+4: Render from SRAM buffer using uint32_t reads for 4 planes at once */
             int bx = 0;
             for (; bx + 1 < src_bytes; bx += 2) {
-                uint32_t byte_addr = addr + 4 * bx;
+                int off = 4 * bx;
+
+                /* Read 4 planes at once as uint32_t (addr is always 4-byte aligned) */
+                uint32_t planes0 = *(const uint32_t *)(src_line + off);
+                uint32_t planes1 = *(const uint32_t *)(src_line + off + 4);
 
                 /* First 8 pixels */
-                const uint8_t *p0 = planar_expand[vram[byte_addr]];
-                const uint8_t *p1 = planar_expand[vram[byte_addr + 1]];
-                const uint8_t *p2 = planar_expand[vram[byte_addr + 2]];
-                const uint8_t *p3 = planar_expand[vram[byte_addr + 3]];
+                const uint8_t *p0 = planar_expand[planes0 & 0xFF];
+                const uint8_t *p1 = planar_expand[(planes0 >> 8) & 0xFF];
+                const uint8_t *p2 = planar_expand[(planes0 >> 16) & 0xFF];
+                const uint8_t *p3 = planar_expand[planes0 >> 24];
 
                 /* Second 8 pixels */
-                const uint8_t *q0 = planar_expand[vram[byte_addr + 4]];
-                const uint8_t *q1 = planar_expand[vram[byte_addr + 5]];
-                const uint8_t *q2 = planar_expand[vram[byte_addr + 6]];
-                const uint8_t *q3 = planar_expand[vram[byte_addr + 7]];
+                const uint8_t *q0 = planar_expand[planes1 & 0xFF];
+                const uint8_t *q1 = planar_expand[(planes1 >> 8) & 0xFF];
+                const uint8_t *q2 = planar_expand[(planes1 >> 16) & 0xFF];
+                const uint8_t *q3 = planar_expand[planes1 >> 24];
 
                 if (cpe_mask == 0x0f) {
-                    /* Fast path: all planes enabled, no masking needed */
                     if (xdiv == 2) {
                         uint32_t *fb32 = (uint32_t *)fb_row;
-                        /* First 8 source pixels -> 16 output pixels */
                         uint32_t c0 = cur_palette[p0[0] | (p1[0] << 1) | (p2[0] << 2) | (p3[0] << 3)];
                         uint32_t c1 = cur_palette[p0[1] | (p1[1] << 1) | (p2[1] << 2) | (p3[1] << 3)];
                         uint32_t c2 = cur_palette[p0[2] | (p1[2] << 1) | (p2[2] << 2) | (p3[2] << 3)];
@@ -1769,7 +1810,6 @@ static void vga_graphic_refresh(VGAState *s,
                         fb32[2] = c2 | (c2 << 16); fb32[3] = c3 | (c3 << 16);
                         fb32[4] = c4 | (c4 << 16); fb32[5] = c5 | (c5 << 16);
                         fb32[6] = c6 | (c6 << 16); fb32[7] = c7 | (c7 << 16);
-                        /* Second 8 source pixels -> 16 output pixels */
                         c0 = cur_palette[q0[0] | (q1[0] << 1) | (q2[0] << 2) | (q3[0] << 3)];
                         c1 = cur_palette[q0[1] | (q1[1] << 1) | (q2[1] << 2) | (q3[1] << 3)];
                         c2 = cur_palette[q0[2] | (q1[2] << 1) | (q2[2] << 2) | (q3[2] << 3)];
@@ -1784,7 +1824,6 @@ static void vga_graphic_refresh(VGAState *s,
                         fb32[14] = c6 | (c6 << 16); fb32[15] = c7 | (c7 << 16);
                         fb_row += 32;
                     } else {
-                        /* xdiv==1: write 16 pixels directly */
                         fb_row[0] = cur_palette[p0[0] | (p1[0] << 1) | (p2[0] << 2) | (p3[0] << 3)];
                         fb_row[1] = cur_palette[p0[1] | (p1[1] << 1) | (p2[1] << 2) | (p3[1] << 3)];
                         fb_row[2] = cur_palette[p0[2] | (p1[2] << 1) | (p2[2] << 2) | (p3[2] << 3)];
@@ -1804,7 +1843,6 @@ static void vga_graphic_refresh(VGAState *s,
                         fb_row += 16;
                     }
                 } else {
-                    /* Slow path: need to mask with cpe_mask */
                     if (xdiv == 2) {
                         uint32_t *fb32 = (uint32_t *)fb_row;
                         for (int i = 0; i < 8; i++) {
@@ -1828,11 +1866,12 @@ static void vga_graphic_refresh(VGAState *s,
 
             /* Handle remaining byte if src_bytes is odd */
             for (; bx < src_bytes; bx++) {
-                uint32_t byte_addr = addr + 4 * bx;
-                const uint8_t *p0 = planar_expand[vram[byte_addr]];
-                const uint8_t *p1 = planar_expand[vram[byte_addr + 1]];
-                const uint8_t *p2 = planar_expand[vram[byte_addr + 2]];
-                const uint8_t *p3 = planar_expand[vram[byte_addr + 3]];
+                int off = 4 * bx;
+                uint32_t planes0 = *(const uint32_t *)(src_line + off);
+                const uint8_t *p0 = planar_expand[planes0 & 0xFF];
+                const uint8_t *p1 = planar_expand[(planes0 >> 8) & 0xFF];
+                const uint8_t *p2 = planar_expand[(planes0 >> 16) & 0xFF];
+                const uint8_t *p3 = planar_expand[planes0 >> 24];
 
                 if (xdiv == 2) {
                     uint32_t *fb32 = (uint32_t *)fb_row;
@@ -2285,7 +2324,9 @@ int vga_step(VGAState *s)
      * Uses dirty page tracking to only copy modified 4KB pages. */
     if (ret && s->render_vga_ram && vga_double_buffer) {
         uint64_t dirty = s->dirty_pages;
-        if (dirty) {
+        if (!dirty) {
+            s->render_dirty_pages = 0;
+        } else {
             /* Determine max pages to copy based on VGA mode */
             int max_pages;
             int shift_control = (s->gr[VGA_GFX_MODE] >> 5) & 3;
@@ -2312,6 +2353,9 @@ int vga_step(VGAState *s)
             /* Copy only dirty pages */
             uint64_t mask = (max_pages < 64) ? ((1ULL << max_pages) - 1) : ~0ULL;
             dirty &= mask;
+
+            /* Record which pages changed for renderer's coarse skip */
+            s->render_dirty_pages = dirty;
 
             while (dirty) {
                 int page = __builtin_ctzll(dirty);  /* Find lowest set bit */
