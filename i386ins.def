@@ -413,7 +413,9 @@ I2(C(0xb1), EvGv,    3, CMPXCH)
 I2(C(0xc0), EbGb,    3, XADDb)
 I2(C(0xc1), EvGv,    3, XADD)
 I2(C(0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf), PlusRegv, _, BSWAP)
+I2(C(0x08), _,       0, INVD)    // Invalidate cache (no writeback) - treat as NOP
 I2(C(0x09), _,       0, WBINVD)
+I2(C(0x0b), _,       0, UD2)     // Explicit #UD
 #endif
 #ifdef IG7
 IG7(C(0x07), Ms,     0, INVLPG)

@@ -727,18 +727,15 @@ static bool IRAM_ATTR segcheck(CPUI386 *cpu, int rwm, int seg, uword addr, int s
 //			dolog("segcheck: seg %d is null %x\n", seg, cpu->seg[seg].sel);
 			THROW(EX_GP, 0);
 		}
-#if 0
 		/* limit check */
 		bool expand_down = (cpu->seg[seg].flags & 0xc) == 0x4;
 		bool over = addr + size - 1 > cpu->seg[seg].limit;
 		if (expand_down)
 			over = addr <= cpu->seg[seg].limit;
 		if (over) {
-			dolog("over: addr %08x size %08x limit %08x\n", addr, size, cpu->seg[seg].limit);
 			THROW(EX_GP, 0);
 		}
 		/* todo: readonly check */
-#endif
 	}
 	return true;
 }
@@ -1323,8 +1320,6 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 	/* Update flat flag for this segment */
 	update_seg_flat(cpu, seg);
 	if (seg == SEG_CS) {
-//		if ((sel & 3) != cpu->cpl)
-//			dolog("set_seg: PVL %d => %d\n", cpu->cpl, sel & 3);
 		cpu->cpl = sel & 3;
 		cpu->code16 = !(cpu->seg[SEG_CS].flags & SEG_D_BIT);
 	}
@@ -2507,8 +2502,13 @@ static inline void clear_segs(CPUI386 *cpu)
 	int rm = modrm & 7; \
 	if (reg == 0) { \
 		u32 new_cr0 = lreg32(rm); \
-		if ((new_cr0 ^ cpu->cr0) & (CR0_PG | CR0_WP | 1)) \
+		if ((new_cr0 ^ cpu->cr0) & (CR0_PG | CR0_WP | 1)) { \
 			tlb_clear(cpu); \
+			if ((new_cr0 ^ cpu->cr0) & 1) { \
+				cpu->int8_cache_valid = false; \
+				cpu->int8_warmup_counter = 0; \
+			} \
+		} \
 		if (cpu->fpu) new_cr0 |= 0x10; \
 		cpu->cr0 = new_cr0; \
 	} else if (reg == 2) { \
@@ -2546,8 +2546,8 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 #define IRET() \
 	if ((cpu->cr0 & 1) && (!(cpu->flags & VM) || get_IOPL(cpu) < 3)) { \
 		TRY(pmret(cpu, opsz16, 0, true)); \
-	} else { \
-		if (!opsz16) cpu_abort(cpu, -201); \
+	} else if (opsz16) { \
+		/* 16-bit IRET in real/V86 mode */ \
 		uword sp = lreg32(4); \
 		uword newip, oldflags; \
 		int newcs; \
@@ -2575,6 +2575,36 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		if (!set_seg(cpu, SEG_CS, newcs)) { cpu->flags = oldflags; return false; } \
 		cpu->cc.mask = 0; \
 		set_sp(sp + 6, sp_mask); \
+		cpu->next_ip = newip; \
+	} else { \
+		/* 32-bit IRETD in real/V86 mode */ \
+		uword sp = lreg32(4); \
+		uword newip, oldflags; \
+		int newcs; \
+		uint32_t newflags_val; \
+		/* Fast path: direct memory read if 12 bytes won't cross page */ \
+		if (likely(((sp & 0xfff) <= 0xff4))) { \
+			uint8_t *stack = cpu->phys_mem + cpu->seg[SEG_SS].base + (sp & sp_mask); \
+			newip = *(uint32_t *)(stack + 0); \
+			newcs = *(uint32_t *)(stack + 4) & 0xffff; \
+			newflags_val = *(uint32_t *)(stack + 8); \
+		} else { \
+			OptAddr meml1, meml2, meml3; \
+			/* eip */ TRY(translate32(cpu, &meml1, 1, SEG_SS, sp & sp_mask)); \
+			newip = laddr32(&meml1); \
+			/* cs */ TRY(translate32(cpu, &meml2, 1, SEG_SS, (sp + 4) & sp_mask)); \
+			newcs = laddr32(&meml2) & 0xffff; \
+			/* eflags */ TRY(translate32(cpu, &meml3, 1, SEG_SS, (sp + 8) & sp_mask)); \
+			newflags_val = laddr32(&meml3); \
+		} \
+		oldflags = cpu->flags; \
+		if (cpu->flags & VM) cpu->flags = (cpu->flags & IOPL) | (newflags_val & ~IOPL); \
+		else cpu->flags = newflags_val; \
+		cpu->flags &= EFLAGS_MASK; \
+		cpu->flags |= 0x2; \
+		if (!set_seg(cpu, SEG_CS, newcs)) { cpu->flags = oldflags; return false; } \
+		cpu->cc.mask = 0; \
+		set_sp(sp + 12, sp_mask); \
 		cpu->next_ip = newip; \
 	} \
 	if (cpu->intr && (cpu->flags & IF)) return true;
@@ -3647,7 +3677,9 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 
 #define LMSW(addr, laddr, saddr) \
 	if (cpu->cpl != 0) THROW(EX_GP, 0); \
-	cpu->cr0 = (cpu->cr0 & ((~0xf) | 1)) | (laddr(addr) & 0xf);
+	{ u32 __lmsw_val = (cpu->cr0 & ((~0xf) | 1)) | (laddr(addr) & 0xf); \
+	if ((__lmsw_val ^ cpu->cr0) & 1) { cpu->int8_cache_valid = false; cpu->int8_warmup_counter = 0; } \
+	cpu->cr0 = __lmsw_val; }
 
 #define LSEGd(NAME, reg, addr, lreg32, sreg32, laddr32, saddr32) \
 	OptAddr meml1, meml2; \
@@ -4012,13 +4044,13 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 	} \
 	cpu->cc.mask &= ~ZF;
 
-#define GvMa GvM
+#define GvMa GvMp
 #define BOUND_helper(BIT, a, b, la, sa, lb, sb) \
 	OptAddr meml1, meml2; \
 	s ## BIT idx = la(a); \
 	uword addr1 = lb(b); \
-	TRY(translate ## BIT(cpu, &meml1, 3, curr_seg, addr1)); \
-	TRY(translate ## BIT(cpu, &meml2, 3, curr_seg, addr1 + BIT / 8)); \
+	TRY(translate ## BIT(cpu, &meml1, 1, curr_seg, addr1)); \
+	TRY(translate ## BIT(cpu, &meml2, 1, curr_seg, addr1 + BIT / 8)); \
 	s ## BIT lo = load ## BIT(cpu, &meml1); \
 	s ## BIT hi = load ## BIT(cpu, &meml2); \
 	if (idx < lo || idx > hi) THROW0(EX_BR);
@@ -4060,10 +4092,12 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 	u32 dst = ((src & 0xff) << 24) | (((src >> 8) & 0xff) << 16) | (((src >> 16) & 0xff) << 8) | ((src >> 24) & 0xff); \
 	sa(a, dst);
 
-#define WBINVD()
+#define INVD()    // Invalidate cache without writeback - NOP for emulator
+#define WBINVD()  // Write back and invalidate cache - NOP for emulator
 
 // 586 and later...
 #define UD0() THROW0(EX_UD);
+#define UD2() THROW0(EX_UD);  // Explicit undefined instruction
 
 #if defined(I386_ENABLE_SSE)
 #define CPUID_SIMD_FEATURE 0x3800000
@@ -4973,6 +5007,17 @@ static int __call_isr_check_cs(CPUI386 *cpu, int sel, int ext, int *csdpl)
 				return 3;
 			}
 		}
+	} else if (conforming && dpl == 0 && cpu->cpl > 0) {
+		/* Conforming code segment with DPL=0 called from ring > 0.
+		 * Per x86 spec, this should be intra-PVL (no stack switch).
+		 * However, DOS extenders (DOSX) expect DPMI-like behavior where
+		 * exception handlers always get ring 0 access. Without a real
+		 * DPMI host, force inter-PVL to make this work. */
+		if (!(cpu->flags & VM)) {
+			return 2;
+		} else {
+			return 3;
+		}
 	} else {
 		if (cpu->flags & VM) {
 			THROW(EX_GP, (sel & ~0x3) | ext);
@@ -5100,7 +5145,8 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 	bool gate16 = gt == 6 || gt == 7;
 
 	int csdpl;
-	switch(__call_isr_check_cs(cpu, newcs, ext, &csdpl)) {
+	int isr_result = __call_isr_check_cs(cpu, newcs, ext, &csdpl);
+	switch(isr_result) {
 	case 0: {
 		return false;
 	}
@@ -5383,8 +5429,6 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 			OptAddr meml;
 			TRY(translate(cpu, &meml, 1, SEG_TR, 0, 2, 0));
 			int tssback = laddr16(&meml);
-			dolog("IRET NT: tss curr: %04x back: %04x\n",
-			      cpu->seg[SEG_TR].sel, tssback);
 			// win2000 needs it...
 			if (tssback == 0) THROW(EX_TS, 0);
 			return task_switch(cpu, tssback, TS_IRET);
@@ -5525,15 +5569,6 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		case EX_PF:
 			pusherr = true;
 		}
-#ifdef DEBUG_CPU_EXCEPTIONS
-		{
-			static const char *exc_names[] = {"DE","DB","NMI","BP","OF","BR","UD","NM","DF","?","TS","NP","SS","GP","PF"};
-			const char *name = (cpu->excno < 15) ? exc_names[cpu->excno] : "??";
-			fprintf(stderr, "CPU EXCEPTION: #%s (%d) err=%lx at CS:IP=%04x:%08lx\n",
-			        name, cpu->excno, (unsigned long)cpu->excerr,
-			        cpu->seg[SEG_CS].sel, (unsigned long)cpu->ip);
-		}
-#endif
 		cpu->next_ip = cpu->ip;
 
 		TRY1(call_isr(cpu, cpu->excno, pusherr, 1));
