@@ -164,15 +164,25 @@ CMOS *cmos_init(long mem_size, int irq, void *pic, void (*set_irq)(void *pic, in
 	c->data[11] = 0x02;
 	c->data[12] = 0x00;
 	c->data[13] = 0x80;
+	/* Base memory: 640KB (CMOS 0x15/0x16, little-endian KB) */
+	c->data[0x15] = 0x80;  /* 640 & 0xFF */
+	c->data[0x16] = 0x02;  /* 640 >> 8 */
+
 	if (mem_size >= 1024 * 1024) {
-		if (mem_size >= 64 * 1024 * 1024) {
-			mem_size -= 16 * 1024 * 1024;
-			c->data[0x35] = mem_size >> 24;
-			c->data[0x34] = mem_size >> 16;
-		} else {
-			mem_size -= 1024 * 1024;
-			c->data[0x31] = mem_size >> 18;
-			c->data[0x30] = mem_size >> 10;
+		/* Extended memory in KB above 1MB (CMOS 0x30/0x31).
+		 * Capped at 63MB (64512 KB = 0xFC00) per CMOS convention. */
+		long ext_kb = (mem_size - 1024 * 1024) / 1024;
+		if (ext_kb > 0xFC00) ext_kb = 0xFC00;
+		c->data[0x30] = ext_kb & 0xFF;
+		c->data[0x31] = (ext_kb >> 8) & 0xFF;
+
+		/* Memory above 16MB in 64KB blocks (CMOS 0x34/0x35).
+		 * Only set if we actually have > 16MB. */
+		if (mem_size > 16 * 1024 * 1024) {
+			long above16m = (mem_size - 16 * 1024 * 1024) / (64 * 1024);
+			if (above16m > 0xFFFF) above16m = 0xFFFF;
+			c->data[0x34] = above16m & 0xFF;
+			c->data[0x35] = (above16m >> 8) & 0xFF;
 		}
 	}
 	return c;
