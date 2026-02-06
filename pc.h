@@ -118,6 +118,7 @@ typedef struct {
 	int brightness;  // 0-100 display brightness (ESP32 only)
 	int volume;      // 0-100 audio volume (ESP32 only)
 	int mouse_speed; // 1-10 mouse emulation speed (ESP32 only)
+	int usb_passthru; // 1=enabled, 0=disabled - pass USB storage to emulator (ESP32 only)
 	const char *ini_path;  // Path to ini file for saving settings
 } PCConfig;
 

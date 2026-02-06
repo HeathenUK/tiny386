@@ -372,7 +372,7 @@ static void pc_io_write(void *o, int addr, u8 val)
 		emulink_data_write_string(pc->emulink, &val, 1, 1);
 		return;
 	default:
-		fprintf(stderr, "out 0x%x => 0x%x\n", val, addr);
+		// fprintf(stderr, "out 0x%x => 0x%x\n", val, addr);
 		return;
 	}
 }
@@ -438,7 +438,7 @@ static void pc_io_write32(void *o, int addr, u32 val)
 		emulink_data_write(pc->emulink, val);
 		return;
 	default:
-		fprintf(stderr, "outd 0x%x => 0x%x\n", val, addr);
+		// fprintf(stderr, "outd 0x%x => 0x%x\n", val, addr);
 		return;
 	}
 }
@@ -928,8 +928,10 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 		int ret = ide_attach_cd(pc->ide, 1, cd_path);
 		assert(ret == 0);
 	}
-	// USB on slot 2
-	ide_attach_usb(pc->ide2, 0);
+	// USB on slot 2 (if passthrough enabled)
+	if (conf->usb_passthru) {
+		ide_attach_usb(pc->ide2, 0);
+	}
 #else
 	for (int i = 0; i < 4; i++) {
 		int ret;
@@ -1268,6 +1270,8 @@ int parse_conf_ini(void* user, const char* section,
 			conf->mouse_speed = atoi(value);
 			if (conf->mouse_speed < 1) conf->mouse_speed = 1;
 			if (conf->mouse_speed > 10) conf->mouse_speed = 10;
+		} else if (NAME("usb_passthru")) {
+			conf->usb_passthru = atoi(value) ? 1 : 0;
 		}
 	} else if (SEC("display")) {
 		if (NAME("width")) {

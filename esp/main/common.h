@@ -54,6 +54,8 @@ struct Globals {
 	bool usb_vfs_mounted;         // True when USB VFS is mounted at /usb
 	// Mouse emulation settings
 	int mouse_speed;              // Mouse speed setting (1-10, default 5)
+	// USB passthrough setting
+	int usb_passthru;             // USB passthrough to emulator (1=enabled, 0=disabled, default 1)
 #endif
 };
 
