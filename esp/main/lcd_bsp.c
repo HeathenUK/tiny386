@@ -54,10 +54,8 @@ static ppa_client_handle_t ppa_srm_handle = NULL;
 static int vga_width = VGA_MAX_WIDTH;    // 800
 static int vga_height = VGA_MAX_HEIGHT;  // 480
 
-// Double buffering for rotation output
-#define NUM_ROTATE_BUFFERS 2
-static uint16_t *fb_rotated_buffers[NUM_ROTATE_BUFFERS];
-static _Atomic int rotate_write_idx = 0;  // Buffer being written by PPA
+// Panel framebuffer for direct rendering (zero-copy blit)
+static uint16_t *fb_rotated;
 
 void pc_vga_step(void *o);
 
@@ -144,15 +142,13 @@ static void update_scale_params(void)
 	 * leaving behind artifacts in the outer areas not covered by the
 	 * new scaled/centered content */
 	size_t fb_rot_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
-	for (int i = 0; i < NUM_ROTATE_BUFFERS; i++) {
-		if (fb_rotated_buffers[i]) {
-			memset(fb_rotated_buffers[i], 0, fb_rot_size);
-			/* Flush cache to ensure DMA sees zeros */
-			esp_cache_msync(fb_rotated_buffers[i], fb_rot_size,
-			                ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-		}
+	if (fb_rotated) {
+		memset(fb_rotated, 0, fb_rot_size);
+		/* Flush cache to ensure DMA sees zeros */
+		esp_cache_msync(fb_rotated, fb_rot_size,
+		                ESP_CACHE_MSYNC_FLAG_DIR_C2M);
 	}
-	ESP_LOGI(TAG, "Mode change: cleared all rotated buffers");
+	ESP_LOGI(TAG, "Mode change: cleared rotated buffer");
 
 	/* Calculate intended VGA output dimensions (native * pixel_double).
 	 * For mode 13h: native 320x200, intended 640x400 (2x both dimensions).
@@ -276,19 +272,18 @@ static void stats_draw_text(uint16_t *fb, int x, int y, const char *text, uint16
 }
 
 // Render persistent stats bar at top of screen (logical landscape coords)
-static int stats_bar_clear_frames = 0;
+static bool stats_bar_was_visible = false;
 static void render_stats_bar(uint16_t *fb)
 {
 	if (!globals.stats_bar_visible) {
-		if (stats_bar_clear_frames > 0) {
-			// Clear the bar area — PPA doesn't overwrite this region.
-			// Must clear for NUM_ROTATE_BUFFERS frames to hit all buffers.
+		if (stats_bar_was_visible) {
+			// Clear the bar area — PPA doesn't overwrite this region
 			stats_fill_rect(fb, 0, 0, LOGICAL_WIDTH, 20, 0x0000);
-			stats_bar_clear_frames--;
+			stats_bar_was_visible = false;
 		}
 		return;
 	}
-	stats_bar_clear_frames = NUM_ROTATE_BUFFERS;
+	stats_bar_was_visible = true;
 
 	// Bar at top of logical landscape: full width, 20px tall
 	int bar_h = 20;
@@ -506,19 +501,19 @@ void vga_task(void *arg)
 	memset(fb, 0, fb_size);
 	atomic_store(&globals.fb, fb);
 
-	// Rotated framebuffers (480x800 RGB565) - double buffer for lock-free updates
+	// Allocate separate rotation buffer — we render here while DPI
+	// hardware scans the panel's own FB.  After TE blanking signal,
+	// bsp_display_blit DMA-copies this buffer into the panel FB.
 	size_t fb_rot_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
-	for (int i = 0; i < NUM_ROTATE_BUFFERS; i++) {
-		fb_rotated_buffers[i] = heap_caps_aligned_alloc(64, fb_rot_size,
-		                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-		if (!fb_rotated_buffers[i]) {
-			fprintf(stderr, "Failed to allocate rotated framebuffer %d\n", i);
-			vTaskDelete(NULL);
-			return;
-		}
-		memset(fb_rotated_buffers[i], 0, fb_rot_size);
+	fb_rotated = heap_caps_aligned_alloc(64, fb_rot_size,
+	                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+	if (!fb_rotated) {
+		fprintf(stderr, "Failed to allocate rotation framebuffer\n");
+		vTaskDelete(NULL);
+		return;
 	}
-	globals.fb_rotated = fb_rotated_buffers[0];
+	memset(fb_rotated, 0, fb_rot_size);
+	globals.fb_rotated = fb_rotated;
 
 	xEventGroupSetBits(global_event_group, BIT1);  // Signal display ready
 
@@ -535,46 +530,36 @@ void vga_task(void *arg)
 		// Step the VGA emulator (vga_step + vga_refresh)
 		pc_vga_step(globals.pc);
 
-		// Rotate, render OSD, and blit using alternating buffers
+		// Rotate + overlay into our buffer, then DMA to panel FB at TE
 		if (globals.fb) {
-			int write_idx = atomic_load(&rotate_write_idx);
-			uint16_t *fb_rot = fb_rotated_buffers[write_idx];
+			rotate_vga_to_display((uint16_t *)globals.fb, fb_rotated);
 
-			// Rotate VGA content to display buffer
-			rotate_vga_to_display((uint16_t *)globals.fb, fb_rot);
-
-			// Render OSD overlay to rotated buffer (consistent size/position)
+			// Render OSD overlay
 			if (globals.osd_enabled && globals.osd) {
-				osd_render(globals.osd, (uint8_t *)fb_rot,
+				osd_render(globals.osd, (uint8_t *)fb_rotated,
 					   DISPLAY_WIDTH, DISPLAY_HEIGHT,
 					   DISPLAY_WIDTH * sizeof(uint16_t));
 			}
 
 			// Render brightness/volume overlay (if not showing full OSD)
 			if (!globals.osd_enabled) {
-				render_overlay_bar(fb_rot);
+				render_overlay_bar(fb_rotated);
 			}
 
 			// Persistent stats bar (renders on top of everything including OSD)
-			render_stats_bar(fb_rot);
+			render_stats_bar(fb_rotated);
 
 			// Toast renders on top of everything (including OSD)
-			toast_render(fb_rot);
+			toast_render(fb_rotated);
 
-			// Wait for vertical blanking then blit (eliminates tearing)
+			// Wait for vertical blanking then DMA blit to panel
 			if (xSemaphoreTake(te_sem, pdMS_TO_TICKS(100)) != pdTRUE) {
 				ESP_LOGW(TAG, "TE signal timeout — blitting without vsync");
 			}
-			bsp_display_blit(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, fb_rot);
-
-			// Swap to next buffer for next frame
-			atomic_store(&rotate_write_idx, (write_idx + 1) % NUM_ROTATE_BUFFERS);
+			bsp_display_blit(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, fb_rotated);
 		}
 
 		// Update drive activity LEDs (turn off after timeout)
 		led_activity_tick();
-
-		// Yield to other tasks - 1 tick minimum to avoid starving lower priority tasks
-		vTaskDelay(1);
 	}
 }

@@ -23,8 +23,6 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr);
 /* Adaptive frame skipping (0=disabled, 1-10=max frames to skip) */
 extern int vga_frame_skip_max;
 
-/* Double buffering for tear-free rendering (0=disabled, 1=enabled) */
-extern int vga_double_buffer;
 
 void vbe_write(VGAState *s, uint32_t offset, uint32_t val);
 uint32_t vbe_read(VGAState *s, uint32_t offset);

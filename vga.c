@@ -115,8 +115,6 @@ static int vga256_palette_valid = 0;
  * When enabled, skips frames if previous render exceeded threshold */
 int vga_frame_skip_max = 0;  /* 0 = disabled, 1-10 = max frames to skip */
 
-/* Double buffering for tear-free rendering */
-int vga_double_buffer = 0;  /* 0 = disabled (default), 1 = enabled */
 static int vga_frame_skip_count = 0;  /* Consecutive frames skipped */
 static uint64_t vga_last_render_time = 0;  /* Time of last render (microseconds) */
 static uint64_t vga_last_render_duration = 0;  /* Duration of last render */
@@ -282,9 +280,7 @@ struct VGAState {
     int force_graphic_clear;  /* Force clear when switching to graphics mode */
 
     uint8_t *vga_ram;
-    uint8_t *render_vga_ram;  /* Snapshot for tear-free rendering */
-    uint64_t dirty_pages;     /* Bitmap: 1 bit per 4KB page (64 pages = 256KB) */
-    uint64_t render_dirty_pages; /* Pages that changed in last double-buffer copy */
+    uint64_t dirty_pages;  /* Written by VRAM stores but unused (TE sync replaces double buffering) */
     int vga_ram_size;
 
     uint8_t sr_index;
@@ -1104,8 +1100,7 @@ static void vga_text_refresh(VGAState *s,
 
     full_update = full_update || update_palette16(s, s->last_palette);
 
-    /* Use render buffer for tear-free display (only if double buffering enabled) */
-    vga_ram = (s->render_vga_ram && vga_double_buffer) ? s->render_vga_ram : s->vga_ram;
+    vga_ram = s->vga_ram;
 
     const uint8_t *font_base[2];
     uint32_t v = s->sr[0x3];
@@ -1533,8 +1528,7 @@ static void vga_graphic_refresh(VGAState *s,
 //        line_compare = 65535;
     }
     uint32_t addr1 = 4 * start_addr;
-    /* Use render buffer for tear-free display (only if double buffering enabled) */
-    uint8_t *vram = (s->render_vga_ram && vga_double_buffer) ? s->render_vga_ram : s->vga_ram;
+    uint8_t *vram = s->vga_ram;
     uint32_t palette[256];
     uint32_t palette_before[16];  /* For mid-frame palette switching (top) */
     uint32_t palette_after[16];   /* For mid-frame palette switching (bottom) */
@@ -2229,55 +2223,6 @@ int vga_step(VGAState *s)
             /* Reset mid-frame palette tracking for new frame */
             s->hblank_poll_count = 0;
             s->retrace_time = now + 15000/3;
-        }
-    }
-
-    /* Double buffering: snapshot vga_ram for tear-free rendering.
-     * Uses dirty page tracking to only copy modified 4KB pages. */
-    if (ret && s->render_vga_ram && vga_double_buffer) {
-        uint64_t dirty = s->dirty_pages;
-        if (!dirty) {
-            s->render_dirty_pages = 0;
-        } else {
-            /* Determine max pages to copy based on VGA mode */
-            int max_pages;
-            int shift_control = (s->gr[VGA_GFX_MODE] >> 5) & 3;
-            int chain4 = (s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) ? 1 : 0;
-
-            if (!(s->gr[VGA_GFX_MISC] & 1)) {
-                /* Text mode - limit to ~32KB (8 pages) */
-                max_pages = 8;
-            } else if (chain4 && shift_control >= 2) {
-                /* Chain-4 mode (Mode 13h) - 64KB (16 pages) */
-                max_pages = 16;
-            } else {
-                /* Planar modes (Mode X) - 256KB (64 pages) */
-                max_pages = 64;
-            }
-
-            /* Cap to actual VRAM size */
-            int vram_pages = s->vga_ram_size >> 12;
-            if (max_pages > vram_pages)
-                max_pages = vram_pages;
-            if (max_pages > 64)
-                max_pages = 64;
-
-            /* Copy only dirty pages */
-            uint64_t mask = (max_pages < 64) ? ((1ULL << max_pages) - 1) : ~0ULL;
-            dirty &= mask;
-
-            /* Record which pages changed for renderer's coarse skip */
-            s->render_dirty_pages = dirty;
-
-            while (dirty) {
-                int page = __builtin_ctzll(dirty);  /* Find lowest set bit */
-                uint32_t offset = page << 12;       /* Page to byte offset */
-                memcpy(s->render_vga_ram + offset, s->vga_ram + offset, 4096);
-                dirty &= dirty - 1;  /* Clear lowest set bit */
-            }
-
-            /* Clear dirty bits for copied region */
-            s->dirty_pages &= ~mask;
         }
     }
 
@@ -3706,12 +3651,6 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
 
     s->vga_ram = (uint8_t *) vga_ram;
     s->vga_ram_size = vga_ram_size;
-
-    /* Allocate render buffer for tear-free display */
-    s->render_vga_ram = heap_caps_malloc(vga_ram_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s->render_vga_ram) {
-        memcpy(s->render_vga_ram, vga_ram, vga_ram_size);
-    }
 
     s->vbe_regs[VBE_DISPI_INDEX_ID] = VBE_DISPI_ID5;
     s->vbe_regs[VBE_DISPI_INDEX_VIDEO_MEMORY_64K] = s->vga_ram_size >> 16;

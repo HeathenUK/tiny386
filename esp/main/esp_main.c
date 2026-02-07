@@ -190,7 +190,6 @@ static int pc_main(const char *file)
 	conf.height = LCD_HEIGHT;
 	conf.cpu_gen = 4;
 	conf.fpu = 0;
-	conf.double_buffer = 0;  // Default disabled
 	conf.brightness = 30;  // Default brightness
 	conf.volume = 80;      // Default volume
 	conf.mouse_speed = 5;  // Default mouse speed (1-10)
@@ -239,7 +238,6 @@ static int pc_main(const char *file)
 
 	/* Apply settings from config */
 	vga_frame_skip_max = conf.frame_skip;
-	vga_double_buffer = conf.double_buffer;
 	pc_batch_size_setting = conf.batch_size;
 
 	/* Store brightness/volume/mouse_speed in globals for input_bsp and OSD to use */

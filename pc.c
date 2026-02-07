@@ -1187,7 +1187,7 @@ int parse_conf_ini(void* user, const char* section,
 			if (conf->frame_skip < 0) conf->frame_skip = 0;
 			if (conf->frame_skip > 10) conf->frame_skip = 10;
 		} else if (NAME("double_buffer")) {
-			conf->double_buffer = atoi(value) ? 1 : 0;
+			// Ignored - TE vsync replaces software double buffering
 		}
 	} else if (SEC("cpu")) {
 		if (NAME("gen")) {

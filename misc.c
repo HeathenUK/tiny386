@@ -419,7 +419,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
                          const char *cdc, const char *cdd,
                          int cpu_gen, int fpu, long mem_size,
                          int brightness, int volume, int frame_skip,
-                         int double_buffer, int batch_size, int mouse_speed,
+                         int batch_size, int mouse_speed,
                          int usb_passthru)
 {
 	if (!ini_path) return -1;
@@ -450,7 +450,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	int found_mem_size = -1;
 	int found_gen = -1, found_fpu = -1, found_batch_size = -1;
 	int found_brightness = -1, found_volume = -1, found_frame_skip = -1;
-	int found_double_buffer = -1, found_mouse_speed = -1, found_usb_passthru = -1;
+	int found_mouse_speed = -1, found_usb_passthru = -1;
 
 	while (line_count < 64 && fgets(lines[line_count], 256, f)) {
 		// Check for section headers
@@ -504,11 +504,6 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			if (line_starts_with(lines[line_count], "gen")) found_gen = line_count;
 			else if (line_starts_with(lines[line_count], "fpu")) found_fpu = line_count;
 			else if (line_starts_with(lines[line_count], "batch_size")) found_batch_size = line_count;
-		}
-
-		// Check for existing settings in [display] section
-		if (in_display_section) {
-			if (line_starts_with(lines[line_count], "double_buffer")) found_double_buffer = line_count;
 		}
 
 		line_count++;
@@ -565,8 +560,6 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			fprintf(f, "mouse_speed = %d\n", mouse_speed);
 		} else if (i == found_usb_passthru) {
 			fprintf(f, "usb_passthru = %d\n", usb_passthru);
-		} else if (i == found_double_buffer) {
-			fprintf(f, "double_buffer = %d\n", double_buffer);
 		} else if (i == found_gen) {
 			fprintf(f, "gen = %d\n", cpu_gen);
 		} else if (i == found_fpu) {
@@ -620,11 +613,6 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 				fprintf(f, "batch_size = %d\n", batch_size);
 		}
 
-		// Add new settings at end of [display] section
-		if (i == display_section_end - 1) {
-			if (found_double_buffer < 0)
-				fprintf(f, "double_buffer = %d\n", double_buffer);
-		}
 	}
 
 	/* Ensure INI is written to physical media before closing */
