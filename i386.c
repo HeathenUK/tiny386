@@ -57,6 +57,16 @@ static inline void fast_memset32(void *dst, uint32_t val, size_t count) {
 #ifndef __wasm__
 #define I386_OPT2
 #endif
+#ifdef I386_OPT2
+#define I386_SEQ_FASTPATH
+#endif
+
+#ifdef I386_SEQ_FASTPATH
+#define SEQ_INVALIDATE(cpu) do { (cpu)->seq_active = false; } while(0)
+#else
+#define SEQ_INVALIDATE(cpu)
+#endif
+
 #define I386_ENABLE_FPU
 
 #ifdef I386_ENABLE_FPU
@@ -166,6 +176,13 @@ struct CPUI386 {
 	/* True when ALL 6 data/code segments are flat (seg_flat == 0x3F).
 	 * Allows a single branch to skip all segment translation overhead. */
 	bool all_segs_flat;
+
+#ifdef I386_SEQ_FASTPATH
+	uword seq_phys;
+	uword seq_prev_ip;
+	bool seq_active;
+	uint32_t seq_hits;
+#endif
 };
 
 #define dolog(...) fprintf(stderr, __VA_ARGS__)
@@ -1426,6 +1443,7 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 		if (seg == SEG_CS) {
 			cpu->cpl = cpu->flags & VM ? 3 : 0;
 			cpu->code16 = true;
+			SEQ_INVALIDATE(cpu);
 		}
 		if (seg == SEG_SS) {
 			cpu->sp_mask = 0xffff;
@@ -1462,6 +1480,7 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 	if (seg == SEG_CS) {
 		cpu->cpl = sel & 3;
 		cpu->code16 = !(cpu->seg[SEG_CS].flags & SEG_D_BIT);
+		SEQ_INVALIDATE(cpu);
 	}
 	if (seg == SEG_SS) {
 		cpu->sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
@@ -2645,6 +2664,7 @@ static inline void clear_segs(CPUI386 *cpu)
 		u32 new_cr0 = lreg32(rm); \
 		if ((new_cr0 ^ cpu->cr0) & (CR0_PG | CR0_WP | 1)) { \
 			tlb_clear(cpu); \
+			SEQ_INVALIDATE(cpu); \
 			if ((new_cr0 ^ cpu->cr0) & 1) { \
 				cpu->int8_cache_valid = false; \
 				cpu->int8_warmup_counter = 0; \
@@ -2657,6 +2677,7 @@ static inline void clear_segs(CPUI386 *cpu)
 	} else if (reg == 3) { \
 		cpu->cr3 = lreg32(rm); \
 		tlb_clear(cpu); \
+		SEQ_INVALIDATE(cpu); \
 	} else if (reg == 4) { \
 	} else THROW0(EX_UD);
 
@@ -4225,7 +4246,7 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 #define XADDw(...) XADD_helper(16, __VA_ARGS__)
 #define XADDd(...) XADD_helper(32, __VA_ARGS__)
 
-#define INVLPG(addr) tlb_clear(cpu);
+#define INVLPG(addr) do { tlb_clear(cpu); SEQ_INVALIDATE(cpu); } while(0);
 
 #define BSWAPw(a, la, sa) THROW0(EX_UD);
 
@@ -4349,6 +4370,7 @@ static void __sysenter(CPUI386 *cpu, int pl, int cs)
 	cpu->seg[SEG_CS].flags = SEG_D_BIT | 0x5b | (pl << 5);
 	cpu->cpl = pl;
 	cpu->code16 = false;
+	SEQ_INVALIDATE(cpu);
 	cpu->sp_mask = 0xffffffff;
 	cpu->seg[SEG_SS].sel = ((cs + 8) & 0xfffc) | pl;
 	cpu->seg[SEG_SS].base = 0;
@@ -4426,12 +4448,51 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	u8 modrm;
 	OptAddr meml;
 	uword addr;
+	/* seq_active persists across cpu_exec1 calls:
+	 * ip check at iteration top handles cross-call correctness */
 	for (; stepcount > 0; stepcount--) {
 	bool code16 = cpu->code16;
 	uword sp_mask = cpu->sp_mask;
 
 	if (code16) cpu->next_ip &= 0xffff;
 	cpu->ip = cpu->next_ip;
+
+	/* Initialize prefix state early (before seq dispatch which skips prefix parsing) */
+	bool opsz16 = code16;
+	bool adsz16 = code16;
+	int rep = 0;
+	/*bool lock = false;*/
+	int curr_seg = -1;
+
+#ifdef I386_SEQ_FASTPATH
+	/* Sequential fast path: if the previous instruction was on the same page
+	 * and execution is sequential (ip advanced by exactly pf_pos bytes),
+	 * derive physical address directly without TLB lookup. */
+	if (likely(cpu->seq_active)) {
+		uword prev_len = cpu->pf_pos;
+		if (likely(cpu->ip == cpu->seq_prev_ip + prev_len)) {
+			uword nphys = cpu->seq_phys + prev_len;
+			/* Same-page check: new offset must be in [1, 0xFF7] to avoid
+			 * page boundary crossing (0 = wrapped, >= 0xFF8 = near end) */
+			unsigned page_off = nphys & 0xFFF;
+			if (likely(page_off != 0 && page_off < 0xFF8)) {
+				/* SEQ HIT — skip TLB lookup, set up prefetch directly */
+				cpu->seq_hits++;
+				cpu->pf_ptr = cpu->phys_mem + nphys;
+				b1 = cpu->pf_ptr[0];
+				cpu->pf_pos = 1;
+				cpu->pf_avail = 8;
+				cpu->next_ip++;
+				cpu->cycle++;
+				cpu->tsc++;
+				cpu->seq_phys = nphys;
+				cpu->seq_prev_ip = cpu->ip;
+				goto seq_dispatch;
+			}
+		}
+		cpu->seq_active = false;
+	}
+#endif
 
 	/* Fused prefetch + opcode fetch: set prefetch pointer and read first byte
 	 * in one step, avoiding the redundant pf_pos check in fetch8. */
@@ -4442,17 +4503,29 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 		if (likely((pf_laddr ^ cpu->ifetch.laddr) < (4096 - 7))) {
 			cpu->pf_ptr = cpu->phys_mem + (cpu->ifetch.xaddr ^ pf_laddr);
 			b1 = cpu->pf_ptr[0];
+#ifdef I386_SEQ_FASTPATH
+			/* Start sequential tracking from this TLB-validated address */
+			cpu->seq_phys = cpu->ifetch.xaddr ^ pf_laddr;
+			cpu->seq_prev_ip = cpu->ip;
+			cpu->seq_active = true;
+#endif
 			cpu->pf_pos = 1;
 			cpu->pf_avail = 8;
 			cpu->next_ip++;
 		} else {
 			cpu->pf_avail = 0;
 			cpu->pf_pos = 0;
+#ifdef I386_SEQ_FASTPATH
+			cpu->seq_active = false;
+#endif
 			TRY(fetch8(cpu, &b1));
 		}
 	}
 	cpu->cycle++;
-	cpu->tsc++;  /* Base cycle for instruction fetch */
+	cpu->tsc++;
+#ifdef I386_SEQ_FASTPATH
+	seq_dispatch: ;
+#endif
 
 #ifndef I386_OPT1
 	if (verbose) {
@@ -4460,11 +4533,6 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	}
 #endif
 	// prefix
-	bool opsz16 = code16;
-	bool adsz16 = code16;
-	int rep = 0;
-	/*bool lock = false;*/
-	int curr_seg = -1;
 #ifndef I386_OPT2
 	for (;;) {
 #define HANDLE_PREFIX(C, STMT) \
@@ -5324,6 +5392,7 @@ static bool task_switch(CPUI386 *cpu, int tss, int sw_type)
 	TRY1(translate(cpu, &meml, 1, SEG_TR, 0x1c, 4, 0));
 	cpu->cr3 = load32(cpu, &meml);
 	tlb_clear(cpu);
+	SEQ_INVALIDATE(cpu);
 
 	return true;
 }
@@ -6235,6 +6304,10 @@ void cpui386_reset(CPUI386 *cpu)
 	/* No segments are flat at reset (all have limit=0, not 4GB) */
 	cpu->seg_flat = 0;
 	cpu->all_segs_flat = false;
+
+#ifdef I386_SEQ_FASTPATH
+	cpu->seq_active = false;
+#endif
 }
 
 void cpui386_reset_pm(CPUI386 *cpu, uint32_t start_addr)
@@ -6271,6 +6344,11 @@ void cpui386_set_gpr(CPUI386 *cpu, int i, u32 val)
 long IRAM_ATTR cpui386_get_cycle(CPUI386 *cpu)
 {
 	return cpu->cycle;
+}
+
+uint32_t cpui386_get_seq_hits(CPUI386 *cpu)
+{
+	return cpu->seq_hits;
 }
 
 CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
