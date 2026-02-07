@@ -56,8 +56,19 @@ static const char *TAG = "input_bsp";
 static bool meta_held = false;
 static bool meta_consumed = false;  // Set if META+combo was used
 
+// OSD key repeat state
+#define KEY_REPEAT_DELAY_MS   400   // Initial delay before repeat starts
+#define KEY_REPEAT_INTERVAL_MS 80   // Interval between repeats
+static uint8_t repeat_keycode = 0;  // Currently held repeatable key (0 = none)
+static uint32_t repeat_next_ms = 0; // When to fire next repeat
+
 // Ctrl key scancode
 #define SC_LEFT_CTRL  0x1D
+
+static bool is_osd_repeatable(uint8_t code)
+{
+	return code == 0x48 || code == 0x50 || code == 0x4B || code == 0x4D;
+}
 
 static void handle_scancode(uint8_t code, int is_down)
 {
@@ -68,14 +79,24 @@ static void handle_scancode(uint8_t code, int is_down)
 
 	// Route input based on OSD state
 	if (globals.osd_enabled) {
+		// Track key repeat for OSD navigation
+		if (is_down && is_osd_repeatable(code)) {
+			repeat_keycode = code;
+			repeat_next_ms = esp_log_timestamp() + KEY_REPEAT_DELAY_MS;
+		} else if (!is_down && code == repeat_keycode) {
+			repeat_keycode = 0;
+		}
+
 		if (osd_handle_key(globals.osd, code, is_down)) {
 			// OSD requested close
 			globals.osd_enabled = false;
 			globals.stats_collecting = false;  // Stop any lazy stats
 			globals.vga_force_redraw = true;  // Force VGA to redraw over OSD
+			repeat_keycode = 0;
 			ESP_LOGI(TAG, "OSD disabled");
 		}
 	} else {
+		repeat_keycode = 0;
 		ps2_put_keycode(globals.kbd, is_down, code);
 	}
 }
@@ -165,7 +186,19 @@ static void input_task(void *arg)
 
 	bsp_input_event_t event;
 	while (1) {
-		if (xQueueReceive(input_queue, &event, portMAX_DELAY) == pdTRUE) {
+		// Use short timeout when key repeat is active, otherwise block
+		TickType_t wait_ticks = portMAX_DELAY;
+		if (repeat_keycode && globals.osd_enabled) {
+			uint32_t now = esp_log_timestamp();
+			if (now >= repeat_next_ms) {
+				// Fire repeat event
+				osd_handle_key(globals.osd, repeat_keycode, 1);
+				repeat_next_ms = now + KEY_REPEAT_INTERVAL_MS;
+			}
+			int remaining = (int)(repeat_next_ms - esp_log_timestamp());
+			wait_ticks = remaining > 0 ? pdMS_TO_TICKS(remaining) : 1;
+		}
+		if (xQueueReceive(input_queue, &event, wait_ticks) == pdTRUE) {
 			// The BSP provides scancodes in AT keyboard format
 			if (event.type == INPUT_EVENT_TYPE_SCANCODE) {
 				uint16_t scancode = event.args_scancode.scancode;

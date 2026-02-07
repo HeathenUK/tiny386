@@ -275,18 +275,19 @@ static void stats_draw_text(uint16_t *fb, int x, int y, const char *text, uint16
 }
 
 // Render persistent stats bar at top of screen (logical landscape coords)
-static bool stats_bar_was_visible = false;
+static int stats_bar_clear_frames = 0;
 static void render_stats_bar(uint16_t *fb)
 {
 	if (!globals.stats_bar_visible) {
-		if (stats_bar_was_visible) {
-			// Clear the bar area — PPA doesn't overwrite this region
+		if (stats_bar_clear_frames > 0) {
+			// Clear the bar area — PPA doesn't overwrite this region.
+			// Must clear for NUM_ROTATE_BUFFERS frames to hit all buffers.
 			stats_fill_rect(fb, 0, 0, LOGICAL_WIDTH, 20, 0x0000);
-			stats_bar_was_visible = false;
+			stats_bar_clear_frames--;
 		}
 		return;
 	}
-	stats_bar_was_visible = true;
+	stats_bar_clear_frames = NUM_ROTATE_BUFFERS;
 
 	// Bar at top of logical landscape: full width, 20px tall
 	int bar_h = 20;
