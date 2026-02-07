@@ -59,5 +59,7 @@ PCIDevice *piix3_ide_init(PCIBus *pci_bus, int devfn);
 void ide_fill_cmos(IDEIFState *s, void *cmos,
                    uint8_t (*set)(void *cmos, int addr, uint8_t val));
 
+void ide_set_geometry(IDEIFState *s, int drive, int heads, int spt);
+
 void ide_sync(IDEIFState *ide, IDEIFState *ide2);
 #endif /* IDE_H */

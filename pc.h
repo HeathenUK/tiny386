@@ -113,6 +113,8 @@ typedef struct {
 	int volume;      // 0-100 audio volume (ESP32 only)
 	int mouse_speed; // 1-10 mouse emulation speed (ESP32 only)
 	int usb_passthru; // 1=enabled, 0=disabled - pass USB storage to emulator (ESP32 only)
+	int hda_heads;    // 0=auto-detect, or override CHS heads for hda
+	int hda_spt;      // 0=auto-detect, or override CHS sectors-per-track for hda
 	const char *ini_path;  // Path to ini file for saving settings
 } PCConfig;
 

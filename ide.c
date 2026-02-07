@@ -1873,6 +1873,19 @@ int ide_data_read_string(void *opaque, uint8_t *buf, int size, int count)
     return len1 / size;
 }
 
+void ide_set_geometry(IDEIFState *s, int drive, int heads, int spt)
+{
+    IDEState *d = s->drives[drive];
+    if (!d || d->drive_kind != IDE_HD)
+        return;
+    d->heads = heads;
+    d->sectors = spt;
+    uint32_t cylinders = d->nb_sectors / (heads * spt);
+    if (cylinders > 16383) cylinders = 16383;
+    else if (cylinders < 2) cylinders = 2;
+    d->cylinders = cylinders;
+}
+
 static IDEState *ide_hddrive_init(IDEIFState *ide_if, BlockDevice *bs)
 {
     IDEState *s;
@@ -1891,14 +1904,21 @@ static IDEState *ide_hddrive_init(IDEIFState *ide_if, BlockDevice *bs)
     s->drive_kind = IDE_HD;
 
     nb_sectors = s->bs->get_sector_count(s->bs);
-    cylinders = nb_sectors / (16 * 63);
+    /* Use 255H/63S for disks >504MB (matches QEMU/real BIOS behavior),
+       16H/63S for smaller DOS-era disks */
+    if (nb_sectors > (uint64_t)16 * 63 * 1024) {
+        s->heads = 255;
+        s->sectors = 63;
+    } else {
+        s->heads = 16;
+        s->sectors = 63;
+    }
+    cylinders = nb_sectors / (s->heads * s->sectors);
     if (cylinders > 16383)
         cylinders = 16383;
     else if (cylinders < 2)
         cylinders = 2;
     s->cylinders = cylinders;
-    s->heads = 16;
-    s->sectors = 63;
     s->nb_sectors = nb_sectors;
     if (s->bs->get_chs)
         s->bs->get_chs(s->bs, &s->cylinders, &s->heads, &s->sectors);
@@ -2166,7 +2186,14 @@ static BlockDevice *block_device_init(const char *filename,
             start_offset = 1024;
     }
     fseeko(f, 0, SEEK_END);
-    file_size = ftello(f) - start_offset;
+    /* ftello returns off_t which is 32-bit signed on ESP32-P4.
+       Files >= 2GB overflow to negative. Cast through uint32_t
+       to get the correct unsigned size (FAT32 max is 4GB-1). */
+    {
+        off_t raw = ftello(f);
+        file_size = (raw >= 0) ? (int64_t)raw : (int64_t)(uint32_t)raw;
+    }
+    file_size -= start_offset;
 
     bs = pcmalloc(sizeof(*bs));
     bf = pcmalloc(sizeof(*bf));
@@ -2205,6 +2232,43 @@ static BlockDevice *block_device_init(const char *filename,
         bf->sectors = buf[12] | (buf[13] << 8);
         bs->get_chs = bf_get_chs;
         fseeko(f, 0, SEEK_END);
+    } else if (mode == BF_MODE_RW || mode == BF_MODE_RO) {
+        /* Auto-detect CHS geometry from MBR partition table */
+        unsigned char mbr[512];
+        fseeko(f, 0, SEEK_SET);
+        if (fread(mbr, 1, 512, f) == 512 &&
+            mbr[510] == 0x55 && mbr[511] == 0xAA) {
+            static const int pe_offsets[4] = {0x1BE, 0x1CE, 0x1DE, 0x1EE};
+            for (int i = 0; i < 4; i++) {
+                const unsigned char *pe = mbr + pe_offsets[i];
+                if (pe[4] == 0) continue; /* empty partition */
+                int end_head = pe[5];
+                int end_sec = pe[6] & 0x3F;
+                int start_head = pe[1];
+                int start_sec = pe[2] & 0x3F;
+                int start_cyl = pe[3] | ((pe[2] & 0xC0) << 2);
+                uint32_t lba_start = pe[8] | (pe[9] << 8) |
+                                     (pe[10] << 16) | (pe[11] << 24);
+                int spt = end_sec;
+                int heads = end_head + 1;
+                if (spt < 1 || spt > 63 || heads < 1 || heads > 255)
+                    continue;
+                if (start_sec < 1 || start_sec > spt)
+                    continue;
+                uint32_t calc_lba = (uint32_t)start_cyl * heads * spt +
+                                    (uint32_t)start_head * spt +
+                                    (start_sec - 1);
+                if (calc_lba == lba_start) {
+                    bf->sectors = spt;
+                    bf->heads = heads;
+                    bf->cylinders = bf->nb_sectors / (heads * spt);
+                    if (bf->cylinders > 16383) bf->cylinders = 16383;
+                    else if (bf->cylinders < 2) bf->cylinders = 2;
+                    bs->get_chs = bf_get_chs;
+                    break;
+                }
+            }
+        }
     }
     bs->read_async = bf_read_async;
     bs->write_async = bf_write_async;

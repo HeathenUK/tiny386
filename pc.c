@@ -859,6 +859,8 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	if (disks[0] && disks[0][0]) {
 		int ret = ide_attach(pc->ide, 0, disks[0]);
 		assert(ret == 0);
+		if (conf->hda_heads > 0 && conf->hda_spt > 0)
+			ide_set_geometry(pc->ide, 0, conf->hda_heads, conf->hda_spt);
 		pc->hda_path = disks[0];  // Store for OSD access
 	} else {
 		pc->hda_path = NULL;
@@ -1101,6 +1103,10 @@ int parse_conf_ini(void* user, const char* section,
 		} else if (NAME("hda")) {
 			conf->disks[0] = strdup(value);
 			conf->iscd[0] = 0;
+		} else if (NAME("hda_heads")) {
+			conf->hda_heads = atoi(value);
+		} else if (NAME("hda_spt")) {
+			conf->hda_spt = atoi(value);
 		} else if (NAME("hdb")) {
 			conf->disks[1] = strdup(value);
 			conf->iscd[1] = 0;
