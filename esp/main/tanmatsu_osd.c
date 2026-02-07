@@ -755,6 +755,19 @@ static void render_status(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, line, COLOR_TEXT, 0);
 	line_y += line_h;
 
+	// IPS (instructions per second)
+	{
+		uint32_t cps = globals.emu_cycles_per_sec;
+		if (cps >= 1000000)
+			snprintf(line, sizeof(line), "IPS: %.2f M", cps / 1000000.0f);
+		else if (cps >= 1000)
+			snprintf(line, sizeof(line), "IPS: %.1f K", cps / 1000.0f);
+		else
+			snprintf(line, sizeof(line), "IPS: %lu", (unsigned long)cps);
+	}
+	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, line, COLOR_TEXT, 0);
+	line_y += line_h;
+
 	// Frame skip
 	if (osd->frame_skip == 0) {
 		snprintf(line, sizeof(line), "Frame Skip: Off");

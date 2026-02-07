@@ -23,8 +23,8 @@ void sb16_get_master_volume(void *opaque, int *left, int *right);
 SB16State *sb16_new(
     int port, // 0x220
     int irq, // 5
-    void *isa_hdma,
     void *isa_dma,
+    void *isa_hdma,
     void *pic,
     void (*set_irq)(void *pic, int irq, int level));
 

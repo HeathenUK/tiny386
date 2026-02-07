@@ -1524,6 +1524,14 @@ static int write_audio (SB16State *s, int nchan, int dma_pos,
             s->audio_q += out_len;
         }
 
+        /* For non-ADPCM: only advance DMA by bytes actually buffered.
+         * This prevents data loss when audio buffer is full - unprocessed
+         * DMA bytes will be re-read next time. For ADPCM, we must consume
+         * all DMA bytes since the decoder state has already advanced. */
+        if (out_data == tmpbuf) {
+            copied = out_len;
+        }
+
         temp -= copied;
         dma_pos = (dma_pos + copied) % dma_len;
         net += copied;

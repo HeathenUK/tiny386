@@ -91,7 +91,7 @@ public:
     void timer_over(int timer)
     {
         if (timer < 2 && m_timer_running[timer]) {
-            m_chip.generate(nullptr, 0);  // Trigger internal timer processing
+            m_engine->engine_timer_expired(timer);
         }
     }
 

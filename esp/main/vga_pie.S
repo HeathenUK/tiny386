@@ -108,6 +108,35 @@ pie_memcpy_128:
     .size   pie_memcpy_128, . - pie_memcpy_128
 
 /*
+ * Fast 32-bit value fill using PIE 128-bit stores
+ * Fills n bytes with a repeated 32-bit value
+ * n must be a multiple of 16, dst must be 16-byte aligned
+ *
+ * void pie_memset32_128(void *dst, uint32_t val, size_t n);
+ */
+    .global pie_memset32_128
+    .type   pie_memset32_128, @function
+pie_memset32_128:
+    beqz    a2, .Lms32_done
+    srli    a2, a2, 4       /* n /= 16 (number of 128-bit chunks) */
+    /* Broadcast 32-bit value to 128-bit q0 via stack */
+    addi    sp, sp, -16
+    sw      a1, 0(sp)
+    sw      a1, 4(sp)
+    sw      a1, 8(sp)
+    sw      a1, 12(sp)
+    mv      a3, sp
+    esp.vld.128.ip q0, a3, 0
+    addi    sp, sp, 16
+.Lms32_loop:
+    esp.vst.128.ip q0, a0, 16
+    addi    a2, a2, -1
+    bnez    a2, .Lms32_loop
+.Lms32_done:
+    ret
+    .size   pie_memset32_128, . - pie_memset32_128
+
+/*
  * Render 8 Mode 13h pixels: load indices, lookup palette, store RGB565
  * Interleaves operations to hide memory latency
  *

@@ -1737,21 +1737,7 @@ static void vga_graphic_refresh(VGAState *s,
             int vram_line_bytes = src_bytes * 4; /* 4 VRAM bytes per source byte (planar) */
 
 #ifdef TANMATSU_BUILD
-            /* OPT 1: Page-dirty coarse skip - if no VRAM pages for this line
-             * were modified, skip without even hashing (zero PSRAM reads) */
-            if (y < VGA_MAX_LINES && s->render_vga_ram && vga_double_buffer) {
-                uint32_t page_start = addr >> 12;
-                uint32_t page_end = (addr + vram_line_bytes - 1) >> 12;
-                uint64_t page_mask = 0;
-                for (uint32_t p = page_start; p <= page_end && p < 64; p++)
-                    page_mask |= (1ULL << p);
-                if (!(s->render_dirty_pages & page_mask) &&
-                    vga_prev_line_hash[y] != 0) {
-                    goto next_line;
-                }
-            }
-
-            /* OPT 2: Copy VRAM line into SRAM buffer - one sequential PSRAM read
+            /* Copy VRAM line into SRAM buffer - one sequential PSRAM read
              * instead of scattered reads during hash + render */
             uint8_t linebuf[400];  /* Max: 800px / 8 * 4 planes = 400 bytes */
             const uint8_t *src_line;
@@ -1760,15 +1746,6 @@ static void vga_graphic_refresh(VGAState *s,
                 src_line = linebuf;
             } else {
                 src_line = vram + addr;
-            }
-
-            /* OPT 1b: Hash-based dirty skip from SRAM buffer (fast) */
-            if (y < VGA_MAX_LINES) {
-                uint32_t line_hash = vga_hash_line(src_line, vram_line_bytes);
-                if (line_hash == vga_prev_line_hash[y] && !vga_is_line_dirty(y)) {
-                    goto next_line;
-                }
-                vga_prev_line_hash[y] = line_hash;
             }
 #else
             const uint8_t *src_line = vram + addr;

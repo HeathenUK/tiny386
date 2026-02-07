@@ -552,6 +552,7 @@ void pc_step(PC *pc)
 	static uint32_t stat_periph_us = 0;
 	static uint32_t stat_calls = 0;
 	static uint32_t stat_last_report = 0;
+	static long stat_last_cycles = 0;
 #endif
 
 	uint32_t t0 = get_uticks();
@@ -654,6 +655,12 @@ void pc_step(PC *pc)
 				globals.emu_periph_percent = (stat_periph_us * 100) / total;
 				globals.emu_calls_per_sec = (stat_calls * 1000000ULL) / (t2 - stat_last_report);
 			}
+			long cur_cycles = cpu_get_cycle(pc->cpu);
+			uint32_t elapsed_us = t2 - stat_last_report;
+			if (elapsed_us > 0) {
+				globals.emu_cycles_per_sec = (uint32_t)(((uint64_t)(cur_cycles - stat_last_cycles) * 1000000ULL) / elapsed_us);
+			}
+			stat_last_cycles = cur_cycles;
 			stat_cpu_us = 0;
 			stat_periph_us = 0;
 			stat_calls = 0;

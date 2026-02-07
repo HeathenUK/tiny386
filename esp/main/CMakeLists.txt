@@ -20,13 +20,9 @@ set(COMMON_SRCS
     "storage.c"
 )
 
-# ymfm OPL emulation (replaces fmopl.c)
-set(YMFM_SRCS
-    "../../ymfm_wrapper.cpp"
-    "../../thirdparty/ymfm/src/ymfm_opl.cpp"
-    "../../thirdparty/ymfm/src/ymfm_adpcm.cpp"
-    "../../thirdparty/ymfm/src/ymfm_pcm.cpp"
-    "../../thirdparty/ymfm/src/ymfm_ssg.cpp"
+# OPL2 emulation (fmopl - lightweight, suitable for ESP32)
+set(OPL_SRCS
+    "../../fmopl.c"
 )
 
 # Board-specific sources based on DEVICE variable
@@ -54,7 +50,7 @@ else()
     endif()
 endif()
 
-idf_component_register(SRCS ${COMMON_SRCS} ${YMFM_SRCS} ${BOARD_SRCS}
+idf_component_register(SRCS ${COMMON_SRCS} ${OPL_SRCS} ${BOARD_SRCS}
                        INCLUDE_DIRS "." "../../")
 
 add_definitions(-include ${CMAKE_CURRENT_SOURCE_DIR}/${BOARD_HEADER})
@@ -72,12 +68,8 @@ set_source_files_properties("../../adlib.c" PROPERTIES COMPILE_FLAGS "-Wno-all -
 set_source_files_properties("../../sb16.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("../../pcspk.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 
-# ymfm OPL emulation: -O3 with C++ flags
-set_source_files_properties("../../ymfm_wrapper.cpp" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-exceptions -fno-rtti")
-set_source_files_properties("../../thirdparty/ymfm/src/ymfm_opl.cpp" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-exceptions -fno-rtti")
-set_source_files_properties("../../thirdparty/ymfm/src/ymfm_adpcm.cpp" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-exceptions -fno-rtti")
-set_source_files_properties("../../thirdparty/ymfm/src/ymfm_pcm.cpp" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-exceptions -fno-rtti")
-set_source_files_properties("../../thirdparty/ymfm/src/ymfm_ssg.cpp" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-exceptions -fno-rtti")
+# OPL2 emulation (fmopl): -O3
+set_source_files_properties("../../fmopl.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 
 # Graphics: -O3 with fast-math for VGA rendering
 set_source_files_properties("../../vga.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -funroll-loops -ffast-math")
@@ -96,5 +88,3 @@ set_source_files_properties("../../pci.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3
 set_source_files_properties("../../osd/osd.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("../../osd/microui.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("tanmatsu_osd.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
-
-# ymfm has no lookup tables to generate, no preparation needed

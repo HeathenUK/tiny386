@@ -14,6 +14,45 @@
 #define DRAM_ATTR
 #endif
 
+/* PIE SIMD helpers for ESP32-P4 string operations */
+#ifdef TANMATSU_BUILD
+extern void pie_memcpy_128(void *dst, const void *src, size_t n);
+extern void pie_memset32_128(void *dst, uint32_t val, size_t n);
+
+static inline void fast_memcpy(void *dst, const void *src, size_t n) {
+	if (n >= 16 && !((uintptr_t)dst & 0xf) && !((uintptr_t)src & 0xf)) {
+		size_t aligned = n & ~(size_t)0xf;
+		pie_memcpy_128(dst, src, aligned);
+		if (n > aligned)
+			memcpy((char *)dst + aligned, (const char *)src + aligned, n - aligned);
+	} else {
+		memcpy(dst, src, n);
+	}
+}
+
+static inline void fast_memset32(void *dst, uint32_t val, size_t count) {
+	if (count >= 4 && !((uintptr_t)dst & 0xf)) {
+		size_t bytes = count * 4;
+		size_t aligned = bytes & ~(size_t)0xf;
+		pie_memset32_128(dst, val, aligned);
+		uint32_t *p = (uint32_t *)((char *)dst + aligned);
+		for (size_t i = 0; i < count - aligned / 4; i++)
+			p[i] = val;
+	} else {
+		uint32_t *p = (uint32_t *)dst;
+		for (size_t i = 0; i < count; i++)
+			p[i] = val;
+	}
+}
+#else
+#define fast_memcpy memcpy
+static inline void fast_memset32(void *dst, uint32_t val, size_t count) {
+	uint32_t *p = (uint32_t *)dst;
+	for (size_t i = 0; i < count; i++)
+		p[i] = val;
+}
+#endif
+
 #define I386_OPT1
 #ifndef __wasm__
 #define I386_OPT2
@@ -70,6 +109,12 @@ struct CPUI386 {
 		uword xaddr;
 	} ifetch;
 
+	/* Instruction prefetch pointer: points into phys_mem for current instruction.
+	 * Eliminates repeated ifetch cache checks within a single instruction. */
+	const uint8_t *pf_ptr;
+	uint8_t pf_pos;
+	uint8_t pf_avail;
+
 	struct {
 		int op;
 		uword dst;
@@ -118,6 +163,9 @@ struct CPUI386 {
 	 * When set, we can skip segment base addition and limit checks.
 	 * Used by DPMI programs like DOOM that set up flat 4GB segments. */
 	uint8_t seg_flat;
+	/* True when ALL 6 data/code segments are flat (seg_flat == 0x3F).
+	 * Allows a single branch to skip all segment translation overhead. */
+	bool all_segs_flat;
 };
 
 #define dolog(...) fprintf(stderr, __VA_ARGS__)
@@ -602,7 +650,7 @@ static inline int get_IOPL(CPUI386 *cpu)
 /* MMU */
 #define CR0_PG (1<<31)
 #define CR0_WP (0x10000)
-#define tlb_size 512
+#define tlb_size 1024
 typedef struct {
 	enum {
 		ADDR_OK1,
@@ -745,7 +793,11 @@ static bool IRAM_ATTR translate(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uw
 	assert(seg != -1);
 	uword laddr;
 
-	/* Fast path for flat segments (base=0, limit=4GB): skip base addition and segcheck */
+	/* Fast path: when ALL segments are flat, skip per-segment check entirely */
+	if (likely(cpu->all_segs_flat)) {
+		return translate_laddr(cpu, res, rwm, addr, size, cpl);
+	}
+
 	if (likely(SEG_IS_FLAT(cpu, seg))) {
 		laddr = addr;
 	} else {
@@ -761,8 +813,10 @@ static bool IRAM_ATTR translate8r(CPUI386 *cpu, OptAddr *res, int seg, uword add
 	assert(seg != -1);
 	uword laddr;
 
-	/* Fast path for flat segments */
-	if (likely(SEG_IS_FLAT(cpu, seg))) {
+	/* Fast path: all segments flat → addr IS the linear address */
+	if (likely(cpu->all_segs_flat)) {
+		laddr = addr;
+	} else if (likely(SEG_IS_FLAT(cpu, seg))) {
 		laddr = addr;
 	} else {
 		laddr = cpu->seg[seg].base + addr;
@@ -1092,6 +1146,11 @@ bool IRAM_ATTR cpu_store64(CPUI386 *cpu, int seg, uword addr, uint64_t val)
 
 static bool IRAM_ATTR peek8(CPUI386 *cpu, u8 *val)
 {
+	/* Prefetch pointer fast path */
+	if (likely(cpu->pf_pos < cpu->pf_avail)) {
+		*val = cpu->pf_ptr[cpu->pf_pos];
+		return true;
+	}
 	/* Fast path for flat CS: laddr = next_ip (skip base addition) */
 	uword laddr = likely(SEG_IS_FLAT(cpu, SEG_CS))
 		? cpu->next_ip
@@ -1110,6 +1169,12 @@ static bool IRAM_ATTR peek8(CPUI386 *cpu, u8 *val)
 
 static bool IRAM_ATTR fetch8(CPUI386 *cpu, u8 *val)
 {
+	/* Prefetch buffer fast path */
+	if (likely(cpu->pf_pos < cpu->pf_avail)) {
+		*val = cpu->pf_ptr[cpu->pf_pos++];
+		cpu->next_ip++;
+		return true;
+	}
 	TRY(peek8(cpu, val));
 	cpu->next_ip++;
 	return true;
@@ -1117,6 +1182,15 @@ static bool IRAM_ATTR fetch8(CPUI386 *cpu, u8 *val)
 
 static bool IRAM_ATTR fetch16(CPUI386 *cpu, u16 *val)
 {
+	/* Prefetch buffer fast path */
+	if (likely(cpu->pf_pos + 2 <= cpu->pf_avail)) {
+		int p = cpu->pf_pos;
+		*val = cpu->pf_ptr[p] | ((u16)cpu->pf_ptr[p + 1] << 8);
+		cpu->pf_pos = p + 2;
+		cpu->next_ip += 2;
+		return true;
+	}
+	cpu->pf_avail = 0; /* Exceeded prefetch, disable */
 	/* Fast path for flat CS */
 	uword laddr = likely(SEG_IS_FLAT(cpu, SEG_CS))
 		? cpu->next_ip
@@ -1134,6 +1208,16 @@ static bool IRAM_ATTR fetch16(CPUI386 *cpu, u16 *val)
 
 static bool IRAM_ATTR fetch32(CPUI386 *cpu, u32 *val)
 {
+	/* Prefetch buffer fast path */
+	if (likely(cpu->pf_pos + 4 <= cpu->pf_avail)) {
+		int p = cpu->pf_pos;
+		*val = cpu->pf_ptr[p] | ((u32)cpu->pf_ptr[p + 1] << 8)
+		     | ((u32)cpu->pf_ptr[p + 2] << 16) | ((u32)cpu->pf_ptr[p + 3] << 24);
+		cpu->pf_pos = p + 4;
+		cpu->next_ip += 4;
+		return true;
+	}
+	cpu->pf_avail = 0; /* Exceeded prefetch, disable */
 	/* Fast path for flat CS */
 	uword laddr = likely(SEG_IS_FLAT(cpu, SEG_CS))
 		? cpu->next_ip
@@ -1271,6 +1355,8 @@ static inline void update_seg_flat(CPUI386 *cpu, int seg)
 	} else {
 		cpu->seg_flat &= ~(1 << seg);
 	}
+	/* 0x3F = bits 0-5 (ES,CS,SS,DS,FS,GS) all set */
+	cpu->all_segs_flat = (cpu->seg_flat == 0x3F);
 }
 
 static bool set_seg(CPUI386 *cpu, int seg, int sel)
@@ -1283,6 +1369,7 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 		cpu->seg[seg].flags = 0; // D_BIT is not set
 		/* Real mode: never flat (base = sel << 4) */
 		cpu->seg_flat &= ~(1 << seg);
+		cpu->all_segs_flat = false;
 		if (seg == SEG_CS) {
 			cpu->cpl = cpu->flags & VM ? 3 : 0;
 			cpu->code16 = true;
@@ -1345,6 +1432,7 @@ static inline void clear_segs(CPUI386 *cpu)
 				cpu->seg[segs[i]].flags = 0;
 				/* Clear flat flag - segment is now null */
 				cpu->seg_flat &= ~(1 << segs[i]);
+				cpu->all_segs_flat = false;
 			}
 		}
 	}
@@ -2929,10 +3017,11 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 				u8 *dest = cpu->phys_mem + memld.addr1; \
 				if (BIT == 8) { \
 					memset(dest, ax, cx); \
+				} else if (BIT == 32) { \
+					fast_memset32(dest, ax, cx); \
 				} else { \
 					for (uword i = 0; i < cx; i++) { \
-						if (BIT == 16) *(u16 *)(dest + i * 2) = ax; \
-						else *(u32 *)(dest + i * 4) = ax; \
+						*(u16 *)(dest + i * 2) = ax; \
 					} \
 				} \
 				sreg ## ABIT(7, dst_log + bytes); \
@@ -3061,8 +3150,8 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 				 * memmove would incorrectly preserve source data by copying backward. \
 				 * Only use fast path for non-overlapping copies. */ \
 				if (memld.addr1 >= memls.addr1 + bytes || memls.addr1 >= memld.addr1 + bytes) { \
-					memcpy(cpu->phys_mem + memld.addr1, \
-					       cpu->phys_mem + memls.addr1, bytes); \
+					fast_memcpy(cpu->phys_mem + memld.addr1, \
+					            cpu->phys_mem + memls.addr1, bytes); \
 					sreg ## ABIT(6, src_log + bytes); \
 					sreg ## ABIT(7, dst_log + bytes); \
 					sreg ## ABIT(1, 0); \
@@ -4290,7 +4379,25 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 
 	if (code16) cpu->next_ip &= 0xffff;
 	cpu->ip = cpu->next_ip;
-	TRY(fetch8(cpu, &b1));
+
+	/* Fused prefetch + opcode fetch: set prefetch pointer and read first byte
+	 * in one step, avoiding the redundant pf_pos check in fetch8. */
+	{
+		uword pf_laddr = likely(cpu->all_segs_flat)
+			? cpu->next_ip
+			: cpu->seg[SEG_CS].base + cpu->next_ip;
+		if (likely((pf_laddr ^ cpu->ifetch.laddr) < (4096 - 7))) {
+			cpu->pf_ptr = cpu->phys_mem + (cpu->ifetch.xaddr ^ pf_laddr);
+			b1 = cpu->pf_ptr[0];
+			cpu->pf_pos = 1;
+			cpu->pf_avail = 8;
+			cpu->next_ip++;
+		} else {
+			cpu->pf_avail = 0;
+			cpu->pf_pos = 0;
+			TRY(fetch8(cpu, &b1));
+		}
+	}
 	cpu->cycle++;
 	cpu->tsc++;  /* Base cycle for instruction fetch */
 
@@ -4329,30 +4436,30 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	}
 #else
 	static const IRAM_ATTR void *pfxlabel[] = {
-/* 0x00 */	&&f0x00, &&f0x01, &&f0x02, &&f0x03, &&f0x04, &&f0x05, &&f0x06, &&f0x07,
-/* 0x08 */	&&f0x08, &&f0x09, &&f0x0a, &&f0x0b, &&f0x0c, &&f0x0d, &&f0x0e, &&f0x0f,
+/* 0x00 */	&&f0x00, &&fast_0x01, &&f0x02, &&fast_0x03, &&f0x04, &&f0x05, &&f0x06, &&f0x07,
+/* 0x08 */	&&f0x08, &&fast_0x09, &&f0x0a, &&fast_0x0b, &&f0x0c, &&f0x0d, &&f0x0e, &&f0x0f,
 /* 0x10 */	&&f0x10, &&f0x11, &&f0x12, &&f0x13, &&f0x14, &&f0x15, &&f0x16, &&f0x17,
 /* 0x18 */	&&f0x18, &&f0x19, &&f0x1a, &&f0x1b, &&f0x1c, &&f0x1d, &&f0x1e, &&f0x1f,
-/* 0x20 */	&&f0x20, &&f0x21, &&f0x22, &&f0x23, &&f0x24, &&f0x25, &&pfx26, &&f0x27,
-/* 0x28 */	&&f0x28, &&f0x29, &&f0x2a, &&f0x2b, &&f0x2c, &&f0x2d, &&pfx2e, &&f0x2f,
-/* 0x30 */	&&f0x30, &&f0x31, &&f0x32, &&f0x33, &&f0x34, &&f0x35, &&pfx36, &&f0x37,
-/* 0x38 */	&&f0x38, &&f0x39, &&f0x3a, &&f0x3b, &&f0x3c, &&f0x3d, &&pfx3e, &&f0x3f,
-/* 0x40 */	&&f0x40, &&f0x41, &&f0x42, &&f0x43, &&f0x44, &&f0x45, &&f0x46, &&f0x47,
-/* 0x48 */	&&f0x48, &&f0x49, &&f0x4a, &&f0x4b, &&f0x4c, &&f0x4d, &&f0x4e, &&f0x4f,
-/* 0x50 */	&&f0x50, &&f0x51, &&f0x52, &&f0x53, &&f0x54, &&f0x55, &&f0x56, &&f0x57,
-/* 0x58 */	&&f0x58, &&f0x59, &&f0x5a, &&f0x5b, &&f0x5c, &&f0x5d, &&f0x5e, &&f0x5f,
+/* 0x20 */	&&f0x20, &&fast_0x21, &&f0x22, &&fast_0x23, &&f0x24, &&f0x25, &&pfx26, &&f0x27,
+/* 0x28 */	&&f0x28, &&fast_0x29, &&f0x2a, &&fast_0x2b, &&f0x2c, &&f0x2d, &&pfx2e, &&f0x2f,
+/* 0x30 */	&&f0x30, &&fast_0x31, &&f0x32, &&fast_0x33, &&f0x34, &&f0x35, &&pfx36, &&f0x37,
+/* 0x38 */	&&f0x38, &&fast_0x39, &&f0x3a, &&fast_0x3b, &&f0x3c, &&f0x3d, &&pfx3e, &&f0x3f,
+/* 0x40 */	&&fast_inc, &&fast_inc, &&fast_inc, &&fast_inc, &&fast_inc, &&fast_inc, &&fast_inc, &&fast_inc,
+/* 0x48 */	&&fast_dec, &&fast_dec, &&fast_dec, &&fast_dec, &&fast_dec, &&fast_dec, &&fast_dec, &&fast_dec,
+/* 0x50 */	&&fast_push, &&fast_push, &&fast_push, &&fast_push, &&fast_push, &&fast_push, &&fast_push, &&fast_push,
+/* 0x58 */	&&fast_pop, &&fast_pop, &&fast_pop, &&fast_pop, &&fast_pop, &&fast_pop, &&fast_pop, &&fast_pop,
 /* 0x60 */	&&f0x60, &&f0x61, &&f0x62, &&f0x63, &&pfx64, &&pfx65, &&pfx66, &&pfx67,
 /* 0x68 */	&&f0x68, &&f0x69, &&f0x6a, &&f0x6b, &&f0x6c, &&f0x6d, &&f0x6e, &&f0x6f,
-/* 0x70 */	&&f0x70, &&f0x71, &&f0x72, &&f0x73, &&f0x74, &&f0x75, &&f0x76, &&f0x77,
-/* 0x78 */	&&f0x78, &&f0x79, &&f0x7a, &&f0x7b, &&f0x7c, &&f0x7d, &&f0x7e, &&f0x7f,
-/* 0x80 */	&&f0x80, &&f0x81, &&f0x82, &&f0x83, &&f0x84, &&f0x85, &&f0x86, &&f0x87,
-/* 0x88 */	&&f0x88, &&f0x89, &&f0x8a, &&f0x8b, &&f0x8c, &&f0x8d, &&f0x8e, &&f0x8f,
+/* 0x70 */	&&fast_jcc, &&fast_jcc, &&fast_jcc, &&fast_jcc, &&fast_jcc, &&fast_jcc, &&fast_jcc, &&fast_jcc,
+/* 0x78 */	&&fast_jcc, &&fast_jcc, &&fast_jcc, &&fast_jcc, &&fast_jcc, &&fast_jcc, &&fast_jcc, &&fast_jcc,
+/* 0x80 */	&&f0x80, &&f0x81, &&f0x82, &&f0x83, &&f0x84, &&fast_0x85, &&f0x86, &&f0x87,
+/* 0x88 */	&&f0x88, &&fast_0x89, &&f0x8a, &&fast_0x8b, &&f0x8c, &&f0x8d, &&f0x8e, &&f0x8f,
 /* 0x90 */	&&f0x90, &&f0x91, &&f0x92, &&f0x93, &&f0x94, &&f0x95, &&f0x96, &&f0x97,
 /* 0x98 */	&&f0x98, &&f0x99, &&f0x9a, &&f0x9b, &&f0x9c, &&f0x9d, &&f0x9e, &&f0x9f,
 /* 0xa0 */	&&f0xa0, &&f0xa1, &&f0xa2, &&f0xa3, &&f0xa4, &&f0xa5, &&f0xa6, &&f0xa7,
 /* 0xa8 */	&&f0xa8, &&f0xa9, &&f0xaa, &&f0xab, &&f0xac, &&f0xad, &&f0xae, &&f0xaf,
 /* 0xb0 */	&&f0xb0, &&f0xb1, &&f0xb2, &&f0xb3, &&f0xb4, &&f0xb5, &&f0xb6, &&f0xb7,
-/* 0xb8 */	&&f0xb8, &&f0xb9, &&f0xba, &&f0xbb, &&f0xbc, &&f0xbd, &&f0xbe, &&f0xbf,
+/* 0xb8 */	&&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm,
 /* 0xc0 */	&&f0xc0, &&f0xc1, &&f0xc2, &&f0xc3, &&f0xc4, &&f0xc5, &&f0xc6, &&f0xc7,
 /* 0xc8 */	&&f0xc8, &&f0xc9, &&f0xca, &&f0xcb, &&f0xcc, &&f0xcd, &&f0xce, &&f0xcf,
 /* 0xd0 */	&&f0xd0, &&f0xd1, &&f0xd2, &&f0xd3, &&f0xd4, &&f0xd5, &&f0xd6, &&f0xd7,
@@ -4468,6 +4575,93 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 				}
 				/* mod != 3: fall through to normal dispatch */
 			}
+			/* CMP r/m, r or CMP r, r/m - reg-to-reg fast path (0x39/0x3b, mod=3) */
+			if (b1 == 0x39 || b1 == 0x3b) {
+				u8 modrm_peek;
+				TRY(peek8(cpu, &modrm_peek));
+				if ((modrm_peek >> 6) == 3) {
+					cpu->next_ip++;
+					int rm = modrm_peek & 7;
+					int r = (modrm_peek >> 3) & 7;
+					if (!code16) {
+						cpu->cc.src1 = sext16(lreg16(b1 == 0x39 ? rm : r));
+						cpu->cc.src2 = sext16(lreg16(b1 == 0x39 ? r : rm));
+					} else {
+						cpu->cc.src1 = sext32(lreg32(b1 == 0x39 ? rm : r));
+						cpu->cc.src2 = sext32(lreg32(b1 == 0x39 ? r : rm));
+					}
+					cpu->cc.dst = cpu->cc.src1 - cpu->cc.src2;
+					cpu->cc.op = CC_SUB;
+					cpu->cc.mask = CF | PF | AF | ZF | SF | OF;
+					continue;
+				}
+			}
+			/* ADD r/m, r or ADD r, r/m - reg-to-reg fast path (0x01/0x03, mod=3) */
+			if (b1 == 0x01 || b1 == 0x03) {
+				u8 modrm_peek;
+				TRY(peek8(cpu, &modrm_peek));
+				if ((modrm_peek >> 6) == 3) {
+					cpu->next_ip++;
+					int rm = modrm_peek & 7;
+					int r = (modrm_peek >> 3) & 7;
+					if (!code16) {
+						cpu->cc.src1 = sext16(lreg16(b1 == 0x01 ? rm : r));
+						cpu->cc.src2 = sext16(lreg16(b1 == 0x01 ? r : rm));
+						cpu->cc.dst = sext16((u16)(cpu->cc.src1 + cpu->cc.src2));
+						sreg16(b1 == 0x01 ? rm : r, cpu->cc.dst);
+					} else {
+						cpu->cc.src1 = sext32(lreg32(b1 == 0x01 ? rm : r));
+						cpu->cc.src2 = sext32(lreg32(b1 == 0x01 ? r : rm));
+						cpu->cc.dst = sext32((u32)(cpu->cc.src1 + cpu->cc.src2));
+						sreg32(b1 == 0x01 ? rm : r, cpu->cc.dst);
+					}
+					cpu->cc.op = CC_ADD;
+					cpu->cc.mask = CF | PF | AF | ZF | SF | OF;
+					continue;
+				}
+			}
+			/* SUB r/m, r or SUB r, r/m - reg-to-reg fast path (0x29/0x2b, mod=3) */
+			if (b1 == 0x29 || b1 == 0x2b) {
+				u8 modrm_peek;
+				TRY(peek8(cpu, &modrm_peek));
+				if ((modrm_peek >> 6) == 3) {
+					cpu->next_ip++;
+					int rm = modrm_peek & 7;
+					int r = (modrm_peek >> 3) & 7;
+					if (!code16) {
+						cpu->cc.src1 = sext16(lreg16(b1 == 0x29 ? rm : r));
+						cpu->cc.src2 = sext16(lreg16(b1 == 0x29 ? r : rm));
+						cpu->cc.dst = sext16((u16)(cpu->cc.src1 - cpu->cc.src2));
+						sreg16(b1 == 0x29 ? rm : r, cpu->cc.dst);
+					} else {
+						cpu->cc.src1 = sext32(lreg32(b1 == 0x29 ? rm : r));
+						cpu->cc.src2 = sext32(lreg32(b1 == 0x29 ? r : rm));
+						cpu->cc.dst = sext32((u32)(cpu->cc.src1 - cpu->cc.src2));
+						sreg32(b1 == 0x29 ? rm : r, cpu->cc.dst);
+					}
+					cpu->cc.op = CC_SUB;
+					cpu->cc.mask = CF | PF | AF | ZF | SF | OF;
+					continue;
+				}
+			}
+			/* TEST r/m, r - reg-to-reg fast path (0x85, mod=3) */
+			if (b1 == 0x85) {
+				u8 modrm_peek;
+				TRY(peek8(cpu, &modrm_peek));
+				if ((modrm_peek >> 6) == 3) {
+					cpu->next_ip++;
+					int rm = modrm_peek & 7;
+					int r = (modrm_peek >> 3) & 7;
+					if (!code16) {
+						cpu->cc.dst = sext16((u16)(lreg16(rm) & lreg16(r)));
+					} else {
+						cpu->cc.dst = sext32((u32)(lreg32(rm) & lreg32(r)));
+					}
+					cpu->cc.op = CC_AND;
+					cpu->cc.mask = CF | PF | ZF | SF | OF;
+					continue;
+				}
+			}
 			/* XCHG AX/EAX, r16/r32 (0x91-0x97) - 0x90 is NOP */
 			if (b1 >= 0x91 && b1 <= 0x97) {
 				if (!code16) {
@@ -4504,6 +4698,286 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 		HANDLE_PREFIX(f2, rep = 2) // REPNE
 		HANDLE_PREFIX(f0, /*lock = true*/)
 #undef HANDLE_PREFIX
+
+	/* Non-prefixed 32-bit fast paths.
+	 * In 32-bit PM, opsz16==false for non-prefixed instructions.
+	 * Skip the opsz16 branch and macro chain for common opcodes. */
+
+	fast_inc: {  /* INC r32 (0x40-0x47) */
+		if (likely(!opsz16)) {
+			int reg = b1 & 7;
+			int cf = get_CF(cpu);
+			cpu->cc.dst = sext32((u32)(lreg32(reg) + 1));
+			cpu->cc.op = CC_INC32;
+			SET_BIT(cpu->flags, cf, CF);
+			cpu->cc.mask = PF | AF | ZF | SF | OF;
+			sreg32(reg, cpu->cc.dst);
+			continue;
+		}
+		goto f0x40;
+	}
+	fast_dec: {  /* DEC r32 (0x48-0x4f) */
+		if (likely(!opsz16)) {
+			int reg = b1 & 7;
+			int cf = get_CF(cpu);
+			cpu->cc.dst = sext32((u32)(lreg32(reg) - 1));
+			cpu->cc.op = CC_DEC32;
+			SET_BIT(cpu->flags, cf, CF);
+			cpu->cc.mask = PF | AF | ZF | SF | OF;
+			sreg32(reg, cpu->cc.dst);
+			continue;
+		}
+		goto f0x48;
+	}
+	fast_push: {  /* PUSH r32 (0x50-0x57) */
+		if (likely(!opsz16)) {
+			int reg = b1 & 7;
+			OptAddr meml1;
+			uword sp = lreg32(4);
+			u32 val = lreg32(reg);
+			TRY(translate32(cpu, &meml1, 2, SEG_SS, (sp - 4) & sp_mask));
+			set_sp(sp - 4, sp_mask);
+			saddr32(&meml1, val);
+			continue;
+		}
+		goto f0x50;
+	}
+	fast_pop: {  /* POP r32 (0x58-0x5f) */
+		if (likely(!opsz16)) {
+			int reg = b1 & 7;
+			OptAddr meml1;
+			uword sp = lreg32(4);
+			TRY(translate32(cpu, &meml1, 1, SEG_SS, sp & sp_mask));
+			u32 src = laddr32(&meml1);
+			set_sp(sp + 4, sp_mask);
+			sreg32(reg, src);
+			continue;
+		}
+		goto f0x58;
+	}
+	fast_jcc: {  /* Jcc rel8 (0x70-0x7f) */
+		if (likely(cpu->pf_pos < cpu->pf_avail)) {
+			sword d = (s8)cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int cond;
+			switch (b1 & 0xf) {
+			case 0x0: cond =  get_OF(cpu); break;
+			case 0x1: cond = !get_OF(cpu); break;
+			case 0x2: cond =  get_CF(cpu); break;
+			case 0x3: cond = !get_CF(cpu); break;
+			case 0x4: cond =  get_ZF(cpu); break;
+			case 0x5: cond = !get_ZF(cpu); break;
+			case 0x6: cond =  get_ZF(cpu) ||  get_CF(cpu); break;
+			case 0x7: cond = !get_ZF(cpu) && !get_CF(cpu); break;
+			case 0x8: cond =  get_SF(cpu); break;
+			case 0x9: cond = !get_SF(cpu); break;
+			case 0xa: cond =  get_PF(cpu); break;
+			case 0xb: cond = !get_PF(cpu); break;
+			case 0xc: cond =  get_SF(cpu) != get_OF(cpu); break;
+			case 0xd: cond =  get_SF(cpu) == get_OF(cpu); break;
+			case 0xe: cond =  get_ZF(cpu) || get_SF(cpu) != get_OF(cpu); break;
+			default:  cond = !get_ZF(cpu) && get_SF(cpu) == get_OF(cpu); break;
+			}
+			if (cond) cpu->next_ip += d;
+			continue;
+		}
+		goto f0x70;
+	}
+	fast_movimm: {  /* MOV r32, imm32 (0xb8-0xbf) */
+		if (likely(!opsz16 && cpu->pf_pos + 4 <= cpu->pf_avail)) {
+			int p = cpu->pf_pos;
+			u32 imm = cpu->pf_ptr[p] | ((u32)cpu->pf_ptr[p+1] << 8)
+			         | ((u32)cpu->pf_ptr[p+2] << 16) | ((u32)cpu->pf_ptr[p+3] << 24);
+			cpu->pf_pos = p + 4;
+			cpu->next_ip += 4;
+			sreg32(b1 & 7, imm);
+			continue;
+		}
+		goto f0xb8;
+	}
+
+	/* Reg-to-reg ALU fast paths (mod=3 only) */
+	fast_0x89: {  /* MOV Ev, Gv */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			sreg32(mrm & 7, lreg32((mrm >> 3) & 7));
+			continue;
+		}
+		goto f0x89;
+	}
+	fast_0x8b: {  /* MOV Gv, Ev */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			sreg32((mrm >> 3) & 7, lreg32(mrm & 7));
+			continue;
+		}
+		goto f0x8b;
+	}
+	fast_0x01: {  /* ADD Ev, Gv */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.src1 = sext32(lreg32(rm));
+			cpu->cc.src2 = sext32(lreg32(reg));
+			cpu->cc.dst = sext32((u32)(cpu->cc.src1 + cpu->cc.src2));
+			cpu->cc.op = CC_ADD;
+			cpu->cc.mask = CF | PF | AF | ZF | SF | OF;
+			sreg32(rm, cpu->cc.dst);
+			continue;
+		}
+		goto f0x01;
+	}
+	fast_0x03: {  /* ADD Gv, Ev */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.src1 = sext32(lreg32(reg));
+			cpu->cc.src2 = sext32(lreg32(rm));
+			cpu->cc.dst = sext32((u32)(cpu->cc.src1 + cpu->cc.src2));
+			cpu->cc.op = CC_ADD;
+			cpu->cc.mask = CF | PF | AF | ZF | SF | OF;
+			sreg32(reg, cpu->cc.dst);
+			continue;
+		}
+		goto f0x03;
+	}
+	fast_0x29: {  /* SUB Ev, Gv */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.src1 = sext32(lreg32(rm));
+			cpu->cc.src2 = sext32(lreg32(reg));
+			cpu->cc.dst = sext32((u32)(cpu->cc.src1 - cpu->cc.src2));
+			cpu->cc.op = CC_SUB;
+			cpu->cc.mask = CF | PF | AF | ZF | SF | OF;
+			sreg32(rm, cpu->cc.dst);
+			continue;
+		}
+		goto f0x29;
+	}
+	fast_0x2b: {  /* SUB Gv, Ev */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.src1 = sext32(lreg32(reg));
+			cpu->cc.src2 = sext32(lreg32(rm));
+			cpu->cc.dst = sext32((u32)(cpu->cc.src1 - cpu->cc.src2));
+			cpu->cc.op = CC_SUB;
+			cpu->cc.mask = CF | PF | AF | ZF | SF | OF;
+			sreg32(reg, cpu->cc.dst);
+			continue;
+		}
+		goto f0x2b;
+	}
+	fast_0x39: {  /* CMP Ev, Gv */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.src1 = sext32(lreg32(rm));
+			cpu->cc.src2 = sext32(lreg32(reg));
+			cpu->cc.dst = sext32((u32)(cpu->cc.src1 - cpu->cc.src2));
+			cpu->cc.op = CC_SUB;
+			cpu->cc.mask = CF | PF | AF | ZF | SF | OF;
+			continue;
+		}
+		goto f0x39;
+	}
+	fast_0x3b: {  /* CMP Gv, Ev */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.src1 = sext32(lreg32(reg));
+			cpu->cc.src2 = sext32(lreg32(rm));
+			cpu->cc.dst = sext32((u32)(cpu->cc.src1 - cpu->cc.src2));
+			cpu->cc.op = CC_SUB;
+			cpu->cc.mask = CF | PF | AF | ZF | SF | OF;
+			continue;
+		}
+		goto f0x3b;
+	}
+	fast_0x85: {  /* TEST Ev, Gv */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.dst = sext32(lreg32(rm) & lreg32(reg));
+			cpu->cc.op = CC_AND;
+			cpu->cc.mask = CF | PF | ZF | SF | OF;
+			continue;
+		}
+		goto f0x85;
+	}
+	fast_0x31: {  /* XOR Ev, Gv */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.dst = sext32(lreg32(rm) ^ lreg32(reg));
+			cpu->cc.op = CC_XOR;
+			cpu->cc.mask = CF | PF | ZF | SF | OF;
+			sreg32(rm, cpu->cc.dst);
+			continue;
+		}
+		goto f0x31;
+	}
+	fast_0x33: {  /* XOR Gv, Ev */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.dst = sext32(lreg32(reg) ^ lreg32(rm));
+			cpu->cc.op = CC_XOR;
+			cpu->cc.mask = CF | PF | ZF | SF | OF;
+			sreg32(reg, cpu->cc.dst);
+			continue;
+		}
+		goto f0x33;
+	}
+	fast_0x09: {  /* OR Ev, Gv */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.dst = sext32(lreg32(rm) | lreg32(reg));
+			cpu->cc.op = CC_OR;
+			cpu->cc.mask = CF | PF | ZF | SF | OF;
+			sreg32(rm, cpu->cc.dst);
+			continue;
+		}
+		goto f0x09;
+	}
+	fast_0x0b: {  /* OR Gv, Ev */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.dst = sext32(lreg32(reg) | lreg32(rm));
+			cpu->cc.op = CC_OR;
+			cpu->cc.mask = CF | PF | ZF | SF | OF;
+			sreg32(reg, cpu->cc.dst);
+			continue;
+		}
+		goto f0x0b;
+	}
+	fast_0x21: {  /* AND Ev, Gv */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.dst = sext32(lreg32(rm) & lreg32(reg));
+			cpu->cc.op = CC_AND;
+			cpu->cc.mask = CF | PF | ZF | SF | OF;
+			sreg32(rm, cpu->cc.dst);
+			continue;
+		}
+		goto f0x21;
+	}
+	fast_0x23: {  /* AND Gv, Ev */
+		if (likely(!opsz16 && cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+			u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			int rm = mrm & 7, reg = (mrm >> 3) & 7;
+			cpu->cc.dst = sext32(lreg32(reg) & lreg32(rm));
+			cpu->cc.op = CC_AND;
+			cpu->cc.mask = CF | PF | ZF | SF | OF;
+			sreg32(reg, cpu->cc.dst);
+			continue;
+		}
+		goto f0x23;
+	}
+
 #endif
 	eswitch(b1) {
 #define I(_case, _rm, _rwm, _op) _case { _rm(_rwm, _op); ebreak; }
@@ -5658,6 +6132,7 @@ void cpui386_reset(CPUI386 *cpu)
 
 	/* No segments are flat at reset (all have limit=0, not 4GB) */
 	cpu->seg_flat = 0;
+	cpu->all_segs_flat = false;
 }
 
 void cpui386_reset_pm(CPUI386 *cpu, uint32_t start_addr)
