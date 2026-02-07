@@ -23,11 +23,9 @@
 #include <errno.h>
 #include <sys/stat.h>
 
-#ifdef USE_BADGE_BSP
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "mouse_emu.h"
-#endif
 
 /* From storage.c */
 extern bool storage_sd_mounted(void);
@@ -104,7 +102,6 @@ typedef struct {
 Console *console_init(int width, int height)
 {
 	Console *c = malloc(sizeof(Console));
-#ifdef USE_LCD_BSP
 	c->fb1 = NULL;  /* Not used for BSP backend */
 	// For BSP backend, fb is allocated in vga_task after BSP init
 	// Use atomic load for cross-core visibility
@@ -112,10 +109,6 @@ Console *console_init(int width, int height)
 	if (!c->fb) {
 		abort();
 	}
-#else
-	c->fb1 = fbmalloc(LCD_WIDTH * LCD_HEIGHT / NN * 2);
-	c->fb = bigmalloc(LCD_WIDTH * LCD_HEIGHT * 2);
-#endif
 	return c;
 }
 
@@ -123,7 +116,6 @@ void lcd_draw(int x_start, int y_start, int x_end, int y_end, void *src);
 static void redraw(void *opaque,
 		   int x, int y, int w, int h)
 {
-#ifdef USE_LCD_BSP
 	/* For BSP backend, lcd_bsp.c handles full-frame rotation via PPA.
 	 * The callback is a no-op - rendering is already done to fb_data. */
 	(void)opaque;
@@ -131,19 +123,6 @@ static void redraw(void *opaque,
 	(void)y;
 	(void)w;
 	(void)h;
-#else
-	Console *s = opaque;
-	for (int i = 0; i < NN; i++) {
-		uint16_t *src = (uint16_t *) s->fb;
-		src += LCD_WIDTH * LCD_HEIGHT / NN * i;
-		memcpy(s->fb1, src, LCD_WIDTH * LCD_HEIGHT / NN * 2);
-		lcd_draw(0, LCD_WIDTH / NN * i,
-			 LCD_HEIGHT, LCD_WIDTH / NN * (i + 1),
-			 s->fb1);
-		vga_step(s->pc->vga);
-		usleep(900);
-	}
-#endif
 }
 
 static void stub(void *opaque)
@@ -177,9 +156,6 @@ static bool file_exists(const char *path)
 	struct stat st;
 	return (stat(path, &st) == 0);
 }
-
-#ifdef USE_BADGE_BSP
-#endif
 
 /* Create default INI file */
 static bool create_default_ini(const char *path)
@@ -251,10 +227,8 @@ static int pc_main(const char *file)
 		conf.mem_size = MAX_MEM_SIZE;
 	}
 #endif
-#ifdef USE_LCD_BSP
 	// Tell LCD backend the actual VGA dimensions for PPA scaling
 	lcd_set_vga_dimensions(conf.width, conf.height);
-#endif
 
 	Console *console = console_init(conf.width, conf.height);
 	PC *pc = pc_new(redraw, stub, console, console->fb, &conf);
@@ -268,18 +242,12 @@ static int pc_main(const char *file)
 	vga_double_buffer = conf.double_buffer;
 	pc_batch_size_setting = conf.batch_size;
 
-#ifdef USE_BADGE_BSP
 	/* Store brightness/volume/mouse_speed in globals for input_bsp and OSD to use */
 	globals.brightness = conf.brightness;
 	globals.volume = conf.volume;
 	globals.mouse_speed = conf.mouse_speed;
 	globals.usb_passthru = conf.usb_passthru;
 	mouse_emu_set_speed(conf.mouse_speed);
-#endif
-#ifndef USE_LCD_BSP
-	// For non-BSP backends, console allocates fb - store it globally
-	globals.fb = console->fb;
-#endif
 	xEventGroupSetBits(global_event_group, BIT0);
 
 	load_bios_and_reset(pc);
@@ -287,11 +255,8 @@ static int pc_main(const char *file)
 	pc->boot_start_time = get_uticks();
 	uint32_t last_delay_time = get_uticks();
 	uint32_t last_sync_time = get_uticks();
-#ifdef USE_BADGE_BSP
 	uint32_t last_mouse_tick = get_uticks();
-#endif
 	for (; pc->shutdown_state != 8;) {
-#ifdef USE_BADGE_BSP
 		// Mouse emulation tick at ~60Hz
 		uint32_t now_mouse = get_uticks();
 		if (now_mouse - last_mouse_tick >= 16667) {  // ~60Hz
@@ -338,7 +303,6 @@ static int pc_main(const char *file)
 			pc->boot_start_time = get_uticks();
 			fprintf(stderr, "Restart: done\n");
 		}
-#endif
 		pc_step(pc);
 		// CRITICAL: Use vTaskDelay() not taskYIELD() to let IDLE task run.
 		// taskYIELD only yields to equal/higher priority tasks, but IDLE
@@ -364,7 +328,6 @@ static int pc_main(const char *file)
 void *esp_psram_get(size_t *size);
 void vga_task(void *arg);
 void i2s_main();
-#ifdef USE_BADGE_BSP
 void input_bsp_init(void);
 
 // Override the weak stub implementation from badge-bsp that uses
@@ -372,9 +335,6 @@ void input_bsp_init(void);
 void bsp_device_restart_to_launcher(void) {
     esp_restart();
 }
-#else
-void wifi_main(const char *, const char *);
-#endif
 void storage_init(void);
 
 struct esp_ini_config {
@@ -389,7 +349,6 @@ static void i386_task(void *arg)
 	int core_id = esp_cpu_get_core_id();
 	fprintf(stderr, "main runs on core %d\n", core_id);
 
-#ifdef USE_LCD_BSP
 	// Wait for display to be ready (vga_task allocates fb after BSP init)
 	xEventGroupWaitBits(global_event_group,
 			    BIT1,
@@ -401,9 +360,7 @@ static void i386_task(void *arg)
 		fprintf(stderr, "ERROR: globals.fb is NULL!\n");
 		vTaskDelay(1000 / portTICK_PERIOD_MS);
 	}
-#endif
 
-#ifdef USE_BADGE_BSP
 	// Initialize USB host subsystem (needs BSP ready for power control)
 	extern esp_err_t usb_host_init(void);
 	extern bool usb_host_msc_connected(void);
@@ -437,7 +394,6 @@ static void i386_task(void *arg)
 			fprintf(stderr, "USB: No device found (continuing)\n");
 		}
 	}
-#endif
 
 	pc_main(config->filename);
 	vTaskDelete(NULL);
@@ -509,7 +465,6 @@ void app_main(void)
 	}
 #endif
 
-#ifdef USE_BADGE_BSP
 	// Initialize BSP early in app_main (before storage/PSRAM) for fast display startup
 	bsp_configuration_t bsp_config = {
 		.display = {
@@ -518,7 +473,6 @@ void app_main(void)
 		},
 	};
 	ESP_ERROR_CHECK(bsp_device_initialize(&bsp_config));
-#endif
 
 	i2s_main();
 	storage_init();
@@ -583,18 +537,10 @@ void app_main(void)
 	}
 	config.filename = ini_path;
 
-#ifndef USE_BADGE_BSP
-	if (config.ssid[0]) {
-		wifi_main(config.ssid, config.pass);
-	}
-#endif
-
 	if (psram) {
 		xTaskCreatePinnedToCore(i386_task, "i386_main", 8192, &config, 3, NULL, 1);
-		xTaskCreatePinnedToCore(vga_task, "vga_task", 4096, NULL, 0, NULL, 0);
-#ifdef USE_BADGE_BSP
+		xTaskCreatePinnedToCore(vga_task, "vga_task", 12288, NULL, 0, NULL, 0);
 		// Start input task after vga_task (which initializes BSP)
 		input_bsp_init();
-#endif
 	}
 }

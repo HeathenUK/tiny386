@@ -775,7 +775,8 @@ static bool IRAM_ATTR segcheck(CPUI386 *cpu, int rwm, int seg, uword addr, int s
 //			dolog("segcheck: seg %d is null %x\n", seg, cpu->seg[seg].sel);
 			THROW(EX_GP, 0);
 		}
-		/* limit check */
+		/* limit check - DISABLED: causes spurious #GP in some DOS/DPMI games */
+#if 0
 		bool expand_down = (cpu->seg[seg].flags & 0xc) == 0x4;
 		bool over = addr + size - 1 > cpu->seg[seg].limit;
 		if (expand_down)
@@ -783,6 +784,7 @@ static bool IRAM_ATTR segcheck(CPUI386 *cpu, int rwm, int seg, uword addr, int s
 		if (over) {
 			THROW(EX_GP, 0);
 		}
+#endif
 		/* todo: readonly check */
 	}
 	return true;
@@ -884,6 +886,9 @@ static inline bool in_vga_direct(uword addr)
 static u8 IRAM_ATTR load8(CPUI386 *cpu, OptAddr *res)
 {
 	uword addr = res->addr1;
+	/* ~99% of loads are to normal RAM below VGA range */
+	if (likely(addr < 0xa0000))
+		return pload8(cpu, addr);
 	/* Fast path for VGA direct access (chain-4 mode) */
 	if (cpu->cb.vga_direct && in_vga_direct(addr))
 		return cpu->cb.vga_direct[addr - 0xa0000];
@@ -906,6 +911,11 @@ static u8 IRAM_ATTR load8(CPUI386 *cpu, OptAddr *res)
 
 static u16 IRAM_ATTR load16(CPUI386 *cpu, OptAddr *res)
 {
+	if (likely(res->addr1 < 0xa0000)) {
+		if (likely(res->res == ADDR_OK1))
+			return pload16(cpu, res->addr1);
+		return pload8(cpu, res->addr1) | (pload8(cpu, res->addr2) << 8);
+	}
 	/* Fast path for VGA direct access (chain-4 mode) */
 	if (cpu->cb.vga_direct && in_vga_direct(res->addr1) && in_vga_direct(res->addr1 + 1))
 		return *(u16 *)(cpu->cb.vga_direct + res->addr1 - 0xa0000);
@@ -922,6 +932,11 @@ static u16 IRAM_ATTR load16(CPUI386 *cpu, OptAddr *res)
 
 static u32 IRAM_ATTR load32(CPUI386 *cpu, OptAddr *res)
 {
+	if (likely(res->addr1 < 0xa0000)) {
+		if (likely(res->res == ADDR_OK1))
+			return pload32(cpu, res->addr1);
+		goto load32_slow;
+	}
 	/* Fast path for VGA direct access (chain-4 mode) */
 	if (cpu->cb.vga_direct && in_vga_direct(res->addr1) && in_vga_direct(res->addr1 + 3))
 		return *(u32 *)(cpu->cb.vga_direct + res->addr1 - 0xa0000);
@@ -932,7 +947,8 @@ static u32 IRAM_ATTR load32(CPUI386 *cpu, OptAddr *res)
 	}
 	if (likely(res->res == ADDR_OK1)) {
 		return pload32(cpu, res->addr1);
-	} else {
+	}
+	load32_slow: {
 		switch(res->addr1 & 0xf) {
 		case 0xf:
 			return pload8(cpu, res->addr1) | (pload16(cpu, res->addr2) << 8) |
@@ -950,6 +966,11 @@ static u32 IRAM_ATTR load32(CPUI386 *cpu, OptAddr *res)
 static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 {
 	uword addr = res->addr1;
+	if (likely(addr < 0xa0000)) {
+		if (likely(addr < cpu->phys_mem_size))
+			pstore8(cpu, addr, val);
+		return;
+	}
 	/* Fast path for VGA direct access (chain-4 mode) */
 	if (cpu->cb.vga_direct && in_vga_direct(addr)) {
 		cpu->cb.vga_direct[addr - 0xa0000] = val;
@@ -1021,6 +1042,15 @@ static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 
 static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 {
+	if (likely(res->addr1 < 0xa0000)) {
+		if (likely(res->res == ADDR_OK1))
+			pstore16(cpu, res->addr1, val);
+		else {
+			pstore8(cpu, res->addr1, val);
+			pstore8(cpu, res->addr2, val >> 8);
+		}
+		return;
+	}
 	/* Fast path for VGA direct access (chain-4 mode) */
 	if (cpu->cb.vga_direct && in_vga_direct(res->addr1) && in_vga_direct(res->addr1 + 1)) {
 		*(u16 *)(cpu->cb.vga_direct + res->addr1 - 0xa0000) = val;
@@ -1045,6 +1075,29 @@ static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 
 static void IRAM_ATTR store32(CPUI386 *cpu, OptAddr *res, u32 val)
 {
+	if (likely(res->addr1 < 0xa0000)) {
+		if (likely(res->res == ADDR_OK1))
+			pstore32(cpu, res->addr1, val);
+		else {
+			switch(res->addr1 & 0xf) {
+			case 0xf:
+				pstore8(cpu, res->addr1, val);
+				pstore16(cpu, res->addr2, val >> 8);
+				pstore8(cpu, res->addr2 + 2, val >> 24);
+				break;
+			case 0xe:
+				pstore16(cpu, res->addr1, val);
+				pstore16(cpu, res->addr2, val >> 16);
+				break;
+			case 0xd:
+				pstore8(cpu, res->addr1, val);
+				pstore16(cpu, res->addr1 + 1, val >> 8);
+				pstore8(cpu, res->addr2, val >> 24);
+				break;
+			}
+		}
+		return;
+	}
 	/* Fast path for VGA direct access (chain-4 mode) */
 	if (cpu->cb.vga_direct && in_vga_direct(res->addr1) && in_vga_direct(res->addr1 + 3)) {
 		*(u32 *)(cpu->cb.vga_direct + res->addr1 - 0xa0000) = val;
@@ -4460,12 +4513,12 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 /* 0xa8 */	&&f0xa8, &&f0xa9, &&f0xaa, &&f0xab, &&f0xac, &&f0xad, &&f0xae, &&f0xaf,
 /* 0xb0 */	&&f0xb0, &&f0xb1, &&f0xb2, &&f0xb3, &&f0xb4, &&f0xb5, &&f0xb6, &&f0xb7,
 /* 0xb8 */	&&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm,
-/* 0xc0 */	&&f0xc0, &&f0xc1, &&f0xc2, &&f0xc3, &&f0xc4, &&f0xc5, &&f0xc6, &&f0xc7,
+/* 0xc0 */	&&f0xc0, &&f0xc1, &&f0xc2, &&fast_ret, &&f0xc4, &&f0xc5, &&f0xc6, &&f0xc7,
 /* 0xc8 */	&&f0xc8, &&f0xc9, &&f0xca, &&f0xcb, &&f0xcc, &&f0xcd, &&f0xce, &&f0xcf,
 /* 0xd0 */	&&f0xd0, &&f0xd1, &&f0xd2, &&f0xd3, &&f0xd4, &&f0xd5, &&f0xd6, &&f0xd7,
 /* 0xd8 */	&&f0xd8, &&f0xd9, &&f0xda, &&f0xdb, &&f0xdc, &&f0xdd, &&f0xde, &&f0xdf,
 /* 0xe0 */	&&f0xe0, &&f0xe1, &&f0xe2, &&f0xe3, &&f0xe4, &&f0xe5, &&f0xe6, &&f0xe7,
-/* 0xe8 */	&&f0xe8, &&f0xe9, &&f0xea, &&f0xeb, &&f0xec, &&f0xed, &&f0xee, &&f0xef,
+/* 0xe8 */	&&fast_call_rel32, &&fast_jmp_rel32, &&f0xea, &&fast_jmp_rel8, &&f0xec, &&f0xed, &&f0xee, &&f0xef,
 /* 0xf0 */	&&pfxf0, &&f0xf1, &&pfxf2, &&pfxf3, &&f0xf4, &&f0xf5, &&f0xf6, &&f0xf7,
 /* 0xf8 */	&&f0xf8, &&f0xf9, &&f0xfa, &&f0xfb, &&f0xfc, &&f0xfd, &&f0xfe, &&f0xff,
 	};
@@ -4793,6 +4846,55 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			continue;
 		}
 		goto f0xb8;
+	}
+
+	fast_call_rel32: {  /* CALL rel32 (0xE8) */
+		if (likely(!opsz16 && cpu->pf_pos + 4 <= cpu->pf_avail)) {
+			int p = cpu->pf_pos;
+			sword d = (s32)(cpu->pf_ptr[p] | ((u32)cpu->pf_ptr[p+1] << 8)
+			         | ((u32)cpu->pf_ptr[p+2] << 16) | ((u32)cpu->pf_ptr[p+3] << 24));
+			cpu->pf_pos = p + 4;
+			cpu->next_ip += 4;
+			/* Push return address */
+			uword sp = lreg32(4);
+			OptAddr meml1;
+			TRY(translate32(cpu, &meml1, 2, SEG_SS, (sp - 4) & sp_mask));
+			set_sp(sp - 4, sp_mask);
+			saddr32(&meml1, cpu->next_ip);
+			cpu->next_ip += d;
+			continue;
+		}
+		goto f0xe8;
+	}
+	fast_ret: {  /* RET near (0xC3) */
+		if (likely(!opsz16)) {
+			uword sp = lreg32(4);
+			OptAddr meml1;
+			TRY(translate32(cpu, &meml1, 1, SEG_SS, sp & sp_mask));
+			set_sp(sp + 4, sp_mask);
+			cpu->next_ip = laddr32(&meml1);
+			continue;
+		}
+		goto f0xc3;
+	}
+	fast_jmp_rel32: {  /* JMP rel32 (0xE9) */
+		if (likely(!opsz16 && cpu->pf_pos + 4 <= cpu->pf_avail)) {
+			int p = cpu->pf_pos;
+			sword d = (s32)(cpu->pf_ptr[p] | ((u32)cpu->pf_ptr[p+1] << 8)
+			         | ((u32)cpu->pf_ptr[p+2] << 16) | ((u32)cpu->pf_ptr[p+3] << 24));
+			cpu->pf_pos = p + 4;
+			cpu->next_ip += 4 + d;
+			continue;
+		}
+		goto f0xe9;
+	}
+	fast_jmp_rel8: {  /* JMP rel8 (0xEB) */
+		if (likely(cpu->pf_pos < cpu->pf_avail)) {
+			sword d = (s8)cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+			cpu->next_ip += d;
+			continue;
+		}
+		goto f0xeb;
 	}
 
 	/* Reg-to-reg ALU fast paths (mod=3 only) */

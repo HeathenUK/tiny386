@@ -1,4 +1,3 @@
-#ifdef USE_BADGE_BSP
 /*
  * Toast notification system for Tanmatsu
  * Displays brief text messages at the bottom of the screen
@@ -225,5 +224,3 @@ void toast_render(uint16_t *fb)
 	int text_y = box_y + TOAST_PADDING;
 	toast_draw_text(text_x, text_y, msg, TOAST_TEXT_COLOR);
 }
-
-#endif /* USE_BADGE_BSP */

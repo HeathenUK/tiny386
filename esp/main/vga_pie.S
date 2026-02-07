@@ -5,8 +5,6 @@
 
 #include "sdkconfig.h"
 
-#ifdef CONFIG_IDF_TARGET_ESP32P4
-
     .text
     .align 4
 
@@ -222,5 +220,3 @@ pie_render_8pixels_mode13:
 
     ret
     .size   pie_render_8pixels_mode13, . - pie_render_8pixels_mode13
-
-#endif /* CONFIG_IDF_TARGET_ESP32P4 */

@@ -25,30 +25,9 @@ set(OPL_SRCS
     "../../fmopl.c"
 )
 
-# Board-specific sources based on DEVICE variable
-if(DEVICE STREQUAL "tanmatsu")
-    # Tanmatsu build with badge-bsp (physical keyboard, custom OSD)
-    # Include PIE assembly for ESP32-P4 SIMD optimization
-    set(BOARD_SRCS "lcd_bsp.c" "input_bsp.c" "tanmatsu_osd.c" "toast.c" "led_activity.c" "mouse_emu.c" "vga_pie.S" "usb_host.c")
-    set(BOARD_HEADER "board_tanmatsu.h")
-elseif(DEVICE STREQUAL "jc4880p433")
-    # JC4880P433 build with direct hardware access
-    set(BOARD_SRCS "lcd_st7701.c" "wifi.c")
-    set(BOARD_HEADER "board_jc4880p433.h")
-elseif(DEVICE STREQUAL "jc3248w535")
-    # ESP32-S3 build
-    set(BOARD_SRCS "lcd_axs15231b.c" "wifi.c")
-    set(BOARD_HEADER "board_jc3248w535.h")
-else()
-    # Fallback based on target
-    if(CONFIG_IDF_TARGET_ESP32P4)
-        set(BOARD_SRCS "lcd_st7701.c" "wifi.c")
-        set(BOARD_HEADER "board_jc4880p433.h")
-    else()
-        set(BOARD_SRCS "lcd_axs15231b.c" "wifi.c")
-        set(BOARD_HEADER "board_jc3248w535.h")
-    endif()
-endif()
+# Tanmatsu (ESP32-P4) sources
+set(BOARD_SRCS "lcd_bsp.c" "input_bsp.c" "tanmatsu_osd.c" "toast.c" "led_activity.c" "mouse_emu.c" "vga_pie.S" "usb_host.c")
+set(BOARD_HEADER "board_tanmatsu.h")
 
 idf_component_register(SRCS ${COMMON_SRCS} ${OPL_SRCS} ${BOARD_SRCS}
                        INCLUDE_DIRS "." "../../")

@@ -1,4 +1,3 @@
-#ifdef USE_BADGE_BSP
 /*
  * Keyboard input backend using badge-bsp for Tanmatsu device
  * The BSP provides PC AT keyboard scancodes directly.
@@ -310,4 +309,3 @@ void console_send_kbd(void *opaque, int keypress, int keycode)
 {
 	ps2_put_keycode(globals.kbd, keypress, keycode);
 }
-#endif

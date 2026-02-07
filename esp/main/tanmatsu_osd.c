@@ -44,7 +44,6 @@ typedef enum {
 	VIEW_MOUNTING,
 	VIEW_AUDIOVISUAL,
 	VIEW_SYSTEM,
-	VIEW_STATUS,
 	VIEW_HELP,
 	VIEW_FILEBROWSER,
 	VIEW_DELETE_CONFIRM
@@ -55,7 +54,6 @@ typedef enum {
 	MAIN_MOUNTING = 0,
 	MAIN_AUDIOVISUAL,
 	MAIN_SYSTEM,
-	MAIN_STATUS,
 	MAIN_HELP,
 	MAIN_SEP1,
 	MAIN_BOOT_ORDER,
@@ -102,6 +100,7 @@ typedef enum {
 	SYS_MEMSIZE,
 	SYS_BATCH,
 	SYS_MOUSE_SPEED,
+	SYS_STATS_BAR,
 	SYS_SEP1,
 	SYS_BACK,
 	SYS_COUNT
@@ -553,7 +552,6 @@ static void render_main_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ "Mounting", 0, 1, NULL },
 		{ "Audio/Visual", 0, 1, NULL },
 		{ "System", 0, 1, NULL },
-		{ "Status", 0, 1, NULL },
 		{ "Help", 0, 1, NULL },
 		{ NULL, 1, 0, NULL },  // SEP1
 		{ "Boot Order:", 0, 0, boot_order_val },
@@ -636,7 +634,7 @@ static const char *cpu_gen_names[] = { "i386", "i486", "i586" };
 // Render system settings submenu
 static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], mouse_val[16];
+	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], mouse_val[16], statsbar_val[16];
 
 	// CPU generation (3=386, 4=486, 5=586)
 	int gen_idx = osd->cpu_gen - 3;
@@ -660,12 +658,16 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	// Mouse speed (1-10)
 	snprintf(mouse_val, sizeof(mouse_val), "%d", osd->mouse_speed);
 
+	// Stats bar
+	snprintf(statsbar_val, sizeof(statsbar_val), "%s", globals.stats_bar_visible ? "On" : "Off");
+
 	MenuEntry entries[SYS_COUNT] = {
 		{ "CPU:", 0, 0, cpu_val },
 		{ "FPU:", 0, 0, fpu_val },
 		{ "Memory:", 0, 0, mem_val },
 		{ "Batch:", 0, 0, batch_val },
 		{ "Mouse Speed:", 0, 0, mouse_val },
+		{ "Stats Bar:", 0, 0, statsbar_val },
 		{ NULL, 1, 0, NULL },  // SEP1
 		{ "< Back (restart to apply)", 0, 0, NULL },
 	};
@@ -702,84 +704,6 @@ static void render_delete_confirm(OSD *osd, uint8_t *pixels, int w, int h, int p
 
 	render_generic_menu(pixels, w, h, pitch, title, entries, 4,
 	                    -1, "Y:Delete N/Esc:Cancel");
-}
-
-// Render status panel (emulator stats)
-static void render_status(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
-{
-	char line[64];
-
-	// Panel dimensions
-	int panel_w = (w > 350) ? 320 : w - 20;
-	int panel_h = 220;
-	int panel_x = (w - panel_w) / 2;
-	int panel_y = (h - panel_h) / 2;
-	int line_y = panel_y + 10;
-	int line_h = 22;
-
-	// Background
-	draw_rect(pixels, w, h, pitch, panel_x, panel_y, panel_w, panel_h, COLOR_BG);
-
-	// Border
-	draw_rect(pixels, w, h, pitch, panel_x, panel_y, panel_w, 2, COLOR_BORDER);
-	draw_rect(pixels, w, h, pitch, panel_x, panel_y + panel_h - 2, panel_w, 2, COLOR_BORDER);
-	draw_rect(pixels, w, h, pitch, panel_x, panel_y, 2, panel_h, COLOR_BORDER);
-	draw_rect(pixels, w, h, pitch, panel_x + panel_w - 2, panel_y, 2, panel_h, COLOR_BORDER);
-
-	// Title
-	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, "SYSTEM STATUS", COLOR_TITLE, 0);
-	line_y += line_h + 8;
-
-	// Separator
-	draw_rect(pixels, w, h, pitch, panel_x + 8, line_y - 4, panel_w - 16, 1, COLOR_SEP);
-
-	// VGA Mode
-	snprintf(line, sizeof(line), "VGA: %dx%d", globals.vga_mode_width, globals.vga_mode_height);
-	if (globals.vga_pixel_double > 1) {
-		char extra[16];
-		snprintf(extra, sizeof(extra), " (x%d)", globals.vga_pixel_double);
-		strncat(line, extra, sizeof(line) - strlen(line) - 1);
-	}
-	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, line, COLOR_TEXT, 0);
-	line_y += line_h;
-
-	// CPU/Peripheral time split
-	snprintf(line, sizeof(line), "CPU: %d%%   Periph: %d%%",
-	         globals.emu_cpu_percent, globals.emu_periph_percent);
-	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, line, COLOR_TEXT, 0);
-	line_y += line_h;
-
-	// Batch size and calls/sec
-	snprintf(line, sizeof(line), "Batch: %d   Calls/s: %lu",
-	         globals.emu_batch_size, (unsigned long)globals.emu_calls_per_sec);
-	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, line, COLOR_TEXT, 0);
-	line_y += line_h;
-
-	// IPS (instructions per second)
-	{
-		uint32_t cps = globals.emu_cycles_per_sec;
-		if (cps >= 1000000)
-			snprintf(line, sizeof(line), "IPS: %.2f M", cps / 1000000.0f);
-		else if (cps >= 1000)
-			snprintf(line, sizeof(line), "IPS: %.1f K", cps / 1000.0f);
-		else
-			snprintf(line, sizeof(line), "IPS: %lu", (unsigned long)cps);
-	}
-	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, line, COLOR_TEXT, 0);
-	line_y += line_h;
-
-	// Frame skip
-	if (osd->frame_skip == 0) {
-		snprintf(line, sizeof(line), "Frame Skip: Off");
-	} else {
-		snprintf(line, sizeof(line), "Frame Skip: Max %d", osd->frame_skip);
-	}
-	draw_text(pixels, w, h, pitch, panel_x + 10, line_y, line, COLOR_TEXT, 0);
-	line_y += line_h + 8;
-
-	// Help text
-	draw_text(pixels, w, h, pitch, panel_x + 10, panel_y + panel_h - 24,
-	          "[Esc] Back", COLOR_MUTED, 0);
 }
 
 // Render help screen (keyboard shortcuts)
@@ -1110,10 +1034,6 @@ static int handle_main_select(OSD *osd)
 		osd->view = VIEW_SYSTEM;
 		osd->sys_sel = SYS_CPU_GEN;
 		break;
-	case MAIN_STATUS:
-		osd->view = VIEW_STATUS;
-		globals.stats_collecting = true;  // Start collecting stats
-		break;
 	case MAIN_HELP:
 		osd->view = VIEW_HELP;
 		break;
@@ -1228,6 +1148,9 @@ static void handle_sys_adjust(OSD *osd, int delta)
 		// Apply immediately
 		mouse_emu_set_speed(osd->mouse_speed);
 		globals.mouse_speed = osd->mouse_speed;
+		break;
+	case SYS_STATS_BAR:
+		globals.stats_bar_visible = !globals.stats_bar_visible;
 		break;
 	}
 }
@@ -1479,21 +1402,11 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 		case SC_ENTER:
 			if (osd->sys_sel == SYS_BACK) {
 				osd->view = VIEW_MAIN_MENU;
+			} else if (osd->sys_sel == SYS_STATS_BAR) {
+				globals.stats_bar_visible = !globals.stats_bar_visible;
 			}
 			break;
 		case SC_ESC:
-			osd->view = VIEW_MAIN_MENU;
-			break;
-		}
-		break;
-
-
-	case VIEW_STATUS:
-		switch (keycode) {
-		case SC_ESC:
-		case SC_LEFT:
-		case SC_ENTER:
-			globals.stats_collecting = false;  // Stop collecting stats
 			osd->view = VIEW_MAIN_MENU;
 			break;
 		}
@@ -1603,9 +1516,6 @@ void osd_render(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		break;
 	case VIEW_SYSTEM:
 		render_sys_menu(osd, pixels, w, h, pitch);
-		break;
-	case VIEW_STATUS:
-		render_status(osd, pixels, w, h, pitch);
 		break;
 	case VIEW_HELP:
 		render_help(osd, pixels, w, h, pitch);

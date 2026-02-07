@@ -1,4 +1,3 @@
-#ifdef USE_LCD_BSP
 /*
  * Display backend using badge-bsp for Tanmatsu device
  * Uses MIPI DSI display via BSP abstraction with PPA rotation
@@ -30,6 +29,7 @@
 #include "toast.h"
 #include "led_activity.h"
 #include "esp_cache.h"
+#include "vga_font_8x16.h"
 
 static const char *TAG = "lcd_bsp";
 
@@ -220,6 +220,98 @@ static void overlay_fill_rect(uint16_t *fb, int x, int y, int w, int h, uint16_t
 			row[x + dx] = color;
 		}
 	}
+}
+
+// Logical landscape dimensions (same as OSD/toast coordinate system)
+#define LOGICAL_WIDTH  800
+#define LOGICAL_HEIGHT 480
+
+// Convert logical landscape (x,y) to portrait buffer index
+// Rotate 90 CCW: logical (x,y) -> buffer (phys_w-1-y, x)
+static inline void stats_put_pixel(uint16_t *fb, int x, int y, uint16_t color)
+{
+	int bx = DISPLAY_WIDTH - 1 - y;
+	int by = x;
+	if (bx < 0 || bx >= DISPLAY_WIDTH || by < 0 || by >= DISPLAY_HEIGHT) return;
+	fb[by * DISPLAY_WIDTH + bx] = color;
+}
+
+// Fill rect in logical landscape coords with rotation
+static void stats_fill_rect(uint16_t *fb, int x, int y, int w, int h, uint16_t color)
+{
+	for (int dy = 0; dy < h; dy++) {
+		int ly = y + dy;
+		if (ly < 0 || ly >= LOGICAL_HEIGHT) continue;
+		for (int dx = 0; dx < w; dx++) {
+			int lx = x + dx;
+			if (lx < 0 || lx >= LOGICAL_WIDTH) continue;
+			stats_put_pixel(fb, lx, ly, color);
+		}
+	}
+}
+
+// Draw text in logical landscape coords with rotation
+static void stats_draw_text(uint16_t *fb, int x, int y, const char *text, uint16_t color)
+{
+	while (*text) {
+		unsigned char c = *text++;
+		if (c < 32 || c > 126) c = '?';
+		const uint8_t *glyph = vga_font_8x16_data[c - 32];
+		for (int dy = 0; dy < 16; dy++) {
+			uint8_t bits = glyph[dy];
+			if (!bits) continue;
+			int ly = y + dy;
+			if (ly < 0 || ly >= LOGICAL_HEIGHT) continue;
+			for (int dx = 0; dx < 8; dx++) {
+				if (bits & (0x80 >> dx)) {
+					int lx = x + dx;
+					if (lx >= 0 && lx < LOGICAL_WIDTH)
+						stats_put_pixel(fb, lx, ly, color);
+				}
+			}
+		}
+		x += 8;
+	}
+}
+
+// Render persistent stats bar at top of screen (logical landscape coords)
+static bool stats_bar_was_visible = false;
+static void render_stats_bar(uint16_t *fb)
+{
+	if (!globals.stats_bar_visible) {
+		if (stats_bar_was_visible) {
+			// Clear the bar area — PPA doesn't overwrite this region
+			stats_fill_rect(fb, 0, 0, LOGICAL_WIDTH, 20, 0x0000);
+			stats_bar_was_visible = false;
+		}
+		return;
+	}
+	stats_bar_was_visible = true;
+
+	// Bar at top of logical landscape: full width, 20px tall
+	int bar_h = 20;
+	stats_fill_rect(fb, 0, 0, LOGICAL_WIDTH, bar_h, 0x18E3);
+
+	// Format stats: IPS ~MHz | CPU/Periph% | VGA WxH fps | Seq% | Bat N | Calls/s
+	char line[100];
+	uint32_t cps = globals.emu_cycles_per_sec;
+	int pos = 0;
+	if (cps >= 1000000) {
+		pos += snprintf(line + pos, sizeof(line) - pos, " %.1fM IPS ~%luMHz",
+		                cps / 1000000.0f, (unsigned long)(cps / 1000000));
+	} else {
+		pos += snprintf(line + pos, sizeof(line) - pos, " %luK IPS",
+		                (unsigned long)(cps / 1000));
+	}
+	pos += snprintf(line + pos, sizeof(line) - pos,
+	                " CPU:%d%% IO:%d%% %dx%d %dfps Seq:%d%% Bat:%d",
+	                globals.emu_cpu_percent, globals.emu_periph_percent,
+	                globals.vga_mode_width, globals.vga_mode_height,
+	                globals.emu_vga_fps, globals.emu_seq_pct,
+	                globals.emu_batch_size);
+
+	// Draw text centered vertically in bar (bar_h=20, font=16, offset=2)
+	stats_draw_text(fb, 4, 2, line, 0xFFFF);
 }
 
 // Render brightness/volume overlay bar
@@ -456,6 +548,9 @@ void vga_task(void *arg)
 				render_overlay_bar(fb_rot);
 			}
 
+			// Persistent stats bar (renders on top of everything including OSD)
+			render_stats_bar(fb_rot);
+
 			// Toast renders on top of everything (including OSD)
 			toast_render(fb_rot);
 
@@ -473,4 +568,3 @@ void vga_task(void *arg)
 		vTaskDelay(1);
 	}
 }
-#endif

@@ -3,8 +3,6 @@
  * Handles USB mass storage devices for use as IDE drives
  */
 
-#ifdef USE_BADGE_BSP
-
 #include "usb_host.h"
 #include "common.h"
 #include "toast.h"
@@ -455,5 +453,3 @@ bool usb_host_vfs_mounted(void)
 {
     return vfs_mounted;
 }
-
-#endif /* USE_BADGE_BSP */

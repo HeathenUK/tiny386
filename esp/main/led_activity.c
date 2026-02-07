@@ -1,4 +1,3 @@
-#ifdef USE_BADGE_BSP
 /*
  * Drive Activity LED indicator for Tanmatsu
  * LED 4: HDD activity (red)
@@ -97,5 +96,3 @@ void led_activity_tick(void)
 		bsp_led_send();
 	}
 }
-
-#endif /* USE_BADGE_BSP */

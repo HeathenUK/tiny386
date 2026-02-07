@@ -2,26 +2,15 @@
 *.o
 .depends
 
-# Local scripts
-mkimg.sh
-
 # Build artifacts
 build/
 out/
-tiny386
-tiny386_nosdl
-tiny386_kvm
-wifikbd
-initnet
 
 # Generated files
 fmopl.inc
 
 # Disk images
 *.img
-
-# Debug/dump files (port numbers)
-0x*
 
 # AI assistant content
 CLAUDE.md

@@ -9,8 +9,6 @@
  *   META+Ctrl: Toggle mouse mode on/off (handled by input_bsp.c)
  */
 
-#ifdef USE_BADGE_BSP
-
 #include "mouse_emu.h"
 #include "common.h"
 #include "toast.h"
@@ -229,5 +227,3 @@ int mouse_emu_get_speed(void)
 {
     return mouse_speed;
 }
-
-#endif /* USE_BADGE_BSP */

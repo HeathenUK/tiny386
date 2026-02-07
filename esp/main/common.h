@@ -3,10 +3,8 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
-#ifdef USE_BADGE_BSP
 #include "freertos/queue.h"
 #include <stdbool.h>
-#endif
 #include <stdatomic.h>
 
 #define KEYCODE_MAX 0x80
@@ -17,7 +15,6 @@ struct Globals {
 	void *mouse;
 	void *panel;
 	void * _Atomic fb;  // Main framebuffer - atomic for cross-core visibility
-#ifdef USE_BADGE_BSP
 	QueueHandle_t input_queue;
 	void *fb_rotated;  // Rotated framebuffer (portrait 480x800)
 	void *osd;         // OSD context
@@ -45,11 +42,14 @@ struct Globals {
 	uint32_t toast_hide_time;    // Timestamp when toast should hide (0 = not active)
 	// Emulator stats for OSD display (lazy - only collected when viewing)
 	bool stats_collecting;        // Set true when Status panel is open
+	bool stats_bar_visible;       // Persistent stats bar overlay on VGA output
 	uint8_t emu_cpu_percent;      // CPU time percentage (0-100)
 	uint8_t emu_periph_percent;   // Peripheral time percentage (0-100)
 	uint16_t emu_batch_size;      // Current instruction batch size
 	uint32_t emu_calls_per_sec;   // pc_step calls per second
 	uint32_t emu_cycles_per_sec;  // Emulated CPU cycles per second (IPS)
+	uint8_t emu_seq_pct;          // Sequential fast path hit rate (0-100%)
+	uint8_t emu_vga_fps;          // VGA frames per second
 	// USB storage state
 	bool usb_storage_connected;   // True when USB mass storage is attached
 	bool usb_vfs_mounted;         // True when USB VFS is mounted at /usb
@@ -57,15 +57,12 @@ struct Globals {
 	int mouse_speed;              // Mouse speed setting (1-10, default 5)
 	// USB passthrough setting
 	int usb_passthru;             // USB passthrough to emulator (1=enabled, 0=disabled, default 1)
-#endif
 };
 
 extern EventGroupHandle_t global_event_group;
 extern struct Globals globals;
 
-#ifdef USE_LCD_BSP
 // Set VGA dimensions for PPA scaling calculation
 void lcd_set_vga_dimensions(int width, int height);
-#endif
 
 #endif /* COMMON_H */
