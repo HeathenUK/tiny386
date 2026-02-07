@@ -7,22 +7,13 @@
 #include <assert.h>
 #include <fcntl.h>
 #include <unistd.h>
-#ifdef BUILD_ESP32
 #include "common.h"
-#else
-#define IRAM_ATTR
-#endif
 
 // Batch size setting: 0=auto (dynamic), or fixed value 512-4096
 int pc_batch_size_setting = 0;
 
-#ifdef USEKVM
-#define cpu_raise_irq cpukvm_raise_irq
-#define cpu_get_cycle cpukvm_get_cycle
-#else
 #define cpu_raise_irq cpui386_raise_irq
 #define cpu_get_cycle cpui386_get_cycle
-#endif
 
 static u8 pc_io_read(void *o, int addr)
 {
@@ -462,14 +453,12 @@ void pc_vga_step(void *o)
 	PC *pc = o;
 	int refresh = vga_step(pc->vga);
 	int full_update = 0;
-#ifdef BUILD_ESP32
 	/* Check if a full redraw was requested (e.g., OSD closed) */
 	if (globals.vga_force_redraw) {
 		globals.vga_force_redraw = false;
 		full_update = 1;
 		refresh = 1;  /* Force refresh even if VGA unchanged */
 	}
-#endif
 	if (refresh) {
 		vga_refresh(pc->vga, pc->redraw, pc->redraw_data, full_update);
 	}
@@ -477,7 +466,6 @@ void pc_vga_step(void *o)
 
 void pc_step(PC *pc)
 {
-#ifdef BUILD_ESP32
 	/* Batch sizing: fixed if pc_batch_size_setting > 0, else dynamic.
 	 * Dynamic mode adjusts instruction count based on step time,
 	 * scaling up when fast and down when slow, with hysteresis. */
@@ -491,25 +479,17 @@ void pc_step(PC *pc)
 		step_time_accum = 0;
 		step_count = 0;
 	}
-#endif
 
-#ifndef USEKVM
 	if (pc->reset_request) {
 		pc->reset_request = 0;
-#ifdef BUILD_ESP32
 		/* Reset batch size on reboot - hardware detection is timing-sensitive */
 		if (pc_batch_size_setting == 0) {
 			batch_size = 512;  /* Only reset if in dynamic mode */
 		}
 		step_time_accum = 0;
 		step_count = 0;
-#endif
 		load_bios_and_reset(pc);
 	}
-#endif
-#ifndef BUILD_ESP32
-	int refresh = vga_step(pc->vga);
-#endif
 
 	/* Update VGA direct access pointer (detects mode changes) */
 	{
@@ -535,7 +515,6 @@ void pc_step(PC *pc)
 		                    &pc->cpu_cb->vga_modex_latch);
 	}
 
-#ifdef BUILD_ESP32
 	/* Check if VGA mode changed - reset batch for new program (dynamic mode only) */
 	if (globals.batch_reset_pending) {
 		globals.batch_reset_pending = false;
@@ -546,14 +525,12 @@ void pc_step(PC *pc)
 		step_count = 0;
 	}
 
-#ifdef USE_BADGE_BSP
 	/* Instrumentation for OSD stats display */
 	static uint32_t stat_cpu_us = 0;
 	static uint32_t stat_periph_us = 0;
 	static uint32_t stat_calls = 0;
 	static uint32_t stat_last_report = 0;
 	static long stat_last_cycles = 0;
-#endif
 
 	uint32_t t0 = get_uticks();
 
@@ -580,9 +557,6 @@ void pc_step(PC *pc)
 		/* Single IRQ pending - use normal path */
 		i8254_update_irq(pc->pit);
 	}
-#else
-	i8254_update_irq(pc->pit);
-#endif
 
 	cmos_update_irq(pc->cmos);
 	if (pc->enable_serial)
@@ -591,28 +565,11 @@ void pc_step(PC *pc)
 	ne2000_step(pc->ne2000);
 	i8257_dma_run(pc->isa_dma);
 	i8257_dma_run(pc->isa_hdma);
-#ifndef BUILD_ESP32
-	pc->poll(pc->redraw_data);
-	if (refresh) {
-		vga_refresh(pc->vga, pc->redraw, pc->redraw_data,
-			    pc->full_update != 0);
-		if (pc->full_update == 2)
-			pc->full_update = 0;
-	}
-#endif
-#ifdef USEKVM
-	cpukvm_step(pc->cpu, 4096);
-#else
-#ifdef BUILD_ESP32
-#ifdef USE_BADGE_BSP
 	uint32_t t1 = 0, t2 = 0;
 	bool collecting = globals.stats_collecting;
 	if (collecting) t1 = get_uticks();  /* After peripherals */
-#endif
 	cpui386_step(pc->cpu, batch_size);
-#ifdef USE_BADGE_BSP
 	if (collecting) t2 = get_uticks();  /* After CPU */
-#endif
 
 	/* Dynamic batch adjustment (only when pc_batch_size_setting == 0) */
 	if (pc_batch_size_setting == 0) {
@@ -640,7 +597,6 @@ void pc_step(PC *pc)
 		}
 	}
 
-#ifdef USE_BADGE_BSP
 	/* Lazy instrumentation - only when Status panel is open */
 	if (collecting) {
 		stat_periph_us += (t1 - t0);
@@ -669,11 +625,6 @@ void pc_step(PC *pc)
 	}
 	/* Batch size is always available (tracked for dynamic batching) */
 	globals.emu_batch_size = batch_size;
-#endif
-#else
-	cpui386_step(pc->cpu, 10240);
-#endif
-#endif
 }
 
 static void raise_irq(void *o, PicState2 *s)
@@ -700,14 +651,6 @@ static void set_pci_vga_bar(void *opaque, int bar_num, uint32_t addr, bool enabl
 		pc->pci_vga_ram_addr = addr;
 	else
 		pc->pci_vga_ram_addr = -1;
-#ifdef USEKVM
-	if (enabled)
-		cpukvm_register_mem(pc->cpu, 2, addr, pc->vga_mem_size,
-				    pc->vga_mem);
-	else
-		cpukvm_register_mem(pc->cpu, 2, addr, 0,
-				    NULL);
-#endif
 }
 
 static u8 IRAM_ATTR iomem_read8(void *iomem, uword addr)
@@ -876,19 +819,13 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	char *mem = bigmalloc(conf->mem_size);
 	CPU_CB *cb = NULL;
 	memset(mem, 0, conf->mem_size);
-#ifdef BUILD_ESP32
 	extern char *pcram;
 	extern long pcram_len;
 	pcram = mem + 0xa0000;
 	pcram_len = 0xc0000 - 0xa0000;  // 128KB
-#endif
-#ifdef USEKVM
-	pc->cpu = cpukvm_new(mem, conf->mem_size, &cb);
-#else
 	pc->cpu = cpui386_new(conf->cpu_gen, mem, conf->mem_size, &cb);
 	if (conf->fpu)
 		cpui386_enable_fpu(pc->cpu);
-#endif
 	pc->cpu_cb = cb;
 	pc->bios = conf->bios;
 	pc->vga_bios = conf->vga_bios;
@@ -900,10 +837,8 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	pc->enable_serial = conf->enable_serial;
 	pc->cpu_gen = conf->cpu_gen;
 	pc->fpu = conf->fpu;
-#if !defined(_WIN32) && !defined(__wasm__)
 	if (pc->enable_serial)
 		CaptureKeyboardInput();
-#endif
 	pc->full_update = 0;
 
 	pc->pic = i8259_init(raise_irq, pc->cpu);
@@ -916,7 +851,6 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	pc->ide = ide_allocate(14, pc->pic, set_irq);
 	pc->ide2 = ide_allocate(15, pc->pic, set_irq);
 	const char **disks = conf->disks;
-#ifdef TANMATSU_BUILD
 	// Tanmatsu fixed layout:
 	// Slot 0 (primary master): HDA - main hard drive
 	// Slot 1 (primary slave): CD-ROM - always created for hot-mounting
@@ -939,31 +873,6 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	if (conf->usb_passthru) {
 		ide_attach_usb(pc->ide2, 0);
 	}
-#else
-	for (int i = 0; i < 4; i++) {
-		int ret;
-		int has_disk = disks[i] && disks[i][0] != 0;
-
-		if (i < 2) {
-			if (conf->iscd[i]) {
-				// CD-ROM drive - create even without disc for hot-mounting
-				ret = ide_attach_cd(pc->ide, i, has_disk ? disks[i] : NULL);
-				assert(ret == 0);
-			} else if (has_disk) {
-				ret = ide_attach(pc->ide, i, disks[i]);
-				assert(ret == 0);
-			}
-		} else {
-			if (conf->iscd[i]) {
-				ret = ide_attach_cd(pc->ide2, i - 2, has_disk ? disks[i] : NULL);
-				assert(ret == 0);
-			} else if (has_disk) {
-				ret = ide_attach(pc->ide2, i - 2, disks[i]);
-				assert(ret == 0);
-			}
-		}
-	}
-#endif
 
 	if (conf->fill_cmos)
 		ide_fill_cmos(pc->ide, pc->cmos, cmos_set);
@@ -1054,11 +963,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	return pc;
 }
 
-#ifdef BUILD_ESP32
 #define MIXER_BUF_LEN 128
-#else
-#define MIXER_BUF_LEN 2048
-#endif
 void mixer_callback (void *opaque, uint8_t *stream, int free)
 {
 	uint8_t tmpbuf[MIXER_BUF_LEN];
@@ -1120,7 +1025,6 @@ void load_bios_and_reset(PC *pc)
 		load_rom(pc->phys_mem, pc->bios, 0x100000, 1);
 	if (pc->vga_bios && pc->vga_bios[0])
 		load_rom(pc->phys_mem, pc->vga_bios, 0xc0000, 0);
-#ifndef USEKVM
 	if (pc->kernel && pc->kernel[0]) {
 		int start_addr = 0x10000;
 		int cmdline_addr = 0xf800;
@@ -1142,7 +1046,6 @@ void load_bios_and_reset(PC *pc)
 	} else {
 		cpui386_reset(pc->cpu);
 	}
-#endif
 }
 
 void pc_reset(PC *pc)
@@ -1239,23 +1142,17 @@ int parse_conf_ini(void* user, const char* section,
 			conf->vga_force_8dm = atoi(value);
 		} else if (NAME("boot_order")) {
 			// Index 0-5 or name like "hdd,floppy,cd"
-#ifdef BUILD_ESP32
 			printf("INI: boot_order value='%s'\n", value);
-#endif
 			int idx = atoi(value);
 			if (idx >= 0 && idx < BOOT_ORDER_COUNT && value[0] >= '0' && value[0] <= '9') {
 				conf->boot_order = idx;
-#ifdef BUILD_ESP32
 				printf("INI: boot_order parsed as index %d\n", idx);
-#endif
 			} else {
 				// Try to match by name
 				for (int i = 0; i < BOOT_ORDER_COUNT; i++) {
 					if (strcasecmp(value, boot_order_names[i]) == 0) {
 						conf->boot_order = i;
-#ifdef BUILD_ESP32
 						printf("INI: boot_order matched name '%s' -> %d\n", boot_order_names[i], i);
-#endif
 						break;
 					}
 				}

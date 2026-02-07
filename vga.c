@@ -32,36 +32,22 @@
 #include "vga.h"
 #include "pci.h"
 
-#ifdef BUILD_ESP32
 #include "esp_attr.h"
 #include "esp_timer.h"
-#ifdef TANMATSU_BUILD
 #include "common.h"
-#endif
-#else
-#define IRAM_ATTR
-#define DRAM_ATTR
-#endif
 
-#ifdef BUILD_ESP32
 void *pcmalloc(long size);
 /* Allocate from PSRAM outside emulator pool (for caches, etc.) */
 #include "esp_heap_caps.h"
 static inline void *psram_malloc(size_t size) {
     return heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
 }
-#else
-#define pcmalloc malloc
-#define psram_malloc malloc
-#endif
 
 /* PIE (SIMD) functions for ESP32-P4 - defined in vga_pie.S */
-#if defined(BUILD_ESP32) && defined(CONFIG_IDF_TARGET_ESP32P4)
 extern void pie_write_8pixels(uint16_t *dst, uint16_t *colors);
 extern void pie_write_8pixels_doubled(uint16_t *dst, uint16_t *colors);
 extern void pie_memcpy_128(void *dst, const void *src, size_t n);
 extern void pie_render_8pixels_mode13(uint16_t *dst, const uint8_t *indices, const uint16_t *palette);
-#endif
 
 //#define DEBUG_VBE
 //#define DEBUG_VGA_REG
@@ -102,7 +88,6 @@ static planar_combine_t *planar_combine_23 = NULL;  /* planes 2,3 -> bits 2,3 (b
 static int ega_fast_logged = 0;
 static int vga256_fast_logged = 0;
 
-#ifdef TANMATSU_BUILD
 /*
  * Mode 13h Performance Optimizations for ESP32-P4
  *
@@ -204,7 +189,6 @@ static inline void vga256_invalidate_palette(void)
     vga256_palette_valid = 0;
     vga_mark_all_dirty();
 }
-#endif /* TANMATSU_BUILD */
 
 /* Initialize the two-plane combine tables. Call once at startup. */
 void vga_init_planar_tables(void)
@@ -212,17 +196,12 @@ void vga_init_planar_tables(void)
     if (planar_combine_01 != NULL)
         return;  /* Already initialized */
 
-#ifdef BUILD_ESP32
     /* On ESP32, skip the 1MB planar_combine tables - the smaller 2KB
      * planar_expand tables are faster due to cache effects (PSRAM is slow).
      * This trades more ALU ops for fewer memory accesses. */
     planar_combine_01 = NULL;
     planar_combine_23 = NULL;
     return;
-#else
-    planar_combine_01 = malloc(sizeof(planar_combine_t));
-    planar_combine_23 = malloc(sizeof(planar_combine_t));
-#endif
 
     if (!planar_combine_01 || !planar_combine_23) {
         /* Allocation failed - will fall back to simple table */
@@ -685,7 +664,6 @@ static int update_palette256(VGAState *s, uint32_t *palette)
         }
         v += 3;
     }
-#ifdef TANMATSU_BUILD
     /* Update IRAM palette cache for fast Mode 13h rendering */
     if (full_update || !vga256_palette_valid) {
         for (i = 0; i < 256; i++) {
@@ -694,7 +672,6 @@ static int update_palette256(VGAState *s, uint32_t *palette)
         vga256_palette_valid = 1;
         vga_mark_all_dirty();  /* Palette changed, redraw everything */
     }
-#endif
     return full_update;
 }
 
@@ -1226,7 +1203,6 @@ static void vga_text_refresh(VGAState *s,
     if (fb_dev->width < width1 || fb_dev->height < height1 ||
         width > MAX_TEXT_WIDTH || height > MAX_TEXT_HEIGHT)
         return; /* not enough space */
-#ifdef TANMATSU_BUILD
     /* For Tanmatsu, render at 0,0 and let PPA handle scaling/centering.
      * Text mode outputs at native resolution (no pixel doubling). */
     x1 = 0;
@@ -1234,10 +1210,6 @@ static void vga_text_refresh(VGAState *s,
     globals.vga_mode_width = width1;
     globals.vga_mode_height = height1;
     globals.vga_pixel_double = 1;
-#else
-    x1 = (fb_dev->width - width1) / 2;
-    y1 = (fb_dev->height - height1) / 2;
-#endif
     int stride = fb_dev->stride;
 #endif
     if (s->last_line_offset != line_offset ||
@@ -1505,12 +1477,10 @@ static void vga_graphic_refresh(VGAState *s,
         /* Reset fast path debug logging on mode change */
         ega_fast_logged = 0;
         vga256_fast_logged = 0;
-#ifdef TANMATSU_BUILD
         /* Invalidate dirty tracking on mode change */
         vga_mark_all_dirty();
         vga256_invalidate_palette();
         memset(vga_prev_line_hash, 0, sizeof(vga_prev_line_hash));
-#endif
         fprintf(stderr, "VGA mode: %dx%d sc=%d xdiv=%d bpp=%d cr17=0x%02x\n",
                 w, h, shift_control, (s->sr[0x01] & 8) ? 2 : 1,
                 (shift_control >= 2) ? 8 : 4, s->cr[0x17]);
@@ -1542,7 +1512,6 @@ static void vga_graphic_refresh(VGAState *s,
         /* XXX: is it correct ? */
         multi_scan = double_scan;
     }
-#ifdef TANMATSU_BUILD
     /* For Tanmatsu 256-color modes, skip CPU vertical doubling - PPA will scale.
      * This outputs native 200 lines instead of doubled 400 for mode 13h. */
     int tanmatsu_vdouble = 0;
@@ -1550,7 +1519,6 @@ static void vga_graphic_refresh(VGAState *s,
         tanmatsu_vdouble = multi_scan + 1;  /* Remember original for height calc */
         multi_scan = 0;
     }
-#endif
     multi_run = multi_scan;
 
     uint32_t start_addr = s->cr[0x0d] | (s->cr[0x0c] << 8);
@@ -1610,7 +1578,6 @@ static void vga_graphic_refresh(VGAState *s,
     } else {
         if (!vbe_enabled(s)) {
             update_palette256(s, palette);
-#ifdef TANMATSU_BUILD
             /* For Tanmatsu, output native resolution and let PPA handle scaling.
              * CRTC gives output resolution (640x400), native is (320x200).
              * xdiv=1 means no software pixel doubling - PPA will scale 2x.
@@ -1619,11 +1586,6 @@ static void vga_graphic_refresh(VGAState *s,
             w = w / 2;  /* Native width: 640->320, 800->400, etc. */
             if (tanmatsu_vdouble > 0)
                 h = h / tanmatsu_vdouble;  /* Native height: 400->200 */
-#else
-            /* For other platforms, software pixel doubling.
-             * xdiv=2 means source is half of w, each byte displayed twice. */
-            xdiv = 2;
-#endif
             bpp = 8;
         } else {
             bpp = s->vbe_regs[VBE_DISPI_INDEX_BPP];
@@ -1671,7 +1633,6 @@ static void vga_graphic_refresh(VGAState *s,
 #else
     int hx = fb_dev->height;
     int wx = fb_dev->width;
-#ifdef TANMATSU_BUILD
     /* For Tanmatsu, don't center - render at 0,0 and let PPA handle scaling.
      * Report native VGA dimensions and pixel doubling factor for PPA. */
     globals.vga_mode_width = (w < wx) ? w : wx;
@@ -1682,16 +1643,6 @@ static void vga_graphic_refresh(VGAState *s,
     if (h > hx) h = hx;
     if (w > wx) w = wx;
     /* i0 stays 0 - no centering offset */
-#else
-    if (h < hx)
-        i0 += (hx - h) / 2 * fb_dev->stride;
-    else
-        h = hx;
-    if (w < wx)
-        i0 += (wx - w) / 2 * (BPP / 8);
-    else
-        w = wx;
-#endif
 #endif
     for (int y = 0; y < h; y++) {
         /* Select palette based on scanline for mid-frame palette switching */
@@ -1736,7 +1687,6 @@ static void vga_graphic_refresh(VGAState *s,
             int src_bytes = (w / xdiv) >> 3;  /* source bytes to process */
             int vram_line_bytes = src_bytes * 4; /* 4 VRAM bytes per source byte (planar) */
 
-#ifdef TANMATSU_BUILD
             /* Copy VRAM line into SRAM buffer - one sequential PSRAM read
              * instead of scattered reads during hash + render */
             uint8_t linebuf[400];  /* Max: 800px / 8 * 4 planes = 400 bytes */
@@ -1747,9 +1697,6 @@ static void vga_graphic_refresh(VGAState *s,
             } else {
                 src_line = vram + addr;
             }
-#else
-            const uint8_t *src_line = vram + addr;
-#endif
 
             /* OPT 3+4: Render from SRAM buffer using uint32_t reads for 4 planes at once */
             int bx = 0;
@@ -1903,11 +1850,9 @@ static void vga_graphic_refresh(VGAState *s,
                 }
 
                 if (xdiv == 1) {
-#if defined(BUILD_ESP32) && defined(CONFIG_IDF_TARGET_ESP32P4)
                     if (((uintptr_t)fb_row & 0xf) == 0) {
                         pie_write_8pixels(fb_row, colors);
                     } else
-#endif
                     {
                         fb_row[0] = colors[0]; fb_row[1] = colors[1];
                         fb_row[2] = colors[2]; fb_row[3] = colors[3];
@@ -1916,7 +1861,6 @@ static void vga_graphic_refresh(VGAState *s,
                     }
                     fb_row += 8;
                 } else {
-#if defined(BUILD_ESP32) && defined(CONFIG_IDF_TARGET_ESP32P4)
                     if (((uintptr_t)fb_row & 0x3) == 0) {
                         uint32_t *fb32 = (uint32_t *)fb_row;
                         fb32[0] = colors[0] | (colors[0] << 16);
@@ -1928,7 +1872,6 @@ static void vga_graphic_refresh(VGAState *s,
                         fb32[6] = colors[6] | (colors[6] << 16);
                         fb32[7] = colors[7] | (colors[7] << 16);
                     } else
-#endif
                     {
                         fb_row[0] = colors[0]; fb_row[1] = colors[0];
                         fb_row[2] = colors[1]; fb_row[3] = colors[1];
@@ -1993,7 +1936,6 @@ static void vga_graphic_refresh(VGAState *s,
             goto next_line;
         }
 
-#ifdef TANMATSU_BUILD
         /*
          * Optimized fast path for VGA 256-color native output (Tanmatsu with PPA scaling)
          * Conditions: shift_control==2, bpp==8, xdiv==1 (no CPU pixel doubling)
@@ -2057,7 +1999,6 @@ static void vga_graphic_refresh(VGAState *s,
             }
             goto next_line;
         }
-#endif
 #endif
 
         /* Cache for EGA planar mode - pre-compute all 8 colors when VRAM changes */
@@ -2230,10 +2171,8 @@ next_line:
 #endif
     }
 
-#ifdef TANMATSU_BUILD
     /* Clear dirty line flags after frame is rendered */
     vga_clear_dirty_lines();
-#endif
 
 #ifdef DEBUG_VGA
     /* Debug timing report */
@@ -2289,11 +2228,7 @@ int vga_step(VGAState *s)
             s->retrace_phase = 0;
             /* Reset mid-frame palette tracking for new frame */
             s->hblank_poll_count = 0;
-#ifdef BUILD_ESP32
             s->retrace_time = now + 15000/3;
-#else
-            s->retrace_time = now + 15000;
-#endif
         }
     }
 
@@ -2355,7 +2290,6 @@ void vga_refresh(VGAState *s,
     FBDevice *fb_dev = s->fb_dev;
     int graphic_mode;
 
-#ifdef TANMATSU_BUILD
     /* Adaptive frame skipping - skip if previous render was slow */
     if (vga_frame_skip_max > 0 && !full_update) {
         uint64_t now = esp_timer_get_time();
@@ -2371,7 +2305,6 @@ void vga_refresh(VGAState *s,
         vga_frame_skip_count = 0;
         vga_last_render_time = now;
     }
-#endif
 
     if (!(s->ar_index & 0x20)) {
         /* blank */
@@ -2391,11 +2324,9 @@ void vga_refresh(VGAState *s,
         simplefb_clear(fb_dev, redraw_func, opaque);
         /* Force vga_graphic_refresh to re-clear on mode change */
         s->force_graphic_clear = 1;
-#ifdef BUILD_ESP32
         /* Signal to reset dynamic batch size - new program starting */
         extern struct Globals globals;
         globals.batch_reset_pending = true;
-#endif
     }
 
     if (s->graphic_mode == 2) {
@@ -2404,7 +2335,6 @@ void vga_refresh(VGAState *s,
         vga_text_refresh(s, redraw_func, opaque, full_update);
     }
 
-#ifdef TANMATSU_BUILD
     /* Track render duration for adaptive frame skip */
     if (vga_frame_skip_max > 0) {
         vga_last_render_duration = esp_timer_get_time() - vga_last_render_time;
@@ -2412,7 +2342,6 @@ void vga_refresh(VGAState *s,
     /* Increment frame generation counter for dirty tracking.
      * lcd_bsp.c can skip PPA rotation if this hasn't changed. */
     globals.vga_frame_gen++;
-#endif
 }
 
 /* force some bits to zero */
@@ -2552,11 +2481,7 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
                  * (500+ rapid consecutive polls = ~10ms of tight polling)
                  * AND in display period (phase 0), skip to retrace.
                  */
-#ifdef BUILD_ESP32
                 const uint32_t rapid_threshold = 500;
-#else
-                const uint32_t rapid_threshold = 2000;
-#endif
                 int should_advance = after_eq(now, s->retrace_time);
 
                 /* Fast-forward from display period if polling heavily */
@@ -2581,11 +2506,7 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
                         s->retrace_phase = 0;
                         /* Reset mid-frame palette tracking for new frame */
                         s->hblank_poll_count = 0;
-#ifdef BUILD_ESP32
                         s->retrace_time = now + 15000/3;
-#else
-                        s->retrace_time = now + 15000;
-#endif
                     }
                     val = s->st01;
                 }
@@ -3738,7 +3659,6 @@ void vga_direct_mark_dirty(VGAState *s, uint32_t addr, int len)
     for (uint32_t p = start_page; p <= end_page && p < 64; p++)
         s->dirty_pages |= (1ULL << p);
 
-#ifdef TANMATSU_BUILD
     /* For mode 13h: 320 pixels per line, addr / 320 = line number */
     int line_start = addr / 320;
     int line_end = (addr + len - 1) / 320;
@@ -3751,7 +3671,6 @@ void vga_direct_mark_dirty(VGAState *s, uint32_t addr, int len)
     for (int y = line_start; y <= line_end; y++) {
         vga_mark_line_dirty(y);
     }
-#endif
 }
 
 static void vga_initmode(VGAState *s);
@@ -3789,11 +3708,7 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
     s->vga_ram_size = vga_ram_size;
 
     /* Allocate render buffer for tear-free display */
-#ifdef BUILD_ESP32
     s->render_vga_ram = heap_caps_malloc(vga_ram_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-#else
-    s->render_vga_ram = malloc(vga_ram_size);
-#endif
     if (s->render_vga_ram) {
         memcpy(s->render_vga_ram, vga_ram, vga_ram_size);
     }
@@ -3802,7 +3717,6 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
     s->vbe_regs[VBE_DISPI_INDEX_VIDEO_MEMORY_64K] = s->vga_ram_size >> 16;
 
 #ifdef TEXT_RENDER_OPT
-#ifdef BUILD_ESP32
     /* Try internal RAM first for font cache (16KB) - accessed every char */
     s->font_cache = heap_caps_malloc(256 * 16 * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!s->font_cache) s->font_cache = psram_malloc(256 * 16 * 4);
@@ -3812,10 +3726,6 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!s->glyph_cache_tiles)
         s->glyph_cache_tiles = psram_malloc(GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE);
-#else
-    s->font_cache = psram_malloc(256 * 16 * 4);
-    s->glyph_cache_tiles = psram_malloc(GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE);
-#endif
     if (s->glyph_cache_tiles) {
         memset(s->glyph_cache_tiles, 0, GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE);
         memset(s->glyph_cache_keys, 0xff, sizeof(s->glyph_cache_keys));  /* Invalid keys */

@@ -45,14 +45,9 @@
 #define g_free(p) /*free(p)*/
 
 // TODO: free...
-#ifdef BUILD_ESP32
 void *pcmalloc(long size);
 void *psmalloc(long size);
 #define FMOPL_USE_STATIC_TABLE
-#else
-#define pcmalloc malloc
-#define psmalloc malloc
-#endif
 
 /* -------------------- for debug --------------------- */
 /* #define OPL_OUTPUT_LOG */

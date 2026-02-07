@@ -28,12 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef BUILD_ESP32
 #include "esp_attr.h"
-#else
-#define IRAM_ATTR
-#define DRAM_ATTR
-#endif
 
 /* #define DEBUG_DMA */
 

@@ -1,7 +1,4 @@
 // requires esp-idf v5.5.x and badge-bsp
-#define BUILD_ESP32
-#define USE_BADGE_BSP
-#define TANMATSU_BUILD  // Guards for Tanmatsu-specific features in core code
 
 // PSRAM pool for emulator - leave room for BSP framebuffers, caches, etc.
 // Uses 24MB for PC RAM, leaving ~8MB for system (framebuffers, glyph cache, etc.)

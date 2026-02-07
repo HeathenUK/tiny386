@@ -6,11 +6,7 @@
 #include <stdlib.h>
 #include <assert.h>
 
-#ifdef BUILD_ESP32
 #include "esp_attr.h"
-#else
-#define IRAM_ATTR
-#endif
 
 typedef struct {
 	uint32_t mant0;
@@ -29,9 +25,7 @@ union union32 {
 };
 
 // Use float32 on ESP32 for hardware FPU acceleration (no double-precision HW)
-#ifdef BUILD_ESP32
 #define USE_FLOAT32_FPU
-#endif
 
 #ifdef USE_FLOAT32_FPU
 // Float32-based FPU emulation - faster on chips without double-precision HW

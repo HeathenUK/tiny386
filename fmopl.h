@@ -1,11 +1,7 @@
 #ifndef FMOPL_H
 #define FMOPL_H
 
-#ifdef BUILD_ESP32
 typedef float FLOAT;
-#else
-typedef double FLOAT;
-#endif
 typedef void (*OPL_TIMERHANDLER)(void *param, int channel, FLOAT interval_Sec);
 
 /* !!!!! here is private section , do not access there member direct !!!!! */

@@ -32,23 +32,9 @@
 //#include "pc.h"
 //#include "net.h"
 
-#ifndef BUILD_ESP32
-#if defined(_WIN32)
-#include <winsock2.h>
-#endif
-#if !defined(__wasm__)
-//#define USE_TUNTAP
-#define USE_SLIRP
-#endif
-#else
 #include "esp_mac.h"
-#endif
 
-#ifdef BUILD_ESP32
 void *pcmalloc(long size);
-#else
-#define pcmalloc malloc
-#endif
 
 static uint16_t le16_to_cpu(uint16_t x)
 {
@@ -353,9 +339,6 @@ static void ne2000_receive(void *opaque, const uint8_t *buf, int size)
 
     /* now we can signal we have received something */
     atomic_fetch_or_explicit(&(s->isr), ENISR_RX, memory_order_release);
-#ifndef BUILD_ESP32
-    ne2000_update_irq(s);
-#endif
 }
 
 uint32_t get_uticks();
@@ -578,7 +561,6 @@ static void *net_open(NE2000State *s)
 
 #else
 
-#ifdef BUILD_ESP32
 extern void (*_Atomic esp32_send_packet)(uint8_t *buf, int size);
 static void qemu_send_packet(void *vc, uint8_t *buf, int size)
 {
@@ -588,25 +570,10 @@ static void qemu_send_packet(void *vc, uint8_t *buf, int size)
     if (send_packet)
         send_packet(buf, size);
 }
-#else
-#include <stdio.h>
-static void qemu_send_packet(void *vc, uint8_t *buf, int size)
-{
-    fprintf(stderr, "recv packet %d bytes:\n", size);
-    for (int i = 0; i < size; i++) {
-        if (i % 16 == 0)
-            fprintf(stderr, "\n");
-        fprintf(stderr, "%02x ", buf[i]);
-    }
-    fprintf(stderr, "\n");
-}
-#endif
 
 void ne2000_step(NE2000State *s)
 {
-#ifdef BUILD_ESP32
     ne2000_update_irq(s);
-#endif
 }
 
 static void *net_open(NE2000State *s)
@@ -959,7 +926,6 @@ typedef struct NICInfo {
     int used;
 } NICInfo;
 
-#ifdef BUILD_ESP32
 void *thene2000;
 
 static inline int filter(uint8_t *buf, int size)
@@ -1005,7 +971,6 @@ int wlanif_l2_input_hook(uint8_t *buf, int size)
     }
     return 0;
 }
-#endif
 
 NE2000State *isa_ne2000_init(int base, int irq,
                              void *pic,
@@ -1034,13 +999,8 @@ NE2000State *isa_ne2000_init(int base, int irq,
     s->irq = irq;
     s->pic = pic;
     s->set_irq = set_irq;
-#ifndef BUILD_ESP32
-    const static uint8_t macaddr[6] = {0x52, 0x54, 0x00, 0x78, 0x9a, 0xbc};
-    memcpy(s->macaddr, macaddr, 6);
-#else
     esp_read_mac(s->macaddr, ESP_MAC_WIFI_STA);
     thene2000 = s;
-#endif
 
     ne2000_reset(s);
 

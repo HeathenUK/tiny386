@@ -43,9 +43,7 @@ typedef struct EMULINK EMULINK;
 EMULINK *emulink_init();
 
 int emulink_attach_floppy(EMULINK *e, int i, const char *filename);
-#ifdef TANMATSU_BUILD
 const char *emulink_get_floppy_path(EMULINK *e, int i);
-#endif
 uint32_t emulink_status_read(void *s);
 void emulink_cmd_write(void *s, uint32_t val);
 void emulink_data_write(void *s, uint32_t val);

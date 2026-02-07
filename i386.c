@@ -5,17 +5,10 @@
 #include <unistd.h>
 #include <string.h>
 
-#ifdef BUILD_ESP32
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
-#else
-#define IRAM_ATTR
-#define IRAM_ATTR_CPU_EXEC1
-#define DRAM_ATTR
-#endif
 
 /* PIE SIMD helpers for ESP32-P4 string operations */
-#ifdef TANMATSU_BUILD
 extern void pie_memcpy_128(void *dst, const void *src, size_t n);
 extern void pie_memset32_128(void *dst, uint32_t val, size_t n);
 
@@ -44,19 +37,9 @@ static inline void fast_memset32(void *dst, uint32_t val, size_t count) {
 			p[i] = val;
 	}
 }
-#else
-#define fast_memcpy memcpy
-static inline void fast_memset32(void *dst, uint32_t val, size_t count) {
-	uint32_t *p = (uint32_t *)dst;
-	for (size_t i = 0; i < count; i++)
-		p[i] = val;
-}
-#endif
 
 #define I386_OPT1
-#ifndef __wasm__
 #define I386_OPT2
-#endif
 #ifdef I386_OPT2
 #define I386_SEQ_FASTPATH
 #endif
@@ -461,7 +444,6 @@ void i386_init_flags_tables(void)
 	if (flags_logic8 != NULL)
 		return;  /* Already initialized */
 
-#ifdef BUILD_ESP32
 	extern void *psmalloc(long size);
 	/* flags_logic8 in internal RAM for speed (accessed on every logical op) */
 	flags_logic8 = heap_caps_malloc(256, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -471,11 +453,6 @@ void i386_init_flags_tables(void)
 	/* Fall back to PSRAM if internal RAM insufficient */
 	if (!flags_add8) flags_add8 = psmalloc(sizeof(flags8_arith_t));
 	if (!flags_sub8) flags_sub8 = psmalloc(sizeof(flags8_arith_t));
-#else
-	flags_logic8 = malloc(256);
-	flags_add8 = malloc(sizeof(flags8_arith_t));
-	flags_sub8 = malloc(sizeof(flags8_arith_t));
-#endif
 
 	if (!flags_logic8 || !flags_add8 || !flags_sub8) {
 		/* Allocation failed - will fall back to computed flags */
@@ -6356,13 +6333,9 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 	/* Initialize flags lookup tables (256KB in PSRAM for fast flag computation) */
 	i386_init_flags_tables();
 
-#ifdef BUILD_ESP32
 	// Cache-aligned allocation for better memory access performance
 	CPUI386 *cpu = heap_caps_aligned_alloc(64, sizeof(CPUI386),
 	                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-#else
-	CPUI386 *cpu = malloc(sizeof(CPUI386));
-#endif
 	switch (gen) {
 	case 3: cpu->flags_mask = EFLAGS_MASK_386; break;
 	case 4: cpu->flags_mask = EFLAGS_MASK_486; break;
@@ -6372,13 +6345,9 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 	cpu->gen = gen;
 
 	cpu->tlb.size = tlb_size;
-#ifdef BUILD_ESP32
 	// Allocate TLB in internal RAM for fastest access
 	cpu->tlb.tab = heap_caps_malloc(sizeof(struct tlb_entry) * tlb_size,
 	                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-#else
-	cpu->tlb.tab = malloc(sizeof(struct tlb_entry) * tlb_size);
-#endif
 
 	cpu->phys_mem = (u8 *) phys_mem;
 	cpu->phys_mem_size = phys_mem_size;
@@ -6411,14 +6380,12 @@ void cpui386_delete(CPUI386 *cpu)
 	free(cpu);
 }
 
-#if !defined(_WIN32) && !defined(__wasm__)
 void cpui386_set_verbose() // for debugging
 {
 	verbose = true;
 	freopen("/tmp/xlog", "w", stderr);
 	setlinebuf(stderr);
 }
-#endif
 
 static void cpu_debug(CPUI386 *cpu)
 {

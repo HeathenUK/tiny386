@@ -29,29 +29,14 @@
 #include <string.h>
 #include "i8257.h"
 
-#ifdef BUILD_ESP32
 void *pcmalloc(long size);
 #include "esp_timer.h"
 static inline uint64_t sb_get_time_us(void) {
     return esp_timer_get_time();
 }
-#else
-#include <time.h>
-static inline uint64_t sb_get_time_us(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-}
-#define pcmalloc malloc
-#endif
 
-#if defined(SB16_LOG) || defined(BUILD_ESP32)
 #define dolog(...) fprintf(stderr, "sb16: " __VA_ARGS__)
 #define qemu_log_mask(_, ...) fprintf(stderr, "sb16: " __VA_ARGS__)
-#else
-#define dolog(...)
-#define qemu_log_mask(_, ...)
-#endif
 
 /* #define DEBUG */
 /* #define DEBUG_SB16_MOST */
@@ -1468,13 +1453,8 @@ static int write_audio (SB16State *s, int nchan, int dma_pos,
     IsaDma *isa_dma = nchan == s->dma ? s->isa_dma : s->isa_hdma;
 
     int temp, net;
-#ifdef BUILD_ESP32
     uint8_t tmpbuf[512];
     uint8_t pcmbuf[1024];  /* Decoded PCM buffer (ADPCM expands ~2-3x) */
-#else
-    uint8_t tmpbuf[4096];
-    uint8_t pcmbuf[8192];
-#endif
 
     temp = len;
     net = 0;

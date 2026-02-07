@@ -32,14 +32,10 @@
 //#include "cutils.h"
 #include "ide.h"
 
-#ifdef TANMATSU_BUILD
 //#define DEBUG_IDE
 #include "led_activity.h"
 #include "usb_host.h"
 #define IDE_ACTIVITY() led_activity_hdd()
-#else
-#define IDE_ACTIVITY() ((void)0)
-#endif
 
 //#define DEBUG_IDE_ATAPI
 
@@ -314,11 +310,7 @@
 
 #define MAX_MULT_SECTORS 4 /* 512 * 4 == 2048 */
 
-#ifdef BUILD_ESP32
 void *pcmalloc(long size);
-#else
-#define pcmalloc malloc
-#endif
 
 typedef void BlockDeviceCompletionFunc(void *opaque, int ret);
 
@@ -1991,16 +1983,12 @@ struct BlockDeviceFile {
     int64_t nb_sectors;
     BlockDeviceModeEnum mode;
     uint8_t **sector_table;
-#ifdef TANMATSU_BUILD
     char path[256];  // Store filename for OSD display
-#endif
-#ifdef BUILD_ESP32
     /* Read-ahead cache for faster sequential access */
     uint8_t *cache_buf;        /* Cache buffer in PSRAM */
     int64_t cache_start;       /* First sector in cache */
     int cache_count;           /* Number of valid sectors in cache */
 #define DISK_CACHE_SECTORS 64  /* Cache 64 sectors = 32KB per disk */
-#endif
     int dirty;                 /* Set on write, cleared on sync */
 };
 
@@ -2064,7 +2052,6 @@ static int bf_read_async(BlockDevice *bs,
             buf += SECTOR_SIZE;
         }
     } else {
-#ifdef BUILD_ESP32
         /* Use read-ahead cache for faster sequential access */
         if (bf->cache_buf) {
             while (n > 0) {
@@ -2096,7 +2083,6 @@ static int bf_read_async(BlockDevice *bs,
                 }
             }
         } else
-#endif
         {
             fseeko(bf->f, bf->start_offset + sector_num * SECTOR_SIZE, SEEK_SET);
             fread(buf, 1, n * SECTOR_SIZE, bf->f);
@@ -2113,12 +2099,10 @@ static int bf_write_async(BlockDevice *bs,
     BlockDeviceFile *bf = bs->opaque;
     int ret;
 
-#ifdef BUILD_ESP32
     /* Invalidate cache on write - simple approach, just clear it */
     if (bf->cache_buf) {
         bf->cache_count = 0;
     }
-#endif
 
     switch(bf->mode) {
     case BF_MODE_RO:
@@ -2193,14 +2177,10 @@ static BlockDevice *block_device_init(const char *filename,
     bf->nb_sectors = file_size / 512;
     bf->f = f;
     bf->start_offset = start_offset;
-#ifdef BUILD_ESP32
     if (mode == BF_MODE_RW)
         setvbuf(f, NULL, _IOFBF, 32768);
-#endif
-#ifdef TANMATSU_BUILD
     strncpy(bf->path, filename, sizeof(bf->path) - 1);
     bf->path[sizeof(bf->path) - 1] = '\0';
-#endif
 
     if (mode == BF_MODE_SNAPSHOT) {
         bf->sector_table = pcmalloc(sizeof(bf->sector_table[0]) *
@@ -2208,12 +2188,10 @@ static BlockDevice *block_device_init(const char *filename,
         memset(bf->sector_table, 0,
                sizeof(bf->sector_table[0]) * bf->nb_sectors);
     }
-#ifdef BUILD_ESP32
     /* Allocate read-ahead cache buffer from heap to avoid pcram exhaustion */
     bf->cache_buf = malloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
     bf->cache_start = -1;
     bf->cache_count = 0;
-#endif
     
     bs->opaque = bf;
     bs->get_sector_count = bf_get_sector_count;
@@ -2251,16 +2229,12 @@ static BlockDevice *block_device_init_empty_ro(void)
     bf->nb_sectors = 0;
     bf->f = NULL;
     bf->start_offset = 0;
-#ifdef TANMATSU_BUILD
     bf->path[0] = '\0';
-#endif
-#ifdef BUILD_ESP32
     /* Allocate cache from heap (not pcram) since CD is read-only and
      * heap/PSRAM is abundant on ESP32-P4 */
     bf->cache_buf = malloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
     bf->cache_start = -1;
     bf->cache_count = 0;
-#endif
 
     bs->opaque = bf;
     bs->get_sector_count = bf_get_sector_count;
@@ -2270,7 +2244,6 @@ static BlockDevice *block_device_init_empty_ro(void)
     return bs;
 }
 
-#ifdef TANMATSU_BUILD
 /* Create empty RW block device for HDD hot-mounting */
 static BlockDevice *block_device_init_empty_rw(void)
 {
@@ -2287,11 +2260,9 @@ static BlockDevice *block_device_init_empty_rw(void)
     bf->f = NULL;
     bf->start_offset = 0;
     bf->path[0] = '\0';
-#ifdef BUILD_ESP32
     bf->cache_buf = malloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
     bf->cache_start = -1;
     bf->cache_count = 0;
-#endif
 
     bs->opaque = bf;
     bs->get_sector_count = bf_get_sector_count;
@@ -2300,9 +2271,7 @@ static BlockDevice *block_device_init_empty_rw(void)
     bs->write_async = bf_write_async;
     return bs;
 }
-#endif
 
-#ifdef BUILD_ESP32
 #include "sdmmc_cmd.h"
 
 // === Sector Cache and Prefetch for ESP32 ===
@@ -2567,9 +2536,7 @@ static BlockDevice *block_device_init_espsd(int64_t start_sector, int64_t nb_sec
     bs->write_async = espsd_write_async;
     return bs;
 }
-#endif
 
-#ifdef TANMATSU_BUILD
 /*
  * USB Mass Storage BlockDevice
  * Returns 0 sectors when no USB device is connected.
@@ -2757,7 +2724,6 @@ static BlockDevice *block_device_init_usb(void)
     bs->write_async = usbmsc_write_async;
     return bs;
 }
-#endif
 
 IDEIFState *ide_allocate(int irq, void *pic, void (*set_irq)(void *pic, int irq, int level))
 {
@@ -2776,16 +2742,12 @@ IDEIFState *ide_allocate(int irq, void *pic, void (*set_irq)(void *pic, int irq,
 
 int ide_attach(IDEIFState *s, int drive, const char *filename)
 {
-#ifdef BUILD_ESP32
     BlockDevice *bs;
     if (strcmp(filename, "/dev/mmcblk0") == 0) {
         bs = block_device_init_espsd(0, -1);
     } else {
         bs = block_device_init(filename, BF_MODE_RW);
     }
-#else
-    BlockDevice *bs = block_device_init(filename, BF_MODE_RW);
-#endif
     if (!bs) {
         return -1;
     }
@@ -2808,7 +2770,6 @@ int ide_attach_cd(IDEIFState *s, int drive, const char *filename)
     return 0;
 }
 
-#ifdef TANMATSU_BUILD
 /* Attach HDD, creating empty slot if filename is NULL for hot-mounting */
 int ide_attach_hdd(IDEIFState *s, int drive, const char *filename)
 {
@@ -2846,7 +2807,6 @@ int ide_attach_usb(IDEIFState *s, int drive)
 #endif
     return 0;
 }
-#endif
 
 static void block_device_reinit(BlockDevice *bs, const char *filename)
 {
@@ -2869,13 +2829,9 @@ static void block_device_reinit(BlockDevice *bs, const char *filename)
         }
         bf->nb_sectors = 0;
         bf->start_offset = 0;
-#ifdef TANMATSU_BUILD
         bf->path[0] = '\0';
-#endif
-#ifdef BUILD_ESP32
         bf->cache_start = -1;
         bf->cache_count = 0;
-#endif
         return;
     }
 
@@ -2897,14 +2853,10 @@ static void block_device_reinit(BlockDevice *bs, const char *filename)
         fclose(bf->f);
     bf->f = f;
     bf->start_offset = 0;
-#ifdef TANMATSU_BUILD
     strncpy(bf->path, filename, sizeof(bf->path) - 1);
     bf->path[sizeof(bf->path) - 1] = '\0';
-#endif
-#ifdef BUILD_ESP32
     bf->cache_start = -1;
     bf->cache_count = 0;
-#endif
 }
 
 void ide_change_cd(IDEIFState *sif, int drive, const char *filename)
@@ -2937,7 +2889,6 @@ void ide_change_cd(IDEIFState *sif, int drive, const char *filename)
     }
 }
 
-#ifdef TANMATSU_BUILD
 const char *ide_get_cd_path(IDEIFState *sif, int drive)
 {
     if (!sif || drive < 0 || drive > 1)
@@ -3012,10 +2963,8 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
     }
     bf->nb_sectors = 0;
     bf->start_offset = 0;
-#ifdef BUILD_ESP32
     bf->cache_start = -1;
     bf->cache_count = 0;
-#endif
 
     /* Handle eject (empty filename) */
     if (!filename || !filename[0]) {
@@ -3046,9 +2995,7 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
     bf->mode = BF_MODE_RW;
     bf->nb_sectors = file_size / 512;
     bf->start_offset = start_offset;
-#ifdef BUILD_ESP32
     setvbuf(f, NULL, _IOFBF, 32768);
-#endif
     strncpy(bf->path, filename, sizeof(bf->path) - 1);
     bf->path[sizeof(bf->path) - 1] = '\0';
 
@@ -3079,7 +3026,6 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
             (long long)s->nb_sectors, s->cylinders, s->heads, s->sectors);
     return 0;
 }
-#endif
 
 PCIDevice *piix3_ide_init(PCIBus *pci_bus, int devfn)
 {

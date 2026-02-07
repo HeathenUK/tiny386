@@ -26,11 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef BUILD_ESP32
 void *pcmalloc(long size);
-#else
-#define pcmalloc malloc
-#endif
 
 #define PCSPK_BUF_LEN 1792
 //#define PCSPK_SAMPLE_RATE 32000

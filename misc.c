@@ -8,22 +8,13 @@
 
 #include <stdio.h>
 
-#ifdef TANMATSU_BUILD
 #include "led_activity.h"
 #define FLOPPY_ACTIVITY() led_activity_floppy()
-#else
-#define FLOPPY_ACTIVITY() ((void)0)
-#endif
-#if !defined(_WIN32) && !defined(__wasm__)
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <signal.h>
-#endif
-#ifdef BUILD_ESP32
 #include "driver/uart.h"
-#endif
 
-#if !defined(_WIN32) && !defined(__wasm__)
 static void CtrlC(int _)
 {
 	exit( 0 );
@@ -42,10 +33,6 @@ static void ResetKeyboardInput()
 void CaptureKeyboardInput()
 {
 	// Hook exit, because we want to re-enable keyboard.
-#ifndef BUILD_ESP32
-	atexit(ResetKeyboardInput);
-	signal(SIGINT, CtrlC);
-#endif
 
 	struct termios term;
 	tcgetattr(0, &term);
@@ -55,38 +42,22 @@ void CaptureKeyboardInput()
 
 static int ReadKBByte()
 {
-#ifdef BUILD_ESP32
 	char data;
 	if (uart_read_bytes(0, &data, 1, 20 / portTICK_PERIOD_MS) > 0) {
 		return data;
 	}
 	return -1;
-#else
-	char rxchar = 0;
-	int rread = read(fileno(stdin), (char*)&rxchar, 1);
-	if( rread > 0 ) // Tricky: getchar can't be used with arrow keys.
-		return rxchar;
-	else
-		abort();
-#endif
 }
 
 static int IsKBHit()
 {
-#ifdef BUILD_ESP32
 	size_t len;
 	if (uart_get_buffered_data_len(0, &len) == ESP_OK) {
 		if (len)
 			return 1;
 	}
 	return 0;
-#else
-	int byteswaiting;
-	ioctl(0, FIONREAD, &byteswaiting);
-	return !!byteswaiting;
-#endif
 }
-#endif
 
 /* sysprog21/semu */
 struct U8250 {
@@ -136,11 +107,7 @@ static void cmos_update_time(CMOS *s)
 	time_t ti;
 
 	ti = time(NULL);
-#ifndef _WIN32
 	gmtime_r(&ti, &tm);
-#else
-	gmtime_s(&tm, &ti);
-#endif
 	s->data[0] = bin2bcd(tm.tm_sec);
 	s->data[2] = bin2bcd(tm.tm_min);
 	s->data[4] = bin2bcd(tm.tm_hour);
@@ -249,14 +216,10 @@ void u8250_reg_write(U8250 *uart, int off, uint8_t val)
 			uart->dll = val;
 			break;
 		} else {
-#ifndef __wasm__
 			ssize_t r;
 			do {
 				r = write(uart->out_fd, &val, 1);
 			} while (r == -1 && errno == EINTR);
-#else
-			putchar(val);
-#endif
 		}
 		break;
 	case 1:
@@ -283,7 +246,6 @@ void u8250_reg_write(U8250 *uart, int off, uint8_t val)
 
 void u8250_update(U8250 *uart)
 {
-#if !defined(_WIN32) && !defined(__wasm__)
 	if (IsKBHit()) {
 		if (!(uart->ioready & 1)) {
 			uart->in = ReadKBByte();
@@ -291,7 +253,6 @@ void u8250_update(U8250 *uart)
 			u8250_update_interrupts(uart);
 		}
 	}
-#endif
 }
 
 #define CMOS_FREQ 32768
@@ -734,9 +695,7 @@ struct EMULINK {
 	// fake floppy drive
 	FILE *fdd[2];
 	int fdfmti[2];
-#ifdef TANMATSU_BUILD
 	char fdd_path[2][256];  // Store filenames for OSD display
-#endif
 };
 
 EMULINK *emulink_init()
@@ -754,17 +713,13 @@ int emulink_attach_floppy(EMULINK *e, int i, const char *filename)
 			fclose(e->fdd[i]);
 			e->fdd[i] = NULL;
 		}
-#ifdef TANMATSU_BUILD
 		e->fdd_path[i][0] = '\0';
-#endif
 		if (filename) {
 			e->fdd[i] = fopen(filename, "r+b");
-#ifdef TANMATSU_BUILD
 			if (e->fdd[i]) {
 				strncpy(e->fdd_path[i], filename, sizeof(e->fdd_path[i]) - 1);
 				e->fdd_path[i][sizeof(e->fdd_path[i]) - 1] = '\0';
 			}
-#endif
 		}
 		if (!e->fdd[i])
 			return -1;
@@ -782,14 +737,12 @@ int emulink_attach_floppy(EMULINK *e, int i, const char *filename)
 	return 0;
 }
 
-#ifdef TANMATSU_BUILD
 const char *emulink_get_floppy_path(EMULINK *e, int i)
 {
 	if (i >= 0 && i < 2)
 		return e->fdd_path[i];
 	return NULL;
 }
-#endif
 
 uint32_t emulink_status_read(void *s)
 {

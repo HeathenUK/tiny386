@@ -414,7 +414,6 @@ bool pit_fire_single_irq(PITState *pit)
 	return true;
 }
 
-#ifdef BUILD_ESP32
 /* Optimized burst start: validates mode once and returns pending count + timing info.
  * Returns number of pending IRQs (0 if none or invalid mode). */
 int pit_burst_start(PITState *pit, uint32_t *out_d, int *out_irq)
@@ -458,4 +457,3 @@ bool pit_burst_fire(PITState *pit, uint32_t d, int irq)
 	s->last_irq_count += s->count;
 	return true;
 }
-#endif
