@@ -9,6 +9,7 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_attr.h"
@@ -485,6 +486,11 @@ void vga_task(void *arg)
 	ESP_ERROR_CHECK(ppa_init());
 	globals.panel = panel;
 
+	// Enable tearing effect sync to eliminate screen tearing
+	SemaphoreHandle_t te_sem = NULL;
+	ESP_ERROR_CHECK(bsp_display_set_tearing_effect_mode(BSP_DISPLAY_TE_V_BLANKING));
+	ESP_ERROR_CHECK(bsp_display_get_tearing_effect_semaphore(&te_sem));
+
 	// Initialize drive activity LEDs
 	led_activity_init();
 
@@ -555,7 +561,10 @@ void vga_task(void *arg)
 			// Toast renders on top of everything (including OSD)
 			toast_render(fb_rot);
 
-			// Blit to display
+			// Wait for vertical blanking then blit (eliminates tearing)
+			if (xSemaphoreTake(te_sem, pdMS_TO_TICKS(100)) != pdTRUE) {
+				ESP_LOGW(TAG, "TE signal timeout — blitting without vsync");
+			}
 			bsp_display_blit(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, fb_rot);
 
 			// Swap to next buffer for next frame
