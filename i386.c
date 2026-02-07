@@ -131,7 +131,8 @@ struct CPUI386 {
 	long phys_mem_size;
 
 	long cycle;
-	uint64_t tsc;  /* Time stamp counter for RDTSC */
+	uint64_t tsc;        /* Time stamp counter for RDTSC (lazy-synced from cycle) */
+	long tsc_sync_cycle; /* cycle value at last TSC sync point */
 
 	int excno;
 	uword excerr;
@@ -4292,6 +4293,9 @@ static const u32 cpuid_signature[] = {
  * This provides more realistic timing for DOS-era benchmarks that use RDTSC.
  */
 #define RDTSC() \
+	/* Lazy-sync TSC from cycle counter (avoids 64-bit increment per instruction) */ \
+	cpu->tsc += (uint32_t)((uint32_t)cpu->cycle - (uint32_t)cpu->tsc_sync_cycle); \
+	cpu->tsc_sync_cycle = cpu->cycle; \
 	REGi(0) = (u32)cpu->tsc; \
 	REGi(2) = (u32)(cpu->tsc >> 32);
 
@@ -4461,7 +4465,6 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 				cpu->pf_avail = 8;
 				cpu->next_ip++;
 				cpu->cycle++;
-				cpu->tsc++;
 				cpu->seq_phys = nphys;
 				cpu->seq_prev_ip = cpu->ip;
 				goto seq_dispatch;
@@ -4499,7 +4502,6 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 		}
 	}
 	cpu->cycle++;
-	cpu->tsc++;
 #ifdef I386_SEQ_FASTPATH
 	seq_dispatch: ;
 #endif
@@ -4535,7 +4537,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 #else
 	static const IRAM_ATTR void *pfxlabel[] = {
 /* 0x00 */	&&f0x00, &&fast_0x01, &&f0x02, &&fast_0x03, &&f0x04, &&f0x05, &&f0x06, &&f0x07,
-/* 0x08 */	&&f0x08, &&fast_0x09, &&f0x0a, &&fast_0x0b, &&f0x0c, &&f0x0d, &&f0x0e, &&f0x0f,
+/* 0x08 */	&&f0x08, &&fast_0x09, &&f0x0a, &&fast_0x0b, &&f0x0c, &&f0x0d, &&f0x0e, &&fast_0x0f,
 /* 0x10 */	&&f0x10, &&f0x11, &&f0x12, &&f0x13, &&f0x14, &&f0x15, &&f0x16, &&f0x17,
 /* 0x18 */	&&f0x18, &&f0x19, &&f0x1a, &&f0x1b, &&f0x1c, &&f0x1d, &&f0x1e, &&f0x1f,
 /* 0x20 */	&&f0x20, &&fast_0x21, &&f0x22, &&fast_0x23, &&f0x24, &&f0x25, &&pfx26, &&f0x27,
@@ -4900,10 +4902,24 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			         | ((u32)cpu->pf_ptr[p+2] << 16) | ((u32)cpu->pf_ptr[p+3] << 24));
 			cpu->pf_pos = p + 4;
 			cpu->next_ip += 4;
-			/* Push return address */
 			uword sp = lreg32(4);
+			uword push_addr = (sp - 4) & sp_mask;
+			/* Inline TLB write for flat mode (skip translate32 chain) */
+			if (likely(cpu->all_segs_flat && (push_addr & 0xfff) <= 0xffc)) {
+				uword lpgno = push_addr >> 12;
+				struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
+				if (likely(ent->lpgno == lpgno &&
+				           !ent->pte_lookup[cpu->cpl > 0][1])) {
+					*(ent->ppte) |= (1 << 6); /* dirty */
+					pstore32(cpu, ent->xaddr ^ push_addr, cpu->next_ip);
+					set_sp(sp - 4, sp_mask);
+					cpu->next_ip += d;
+					continue;
+				}
+			}
+			/* Fallback: full translate path */
 			OptAddr meml1;
-			TRY(translate32(cpu, &meml1, 2, SEG_SS, (sp - 4) & sp_mask));
+			TRY(translate32(cpu, &meml1, 2, SEG_SS, push_addr));
 			set_sp(sp - 4, sp_mask);
 			saddr32(&meml1, cpu->next_ip);
 			cpu->next_ip += d;
@@ -4914,8 +4930,21 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	fast_ret: {  /* RET near (0xC3) */
 		if (likely(!opsz16)) {
 			uword sp = lreg32(4);
+			uword pop_addr = sp & sp_mask;
+			/* Inline TLB read for flat mode (skip translate32 chain) */
+			if (likely(cpu->all_segs_flat && (pop_addr & 0xfff) <= 0xffc)) {
+				uword lpgno = pop_addr >> 12;
+				struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
+				if (likely(ent->lpgno == lpgno &&
+				           !ent->pte_lookup[cpu->cpl > 0][0])) {
+					set_sp(sp + 4, sp_mask);
+					cpu->next_ip = pload32(cpu, ent->xaddr ^ pop_addr);
+					continue;
+				}
+			}
+			/* Fallback: full translate path */
 			OptAddr meml1;
-			TRY(translate32(cpu, &meml1, 1, SEG_SS, sp & sp_mask));
+			TRY(translate32(cpu, &meml1, 1, SEG_SS, pop_addr));
 			set_sp(sp + 4, sp_mask);
 			cpu->next_ip = laddr32(&meml1);
 			continue;
@@ -4940,6 +4969,40 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			continue;
 		}
 		goto f0xeb;
+	}
+	fast_0x0f: {  /* Fast path for Jcc rel32 (0F 80-8F) */
+		if (likely(!adsz16 && cpu->pf_pos + 5 <= cpu->pf_avail)) {
+			u8 b2 = cpu->pf_ptr[cpu->pf_pos];
+			if (likely((b2 & 0xf0) == 0x80)) {
+				int p = cpu->pf_pos + 1;
+				sword d = (s32)(cpu->pf_ptr[p] | ((u32)cpu->pf_ptr[p+1] << 8)
+				         | ((u32)cpu->pf_ptr[p+2] << 16) | ((u32)cpu->pf_ptr[p+3] << 24));
+				cpu->pf_pos = p + 4;
+				cpu->next_ip += 5;
+				int cond;
+				switch (b2 & 0xf) {
+				case 0x0: cond =  get_OF(cpu); break;
+				case 0x1: cond = !get_OF(cpu); break;
+				case 0x2: cond =  get_CF(cpu); break;
+				case 0x3: cond = !get_CF(cpu); break;
+				case 0x4: cond =  get_ZF(cpu); break;
+				case 0x5: cond = !get_ZF(cpu); break;
+				case 0x6: cond =  get_ZF(cpu) ||  get_CF(cpu); break;
+				case 0x7: cond = !get_ZF(cpu) && !get_CF(cpu); break;
+				case 0x8: cond =  get_SF(cpu); break;
+				case 0x9: cond = !get_SF(cpu); break;
+				case 0xa: cond =  get_PF(cpu); break;
+				case 0xb: cond = !get_PF(cpu); break;
+				case 0xc: cond =  get_SF(cpu) != get_OF(cpu); break;
+				case 0xd: cond =  get_SF(cpu) == get_OF(cpu); break;
+				case 0xe: cond =  get_ZF(cpu) || get_SF(cpu) != get_OF(cpu); break;
+				default:  cond = !get_ZF(cpu) && get_SF(cpu) == get_OF(cpu); break;
+				}
+				if (cond) cpu->next_ip += d;
+				continue;
+			}
+		}
+		goto f0x0f;
 	}
 
 	/* Reg-to-reg ALU fast paths (mod=3 only) */
@@ -6320,6 +6383,9 @@ void cpui386_set_gpr(CPUI386 *cpu, int i, u32 val)
 
 long IRAM_ATTR cpui386_get_cycle(CPUI386 *cpu)
 {
+	/* Periodic TSC sync to prevent 32-bit cycle delta overflow */
+	cpu->tsc += (uint32_t)((uint32_t)cpu->cycle - (uint32_t)cpu->tsc_sync_cycle);
+	cpu->tsc_sync_cycle = cpu->cycle;
 	return cpu->cycle;
 }
 
@@ -6353,6 +6419,7 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 	cpu->phys_mem_size = phys_mem_size;
 
 	cpu->cycle = 0;
+	cpu->tsc_sync_cycle = 0;
 
 	cpu->intr = false;
 
