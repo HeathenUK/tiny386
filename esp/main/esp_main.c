@@ -15,6 +15,7 @@
 #include "esp_vfs.h"
 #include "esp_vfs_fat.h"
 #include "esp_system.h"
+#include "nvs_flash.h"
 
 #include "../../ini.h"
 #include "../../pc.h"
@@ -327,6 +328,8 @@ void *esp_psram_get(size_t *size);
 void vga_task(void *arg);
 void i2s_main();
 void input_bsp_init(void);
+void wifi_init(void);
+void wifi_connect(void);
 
 // Override the weak stub implementation from badge-bsp that uses
 // incompatible bootloader_common_get_rtc_retain_mem() API on ESP32-P4
@@ -337,8 +340,6 @@ void storage_init(void);
 
 struct esp_ini_config {
 	const char *filename;
-	char ssid[16];
-	char pass[32];
 };
 
 static void i386_task(void *arg)
@@ -426,21 +427,16 @@ void *fbmalloc(long size)
 static int parse_ini(void* user, const char* section,
 		     const char* name, const char* value)
 {
-	struct esp_ini_config *conf = user;
-#define SEC(a) (strcmp(section, a) == 0)
-#define NAME(a) (strcmp(name, a) == 0)
-	if (SEC("esp")) {
-		if (NAME("ssid")) {
-			if (strlen(value) < 32)
-				strcpy(conf->ssid, value);
-		} else if (NAME("pass")) {
-			if (strlen(value) < 64)
-				strcpy(conf->pass, value);
-		}
-	}
-#undef SEC
-#undef NAME
+	(void)user;
+	(void)section;
+	(void)name;
+	(void)value;
 	return 1;
+}
+
+static void wifi_task(void *arg)
+{
+	wifi_connect(); /* never returns — monitors and auto-reconnects */
 }
 
 void app_main(void)
@@ -463,6 +459,13 @@ void app_main(void)
 	}
 #endif
 
+	// Initialize NVS — required for WiFi credentials stored by launcher
+	esp_err_t nvs_ret = nvs_flash_init();
+	if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+		nvs_flash_erase();
+		nvs_ret = nvs_flash_init();
+	}
+
 	// Initialize BSP early in app_main (before storage/PSRAM) for fast display startup
 	bsp_configuration_t bsp_config = {
 		.display = {
@@ -472,8 +475,9 @@ void app_main(void)
 	};
 	ESP_ERROR_CHECK(bsp_device_initialize(&bsp_config));
 
-	i2s_main();
-	storage_init();
+	wifi_init();     // ESP-HOSTED SDIO slot 1 — must init before SD (shared SDMMC host)
+	storage_init();  // SDMMC native slot 0
+	i2s_main();      // Audio task on core 0 — after SDMMC init completes
 
 	/* Check if SD card mounted - required for operation */
 	if (!storage_sd_mounted()) {
@@ -540,5 +544,7 @@ void app_main(void)
 		xTaskCreatePinnedToCore(vga_task, "vga_task", 12288, NULL, 0, NULL, 0);
 		// Start input task after vga_task (which initializes BSP)
 		input_bsp_init();
+		// WiFi: non-blocking auto-connect using launcher-saved credentials
+		xTaskCreatePinnedToCore(wifi_task, "wifi", 8192, NULL, 2, NULL, 0);
 	}
 }

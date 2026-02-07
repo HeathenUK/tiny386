@@ -930,30 +930,13 @@ void *thene2000;
 
 static inline int filter(uint8_t *buf, int size)
 {
-    if (size >= 38) {
+    if (size >= 14) {
         int l2type = (buf[12] << 8) | buf[13];
         switch(l2type) {
-        case 0x0800: // ipv4
-            switch (buf[23]) {
-            case 0x06: // tcp
-                if (buf[36] == 0x27 && buf[37] == 0x0f) { // dst 9999
-                    return 0;
-                } else {
-                    return 1;
-                }
-            case 0x11: // udp
-                if (buf[36] == 0x00 && buf[37] == 0x44) { // dhcp
-                    return 2;
-                } else {
-                    return 1;
-                }
-            default:
-                return 1;
-            }
-        case 0x0806: //arp
-            return 2;
-        default:
-            return 0;
+        case 0x0800: return 1; /* IPv4 → NE2000 exclusive */
+        case 0x86DD: return 1; /* IPv6 → NE2000 exclusive */
+        case 0x0806: return 2; /* ARP  → shared (lwIP + NE2000) */
+        default:     return 0; /* Other → lwIP only */
         }
     }
     return 0;

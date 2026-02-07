@@ -5,6 +5,13 @@ dependencies:
       path: /home/gadyke/tiny386/esp/components/badgeteam__badge-bsp
       type: local
     version: 0.8.0
+  badgeteam/custom-certificates:
+    component_hash: fe511ea8c8301bfc0a148d4458d5f2f3129ddc0d60c0fb4e8c720e256f7e73ce
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.1.0
   espressif/cmake_utilities:
     component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
     dependencies:
@@ -113,7 +120,7 @@ dependencies:
       type: service
     version: 1.2.1
   espressif/led_strip:
-    component_hash: f0d1b7f93eb3ee57bcfd220656176b0b5616e1947f89ed44364555cf910c4840
+    component_hash: 28621486f77229aaf81c71f5e15d6fbf36c2949cf11094e07090593e659e7639
     dependencies:
     - name: idf
       require: private
@@ -121,7 +128,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 3.0.2
+    version: 3.0.3
   espressif/usb_host_msc:
     component_hash: 865a651c08d0bf2ce255a369778375e493df588dfb0720c3d97e12bfdcc4c0f9
     dependencies:
@@ -169,6 +176,32 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 0.0.3
+  nicolaielectronics/esp-hosted-tanmatsu:
+    component_hash: 346d5cda942384751873e06c0f97120c3468449dfa05ce0eda0ef52762210c79
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.3'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.0.0
+  nicolaielectronics/esp-wifi-remote-tanmatsu:
+    component_hash: bb109ea694be70934ec43193fbaa90fb901b7a9a858249e7691858abda0f02eb
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.3'
+    - name: nicolaielectronics/esp-hosted-tanmatsu
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: target in [esp32h2, esp32p4]
+      version: '>=1.0.0'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.0.0
   nicolaielectronics/mipi_dsi_abstraction:
     component_hash: 4d603f790ab7736bd68e4dae997e60a2d5e55549c4a485874c1f919629a28e5d
     dependencies:
@@ -229,6 +262,40 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 0.0.1
+  nicolaielectronics/tanmatsu-wifi:
+    component_hash: a5b7b7c860911320991fb833b495e321ad7922bcfa6474fa120e8077c6c1609f
+    dependencies:
+    - name: badgeteam/badge-bsp
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=0.3.0'
+    - name: badgeteam/custom-certificates
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=1.0.0'
+    - name: idf
+      require: private
+      version: '>=5.4.0'
+    - name: nicolaielectronics/esp-hosted-tanmatsu
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: target == esp32p4
+      version: '>=1.0.0'
+    - name: nicolaielectronics/esp-wifi-remote-tanmatsu
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: target == esp32p4
+      version: '>=1.0.0'
+    - name: nicolaielectronics/wifi-manager
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=0.1.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.1.2
   nicolaielectronics/tanmatsu_coprocessor:
     component_hash: 260deab16cc79b0545f020c5eab20b5012ccbd8c3bc000f23adf51b7f83bc6e3
     dependencies:
@@ -245,6 +312,13 @@ dependencies:
     targets:
     - esp32p4
     version: 0.6.0
+  nicolaielectronics/wifi-manager:
+    component_hash: a5a8fb59d367a5f37ee3cfa6bc2615eafa22a7bf620739cd5bb9b571c2b3c871
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.3.0
 direct_dependencies:
 - badgeteam/badge-bsp
 - espressif/cmake_utilities
@@ -259,7 +333,8 @@ direct_dependencies:
 - nicolaielectronics/mipi_dsi_abstraction
 - nicolaielectronics/mpr121
 - nicolaielectronics/ssd1619
+- nicolaielectronics/tanmatsu-wifi
 - nicolaielectronics/tanmatsu_coprocessor
-manifest_hash: c0d212bbc82a69fac18a5b0dfacd9ac4d6b83ebf117b904ded4fdef0b7edc2db
+manifest_hash: 01825d903f3dfdefa2ef980f8fc0e840a009ee48cb6f244b8678dbb3d9688be6
 target: esp32p4
 version: 2.0.0

@@ -1,18 +1,20 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/gpio.h"
 #include "driver/sdmmc_host.h"
 #include "esp_vfs.h"
 #include "esp_vfs_fat.h"
 #include "esp_system.h"
 #include "sdmmc_cmd.h"
+#include "esp_attr.h"
 #include "sd_pwr_ctrl.h"
 #include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #include "common.h"
 
 static const char *TAG = "storage";
 void *rawsd;
-static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
+static sd_pwr_ctrl_handle_t sd_pwr_handle = NULL;
 static bool sd_mounted = false;
 
 bool storage_sd_mounted(void)
@@ -20,131 +22,91 @@ bool storage_sd_mounted(void)
 	return sd_mounted;
 }
 
+#ifdef SD_CLK
+/* Power cycle SD card — mirrors launcher's reset_sd_card() exactly */
+static void reset_sd_card(void)
+{
+	if (!sd_pwr_handle)
+		return;
+
+	ESP_LOGI(TAG, "Power cycling SD card...");
+
+	gpio_config_t cfg = {
+		.pin_bit_mask = BIT64(SD_D0) | BIT64(SD_D1) | BIT64(SD_D2) |
+				BIT64(SD_D3) | BIT64(SD_CLK) | BIT64(SD_CMD),
+		.mode = GPIO_MODE_OUTPUT_OD,
+		.pull_up_en = GPIO_PULLUP_DISABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+		.intr_type = GPIO_INTR_DISABLE,
+	};
+	gpio_config(&cfg);
+
+	gpio_set_level(SD_D0, 0);
+	gpio_set_level(SD_D1, 0);
+	gpio_set_level(SD_D2, 0);
+	gpio_set_level(SD_D3, 0);
+	gpio_set_level(SD_CLK, 0);
+	gpio_set_level(SD_CMD, 0);
+
+	sd_pwr_ctrl_set_io_voltage(sd_pwr_handle, 0);
+	vTaskDelay(pdMS_TO_TICKS(150));
+
+	cfg.mode = GPIO_MODE_INPUT;
+	gpio_config(&cfg);
+	sd_pwr_ctrl_set_io_voltage(sd_pwr_handle, 3300);
+	vTaskDelay(pdMS_TO_TICKS(150));
+}
+#endif
+
 void storage_init(void)
 {
-	bool sd_mount_ok = false;
 #ifdef SD_CLK
-	// Power cycle SD card via LDO4 to reset its state
-	ESP_LOGI(TAG, "Power cycling SD card...");
+	/* Init LDO4 power control — same as launcher's initialize_sd_ldo() */
 	sd_pwr_ctrl_ldo_config_t ldo_config = {
 		.ldo_chan_id = 4,
 	};
-	sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
-	esp_err_t pwr_err = sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &pwr_ctrl_handle);
-	if (pwr_err == ESP_OK) {
-		sd_pwr_ctrl_set_io_voltage(pwr_ctrl_handle, 0);
-		vTaskDelay(pdMS_TO_TICKS(150));
-		sd_pwr_ctrl_set_io_voltage(pwr_ctrl_handle, 3300);
-		vTaskDelay(pdMS_TO_TICKS(150));
-		ESP_LOGI(TAG, "SD card power cycle complete");
-	} else {
-		ESP_LOGW(TAG, "Failed to init SD power control: %s", esp_err_to_name(pwr_err));
-	}
+	sd_pwr_ctrl_new_on_chip_ldo(&ldo_config, &sd_pwr_handle);
 
-#ifndef USE_RAWSD
-	// Options for mounting the filesystem.
-	esp_vfs_fat_sdmmc_mount_config_t sdmount_config = {
+	reset_sd_card();
+
+	esp_vfs_fat_sdmmc_mount_config_t mount_config = {
 		.format_if_mount_failed = false,
 		.max_files = 3,
-		.allocation_unit_size = 16 * 1024
+		.allocation_unit_size = 16 * 1024,
 	};
-	sdmmc_card_t *card;
+
+	sdmmc_card_t *card = NULL;
+
 	ESP_LOGI(TAG, "Initializing SD card");
 
-	// Use settings defined above to initialize SD card and mount FAT filesystem.
-	// Note: esp_vfs_fat_sdmmc/sdspi_mount is all-in-one convenience functions.
-	// Please check its source code and implement error recovery when developing
-	// production applications.
-	ESP_LOGI(TAG, "Using SDMMC peripheral");
-
-	// By default, SD card frequency is initialized to SDMMC_FREQ_DEFAULT (20MHz)
-	// For setting a specific frequency, use host.max_freq_khz (range 400kHz - 40MHz for SDMMC)
-	// Example: for fixed frequency of 10MHz, use host.max_freq_khz = 10000;
+	/* SDMMC native slot 0 — mirrors launcher's sd_mount() */
 	sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+	host.slot = SDMMC_HOST_SLOT_0;
 	host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+	host.pwr_ctrl_handle = sd_pwr_handle;
 
-	// This initializes the slot without card detect (CD) and write protect (WP) signals.
-	// Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
+	/* DMA buffer in internal RAM — same as launcher */
+	static DRAM_DMA_ALIGNED_ATTR uint8_t dma_buf[512 * 4];
+	host.dma_aligned_buffer = dma_buf;
+
 	sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-
-#ifdef SD_D3
+	slot_config.clk   = SD_CLK;  /* GPIO 43 */
+	slot_config.cmd   = SD_CMD;  /* GPIO 44 */
+	slot_config.d0    = SD_D0;   /* GPIO 39 */
+	slot_config.d1    = SD_D1;   /* GPIO 40 */
+	slot_config.d2    = SD_D2;   /* GPIO 41 */
+	slot_config.d3    = SD_D3;   /* GPIO 42 */
 	slot_config.width = 4;
-	slot_config.clk = SD_CLK;
-	slot_config.cmd = SD_CMD;
-	slot_config.d0 = SD_D0;
-	slot_config.d1 = SD_D1;
-	slot_config.d2 = SD_D2;
-	slot_config.d3 = SD_D3;
-#else
-	slot_config.width = 1;
-	slot_config.clk = SD_CLK;
-	slot_config.cmd = SD_CMD;
-	slot_config.d0 = SD_D0;
-#endif
-	slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
 	ESP_LOGI(TAG, "Mounting filesystem");
-	esp_err_t ret;
-	ret = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config, &sdmount_config, &card);
-
+	esp_err_t ret = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config,
+						&mount_config, &card);
 	if (ret != ESP_OK) {
-		if (ret == ESP_FAIL) {
-			ESP_LOGE(TAG, "Failed to mount filesystem. "
-				 "If you want the card to be formatted, set the EXAMPLE_FORMAT_IF_MOUNT_FAILED menuconfig option.");
-		} else {
-			ESP_LOGE(TAG, "Failed to initialize the card (%s). "
-				 "Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
-		}
+		ESP_LOGE(TAG, "Failed to mount SD card (%s)", esp_err_to_name(ret));
 	} else {
 		ESP_LOGI(TAG, "Filesystem mounted");
-		sd_mount_ok = true;
 		sd_mounted = true;
+		rawsd = card;
 	}
-#else
-	sdmmc_card_t *card = malloc(sizeof(sdmmc_card_t));
-	memset(card, 0, sizeof(sdmmc_card_t));
-	ESP_LOGI(TAG, "Initializing SD card");
-	ESP_LOGI(TAG, "Using SDMMC peripheral");
-	sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-	host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
-
-	sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-#ifdef SD_D3
-	slot_config.width = 4;
-	slot_config.clk = SD_CLK;
-	slot_config.cmd = SD_CMD;
-	slot_config.d0 = SD_D0;
-	slot_config.d1 = SD_D1;
-	slot_config.d2 = SD_D2;
-	slot_config.d3 = SD_D3;
-#else
-	slot_config.width = 1;
-	slot_config.clk = SD_CLK;
-	slot_config.cmd = SD_CMD;
-	slot_config.d0 = SD_D0;
 #endif
-	slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-
-	esp_err_t ret;
-	ret = host.init();
-	assert(ret == 0);
-	ret = sdmmc_host_init_slot(host.slot, &slot_config);
-	assert(ret == 0);
-	ret = sdmmc_card_init(&host, card);
-	assert(ret == 0);
-	sdmmc_card_print_info(stderr, card);
-#endif
-	rawsd = card;
-#endif /* SD_CLK */
-	// mount spiflash, only if sdcard is not mounted
-	// to save memroy
-	if (!sd_mount_ok) {
-		const esp_vfs_fat_mount_config_t mount_config = {
-			.max_files = 4,
-			.format_if_mount_failed = false,
-			.allocation_unit_size = CONFIG_WL_SECTOR_SIZE
-		};
-		esp_vfs_fat_spiflash_mount_rw_wl("/spiflash", "storage",
-						 &mount_config, &s_wl_handle);
-	}
 }

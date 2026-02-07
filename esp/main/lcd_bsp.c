@@ -34,9 +34,6 @@
 
 static const char *TAG = "lcd_bsp";
 
-// Network stub - ne2000.c needs this symbol
-void (*_Atomic esp32_send_packet)(uint8_t *buf, int size) = NULL;
-
 // PPA client handle for rotation
 static ppa_client_handle_t ppa_srm_handle = NULL;
 
