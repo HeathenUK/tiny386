@@ -6239,7 +6239,12 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		cpu->halt = false;
 		int no = cpu->cb.pic_read_irq(cpu->cb.pic);
 		cpu->ip = cpu->next_ip;
-		TRY1(call_isr(cpu, no, false, 1));
+		if (unlikely(!call_isr(cpu, no, false, 1))) {
+			/* Hardware interrupt delivery failed — triple fault */
+			dolog("triple fault (IRQ %d delivery failed) — resetting CPU\n", no);
+			cpui386_reset(cpu);
+			return;
+		}
 	}
 
 	if (cpu->halt) {
@@ -6254,9 +6259,24 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		case EX_PF:
 			pusherr = true;
 		}
+		int orig_exc = cpu->excno;
 		cpu->next_ip = cpu->ip;
 
-		TRY1(call_isr(cpu, cpu->excno, pusherr, 1));
+		if (unlikely(!call_isr(cpu, cpu->excno, pusherr, 1))) {
+			/* Exception delivery failed — try double fault (#DF) */
+			if (orig_exc == EX_DF) {
+				/* Double fault delivery failed — triple fault */
+				dolog("triple fault — resetting CPU\n");
+				cpui386_reset(cpu);
+				return;
+			}
+			if (!call_isr(cpu, EX_DF, true, 1)) {
+				/* Double fault delivery also failed — triple fault */
+				dolog("triple fault (via #DF) — resetting CPU\n");
+				cpui386_reset(cpu);
+				return;
+			}
+		}
 	}
 }
 

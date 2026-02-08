@@ -57,6 +57,10 @@ struct Globals {
 	int mouse_speed;              // Mouse speed setting (1-10, default 5)
 	// USB passthrough setting
 	int usb_passthru;             // USB passthrough to emulator (1=enabled, 0=disabled, default 1)
+	// System config (set from INI, read by OSD)
+	int cpu_gen;                  // CPU generation (3=386, 4=486, 5=586)
+	int fpu;                      // FPU enabled (0/1)
+	int mem_size_mb;              // Guest RAM in MB (actual, after PSRAM cap)
 };
 
 extern EventGroupHandle_t global_event_group;

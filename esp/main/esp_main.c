@@ -241,11 +241,14 @@ static int pc_main(const char *file)
 	vga_frame_skip_max = conf.frame_skip;
 	pc_batch_size_setting = conf.batch_size;
 
-	/* Store brightness/volume/mouse_speed in globals for input_bsp and OSD to use */
+	/* Store settings in globals for input_bsp and OSD to use */
 	globals.brightness = conf.brightness;
 	globals.volume = conf.volume;
 	globals.mouse_speed = conf.mouse_speed;
 	globals.usb_passthru = conf.usb_passthru;
+	globals.cpu_gen = conf.cpu_gen;
+	globals.fpu = conf.fpu;
+	globals.mem_size_mb = (int)(conf.mem_size / (1024 * 1024));
 	mouse_emu_set_speed(conf.mouse_speed);
 	xEventGroupSetBits(global_event_group, BIT0);
 
@@ -401,6 +404,12 @@ static void i386_task(void *arg)
 static char *psram;
 static long psram_off;
 static long psram_len;
+
+long psram_remaining(void)
+{
+	return psram_len - psram_off;
+}
+
 void *psmalloc(long size)
 {
 	void *ret = psram + psram_off;
@@ -493,15 +502,19 @@ void app_main(void)
 	}
 
 	esp_psram_init();
-#ifndef PSRAM_ALLOC_LEN
-	// use the whole psram
-	size_t len;
-	psram = esp_psram_get(&len);
-	psram_len = len;
-#else
-	psram_len = PSRAM_ALLOC_LEN;
-	psram = heap_caps_calloc(1, psram_len, MALLOC_CAP_SPIRAM);
-#endif
+	/* Grab as much PSRAM as possible, leaving ~4MB for framebuffers/WiFi/system */
+	for (long try_len = 28L * 1024 * 1024; try_len >= 8L * 1024 * 1024; try_len -= 1024 * 1024) {
+		psram = heap_caps_calloc(1, try_len, MALLOC_CAP_SPIRAM);
+		if (psram) {
+			psram_len = try_len;
+			break;
+		}
+	}
+	if (!psram) {
+		fprintf(stderr, "FATAL: cannot allocate PSRAM pool\n");
+		abort();
+	}
+	fprintf(stderr, "PSRAM pool: %ldMB allocated\n", psram_len / (1024 * 1024));
 
 	/* INI file handling with fallback creation */
 	const char *ini_path = "/sdcard/tiny386.ini";

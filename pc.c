@@ -816,6 +816,17 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	   u8 *fb, PCConfig *conf)
 {
 	PC *pc = malloc(sizeof(PC));
+	/* Cap guest RAM to fit in PSRAM pool, leaving room for VGA + peripherals */
+	extern long psram_remaining(void);
+	long reserve = conf->vga_mem_size + 1024 * 1024; /* VGA + 1MB safety */
+	long avail = psram_remaining() - reserve;
+	if (avail < 1024 * 1024) avail = 1024 * 1024;
+	avail = (avail / (1024 * 1024)) * (1024 * 1024); /* round down to 1MB */
+	if (conf->mem_size > avail) {
+		fprintf(stderr, "Reducing guest RAM from %ldMB to %ldMB (PSRAM limit)\n",
+			conf->mem_size / (1024 * 1024), avail / (1024 * 1024));
+		conf->mem_size = avail;
+	}
 	char *mem = bigmalloc(conf->mem_size);
 	CPU_CB *cb = NULL;
 	memset(mem, 0, conf->mem_size);

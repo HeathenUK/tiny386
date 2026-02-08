@@ -177,7 +177,9 @@ static void input_task(void *arg)
 	// Attach console to OSD for button callbacks
 	osd_attach_console(globals.osd, NULL);
 
-	// Apply initial brightness/volume from config (globals set by esp_main.c)
+	// Apply initial settings from config (globals set by esp_main.c before BIT0)
+	osd_set_system_config(globals.osd, globals.cpu_gen, globals.fpu,
+	                      (long)globals.mem_size_mb * 1024 * 1024);
 	bsp_display_set_backlight_brightness((uint8_t)globals.brightness);
 	bsp_audio_set_volume((float)globals.volume);
 

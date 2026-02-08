@@ -1165,10 +1165,10 @@ OSD *osd_init(void)
 	osd->mouse_speed = globals.mouse_speed > 0 ? globals.mouse_speed : 5;  // Load from config, default 5
 	osd->usb_passthru = globals.usb_passthru >= 0 ? globals.usb_passthru : 1;  // Default enabled
 
-	// Default system settings
-	osd->cpu_gen = 4;      // i486
-	osd->fpu = 1;          // Enabled
-	osd->mem_size_mb = 16; // 16MB
+	// System settings from config (globals set by esp_main.c after INI parse)
+	osd->cpu_gen = globals.cpu_gen > 0 ? globals.cpu_gen : 4;
+	osd->fpu = globals.fpu;
+	osd->mem_size_mb = globals.mem_size_mb > 0 ? globals.mem_size_mb : 16;
 
 	strcpy(osd->browser_path, "/sdcard");
 

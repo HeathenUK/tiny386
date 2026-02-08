@@ -1,9 +1,7 @@
 // requires esp-idf v5.5.x and badge-bsp
 
-// PSRAM pool for emulator - leave room for BSP framebuffers, caches, etc.
-// Uses 24MB for PC RAM, leaving ~8MB for system (framebuffers, glyph cache, etc.)
-#define PSRAM_ALLOC_LEN (24 * 1024 * 1024)
-#define MAX_MEM_SIZE (24 * 1024 * 1024)  // Cap for ini mem_size
+// PSRAM pool allocated dynamically at boot (grabs as much as possible)
+// Guest RAM auto-capped to fit, leaving room for VGA + peripherals
 
 // Note: cpu_exec1() is too large (~1600 lines) for IRAM on ESP32-P4
 // Keep empty to avoid IRAM overflow. Dispatch table in IRAM provides partial benefit.

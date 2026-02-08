@@ -448,11 +448,10 @@ static void ide_identify(IDEState *s)
     padstr((char *)(tab + 27), "TINY386 HARDDISK", 40);
     stw(tab + 47, 0x8000 | MAX_MULT_SECTORS);
     stw(tab + 48, 1); /* dword I/O */
-    stw(tab + 49, (1 << 9) | (1 << 8)); /* LBA supported, DMA supported */
+    stw(tab + 49, (1 << 9)); /* LBA supported, no DMA (no Bus Master) */
     stw(tab + 51, 0x200); /* PIO transfer cycle */
     stw(tab + 52, 0x200); /* DMA transfer cycle */
-    stw(tab + 63, 0x07);  /* Multiword DMA modes 0-2 supported */
-    stw(tab + 88, 0x3f);  /* Ultra DMA modes 0-5 supported */
+    /* No DMA modes advertised — Bus Master DMA not emulated */
     stw(tab + 54, cyls);
     stw(tab + 55, heads);
     stw(tab + 56, secs);
@@ -531,6 +530,8 @@ static void ide_set_irq(IDEState *s)
 static void ide_transfer_start(IDEState *s, int size,
                                EndTransferFunc *end_transfer_func)
 {
+    if (size > (int)sizeof(s->io_buffer))
+        size = sizeof(s->io_buffer);
     s->end_transfer_func = end_transfer_func;
     s->data_index = 0;
     s->data_end = size;
@@ -546,9 +547,14 @@ static void ide_transfer_stop(IDEState *s)
 static void ide_transfer_start2(IDEState *s, int off, int size,
                                EndTransferFunc *end_transfer_func)
 {
+    int end = off + size;
+    if (end > (int)sizeof(s->io_buffer))
+        end = sizeof(s->io_buffer);
+    if (off > end)
+        off = end;
     s->end_transfer_func = end_transfer_func;
     s->data_index = off;
-    s->data_end = off + size;
+    s->data_end = end;
     if (!(s->status & ERR_STAT))
         s->status |= DRQ_STAT;
 }
@@ -813,21 +819,16 @@ static void ide_exec_cmd(IDEState *s, int val)
         break;
     case WIN_READDMA:
     case WIN_READDMA_ONCE:
-        // DMA read - for now, treat same as multi-sector PIO read
-        // This gives us the speed benefit without full DMA controller emulation
-        s->req_nb_sectors = s->nsector ? s->nsector : 256;
-#ifdef DEBUG_IDE
-        printf("DMA read: sector=%d count=%d\n", (int)ide_get_sector(s), s->req_nb_sectors);
-#endif
+        /* DMA not emulated — fall back to PIO multi-sector read.
+         * Clamp to MAX_MULT_SECTORS to prevent io_buffer overflow. */
+        s->req_nb_sectors = MAX_MULT_SECTORS;
         ide_sector_read(s);
         break;
     case WIN_WRITEDMA:
     case WIN_WRITEDMA_ONCE:
-        // DMA write - for now, treat same as multi-sector PIO write
-        s->req_nb_sectors = s->nsector ? s->nsector : 256;
-#ifdef DEBUG_IDE
-        printf("DMA write: sector=%d count=%d\n", (int)ide_get_sector(s), s->req_nb_sectors);
-#endif
+        /* DMA not emulated — fall back to PIO multi-sector write.
+         * Clamp to MAX_MULT_SECTORS to prevent io_buffer overflow. */
+        s->req_nb_sectors = MAX_MULT_SECTORS;
         ide_sector_write(s);
         break;
     default:
@@ -1841,14 +1842,17 @@ int ide_data_write_string(void *opaque, uint8_t *buf, int size, int count)
     if (!s)
         return 0;
 
+    int avail = s->data_end - s->data_index;
+    if (avail <= 0)
+        return 0;
     int len1 = size * count;
-    if (len1 > s->data_end - s->data_index)
-        len1 = s->data_end - s->data_index;
+    if (len1 > avail)
+        len1 = avail;
     len1 -= len1 % size;
-    if (len1 >= 0) {
+    if (len1 > 0) {
         memcpy(s->io_buffer + s->data_index, buf, len1);
+        s->data_index += len1;
     }
-    s->data_index += len1;
     if (s->data_index >= s->data_end)
         s->end_transfer_func(s);
     return len1 / size;
@@ -1861,14 +1865,17 @@ int ide_data_read_string(void *opaque, uint8_t *buf, int size, int count)
     if (!s)
         return 0;
 
+    int avail = s->data_end - s->data_index;
+    if (avail <= 0)
+        return 0;
     int len1 = size * count;
-    if (len1 > s->data_end - s->data_index)
-        len1 = s->data_end - s->data_index;
+    if (len1 > avail)
+        len1 = avail;
     len1 -= len1 % size;
-    if (len1 >= 0) {
+    if (len1 > 0) {
         memcpy(buf, s->io_buffer + s->data_index, len1);
+        s->data_index += len1;
     }
-    s->data_index += len1;
     if (s->data_index >= s->data_end)
         s->end_transfer_func(s);
     return len1 / size;
@@ -2195,6 +2202,14 @@ static BlockDevice *block_device_init(const char *filename,
         file_size = (raw >= 0) ? (int64_t)raw : (int64_t)(uint32_t)raw;
     }
     file_size -= start_offset;
+
+    /* off_t is 32-bit signed on ESP32-P4, so fseeko can only address
+       up to 2GB-1 bytes.  Cap file_size to avoid seek overflow. */
+    if (file_size > (int64_t)0x7FFFFFFF) {
+        fprintf(stderr, "Warning: %s is %lldMB, capping to 2047MB (off_t limit)\n",
+                filename, (long long)(file_size / (1024 * 1024)));
+        file_size = (int64_t)0x7FFFFE00;  /* 2GB - 512, aligned to sector */
+    }
 
     bs = pcmalloc(sizeof(*bs));
     bf = pcmalloc(sizeof(*bf));
@@ -3072,7 +3087,7 @@ PCIDevice *piix3_ide_init(PCIBus *pci_bus, int devfn)
 {
     PCIDevice *d;
     d = pci_register_device(pci_bus, "PIIX3 IDE", devfn, 0x8086, 0x7010, 0x00, 0x0101);
-    pci_device_set_config8(d, 0x09, 0x80); /* ISA IDE ports with DMA */
+    pci_device_set_config8(d, 0x09, 0x00); /* ISA IDE ports, PIO only */
     return d;
 }
 
