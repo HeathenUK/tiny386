@@ -35,6 +35,7 @@
 //#define DEBUG_IDE
 #include "led_activity.h"
 #include "usb_host.h"
+#include "esp_heap_caps.h"
 #define IDE_ACTIVITY() led_activity_hdd()
 
 //#define DEBUG_IDE_ATAPI
@@ -2607,18 +2608,21 @@ static BlockDevice *block_device_init_espsd(int64_t start_sector, int64_t nb_sec
  * Reads return zeros and writes are silently discarded when disconnected.
  */
 
-/* USB cache for faster repeated reads (FAT tables, directory scans) */
-#define USB_CACHE_SECTORS 64
-#define USB_PREFETCH_SECTORS 32
+/*
+ * USB MSC block device — all transfers bounce through internal SRAM.
+ *
+ * The IDE io_buffer lives in PSRAM (via pcmalloc). On ESP32-P4 the USB DMA
+ * controller may bypass the CPU data cache, so reading/writing PSRAM directly
+ * from USB causes silent corruption. We keep a small bounce buffer in
+ * internal SRAM and do one-sector-at-a-time transfers through it.
+ */
+#define USB_BOUNCE_SECTORS 4  /* 2KB — small enough to always fit in SRAM */
 
 typedef struct BlockDeviceUSB {
-    uint8_t *cache_buf;
-    int64_t cache_start;
-    int cache_count;
-    int64_t last_read_end;  /* For sequential detection */
+    uint8_t *bounce;  /* Internal SRAM bounce buffer — MUST NOT be NULL */
 } BlockDeviceUSB;
 
-static BlockDeviceUSB *usb_bf = NULL;  /* Global for cache access */
+static BlockDeviceUSB *usb_bf = NULL;
 
 static int64_t usbmsc_get_sector_count(BlockDevice *bs)
 {
@@ -2637,7 +2641,7 @@ static int usbmsc_read_async(BlockDevice *bs,
     BlockDeviceUSB *bf = bs->opaque;
 
     if (!usb_host_msc_connected()) {
-        memset(buf, 0, n * 512);
+        memset(buf, 0, n * SECTOR_SIZE);
         return 0;
     }
 
@@ -2647,53 +2651,23 @@ static int usbmsc_read_async(BlockDevice *bs,
         return 0;
     }
     if ((int64_t)(sector_num + n) > nb_sectors) {
-        int valid_sectors = nb_sectors - sector_num;
-        memset(buf + valid_sectors * SECTOR_SIZE, 0, (n - valid_sectors) * SECTOR_SIZE);
-        n = valid_sectors;
+        int valid = nb_sectors - sector_num;
+        memset(buf + valid * SECTOR_SIZE, 0, (n - valid) * SECTOR_SIZE);
+        n = valid;
     }
 
-    /* Check cache first */
-    if (bf->cache_buf && bf->cache_count > 0) {
-        int64_t cache_end = bf->cache_start + bf->cache_count;
-        if ((int64_t)sector_num >= bf->cache_start && (int64_t)(sector_num + n) <= cache_end) {
-            /* Fully cached */
-            int offset = (sector_num - bf->cache_start) * SECTOR_SIZE;
-            memcpy(buf, bf->cache_buf + offset, n * SECTOR_SIZE);
-            bf->last_read_end = sector_num + n;
-            return 0;
-        }
+    /* Read through SRAM bounce buffer, USB_BOUNCE_SECTORS at a time */
+    while (n > 0) {
+        int chunk = (n > USB_BOUNCE_SECTORS) ? USB_BOUNCE_SECTORS : n;
+        int ret = usb_host_msc_read(sector_num, bf->bounce, chunk);
+        if (ret != 0)
+            return ret;
+        memcpy(buf, bf->bounce, chunk * SECTOR_SIZE);
+        buf += chunk * SECTOR_SIZE;
+        sector_num += chunk;
+        n -= chunk;
     }
-
-    /* Determine how many sectors to read (with prefetch for sequential access) */
-    int read_count = n;
-    int is_sequential = (bf->last_read_end > 0 && (int64_t)sector_num == bf->last_read_end);
-
-    if (bf->cache_buf && is_sequential) {
-        /* Sequential read - prefetch extra sectors */
-        read_count = n + USB_PREFETCH_SECTORS;
-        if ((int64_t)(sector_num + read_count) > nb_sectors)
-            read_count = nb_sectors - sector_num;
-        if (read_count > USB_CACHE_SECTORS)
-            read_count = USB_CACHE_SECTORS;
-    }
-
-    /* Read from USB */
-    int ret;
-    if (bf->cache_buf && read_count > n) {
-        /* Read into cache, then copy to buffer */
-        ret = usb_host_msc_read(sector_num, bf->cache_buf, read_count);
-        if (ret == 0) {
-            bf->cache_start = sector_num;
-            bf->cache_count = read_count;
-            memcpy(buf, bf->cache_buf, n * SECTOR_SIZE);
-        }
-    } else {
-        /* Direct read */
-        ret = usb_host_msc_read(sector_num, buf, n);
-    }
-
-    bf->last_read_end = sector_num + n;
-    return (ret < 0) ? ret : 0;
+    return 0;
 }
 
 static int usbmsc_write_async(BlockDevice *bs,
@@ -2706,55 +2680,52 @@ static int usbmsc_write_async(BlockDevice *bs,
 
     BlockDeviceUSB *bf = bs->opaque;
 
-    /* Invalidate cache on write */
-    if (bf->cache_buf)
-        bf->cache_count = 0;
-
-    if (!usb_host_msc_connected()) {
+    if (!usb_host_msc_connected())
         return 0;
-    }
 
-    int ret = usb_host_msc_write(sector_num, buf, n);
-    return (ret < 0) ? ret : 0;
+    /* Write through SRAM bounce buffer */
+    while (n > 0) {
+        int chunk = (n > USB_BOUNCE_SECTORS) ? USB_BOUNCE_SECTORS : n;
+        memcpy(bf->bounce, buf, chunk * SECTOR_SIZE);
+        int ret = usb_host_msc_write(sector_num, bf->bounce, chunk);
+        if (ret != 0)
+            return ret;
+        buf += chunk * SECTOR_SIZE;
+        sector_num += chunk;
+        n -= chunk;
+    }
+    return 0;
 }
 
-/* Read CHS geometry from FAT BPB on USB drive */
+/* Read CHS geometry from FAT BPB on USB drive.
+ * Uses the SRAM bounce buffer to avoid PSRAM DMA issues. */
 static int usbmsc_get_chs(BlockDevice *bs, int *cyls, int *heads, int *secs)
 {
-    (void)bs;
-    uint8_t bpb[512];
+    BlockDeviceUSB *bf = bs->opaque;
+    uint8_t *bpb = bf->bounce;  /* Use SRAM bounce buffer */
 
-    if (!usb_host_msc_connected()) {
-        return 0;  /* Keep default geometry */
-    }
-
-    /* Try to read MBR to find partition */
-    if (usb_host_msc_read(0, bpb, 1) != 0) {
+    if (!usb_host_msc_connected())
         return 0;
-    }
+
+    if (usb_host_msc_read(0, bpb, 1) != 0)
+        return 0;
 
     /* Check for MBR signature */
     if (bpb[510] == 0x55 && bpb[511] == 0xAA && bpb[0] != 0xEB && bpb[0] != 0xE9) {
-        /* This is an MBR, find first partition */
         uint32_t part_start = bpb[446+8] | (bpb[446+9]<<8) | (bpb[446+10]<<16) | (bpb[446+11]<<24);
-        if (part_start > 0 && usb_host_msc_read(part_start, bpb, 1) != 0) {
+        if (part_start > 0 && usb_host_msc_read(part_start, bpb, 1) != 0)
             return 0;
-        }
     }
 
-    /* Check for FAT BPB signature */
-    if ((bpb[0] != 0xEB && bpb[0] != 0xE9) || bpb[510] != 0x55 || bpb[511] != 0xAA) {
-        return 0;  /* Not a valid BPB */
-    }
+    if ((bpb[0] != 0xEB && bpb[0] != 0xE9) || bpb[510] != 0x55 || bpb[511] != 0xAA)
+        return 0;
 
-    /* Read geometry from BPB */
-    int bpb_secs = bpb[0x18] | (bpb[0x19] << 8);  /* Sectors per track */
-    int bpb_heads = bpb[0x1A] | (bpb[0x1B] << 8); /* Number of heads */
+    int bpb_secs = bpb[0x18] | (bpb[0x19] << 8);
+    int bpb_heads = bpb[0x1A] | (bpb[0x1B] << 8);
 
     if (bpb_secs > 0 && bpb_secs <= 63 && bpb_heads > 0 && bpb_heads <= 255) {
         *secs = bpb_secs;
         *heads = bpb_heads;
-        /* Recalculate cylinders based on disk size and new H/S */
         uint64_t total = usb_host_msc_get_sector_count();
         int c = total / (bpb_heads * bpb_secs);
         if (c > 16383) c = 16383;
@@ -2774,12 +2745,18 @@ static BlockDevice *block_device_init_usb(void)
     memset(bs, 0, sizeof(*bs));
     memset(bf, 0, sizeof(*bf));
 
-    /* Allocate read cache from heap (not pcram) */
-    bf->cache_buf = malloc(USB_CACHE_SECTORS * SECTOR_SIZE);
-    bf->cache_start = -1;
-    bf->cache_count = 0;
-    bf->last_read_end = -1;
-    usb_bf = bf;  /* Save for global access */
+    /* Bounce buffer MUST be in internal SRAM — USB DMA vs CPU cache
+     * coherency on ESP32-P4 corrupts data in PSRAM. */
+    bf->bounce = heap_caps_malloc(USB_BOUNCE_SECTORS * SECTOR_SIZE,
+                                  MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!bf->bounce) {
+        fprintf(stderr, "USB IDE: FATAL — cannot allocate %d bytes of internal SRAM for bounce buffer\n",
+                USB_BOUNCE_SECTORS * SECTOR_SIZE);
+        return NULL;
+    }
+    fprintf(stderr, "USB IDE: bounce buffer %d bytes at %p (internal SRAM)\n",
+            USB_BOUNCE_SECTORS * SECTOR_SIZE, bf->bounce);
+    usb_bf = bf;
 
     bs->opaque = bf;
     bs->get_sector_count = usbmsc_get_sector_count;

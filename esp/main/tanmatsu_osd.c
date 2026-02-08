@@ -1235,9 +1235,12 @@ long osd_get_mem_size_bytes(OSD *osd)
 void osd_refresh(OSD *osd)
 {
 	populate_drive_paths(osd);
-	// Sync brightness/volume from globals (may have been changed via META+arrow)
+	// Sync settings from globals (INI values set by i386_task after boot)
 	osd->brightness = globals.brightness;
 	osd->volume = globals.volume;
+	osd->mouse_speed = globals.mouse_speed > 0 ? globals.mouse_speed : osd->mouse_speed;
+	if (globals.usb_passthru >= 0)
+		osd->usb_passthru = globals.usb_passthru;
 }
 
 void osd_handle_mouse_motion(OSD *osd, int x, int y)

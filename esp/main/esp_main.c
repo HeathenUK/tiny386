@@ -442,6 +442,7 @@ static void wifi_task(void *arg)
 void app_main(void)
 {
 	global_event_group = xEventGroupCreate();
+	globals.usb_passthru = -1;  // Sentinel: not yet loaded from INI
 
 #ifdef ESPDEBUG
 	uart_config_t uart_config = {

@@ -33,6 +33,7 @@
 //#include "net.h"
 
 #include "esp_mac.h"
+#include "esp_wifi.h"
 
 void *pcmalloc(long size);
 
@@ -982,7 +983,29 @@ NE2000State *isa_ne2000_init(int base, int irq,
     s->irq = irq;
     s->pic = pic;
     s->set_irq = set_irq;
-    esp_read_mac(s->macaddr, ESP_MAC_WIFI_STA);
+    /* Get MAC address for NE2000.
+     * Try esp_wifi_get_mac (queries C6 via ESP-HOSTED) first,
+     * fall back to esp_read_mac (P4 efuse), fall back to generated. */
+    esp_err_t mac_err = esp_wifi_get_mac(WIFI_IF_STA, s->macaddr);
+    fprintf(stderr, "NE2000: esp_wifi_get_mac returned %d (%s)\n",
+            mac_err, esp_err_to_name(mac_err));
+    if (mac_err != ESP_OK ||
+        (s->macaddr[0] == 0xff && s->macaddr[1] == 0xff)) {
+        /* Try P4 base MAC */
+        esp_read_mac(s->macaddr, ESP_MAC_WIFI_STA);
+        fprintf(stderr, "NE2000: esp_read_mac fallback: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                s->macaddr[0], s->macaddr[1], s->macaddr[2],
+                s->macaddr[3], s->macaddr[4], s->macaddr[5]);
+    }
+    if (s->macaddr[0] == 0xff && s->macaddr[1] == 0xff) {
+        /* Both failed — generate a locally-administered MAC from P4 base */
+        esp_read_mac(s->macaddr, ESP_MAC_BASE);
+        s->macaddr[0] = (s->macaddr[0] | 0x02) & 0xfe; /* locally administered, unicast */
+        fprintf(stderr, "NE2000: generated MAC from base\n");
+    }
+    fprintf(stderr, "NE2000: MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
+            s->macaddr[0], s->macaddr[1], s->macaddr[2],
+            s->macaddr[3], s->macaddr[4], s->macaddr[5]);
     thene2000 = s;
 
     ne2000_reset(s);
