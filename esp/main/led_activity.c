@@ -71,6 +71,25 @@ void led_activity_floppy(void)
 	}
 }
 
+void led_activity_off(void)
+{
+	if (!led_initialized) return;
+
+	bool need_update = false;
+	if (hdd_led_on) {
+		bsp_led_set_pixel_rgb(LED_HDD_INDEX, 0, 0, 0);
+		hdd_led_on = false;
+		need_update = true;
+	}
+	if (floppy_led_on) {
+		bsp_led_set_pixel_rgb(LED_FLOPPY_INDEX, 0, 0, 0);
+		floppy_led_on = false;
+		need_update = true;
+	}
+	if (need_update)
+		bsp_led_send();
+}
+
 void led_activity_tick(void)
 {
 	if (!led_initialized) return;

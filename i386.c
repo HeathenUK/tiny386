@@ -11,6 +11,7 @@
 /* PIE SIMD helpers for ESP32-P4 string operations */
 extern void pie_memcpy_128(void *dst, const void *src, size_t n);
 extern void pie_memset32_128(void *dst, uint32_t val, size_t n);
+uint32_t get_uticks(void);
 
 static inline void fast_memcpy(void *dst, const void *src, size_t n) {
 	if (n >= 16 && !((uintptr_t)dst & 0xf) && !((uintptr_t)src & 0xf)) {
@@ -152,6 +153,8 @@ struct CPUI386 {
 	struct {
 		uword cs, eip, esp;
 	} sysenter;
+
+	int diag_gen; /* Diagnostic generation counter — incremented on reset */
 
 	/* Flat memory optimization: bitmask of segments with base=0 and limit=4GB.
 	 * When set, we can skip segment base addition and limit checks.
@@ -1382,7 +1385,13 @@ static bool read_desc(CPUI386 *cpu, int sel, uword *w1, uword *w2)
 	}
 
 	if (off + 7 > limit) {
-		dolog("read_desc: sel %04x base %x limit %x off %x\n", sel, base, limit, off);
+		static int rd_log_count = 0;
+		if (rd_log_count < 5) {
+			dolog("read_desc: sel %04x base %x limit %x off %x CS:EIP=%04x:%08x CPL=%d\n",
+				sel, base, limit, off,
+				cpu->seg[SEG_CS].sel, cpu->ip, cpu->cpl);
+			rd_log_count++;
+		}
 		THROW(EX_GP, sel & ~0x3);
 	}
 	if (w1) {
@@ -1411,6 +1420,40 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 {
 	sel = sel & 0xffff;
 	if (!(cpu->cr0 & 1) || (cpu->flags & VM)) {
+		if ((cpu->flags & VM) && seg == SEG_DS && sel < 0x40 && sel != 0) {
+			static int ds_dump_done = 0;
+			static int ds_diag_gen = -1;
+			if (ds_diag_gen != cpu->diag_gen) { ds_diag_gen = cpu->diag_gen; ds_dump_done = 0; }
+			if (!ds_dump_done) {
+				ds_dump_done = 1;
+				dolog("=== V86 DS=%04x — one-shot dump ===\n", sel);
+				dolog("CS:IP=%04x:%04x  prev DS=%04x (base=%08x)\n",
+				      cpu->seg[SEG_CS].sel, cpu->ip & 0xffff,
+				      cpu->seg[SEG_DS].sel, cpu->seg[SEG_DS].base);
+				dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
+				      REGi(0), REGi(3), REGi(1), REGi(2));
+				dolog("ESI=%08x EDI=%08x EBP=%08x ESP=%08x\n",
+				      REGi(6), REGi(7), REGi(5), REGi(4));
+				dolog("ES=%04x SS=%04x FS=%04x GS=%04x FL=%08x\n",
+				      cpu->seg[SEG_ES].sel, cpu->seg[SEG_SS].sel,
+				      cpu->seg[SEG_FS].sel, cpu->seg[SEG_GS].sel,
+				      cpu->flags);
+				dolog("CR0=%08x CR2=%08x CR3=%08x CPL=%d\n",
+				      cpu->cr0, cpu->cr2, cpu->cr3, cpu->cpl);
+				/* Try to read opcode bytes at CS:IP to identify the instruction */
+				uword lin = (uword)(cpu->seg[SEG_CS].sel) * 16 + (cpu->ip & 0xffff);
+				uint8_t opcodes[8] = {0};
+				for (int i = 0; i < 8; i++) {
+					OptAddr oa;
+					if (translate16(cpu, &oa, 1, SEG_CS, (cpu->ip + i) & 0xffff) == 0)
+						opcodes[i] = load8(cpu, &oa);
+				}
+				dolog("Opcodes at CS:IP: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+				      opcodes[0], opcodes[1], opcodes[2], opcodes[3],
+				      opcodes[4], opcodes[5], opcodes[6], opcodes[7]);
+				dolog("Linear addr of CS:IP: %08x\n", lin);
+			}
+		}
 		cpu->seg[seg].sel = sel;
 		cpu->seg[seg].base = sel << 4;
 		cpu->seg[seg].limit = 0xffff;
@@ -2692,8 +2735,9 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		uword newip, oldflags; \
 		int newcs; \
 		uint16_t newflags_val; \
-		/* Fast path: direct memory read if 6 bytes won't cross page */ \
-		if (likely(((sp & 0xfff) <= 0xffa))) { \
+		/* Fast path: direct memory read if 6 bytes won't cross page. \
+		 * MUST NOT use in V86 mode — paging maps linear != physical. */ \
+		if (likely(((sp & 0xfff) <= 0xffa) && !(cpu->flags & VM))) { \
 			uint8_t *stack = cpu->phys_mem + cpu->seg[SEG_SS].base + (sp & sp_mask); \
 			newip = *(uint16_t *)(stack + 0); \
 			newcs = *(uint16_t *)(stack + 2); \
@@ -2722,8 +2766,9 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		uword newip, oldflags; \
 		int newcs; \
 		uint32_t newflags_val; \
-		/* Fast path: direct memory read if 12 bytes won't cross page */ \
-		if (likely(((sp & 0xfff) <= 0xff4))) { \
+		/* Fast path: direct memory read if 12 bytes won't cross page. \
+		 * MUST NOT use in V86 mode — paging maps linear != physical. */ \
+		if (likely(((sp & 0xfff) <= 0xff4) && !(cpu->flags & VM))) { \
 			uint8_t *stack = cpu->phys_mem + cpu->seg[SEG_SS].base + (sp & sp_mask); \
 			newip = *(uint32_t *)(stack + 0); \
 			newcs = *(uint32_t *)(stack + 4) & 0xffff; \
@@ -4194,7 +4239,16 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 	TRY(translate ## BIT(cpu, &meml2, 1, curr_seg, addr1 + BIT / 8)); \
 	s ## BIT lo = load ## BIT(cpu, &meml1); \
 	s ## BIT hi = load ## BIT(cpu, &meml2); \
-	if (idx < lo || idx > hi) THROW0(EX_BR);
+	if (idx < lo || idx > hi) { \
+		static int bound_log_count = 0; \
+		if (bound_log_count < 5) { \
+			dolog("BOUND%d fail: idx=%d lo=%d hi=%d reg=%d addr=%08x CS:IP=%04x:%04x\n", \
+				BIT, (int)idx, (int)lo, (int)hi, a, (unsigned)addr1, \
+				cpu->seg[SEG_CS].sel, cpu->ip & 0xffff); \
+			bound_log_count++; \
+		} \
+		THROW0(EX_BR); \
+	}
 #define BOUNDw(...) BOUND_helper(16, __VA_ARGS__)
 #define BOUNDd(...) BOUND_helper(32, __VA_ARGS__)
 
@@ -4263,10 +4317,13 @@ static const u32 cpuid_signature[] = {
 	switch (REGi(0)) { \
 	case 0: \
 		REGi(0) = 1; \
-		/* "GenuineIntel" in little-endian dword order: EBX, EDX, ECX */ \
-		REGi(3) = 0x756e6547;  /* "Genu" */ \
-		REGi(2) = 0x6c65746e;  /* "ntel" */ \
-		REGi(1) = 0x49656e69;  /* "ineI" */ \
+		/* "TINY 386 CPU" — non-Intel vendor avoids Win95 Intel-specific code paths \
+		 * that assume MSR/TSC/Pentium errata handling we don't fully implement. \
+		 * "GenuineIntel" triggers Win95 RDTSC-based calibration that fails with \
+		 * our emulated cycle-count TSC. */ \
+		REGi(3) = 0x594e4954;  /* "TINY" */ \
+		REGi(2) = 0x20363833;  /* " 386" */ \
+		REGi(1) = 0x20555043;  /* " CPU" */ \
 		break; \
 	case 1: { \
 		int gen = cpu->gen < 3 ? 3 : (cpu->gen > 6 ? 6 : cpu->gen); \
@@ -4275,8 +4332,7 @@ static const u32 cpuid_signature[] = {
 		/* EDX feature flags */ \
 		REGi(2) = 0x100;  /* CMPXCHG8B */ \
 		if (cpu->fpu) REGi(2) |= 1;  /* FPU on-chip */ \
-		if (cpu->gen >= 5) REGi(2) |= 0x10;  /* RDTSC */ \
-		if (cpu->gen > 5) REGi(2) |= 0x8820;  /* CMOV, FXSR, FXSAVE */ \
+		if (cpu->gen > 5) REGi(2) |= 0x8830;  /* RDTSC, CMOV, FXSR, FXSAVE */ \
 		if (cpu->gen > 5 && cpu->fpu) REGi(2) |= CPUID_SIMD_FEATURE; \
 		REGi(1) = 0; \
 		break; \
@@ -5717,8 +5773,145 @@ static int __call_isr_check_cs(CPUI386 *cpu, int sel, int ext, int *csdpl)
 	}
 }
 
+/* Exception ring buffer — file-scope for post-mortem dump from cpui386_step */
+static struct { uint8_t no; uint8_t mode; uint16_t cs; uint32_t ip; uint32_t err; } exc_ring[128];
+static int exc_ring_pos = 0;
+/* Delayed ring buffer dump: set to wall-clock time when a trigger fires;
+ * cpui386_step checks and dumps 2 seconds later to capture post-trigger events. */
+static uint32_t exc_ring_delayed_dump_time = 0;
+
+static void dump_exc_ring(const char *label) {
+	int n = exc_ring_pos > 128 ? 128 : exc_ring_pos;
+	int start = exc_ring_pos - n;
+	dolog("=== %s: Last %d exceptions ===\n", label, n);
+	for (int i = start; i < exc_ring_pos; i++) {
+		int j = i & 127;
+		dolog("  %c exc %2d @ %04x:%08x err=%x\n",
+			exc_ring[j].mode, exc_ring[j].no,
+			exc_ring[j].cs, exc_ring[j].ip, exc_ring[j].err);
+	}
+}
+
 static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 {
+	/* Exception ring buffer — records last 32 exceptions for post-mortem.
+	 * Uses a generation counter so traps reset when cpui386_reset() is called. */
+	{
+		static int diag_generation = -1;
+		static bool de_dumped, ud_dumped, gp0_dumped, pf0_dumped;
+		static int post_ud_trace_count = 0;
+		/* Reset diagnostics on CPU reset (generation change) */
+		if (diag_generation != cpu->diag_gen) {
+			diag_generation = cpu->diag_gen;
+			exc_ring_pos = 0;
+			exc_ring_delayed_dump_time = 0;
+			de_dumped = ud_dumped = gp0_dumped = pf0_dumped = false;
+			post_ud_trace_count = 0;
+		}
+		/* Record this exception (only faults/traps, not software INTs) */
+		if (ext || no < 32) {
+			int idx = exc_ring_pos & 127;
+			exc_ring[idx].no = no;
+			exc_ring[idx].mode = (cpu->flags & VM) ? 'V' : ((cpu->cr0 & 1) ? 'P' : 'R');
+			exc_ring[idx].cs = cpu->seg[SEG_CS].sel;
+			exc_ring[idx].ip = cpu->ip;
+			exc_ring[idx].err = pusherr ? cpu->excerr : 0;
+			exc_ring_pos++;
+			/* Post-#UD trace: log first 10 exceptions after #UD delivery */
+			if (post_ud_trace_count > 0) {
+				dolog("  post-#UD[%d]: %c exc %2d @ %04x:%08x err=%x CPL=%d\n",
+					11 - post_ud_trace_count,
+					(cpu->flags & VM) ? 'V' : ((cpu->cr0 & 1) ? 'P' : 'R'),
+					no, cpu->seg[SEG_CS].sel, cpu->ip,
+					pusherr ? cpu->excerr : 0, cpu->cpl);
+				post_ud_trace_count--;
+			}
+		}
+		/* One-shot dump of #DE (divide error) — classic Win95 timing-loop crash */
+		if (no == 0 && (cpu->cr0 & 1) && !de_dumped) {
+			de_dumped = true;
+			dolog("=== #DE (divide error) in %s mode ===\n",
+				(cpu->flags & VM) ? "V86" : "PM");
+			dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x\n",
+				cpu->seg[SEG_CS].sel, cpu->ip,
+				cpu->seg[SEG_SS].sel, REGi(4), cpu->flags);
+			dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
+				REGi(0), REGi(3), REGi(1), REGi(2));
+			dolog("ESI=%08x EDI=%08x EBP=%08x\n",
+				REGi(6), REGi(7), REGi(5));
+		}
+		/* One-shot dump of #UD (invalid opcode) — only in PM, skip V86 */
+		if (no == 6 && (cpu->cr0 & 1) && !(cpu->flags & VM) && !ud_dumped) {
+			ud_dumped = true;
+			dolog("=== #UD (invalid opcode) in PM ===\n");
+			dolog("CS:EIP=%04x:%08x FL=%08x CPL=%d\n",
+				cpu->seg[SEG_CS].sel, cpu->ip, cpu->flags, cpu->cpl);
+			dolog("Code:");
+			for (int i = 0; i < 8; i++) {
+				u8 b;
+				if (cpu_load8(cpu, SEG_CS, (cpu->ip + i) & 0xffffffff, &b))
+					dolog(" %02x", b);
+				else
+					dolog(" ??");
+			}
+			dolog("\n");
+			dump_exc_ring("at #UD");
+			/* Dump IDT entry for vector 6 to verify handler address */
+			{
+				int idt_off = 6 << 3;
+				if (idt_off + 7 <= cpu->idt.limit) {
+					OptAddr idt_meml;
+					if (translate_laddr(cpu, &idt_meml, 1, cpu->idt.base + idt_off, 4, 0)) {
+						uword idt_w1 = load32(cpu, &idt_meml);
+						if (translate_laddr(cpu, &idt_meml, 1, cpu->idt.base + idt_off + 4, 4, 0)) {
+							uword idt_w2 = load32(cpu, &idt_meml);
+							int idt_gt = (idt_w2 >> 8) & 0xf;
+							int idt_dpl = (idt_w2 >> 13) & 3;
+							int idt_p = (idt_w2 >> 15) & 1;
+							int handler_cs = idt_w1 >> 16;
+							uword handler_eip = (idt_w1 & 0xffff) | (idt_w2 & 0xffff0000);
+							dolog("IDT[6]: type=%x DPL=%d P=%d => %04x:%08x\n",
+								idt_gt, idt_dpl, idt_p, handler_cs, handler_eip);
+						}
+					}
+				}
+			}
+			/* Schedule a delayed dump 300ms from now to capture post-#UD events */
+			exc_ring_delayed_dump_time = get_uticks();
+			/* Trace first 10 exceptions after this #UD delivery */
+			post_ud_trace_count = 10;
+		}
+		/* One-shot dump of #GP at CPL=0 (kernel GP fault) */
+		if (no == 13 && (cpu->cr0 & 1) && cpu->cpl == 0 && !gp0_dumped) {
+			gp0_dumped = true;
+			dolog("=== #GP at CPL=0 (kernel mode) err=%04x ===\n", cpu->excerr);
+			dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x\n",
+				cpu->seg[SEG_CS].sel, cpu->ip,
+				cpu->seg[SEG_SS].sel, REGi(4), cpu->flags);
+			dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
+				REGi(0), REGi(3), REGi(1), REGi(2));
+			dolog("DS=%04x ES=%04x FS=%04x GS=%04x CPL=%d\n",
+				cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
+				cpu->seg[SEG_FS].sel, cpu->seg[SEG_GS].sel, cpu->cpl);
+			dump_exc_ring("#GP CPL=0");
+		}
+		/* One-shot dump of #PF at CPL=0 (kernel page fault) */
+		if (no == 14 && (cpu->cr0 & 1) && cpu->cpl == 0 && !pf0_dumped) {
+			pf0_dumped = true;
+			dolog("=== #PF at CPL=0 (kernel mode) err=%04x CR2=%08x ===\n",
+				cpu->excerr, cpu->cr2);
+			dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x\n",
+				cpu->seg[SEG_CS].sel, cpu->ip,
+				cpu->seg[SEG_SS].sel, REGi(4), cpu->flags);
+			dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
+				REGi(0), REGi(3), REGi(1), REGi(2));
+			dolog("DS=%04x ES=%04x FS=%04x GS=%04x CPL=%d\n",
+				cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
+				cpu->seg[SEG_FS].sel, cpu->seg[SEG_GS].sel, cpu->cpl);
+			dump_exc_ring("#PF CPL=0");
+		}
+	}
+
 	if (!(cpu->cr0 & 1)) {
 		/* REAL-ADDRESS-MODE */
 		uword sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
@@ -6241,15 +6434,56 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		cpu->ip = cpu->next_ip;
 		if (unlikely(!call_isr(cpu, no, false, 1))) {
 			/* Hardware interrupt delivery failed — triple fault */
-			dolog("triple fault (IRQ %d delivery failed) — resetting CPU\n", no);
-			cpui386_reset(cpu);
-			return;
+			dolog("IRQ %d delivery failed\n", no);
+			goto triple_fault;
 		}
 	}
 
 	if (cpu->halt) {
+		/* Detect permanently-halted or error-looping system.
+		 * Uses wall time (5 seconds cumulative halt) instead of iteration
+		 * count since usleep granularity varies across platforms. */
+		static uint32_t halt_start_time = 0;
+		static uint32_t halt_total_us = 0;
+		static int halt_diag_gen = -1;
+		static bool halt_dumped = false;
+		if (halt_diag_gen != cpu->diag_gen) {
+			halt_diag_gen = cpu->diag_gen;
+			halt_total_us = 0;
+			halt_dumped = false;
+			halt_start_time = get_uticks();
+		}
+		uint32_t now = get_uticks();
+		if (halt_start_time == 0) halt_start_time = now;
+		halt_total_us += (now - halt_start_time);
+		halt_start_time = now;
+		if (!halt_dumped && halt_total_us > 5000000) { /* 5 seconds */
+			halt_dumped = true;
+			dolog("=== System halted %.1fs (IF=%d) — post-mortem ===\n",
+				halt_total_us / 1000000.0f, !!(cpu->flags & IF));
+			dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x CR0=%08x %s\n",
+				cpu->seg[SEG_CS].sel, cpu->ip,
+				cpu->seg[SEG_SS].sel, REGi(4),
+				cpu->flags, cpu->cr0,
+				(cpu->flags & VM) ? "V86" : ((cpu->cr0 & 1) ? "PM" : "RM"));
+			dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
+				REGi(0), REGi(3), REGi(1), REGi(2));
+			dump_exc_ring("halted post-mortem");
+		}
 		usleep(1);
 		return;
+	}
+
+	/* Delayed ring buffer dump: fires 2 seconds after a trigger (e.g., #UD)
+	 * to capture what exceptions happen AFTER the trigger event. */
+	if (exc_ring_delayed_dump_time != 0 &&
+	    (get_uticks() - exc_ring_delayed_dump_time) > 300000) {
+		exc_ring_delayed_dump_time = 0;
+		dolog("=== Delayed ring buffer dump (300ms post-trigger) ===\n");
+		dolog("CS:EIP=%04x:%08x FL=%08x CPL=%d %s\n",
+			cpu->seg[SEG_CS].sel, cpu->ip, cpu->flags, cpu->cpl,
+			(cpu->flags & VM) ? "V86" : ((cpu->cr0 & 1) ? "PM" : "RM"));
+		dump_exc_ring("2s post-trigger");
 	}
 
 	if (!cpu_exec1(cpu, stepcount)) {
@@ -6260,23 +6494,169 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 			pusherr = true;
 		}
 		int orig_exc = cpu->excno;
+		bool orig_vm = !!(cpu->flags & VM);  /* save before call_isr clears VM */
 		cpu->next_ip = cpu->ip;
+
+		/* One-shot full state dump on the first #GP that looks like
+		 * the sel c0fe cascade (err code = sel & ~3 = 0xc0fc).
+		 * This captures the CPU state BEFORE exception delivery
+		 * corrupts it further via the cascade. */
+		{
+			static bool gp_dumped = false;
+			static int gp_diag_gen = -1;
+			if (gp_diag_gen != cpu->diag_gen) { gp_diag_gen = cpu->diag_gen; gp_dumped = false; }
+			if (!gp_dumped && orig_exc == EX_GP && cpu->excerr == 0xc0fc) {
+				gp_dumped = true;
+				refresh_flags(cpu);
+				dolog("=== FIRST #GP(c0fc) — full state dump ===\n");
+				dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x CR0=%08x\n",
+					cpu->seg[SEG_CS].sel, cpu->ip,
+					cpu->seg[SEG_SS].sel, REGi(4),
+					cpu->flags, cpu->cr0);
+				dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
+					REGi(0), REGi(3), REGi(1), REGi(2));
+				dolog("ESI=%08x EDI=%08x EBP=%08x\n",
+					REGi(6), REGi(7), REGi(5));
+				dolog("DS=%04x ES=%04x FS=%04x GS=%04x\n",
+					cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
+					cpu->seg[SEG_FS].sel, cpu->seg[SEG_GS].sel);
+				dolog("LDT sel=%04x base=%08x limit=%x\n",
+					cpu->seg[SEG_LDT].sel, cpu->seg[SEG_LDT].base,
+					cpu->seg[SEG_LDT].limit);
+				dolog("CR2=%08x CR3=%08x CPL=%d\n",
+					cpu->cr2, cpu->cr3, cpu->cpl);
+				/* Dump top of stack (8 dwords) */
+				dolog("Stack:");
+				for (int i = 0; i < 8; i++) {
+					OptAddr stk;
+					uword sp = (REGi(4) + i * 4) & 0xffffffff;
+					if (translate_laddr(cpu, &stk, 1,
+					    cpu->seg[SEG_SS].base + sp, 4, 0))
+						dolog(" %08x", load32(cpu, &stk));
+					else
+						dolog(" ????????");
+				}
+				dolog("\n");
+			}
+		}
 
 		if (unlikely(!call_isr(cpu, cpu->excno, pusherr, 1))) {
 			/* Exception delivery failed — try double fault (#DF) */
+			refresh_flags(cpu);
+
+			/* One-shot full dump on first delivery failure */
+			{
+				static bool isr_fail_dumped = false;
+				static int isrf_diag_gen = -1;
+				if (isrf_diag_gen != cpu->diag_gen) { isrf_diag_gen = cpu->diag_gen; isr_fail_dumped = false; }
+				if (!isr_fail_dumped) {
+					isr_fail_dumped = true;
+					dolog("=== FIRST call_isr failure (exc %d err=%d) ===\n",
+						orig_exc, cpu->excerr);
+					dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x CR0=%08x %s\n",
+						cpu->seg[SEG_CS].sel, cpu->ip,
+						cpu->seg[SEG_SS].sel, REGi(4),
+						cpu->flags, cpu->cr0,
+						(cpu->flags & VM) ? "V86" : "PM");
+					dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
+						REGi(0), REGi(3), REGi(1), REGi(2));
+					dolog("ESI=%08x EDI=%08x EBP=%08x\n",
+						REGi(6), REGi(7), REGi(5));
+					dolog("DS=%04x ES=%04x FS=%04x GS=%04x\n",
+						cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
+						cpu->seg[SEG_FS].sel, cpu->seg[SEG_GS].sel);
+					dolog("LDT sel=%04x base=%08x limit=%x\n",
+						cpu->seg[SEG_LDT].sel, cpu->seg[SEG_LDT].base,
+						cpu->seg[SEG_LDT].limit);
+					dolog("IDT base=%08x limit=%x\n",
+						cpu->idt.base, cpu->idt.limit);
+					dolog("CR2=%08x CR3=%08x CPL=%d\n",
+						cpu->cr2, cpu->cr3, cpu->cpl);
+					dolog("Stack:");
+					for (int i = 0; i < 8; i++) {
+						OptAddr stk;
+						uword sp = (REGi(4) + i * 4) & 0xffffffff;
+						if (translate_laddr(cpu, &stk, 1,
+						    cpu->seg[SEG_SS].base + sp, 4, 0))
+							dolog(" %08x", load32(cpu, &stk));
+						else
+							dolog(" ????????");
+					}
+					dolog("\n");
+				}
+			}
+
 			if (orig_exc == EX_DF) {
 				/* Double fault delivery failed — triple fault */
-				dolog("triple fault — resetting CPU\n");
-				cpui386_reset(cpu);
-				return;
+				goto triple_fault;
 			}
 			if (!call_isr(cpu, EX_DF, true, 1)) {
 				/* Double fault delivery also failed — triple fault */
-				dolog("triple fault (via #DF) — resetting CPU\n");
-				cpui386_reset(cpu);
-				return;
+				goto triple_fault;
 			}
 		}
+		/* One-shot: dump CPU state after #UD delivery to verify handler setup */
+		{
+			static bool ud_post_dumped = false;
+			static int upd_gen = -1;
+			if (upd_gen != cpu->diag_gen) { upd_gen = cpu->diag_gen; ud_post_dumped = false; }
+			if (!ud_post_dumped && orig_exc == EX_UD && !orig_vm) {
+				ud_post_dumped = true;
+				dolog("=== After #UD delivery ===\n");
+				dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x CPL=%d\n",
+					cpu->seg[SEG_CS].sel, cpu->ip,
+					cpu->seg[SEG_SS].sel, REGi(4),
+					cpu->flags, cpu->cpl);
+				/* Dump the stack frame the handler will see */
+				dolog("Handler stack:");
+				for (int i = 0; i < 8; i++) {
+					OptAddr stk;
+					uword sp = (REGi(4) + i * 4) & 0xffffffff;
+					if (translate_laddr(cpu, &stk, 1,
+					    cpu->seg[SEG_SS].base + sp, 4, 0))
+						dolog(" %08x", load32(cpu, &stk));
+					else
+						dolog(" ????????");
+				}
+				dolog("\n");
+			}
+		}
+	}
+	return;
+
+triple_fault:
+	{
+		static bool tf_dumped = false;
+		static int tf_diag_gen = -1;
+		if (tf_diag_gen != cpu->diag_gen) { tf_diag_gen = cpu->diag_gen; tf_dumped = false; }
+		if (!tf_dumped) {
+			tf_dumped = true;
+			refresh_flags(cpu);
+			dolog("=== TRIPLE FAULT — full state dump ===\n");
+			dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x CR0=%08x %s\n",
+				cpu->seg[SEG_CS].sel, cpu->ip,
+				cpu->seg[SEG_SS].sel, REGi(4),
+				cpu->flags, cpu->cr0,
+				(cpu->flags & VM) ? "V86" : "PM");
+			dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
+				REGi(0), REGi(3), REGi(1), REGi(2));
+			dolog("ESI=%08x EDI=%08x EBP=%08x\n",
+				REGi(6), REGi(7), REGi(5));
+			dolog("DS=%04x ES=%04x FS=%04x GS=%04x\n",
+				cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
+				cpu->seg[SEG_FS].sel, cpu->seg[SEG_GS].sel);
+			dolog("LDT sel=%04x base=%08x limit=%x\n",
+				cpu->seg[SEG_LDT].sel, cpu->seg[SEG_LDT].base,
+				cpu->seg[SEG_LDT].limit);
+			dolog("IDT base=%08x limit=%x TR sel=%04x base=%08x limit=%x\n",
+				cpu->idt.base, cpu->idt.limit,
+				cpu->seg[SEG_TR].sel, cpu->seg[SEG_TR].base,
+				cpu->seg[SEG_TR].limit);
+			dolog("CR2=%08x CR3=%08x CPL=%d\n",
+				cpu->cr2, cpu->cr3, cpu->cpl);
+		}
+		dolog("triple fault — resetting CPU\n");
+		cpui386_reset(cpu);
 	}
 }
 
@@ -6364,6 +6744,7 @@ void cpui386_reset(CPUI386 *cpu)
 	/* No segments are flat at reset (all have limit=0, not 4GB) */
 	cpu->seg_flat = 0;
 	cpu->all_segs_flat = false;
+	cpu->diag_gen++;
 
 #ifdef I386_SEQ_FASTPATH
 	cpu->seq_active = false;
@@ -6411,7 +6792,11 @@ long IRAM_ATTR cpui386_get_cycle(CPUI386 *cpu)
 
 uint32_t cpui386_get_seq_hits(CPUI386 *cpu)
 {
+#ifdef I386_SEQ_FASTPATH
 	return cpu->seq_hits;
+#else
+	return 0;
+#endif
 }
 
 CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)

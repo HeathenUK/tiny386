@@ -784,6 +784,7 @@ static void command (SB16State *s, uint8_t cmd)
         case 0xf3:
             dsp_out_data (s, 0xaa);
             s->mixer_regs[0x82] |= (cmd == 0xf2) ? 1 : 2;
+            s->set_irq(s->pic, s->irq, 0);
             s->set_irq(s->pic, s->irq, 1);
             break;
 
@@ -1053,6 +1054,7 @@ static void complete (SB16State *s)
                 bytes = samples << s->fmt_stereo << (s->fmt_bits == 16);
                 ticks = muldiv64(bytes, NANOSECONDS_PER_SECOND, freq);
                 if (ticks < NANOSECONDS_PER_SECOND / 1024) {
+                    s->set_irq(s->pic, s->irq, 0);
                     s->set_irq(s->pic, s->irq, 1);
                 } else {
                     dolog("TODO: aux_ts\n");
@@ -1569,6 +1571,7 @@ static int SB_read_DMA (void *opaque, int nchan, int dma_pos, int dma_len)
 
     if (s->left_till_irq <= 0) {
         s->mixer_regs[0x82] |= (nchan & 4) ? 2 : 1;
+        s->set_irq(s->pic, s->irq, 0);
         s->set_irq(s->pic, s->irq, 1);
         if (s->dma_auto == 0) {
             control (s, 0);

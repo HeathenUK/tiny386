@@ -16,12 +16,14 @@ static void i2s_bsp_task(void *arg)
 	int core_id = esp_cpu_get_core_id();
 	fprintf(stderr, "i2s runs on core %d\n", core_id);
 
+	fprintf(stderr, "i2s: waiting BIT1 (BSP)\n");
 	// Wait for BSP initialization (done by vga_task)
 	xEventGroupWaitBits(global_event_group,
 			    BIT1,
 			    pdFALSE,
 			    pdFALSE,
 			    portMAX_DELAY);
+	fprintf(stderr, "i2s: BIT1 received\n");
 
 	// Get I2S handle from BSP (audio already configured by bsp_device_initialize)
 	if (bsp_audio_get_i2s_handle(&tx_chan) != ESP_OK || !tx_chan) {
@@ -29,16 +31,19 @@ static void i2s_bsp_task(void *arg)
 		vTaskDelete(NULL);
 		return;
 	}
+	fprintf(stderr, "i2s: handle OK, enabling amp\n");
 
 	// Enable amplifier (rate already set by BSP init)
 	bsp_audio_set_amplifier(true);
 
+	fprintf(stderr, "i2s: waiting BIT0 (PC)\n");
 	// Wait for PC to be initialized
 	xEventGroupWaitBits(global_event_group,
 			    BIT0,
 			    pdFALSE,
 			    pdFALSE,
 			    portMAX_DELAY);
+	fprintf(stderr, "i2s: BIT0 received, starting audio loop\n");
 
 	// Apply initial volume from globals
 	int vol = globals.volume;

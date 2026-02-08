@@ -11,6 +11,9 @@ void led_activity_init(void);
 void led_activity_hdd(void);    // Flash LED 4 (red)
 void led_activity_floppy(void); // Flash LED 5 (green)
 
+// Force all activity LEDs off (call on emulator reset/exit)
+void led_activity_off(void);
+
 // Must be called periodically to manage LED timeouts
 // Call from display loop or main task
 void led_activity_tick(void);

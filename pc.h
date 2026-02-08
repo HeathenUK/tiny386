@@ -74,6 +74,7 @@ typedef struct {
 	const char *hda_path;  // HDA path for OSD (stored for runtime access)
 
 	u8 port92;
+	int fill_cmos;
 	int shutdown_state;
 	int reset_request;
 

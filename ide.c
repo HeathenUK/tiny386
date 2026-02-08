@@ -36,6 +36,8 @@
 #include "led_activity.h"
 #include "usb_host.h"
 #include "esp_heap_caps.h"
+#include "ff.h"
+#include "sdmmc_cmd.h"
 #define IDE_ACTIVITY() led_activity_hdd()
 
 //#define DEBUG_IDE_ATAPI
@@ -309,7 +311,7 @@
 #define SENSE_ILLEGAL_REQUEST 5
 #define SENSE_UNIT_ATTENTION  6
 
-#define MAX_MULT_SECTORS 4 /* 512 * 4 == 2048 */
+#define MAX_MULT_SECTORS 16 /* 512 * 16 == 8192 */
 
 void *pcmalloc(long size);
 
@@ -518,10 +520,15 @@ static void ide_abort_command(IDEState *s)
     s->error = ABRT_ERR;
 }
 
-static void ide_set_irq(IDEState *s) 
+static void ide_set_irq(IDEState *s)
 {
     IDEIFState *ide_if = s->ide_if;
     if (!(ide_if->cmd & IDE_CMD_DISABLE_IRQ)) {
+        /* Ensure a clean 0→1 edge for the PIC's edge-triggered detection.
+           Without lowering first, back-to-back ide_set_irq() calls (e.g.
+           multi-sector PIO where the host reads 0x3F6 instead of 0x1F7)
+           leave last_irr high and the PIC silently drops the interrupt. */
+        ide_if->set_irq(ide_if->pic, ide_if->irq, 0);
         ide_if->set_irq(ide_if->pic, ide_if->irq, 1);
     }
 }
@@ -2002,17 +2009,30 @@ typedef enum {
 
 #define SECTOR_SIZE 512
 
+/* Run-length encoded mapping: contiguous file sectors → SD card sectors */
+typedef struct {
+    uint32_t file_sector;  /* Starting sector within the disk image file */
+    uint32_t sd_sector;    /* Starting sector on the SD card */
+    uint32_t count;        /* Number of contiguous 512-byte sectors */
+} DiskExtent;
+
 typedef struct BlockDeviceFile BlockDeviceFile;
 
 struct BlockDeviceFile {
-    FILE *f;
+    FILE *f;               /* stdio handle (NULL when using raw SD) */
     int start_offset;
     int cylinders, heads, sectors;
     int64_t nb_sectors;
     BlockDeviceModeEnum mode;
     uint8_t **sector_table;
     char path[256];  // Store filename for OSD display
-    /* Read-ahead cache for faster sequential access */
+
+    /* Raw SD acceleration (bypasses VFS/FatFS) */
+    sdmmc_card_t *card;    /* Raw SD card handle (NULL = use stdio) */
+    DiskExtent *extents;   /* Extent map (NULL = use stdio) */
+    int num_extents;
+
+    /* Fallback stdio cache (used when raw SD not available) */
     uint8_t *cache_buf;        /* Cache buffer in PSRAM */
     int64_t cache_start;       /* First sector in cache */
     int cache_count;           /* Number of valid sectors in cache */
@@ -2035,6 +2055,243 @@ static int bf_get_chs(BlockDevice *bs, int *cylinders, int *heads, int *sectors)
     return 0;
 }
 
+/*
+ * Build a raw SD sector extent map for a file on the FAT32 SD card.
+ * This allows bypassing VFS/FatFS entirely for disk image I/O,
+ * avoiding the expensive cluster-chain walk on every fseeko().
+ *
+ * Returns 0 on success (bf->extents/num_extents populated), -1 on failure.
+ */
+extern void *rawsd;
+
+/*
+ * Read the next cluster number from the FAT via raw SD reads.
+ * Handles FAT16 (2 bytes/entry) and FAT32/exFAT (4 bytes/entry).
+ * Caches one FAT sector at a time to avoid re-reading for consecutive clusters.
+ * Returns the next cluster, or 0 on read error.
+ */
+static DWORD fat_next_cluster(sdmmc_card_t *card, DWORD cluster,
+                              int fs_type, LBA_t fat_base,
+                              uint8_t *fat_buf, uint32_t *cached_fat_sector)
+{
+    uint32_t entry_size = (fs_type == FS_FAT16) ? 2 : 4;
+    uint32_t fat_sector = fat_base + (cluster * entry_size) / SECTOR_SIZE;
+
+    if (fat_sector != *cached_fat_sector) {
+        if (sdmmc_read_sectors(card, fat_buf, fat_sector, 1) != ESP_OK)
+            return 0;  /* read error */
+        *cached_fat_sector = fat_sector;
+    }
+
+    uint32_t byte_offset = (cluster * entry_size) % SECTOR_SIZE;
+    if (fs_type == FS_FAT16) {
+        uint16_t val;
+        memcpy(&val, fat_buf + byte_offset, 2);
+        return (val >= 0xFFF8) ? 0x0FFFFFFF : (DWORD)val;
+    } else {
+        uint32_t val;
+        memcpy(&val, fat_buf + byte_offset, 4);
+        /* FAT32: top 4 bits reserved, mask them off.
+         * exFAT: full 32-bit entry, no mask needed. */
+        return (fs_type == FS_FAT32) ? (val & 0x0FFFFFFF) : val;
+    }
+}
+
+static int build_extent_map(BlockDeviceFile *bf)
+{
+    sdmmc_card_t *card = rawsd;
+    if (!card)
+        return -1;
+
+    /* Convert VFS path "/sdcard/foo.img" to FatFS path "0:/foo.img" */
+    const char *prefix = "/sdcard/";
+    size_t pfxlen = strlen(prefix);
+    if (strncmp(bf->path, prefix, pfxlen) != 0)
+        return -1;  /* Not on SD card */
+
+    char fatfs_path[256];
+    snprintf(fatfs_path, sizeof(fatfs_path), "0:/%s", bf->path + pfxlen);
+
+    /* Open via FatFS to get starting cluster and filesystem geometry.
+     * FIL is heap-allocated because it contains a 4KB buf[FF_MAX_SS]
+     * which would overflow the 8KB task stack. */
+    FIL *fil = malloc(sizeof(FIL));
+    if (!fil)
+        return -1;
+    FRESULT fres = f_open(fil, fatfs_path, FA_READ);
+    if (fres != FR_OK) {
+        fprintf(stderr, "extent_map: f_open(%s) failed: %d\n", fatfs_path, fres);
+        free(fil);
+        return -1;
+    }
+
+    DWORD start_cluster = fil->obj.sclust;
+    FATFS *fs = fil->obj.fs;
+    int fs_type = fs->fs_type;
+    int sectors_per_cluster = fs->csize;
+    LBA_t fat_base = fs->fatbase;
+    LBA_t data_base = fs->database;
+    DWORD n_fatent = fs->n_fatent;  /* number of clusters + 2 */
+#if FF_FS_EXFAT
+    int exfat_contiguous = (fs_type == FS_EXFAT) && (fil->obj.stat & 2);
+    FSIZE_t file_obj_size = fil->obj.objsize;
+#endif
+    f_close(fil);
+    free(fil);
+
+    if (start_cluster < 2 || sectors_per_cluster == 0) {
+        fprintf(stderr, "extent_map: invalid file (sclust=%lu spc=%d)\n",
+                (unsigned long)start_cluster, sectors_per_cluster);
+        return -1;
+    }
+
+    if (fs_type != FS_FAT16 && fs_type != FS_FAT32
+#if FF_FS_EXFAT
+        && fs_type != FS_EXFAT
+#endif
+    ) {
+        fprintf(stderr, "extent_map: unsupported fs_type %d\n", fs_type);
+        return -1;
+    }
+
+    const char *fs_name = (fs_type == FS_FAT16) ? "FAT16" :
+                          (fs_type == FS_FAT32) ? "FAT32" : "exFAT";
+
+    /* Calculate total clusters in file (including start_offset sectors) */
+    int64_t total_file_bytes = (int64_t)bf->nb_sectors * SECTOR_SIZE + bf->start_offset;
+    uint32_t total_clusters = (total_file_bytes + (int64_t)sectors_per_cluster * SECTOR_SIZE - 1)
+                              / ((int64_t)sectors_per_cluster * SECTOR_SIZE);
+
+#if FF_FS_EXFAT
+    /* exFAT contiguous files: no FAT walk needed — one extent from sclust */
+    if (exfat_contiguous) {
+        DiskExtent *extents = malloc(sizeof(DiskExtent));
+        if (!extents)
+            return -1;
+        extents[0].file_sector = 0;
+        extents[0].sd_sector = data_base + (start_cluster - 2) * sectors_per_cluster;
+        extents[0].count = total_clusters * sectors_per_cluster;
+        bf->card = card;
+        bf->extents = extents;
+        bf->num_extents = 1;
+        fprintf(stderr, "extent_map: %s → 1 extent (exFAT contiguous), %u clusters, spc=%d\n",
+                bf->path, total_clusters, sectors_per_cluster);
+        return 0;
+    }
+#endif
+
+    /* Walk the FAT chain via raw SD reads.
+     * Cache one FAT sector at a time to minimize I/O. */
+    uint8_t *fat_buf = malloc(SECTOR_SIZE);
+    if (!fat_buf)
+        return -1;
+    uint32_t cached_fat_sector = (uint32_t)-1;
+
+    /* First pass: count extents (contiguous cluster runs) */
+    int num_extents = 0;
+    DWORD cluster = start_cluster;
+    DWORD prev_cluster = 0;
+    uint32_t clusters_walked = 0;
+
+    while (cluster >= 2 && cluster < n_fatent && clusters_walked < total_clusters) {
+        if (prev_cluster == 0 || cluster != prev_cluster + 1)
+            num_extents++;
+        prev_cluster = cluster;
+        clusters_walked++;
+
+        cluster = fat_next_cluster(card, cluster, fs_type, fat_base,
+                                   fat_buf, &cached_fat_sector);
+        if (cluster == 0) {  /* read error */
+            fprintf(stderr, "extent_map: FAT read error at cluster %lu\n",
+                    (unsigned long)prev_cluster);
+            free(fat_buf);
+            return -1;
+        }
+    }
+
+    if (num_extents == 0) {
+        free(fat_buf);
+        return -1;
+    }
+
+    /* Allocate extent array */
+    DiskExtent *extents = malloc(num_extents * sizeof(DiskExtent));
+    if (!extents) {
+        free(fat_buf);
+        return -1;
+    }
+
+    /* Second pass: fill extent array */
+    cluster = start_cluster;
+    cached_fat_sector = (uint32_t)-1;
+    int ext_idx = -1;
+    uint32_t file_sector = 0;
+    clusters_walked = 0;
+
+    while (cluster >= 2 && cluster < n_fatent && clusters_walked < total_clusters) {
+        uint32_t sd_sector = data_base + (cluster - 2) * sectors_per_cluster;
+
+        if (ext_idx < 0 ||
+            sd_sector != extents[ext_idx].sd_sector + extents[ext_idx].count) {
+            /* Start new extent */
+            ext_idx++;
+            extents[ext_idx].file_sector = file_sector;
+            extents[ext_idx].sd_sector = sd_sector;
+            extents[ext_idx].count = sectors_per_cluster;
+        } else {
+            /* Extend current extent */
+            extents[ext_idx].count += sectors_per_cluster;
+        }
+        file_sector += sectors_per_cluster;
+        clusters_walked++;
+
+        cluster = fat_next_cluster(card, cluster, fs_type, fat_base,
+                                   fat_buf, &cached_fat_sector);
+        if (cluster == 0) {
+            free(fat_buf);
+            free(extents);
+            return -1;
+        }
+    }
+
+    free(fat_buf);
+
+    bf->card = card;
+    bf->extents = extents;
+    bf->num_extents = ext_idx + 1;
+
+    fprintf(stderr, "extent_map: %s → %d extents, %u clusters, spc=%d (%s)\n",
+            bf->path, bf->num_extents, clusters_walked, sectors_per_cluster, fs_name);
+
+    return 0;
+}
+
+/*
+ * Translate a file-relative sector number to an SD card sector
+ * using the extent map. Returns the SD sector, or (uint32_t)-1 on miss.
+ * Also returns the number of contiguous sectors available via *contig.
+ */
+static uint32_t extent_lookup(BlockDeviceFile *bf, uint32_t file_sector, int *contig)
+{
+    /* Binary search through sorted extents */
+    int lo = 0, hi = bf->num_extents - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        DiskExtent *e = &bf->extents[mid];
+        if (file_sector < e->file_sector) {
+            hi = mid - 1;
+        } else if (file_sector >= e->file_sector + e->count) {
+            lo = mid + 1;
+        } else {
+            uint32_t offset = file_sector - e->file_sector;
+            *contig = e->count - offset;
+            return e->sd_sector + offset;
+        }
+    }
+    *contig = 0;
+    return (uint32_t)-1;
+}
+
 //#define DUMP_BLOCK_READ
 
 static int bf_read_async(BlockDevice *bs,
@@ -2043,29 +2300,44 @@ static int bf_read_async(BlockDevice *bs,
 {
     BlockDeviceFile *bf = bs->opaque;
     //    printf("bf_read_async: sector_num=%" PRId64 " n=%d\n", sector_num, n);
-#ifdef DUMP_BLOCK_READ
-    {
-        static FILE *f;
-        if (!f)
-            f = fopen("/tmp/read_sect.txt", "wb");
-        fprintf(f, "%" PRId64 " %d\n", sector_num, n);
-    }
-#endif
-    if (!bf->f)
-        return -1;
 
     /* Bounds checking: return zeros for sectors beyond disk size */
-    if (sector_num >= bf->nb_sectors) {
+    if (sector_num >= (uint64_t)bf->nb_sectors) {
         memset(buf, 0, n * SECTOR_SIZE);
         return 0;
     }
     /* Clamp read count to not exceed disk size */
-    if (sector_num + n > bf->nb_sectors) {
+    if (sector_num + n > (uint64_t)bf->nb_sectors) {
         int valid_sectors = bf->nb_sectors - sector_num;
         /* Zero the out-of-bounds portion */
         memset(buf + valid_sectors * SECTOR_SIZE, 0, (n - valid_sectors) * SECTOR_SIZE);
         n = valid_sectors;
     }
+
+    /* Raw SD path: bypass VFS/FatFS entirely */
+    if (bf->extents) {
+        /* Convert disk-image sector to file-relative sector (account for IDE header) */
+        uint32_t file_sector = (uint32_t)((sector_num * SECTOR_SIZE + bf->start_offset) / SECTOR_SIZE);
+        while (n > 0) {
+            int contig;
+            uint32_t sd_sector = extent_lookup(bf, file_sector, &contig);
+            if (sd_sector == (uint32_t)-1) {
+                memset(buf, 0, n * SECTOR_SIZE);
+                break;
+            }
+            int chunk = (n < contig) ? n : contig;
+            if (sdmmc_read_sectors(bf->card, buf, sd_sector, chunk) != ESP_OK) {
+                return -1;
+            }
+            buf += chunk * SECTOR_SIZE;
+            file_sector += chunk;
+            n -= chunk;
+        }
+        return 0;
+    }
+
+    if (!bf->f)
+        return -1;
 
     if (bf->mode == BF_MODE_SNAPSHOT) {
         int i;
@@ -2126,6 +2398,26 @@ static int bf_write_async(BlockDevice *bs,
 {
     BlockDeviceFile *bf = bs->opaque;
     int ret;
+
+    /* Raw SD path: bypass VFS/FatFS entirely */
+    if (bf->extents) {
+        if (bf->mode == BF_MODE_RO)
+            return -1;
+        uint32_t file_sector = (uint32_t)((sector_num * SECTOR_SIZE + bf->start_offset) / SECTOR_SIZE);
+        while (n > 0) {
+            int contig;
+            uint32_t sd_sector = extent_lookup(bf, file_sector, &contig);
+            if (sd_sector == (uint32_t)-1)
+                return -1;
+            int chunk = (n < contig) ? n : contig;
+            if (sdmmc_write_sectors(bf->card, buf, sd_sector, chunk) != ESP_OK)
+                return -1;
+            buf += chunk * SECTOR_SIZE;
+            file_sector += chunk;
+            n -= chunk;
+        }
+        return 0;
+    }
 
     /* Invalidate cache on write - simple approach, just clear it */
     if (bf->cache_buf) {
@@ -2231,11 +2523,7 @@ static BlockDevice *block_device_init(const char *filename,
         memset(bf->sector_table, 0,
                sizeof(bf->sector_table[0]) * bf->nb_sectors);
     }
-    /* Allocate read-ahead cache buffer from heap to avoid pcram exhaustion */
-    bf->cache_buf = malloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
-    bf->cache_start = -1;
-    bf->cache_count = 0;
-    
+
     bs->opaque = bf;
     bs->get_sector_count = bf_get_sector_count;
     bs->get_chs = NULL;
@@ -2288,6 +2576,43 @@ static BlockDevice *block_device_init(const char *filename,
     }
     bs->read_async = bf_read_async;
     bs->write_async = bf_write_async;
+
+    /* Try raw SD acceleration for /sdcard/ files (non-snapshot mode).
+     * On success: close stdio FILE, skip cache — all I/O goes direct to SD.
+     * On failure: fall back to stdio + read-ahead cache. */
+    if (mode != BF_MODE_SNAPSHOT && build_extent_map(bf) == 0) {
+        /* Raw SD active — close stdio handle, no cache needed */
+        fclose(f);
+        bf->f = NULL;
+        /* Remove 2GB cap — raw SD reads use 32-bit sector numbers directly,
+         * no off_t limitation. Recalculate from original file size.
+         * FIL heap-allocated to avoid stack overflow (4KB buf inside). */
+        {
+            FIL *fil2 = malloc(sizeof(FIL));
+            if (fil2) {
+                char fatfs_path[256];
+                snprintf(fatfs_path, sizeof(fatfs_path), "0:/%s", filename + strlen("/sdcard/"));
+                if (f_open(fil2, fatfs_path, FA_READ) == FR_OK) {
+                    int64_t real_size = (int64_t)f_size(fil2) - start_offset;
+                    f_close(fil2);
+                    if (real_size > 0) {
+                        bf->nb_sectors = real_size / SECTOR_SIZE;
+                        fprintf(stderr, "extent_map: full size %lldMB (off_t cap bypassed)\n",
+                                (long long)(real_size / (1024 * 1024)));
+                    }
+                }
+                free(fil2);
+            }
+        }
+    } else {
+        /* Fallback: allocate read-ahead cache for stdio path */
+        fprintf(stderr, "disk: %s using stdio (mode=%d, no raw SD)\n",
+                filename, mode);
+        bf->cache_buf = malloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
+        bf->cache_start = -1;
+        bf->cache_count = 0;
+    }
+
     return bs;
 }
 
@@ -2351,8 +2676,6 @@ static BlockDevice *block_device_init_empty_rw(void)
     bs->write_async = bf_write_async;
     return bs;
 }
-
-#include "sdmmc_cmd.h"
 
 // === Sector Cache and Prefetch for ESP32 ===
 // Cache recently read sectors to avoid repeated SD card access
@@ -2589,7 +2912,6 @@ static int espsd_write_async(BlockDevice *bs,
     return 0;
 }
 
-extern void *rawsd;
 static BlockDevice *block_device_init_espsd(int64_t start_sector, int64_t nb_sectors)
 {
     sdmmc_card_t *card = rawsd;
@@ -3012,15 +3334,25 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
 
     BlockDeviceFile *bf = s->bs->opaque;
 
-    /* Close old file */
+    /* --- Tear down old state --- */
     if (bf->f) {
         fclose(bf->f);
         bf->f = NULL;
+    }
+    /* Free old extent map if any */
+    if (bf->extents) {
+        free(bf->extents);
+        bf->extents = NULL;
+        bf->num_extents = 0;
     }
     bf->nb_sectors = 0;
     bf->start_offset = 0;
     bf->cache_start = -1;
     bf->cache_count = 0;
+    bf->cylinders = 0;
+    bf->heads = 0;
+    bf->sectors = 0;
+    s->bs->get_chs = NULL;
 
     /* Handle eject (empty filename) */
     if (!filename || !filename[0]) {
@@ -3044,8 +3376,21 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
     if (memcmp(buf, ide_magic, 8) == 0)
         start_offset = 1024;
 
+    /* Get file size (handle 32-bit off_t overflow on ESP32-P4) */
     fseeko(f, 0, SEEK_END);
-    int64_t file_size = ftello(f) - start_offset;
+    int64_t file_size;
+    {
+        off_t raw = ftello(f);
+        file_size = (raw >= 0) ? (int64_t)raw : (int64_t)(uint32_t)raw;
+    }
+    file_size -= start_offset;
+
+    /* Cap to off_t limit for stdio path (may be lifted by extent map below) */
+    if (file_size > (int64_t)0x7FFFFFFF) {
+        fprintf(stderr, "ide_change_hdd: %s is %lldMB, capping to 2047MB (off_t limit)\n",
+                filename, (long long)(file_size / (1024 * 1024)));
+        file_size = (int64_t)0x7FFFFE00;
+    }
 
     bf->f = f;
     bf->mode = BF_MODE_RW;
@@ -3055,31 +3400,118 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
     strncpy(bf->path, filename, sizeof(bf->path) - 1);
     bf->path[sizeof(bf->path) - 1] = '\0';
 
-    /* Update IDE drive state */
-    s->nb_sectors = bf->nb_sectors;
-
-    /* Recalculate CHS geometry (same as ide_hddrive_init) */
-    uint32_t cyls = bf->nb_sectors / (16 * 63);
-    if (cyls > 16383)
-        cyls = 16383;
-    else if (cyls < 2)
-        cyls = 2;
-    s->cylinders = cyls;
-    s->heads = 16;
-    s->sectors = 63;
-
-    /* Use old-format geometry if available */
+    /* Read CHS from magic header or auto-detect from MBR */
     if (start_offset) {
+        /* Old-format header has geometry at offset 512 */
+        unsigned char geobuf[14];
+        fseeko(f, 512, SEEK_SET);
+        fread(geobuf, 1, 14, f);
+        bf->cylinders = geobuf[2] | (geobuf[3] << 8);
+        bf->heads = geobuf[6] | (geobuf[7] << 8);
+        bf->sectors = geobuf[12] | (geobuf[13] << 8);
         s->bs->get_chs = bf_get_chs;
-        if (bf->cylinders && bf->heads && bf->sectors) {
-            s->cylinders = bf->cylinders;
-            s->heads = bf->heads;
-            s->sectors = bf->sectors;
+    } else {
+        /* Auto-detect CHS geometry from MBR partition table */
+        unsigned char mbr[512];
+        fseeko(f, 0, SEEK_SET);
+        if (fread(mbr, 1, 512, f) == 512 &&
+            mbr[510] == 0x55 && mbr[511] == 0xAA) {
+            static const int pe_offsets[4] = {0x1BE, 0x1CE, 0x1DE, 0x1EE};
+            for (int i = 0; i < 4; i++) {
+                const unsigned char *pe = mbr + pe_offsets[i];
+                if (pe[4] == 0) continue;
+                int end_head = pe[5];
+                int end_sec = pe[6] & 0x3F;
+                int start_head = pe[1];
+                int start_sec = pe[2] & 0x3F;
+                int start_cyl = pe[3] | ((pe[2] & 0xC0) << 2);
+                uint32_t lba_start = pe[8] | (pe[9] << 8) |
+                                     (pe[10] << 16) | (pe[11] << 24);
+                int spt = end_sec;
+                int heads = end_head + 1;
+                if (spt < 1 || spt > 63 || heads < 1 || heads > 255)
+                    continue;
+                if (start_sec < 1 || start_sec > spt)
+                    continue;
+                uint32_t calc_lba = (uint32_t)start_cyl * heads * spt +
+                                    (uint32_t)start_head * spt +
+                                    (start_sec - 1);
+                if (calc_lba == lba_start) {
+                    bf->sectors = spt;
+                    bf->heads = heads;
+                    bf->cylinders = bf->nb_sectors / (heads * spt);
+                    if (bf->cylinders > 16383) bf->cylinders = 16383;
+                    else if (bf->cylinders < 2) bf->cylinders = 2;
+                    s->bs->get_chs = bf_get_chs;
+                    break;
+                }
+            }
         }
     }
 
-    fprintf(stderr, "ide_change_hdd: done, sectors=%lld cyl=%d heads=%d secs=%d\n",
-            (long long)s->nb_sectors, s->cylinders, s->heads, s->sectors);
+    /* Try raw SD acceleration (rebuilds extent map for new file) */
+    if (build_extent_map(bf) == 0) {
+        /* Raw SD active — close stdio handle */
+        fclose(f);
+        bf->f = NULL;
+        /* Remove 2GB cap via FatFS.
+         * FIL heap-allocated to avoid stack overflow (4KB buf inside). */
+        FIL *fil2 = malloc(sizeof(FIL));
+        if (fil2) {
+            char fatfs_path[256];
+            snprintf(fatfs_path, sizeof(fatfs_path), "0:/%s", filename + strlen("/sdcard/"));
+            if (f_open(fil2, fatfs_path, FA_READ) == FR_OK) {
+                int64_t real_size = (int64_t)f_size(fil2) - start_offset;
+                f_close(fil2);
+                if (real_size > 0)
+                    bf->nb_sectors = real_size / SECTOR_SIZE;
+            }
+            free(fil2);
+        }
+    } else if (!bf->cache_buf) {
+        /* Allocate read-ahead cache if not already present */
+        bf->cache_buf = malloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
+        bf->cache_start = -1;
+        bf->cache_count = 0;
+    }
+
+    /* Update IDE drive geometry (mirrors ide_hddrive_init logic) */
+    s->nb_sectors = bf->nb_sectors;
+    if (s->bs->get_chs) {
+        s->bs->get_chs(s->bs, &s->cylinders, &s->heads, &s->sectors);
+    } else {
+        /* Default geometry: 255H/63S for >504MB, 16H/63S for smaller */
+        if (s->nb_sectors > (uint64_t)16 * 63 * 1024) {
+            s->heads = 255;
+            s->sectors = 63;
+        } else {
+            s->heads = 16;
+            s->sectors = 63;
+        }
+        uint32_t cyls = s->nb_sectors / (s->heads * s->sectors);
+        if (cyls > 16383) cyls = 16383;
+        else if (cyls < 2) cyls = 2;
+        s->cylinders = cyls;
+    }
+
+    /* Reset IDE register state for clean BIOS detection */
+    s->feature = 0;
+    s->error = 0;
+    s->nsector = 0;
+    s->sector = 0;
+    s->lcyl = 0;
+    s->hcyl = 0;
+    s->select = 0xa0;
+    s->status = READY_STAT | SEEK_STAT;
+    s->data_index = 0;
+    s->data_end = 0;
+    s->end_transfer_func = ide_transfer_stop;
+    s->req_nb_sectors = 0;
+    s->io_nb_sectors = 0;
+
+    fprintf(stderr, "ide_change_hdd: done, sectors=%lld cyl=%d heads=%d secs=%d%s\n",
+            (long long)s->nb_sectors, s->cylinders, s->heads, s->sectors,
+            bf->extents ? " (raw SD)" : " (stdio)");
     return 0;
 }
 

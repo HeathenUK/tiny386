@@ -51,6 +51,7 @@ typedef struct PITChannelState {
 
 	uint32_t count_load_time;
 	uint32_t last_irq_count;
+	uint32_t last_read_d;  /* monotonic guard: prevents consecutive reads returning same value */
 	int irq;
 } PITChannelState;
 
@@ -67,6 +68,12 @@ static int pit_get_count(PITChannelState *s)
 	int counter;
 
 	d = ((uint64_t) (get_uticks() - s->count_load_time)) * PIT_FREQ / 1000000;
+	/* Ensure strictly monotonic d to prevent patcher9x timing bug:
+	 * Two rapid PIT reads within the same microsecond would return identical
+	 * counter values, giving delta=0 which crashes Win95 NDIS.VXD/VMM32. */
+	if (d <= s->last_read_d)
+		d = s->last_read_d + 1;
+	s->last_read_d = d;
 	switch(s->mode) {
 	case 0:
 	case 1:
@@ -123,6 +130,7 @@ static inline void pit_load_count(PITState *pit, PITChannelState *s, int val)
 		val = 0x10000;
 	s->count_load_time = get_uticks();
 	s->last_irq_count = 0;
+	s->last_read_d = 0;
 	s->count = val;
 }
 

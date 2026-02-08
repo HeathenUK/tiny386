@@ -194,7 +194,12 @@ static void ne2000_update_irq(NE2000State *s)
     printf("NE2000: Set IRQ to %d (%02x %02x)\n",
            isr ? 1 : 0, sisr, s->imr);
 #endif
-    s->set_irq(s->pic, s->irq, (isr != 0));
+    if (isr) {
+        s->set_irq(s->pic, s->irq, 0);
+        s->set_irq(s->pic, s->irq, 1);
+    } else {
+        s->set_irq(s->pic, s->irq, 0);
+    }
 }
 
 #define POLYNOMIAL 0x04c11db6

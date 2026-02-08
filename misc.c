@@ -158,6 +158,7 @@ CMOS *cmos_init(long mem_size, int irq, void *pic, void (*set_irq)(void *pic, in
 static void u8250_update_interrupts(U8250 *uart)
 {
 	if (uart->ier & uart->ioready) {
+		uart->set_irq(uart->pic, uart->irq, 0);
 		uart->set_irq(uart->pic, uart->irq, 1);
 	} else {
 		uart->set_irq(uart->pic, uart->irq, 0);

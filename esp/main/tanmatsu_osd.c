@@ -34,6 +34,8 @@
 #include "mouse_emu.h"
 #include "usb_host.h"
 #include "../../pc.h"
+#include "esp_vfs_fat.h"
+#include "led_activity.h"
 
 // Audio shutdown for clean exit
 extern void i2s_shutdown(void);
@@ -46,7 +48,8 @@ typedef enum {
 	VIEW_SYSTEM,
 	VIEW_HELP,
 	VIEW_FILEBROWSER,
-	VIEW_DELETE_CONFIRM
+	VIEW_DELETE_CONFIRM,
+	VIEW_CREATE_HDD
 } ViewMode;
 
 // Main menu items
@@ -71,6 +74,7 @@ typedef enum {
 	MOUNT_FDB,
 	MOUNT_SEP1,
 	MOUNT_HDA,     // Hard drive (requires restart)
+	MOUNT_CREATE_HDD,  // Create new HDD image
 	MOUNT_CD,      // Single CD-ROM slot (primary slave)
 	MOUNT_USB,     // USB storage (secondary master) - read-only status
 	MOUNT_USB_PASSTHRU, // Enable/disable USB passthrough (requires restart)
@@ -81,6 +85,7 @@ typedef enum {
 
 // Special browser_target values
 #define BROWSER_TARGET_HDA 101
+#define BROWSER_TARGET_CREATE_HDD 102
 
 // Audio/Visual submenu items
 typedef enum {
@@ -118,6 +123,7 @@ typedef struct {
 // Special file entry types
 #define FILE_TYPE_EJECT -1
 #define FILE_TYPE_SWITCH_STORAGE -2
+#define FILE_TYPE_CREATE_HERE -3
 
 struct OSD {
 	EMULINK *emulink;
@@ -161,6 +167,14 @@ struct OSD {
 	// Delete confirmation state
 	char delete_path[MAX_PATH_LEN];
 
+	// Create HDD state
+	char create_path[MAX_PATH_LEN];  // Directory to create image in (VFS path)
+	char create_name[33];     // Filename (without .img extension)
+	int create_name_len;      // Current name length
+	int create_size_idx;      // Index into hdd_sizes array
+	int create_fs_type;       // 0=FAT16, 1=FAT32
+	int create_sel;           // 0=name, 1=size, 2=partition, 3=create, 4=cancel
+
 };
 
 // Scancode defines
@@ -184,6 +198,22 @@ static char scancode_to_char(int sc) {
 	if (sc >= 0x2c && sc <= 0x32) return "ZXCVBNM"[sc - 0x2c];
 	return 0;
 }
+
+// HDD size presets for Create HDD dialog
+static const struct {
+	const char *label;
+	int64_t bytes;
+	int heads;
+	int spt;
+} hdd_sizes[] = {
+	{ "64 MB",   64*1024*1024LL,   16, 63 },
+	{ "128 MB",  128*1024*1024LL,  16, 63 },
+	{ "256 MB",  256*1024*1024LL,  16, 63 },
+	{ "504 MB",  1023*16*63*512LL, 16, 63 },
+	{ "1024 MB", 1024*1024*1024LL, 255, 63 },
+	{ "2048 MB", 2048*1024*1024LL, 255, 63 },
+};
+#define HDD_SIZE_COUNT 6
 
 // Colors (RGB565) - clean color scheme inspired by trackmatsu
 #define COLOR_BG      0x0000  // Black
@@ -293,6 +323,13 @@ static void scan_directory(OSD *osd)
 			osd->files[osd->file_count].is_dir = FILE_TYPE_SWITCH_STORAGE;
 			osd->file_count++;
 		}
+	}
+
+	// Add "create image here" option when browsing for HDD creation location
+	if (osd->browser_target == BROWSER_TARGET_CREATE_HDD) {
+		strcpy(osd->files[osd->file_count].name, "[Create Image Here]");
+		osd->files[osd->file_count].is_dir = FILE_TYPE_CREATE_HERE;
+		osd->file_count++;
 	}
 
 	// Add parent directory option
@@ -588,6 +625,7 @@ static void render_mounting_menu(OSD *osd, uint8_t *pixels, int w, int h, int pi
 		{ "Floppy B:", 0, 0, fdb_val },
 		{ NULL, 1, 0, NULL },  // SEP1
 		{ "HDD:", 0, 0, hda_val },
+		{ "Create HDD...", 0, 0, NULL },
 		{ "CD-ROM:", 0, 0, cd_val },
 		{ "USB Storage:", 0, 0, usb_val },
 		{ "USB Passthru:", 0, 0, usb_pass_val },
@@ -699,6 +737,285 @@ static void render_delete_confirm(OSD *osd, uint8_t *pixels, int w, int h, int p
 
 	render_generic_menu(pixels, w, h, pitch, title, entries, 4,
 	                    -1, "Y:Delete N/Esc:Cancel");
+}
+
+// Build MBR with a single partition spanning the disk
+static void build_mbr(uint8_t *mbr, int64_t total_bytes, int fs_type, int heads, int spt)
+{
+	memset(mbr, 0, 512);
+
+	uint32_t total_sectors = (uint32_t)(total_bytes / 512);
+	uint32_t lba_start = 63;
+	uint32_t lba_size = total_sectors - lba_start;
+
+	// CHS start: H=1, S=1, C=0
+	uint8_t start_h = 1, start_s = 1, start_c = 0;
+
+	// CHS end: compute from geometry, cap cylinder at 1023
+	uint32_t last_lba = total_sectors - 1;
+	uint32_t c = last_lba / (heads * spt);
+	uint32_t rem = last_lba % (heads * spt);
+	uint32_t h = rem / spt;
+	uint32_t s = (rem % spt) + 1;
+	if (c > 1023) { c = 1023; h = heads - 1; s = spt; }
+
+	uint8_t end_h = (uint8_t)h;
+	uint8_t end_s = (uint8_t)((s & 0x3F) | ((c >> 2) & 0xC0));
+	uint8_t end_c = (uint8_t)(c & 0xFF);
+
+	// Encode CHS start
+	uint8_t start_s_enc = (uint8_t)((start_s & 0x3F) | ((start_c >> 2) & 0xC0));
+	uint8_t start_c_enc = (uint8_t)(start_c & 0xFF);
+
+	// Partition entry at 0x1BE
+	uint8_t *pe = &mbr[0x1BE];
+	pe[0] = 0x00;          // Status: not bootable
+	pe[1] = start_h;       // CHS start head
+	pe[2] = start_s_enc;   // CHS start sector + cyl high
+	pe[3] = start_c_enc;   // CHS start cylinder low
+	pe[4] = fs_type ? 0x0C : 0x06;  // Type: FAT32 LBA or FAT16B
+	pe[5] = end_h;         // CHS end head
+	pe[6] = end_s;         // CHS end sector + cyl high
+	pe[7] = end_c;         // CHS end cylinder low
+	// LBA start (little-endian)
+	pe[8]  = (uint8_t)(lba_start);
+	pe[9]  = (uint8_t)(lba_start >> 8);
+	pe[10] = (uint8_t)(lba_start >> 16);
+	pe[11] = (uint8_t)(lba_start >> 24);
+	// LBA size (little-endian)
+	pe[12] = (uint8_t)(lba_size);
+	pe[13] = (uint8_t)(lba_size >> 8);
+	pe[14] = (uint8_t)(lba_size >> 16);
+	pe[15] = (uint8_t)(lba_size >> 24);
+
+	// Boot signature
+	mbr[0x1FE] = 0x55;
+	mbr[0x1FF] = 0xAA;
+}
+
+// Determine the VFS base path ("/sdcard" or "/usb") from a full path
+static const char *get_base_path(const char *path)
+{
+	if (strncmp(path, "/usb", 4) == 0 && (path[4] == '/' || path[4] == '\0'))
+		return "/usb";
+	return "/sdcard";
+}
+
+// Create a new HDD image file
+static void do_create_hdd(OSD *osd)
+{
+	if (osd->create_name_len == 0) {
+		toast_show("Enter a filename!");
+		return;
+	}
+
+	// Build full VFS path: <create_path>/<name>.img
+	char path[MAX_PATH_LEN];
+	snprintf(path, sizeof(path), "%s/%s.img", osd->create_path, osd->create_name);
+
+	// Check if file already exists
+	struct stat st;
+	if (stat(path, &st) == 0) {
+		toast_show("File already exists!");
+		return;
+	}
+
+	int64_t size = hdd_sizes[osd->create_size_idx].bytes;
+	const char *base = get_base_path(osd->create_path);
+
+	// Allocate file space via VFS (handles FatFS drive mapping internally)
+	// Try contiguous first, fall back to non-contiguous
+	esp_err_t err = esp_vfs_fat_create_contiguous_file(base, path, (uint64_t)size, true);
+	if (err != ESP_OK)
+		err = esp_vfs_fat_create_contiguous_file(base, path, (uint64_t)size, false);
+	if (err != ESP_OK) {
+		unlink(path);  // Clean up partial file if any
+		toast_show("Not enough space!");
+		return;
+	}
+
+	// Write MBR at file offset 0 via standard I/O
+	uint8_t mbr[512];
+	build_mbr(mbr, size, osd->create_fs_type,
+	          hdd_sizes[osd->create_size_idx].heads,
+	          hdd_sizes[osd->create_size_idx].spt);
+	FILE *f = fopen(path, "r+b");
+	if (f) {
+		fwrite(mbr, 1, 512, f);
+		fclose(f);
+	}
+
+	// Auto-set as HDA path
+	strncpy(osd->hda_path, path, MAX_PATH_LEN - 1);
+	osd->hda_path[MAX_PATH_LEN - 1] = '\0';
+	toast_show("HDD image created!");
+	osd->view = VIEW_MOUNTING;
+}
+
+// Render Create HDD dialog
+static void render_create_hdd(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
+{
+	int line_h = 20;
+	int title_h = 28;
+	int help_h = 22;
+	int padding = 6;
+	int menu_w = 380;
+	if (menu_w > w - 10) menu_w = w - 10;
+	if (menu_w < 100) menu_w = 100;
+
+	// Path info row + 5 selectable rows + separator
+	int content_h = title_h + (6 * line_h) + (line_h / 2) + help_h;
+	int menu_h = content_h + padding * 2;
+	int menu_x = (w - menu_w) / 2;
+	if (menu_x < 0) menu_x = 0;
+	int menu_y = (h - menu_h) / 2;
+	if (menu_y < 0) menu_y = 0;
+
+	// Background
+	draw_rect(pixels, w, h, pitch, menu_x, menu_y, menu_w, menu_h, COLOR_PANEL);
+
+	// Border
+	draw_rect(pixels, w, h, pitch, menu_x, menu_y, menu_w, 1, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, menu_x, menu_y + menu_h - 1, menu_w, 1, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, menu_x, menu_y, 1, menu_h, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, menu_x + menu_w - 1, menu_y, 1, menu_h, COLOR_BORDER);
+
+	// Title
+	draw_text(pixels, w, h, pitch, menu_x + 10, menu_y + 8, "Create HDD Image", COLOR_TITLE, 0);
+
+	int y = menu_y + title_h;
+
+	// Path info (not selectable)
+	draw_text(pixels, w, h, pitch, menu_x + 10, y + 2, "Path:", COLOR_DIM, 0);
+	{
+		// Show truncated path on the right
+		const char *display_path = osd->create_path;
+		int path_len = strlen(display_path);
+		if (path_len > 28) display_path = display_path + path_len - 28;
+		int vw = get_text_width(display_path);
+		draw_text(pixels, w, h, pitch, menu_x + menu_w - 10 - vw, y + 2,
+		          display_path, COLOR_DIM, 0);
+	}
+	y += line_h;
+
+	// Row 0: Name field
+	if (osd->create_sel == 0)
+		draw_rect(pixels, w, h, pitch, menu_x + 4, y, menu_w - 8, line_h, COLOR_HILITE);
+	draw_text(pixels, w, h, pitch, menu_x + 10, y + 2, "Name:", COLOR_TEXT, 0);
+	{
+		char name_display[42];
+		snprintf(name_display, sizeof(name_display), "[%s_].img", osd->create_name);
+		int vw = get_text_width(name_display);
+		draw_text(pixels, w, h, pitch, menu_x + menu_w - 10 - vw, y + 2,
+		          name_display, COLOR_VALUE, 0);
+	}
+	y += line_h;
+
+	// Row 1: Size
+	if (osd->create_sel == 1)
+		draw_rect(pixels, w, h, pitch, menu_x + 4, y, menu_w - 8, line_h, COLOR_HILITE);
+	draw_text(pixels, w, h, pitch, menu_x + 10, y + 2, "Size:", COLOR_TEXT, 0);
+	{
+		char size_display[24];
+		snprintf(size_display, sizeof(size_display), "< %s >", hdd_sizes[osd->create_size_idx].label);
+		int vw = get_text_width(size_display);
+		draw_text(pixels, w, h, pitch, menu_x + menu_w - 10 - vw, y + 2,
+		          size_display, COLOR_VALUE, 0);
+	}
+	y += line_h;
+
+	// Row 2: Partition type
+	if (osd->create_sel == 2)
+		draw_rect(pixels, w, h, pitch, menu_x + 4, y, menu_w - 8, line_h, COLOR_HILITE);
+	draw_text(pixels, w, h, pitch, menu_x + 10, y + 2, "Type:", COLOR_TEXT, 0);
+	{
+		const char *type_str = osd->create_fs_type ? "< FAT32 >" : "< FAT16 >";
+		int vw = get_text_width(type_str);
+		draw_text(pixels, w, h, pitch, menu_x + menu_w - 10 - vw, y + 2,
+		          type_str, COLOR_VALUE, 0);
+	}
+	y += line_h;
+
+	// Separator
+	draw_rect(pixels, w, h, pitch, menu_x + 10, y + 8, menu_w - 20, 1, COLOR_SEP);
+	y += line_h / 2;
+
+	// Row 3: Create button
+	if (osd->create_sel == 3)
+		draw_rect(pixels, w, h, pitch, menu_x + 4, y, menu_w - 8, line_h, COLOR_HILITE);
+	draw_text(pixels, w, h, pitch, menu_x + 10, y + 2, "[Create]", COLOR_TEXT, 0);
+	y += line_h;
+
+	// Row 4: Cancel button
+	if (osd->create_sel == 4)
+		draw_rect(pixels, w, h, pitch, menu_x + 4, y, menu_w - 8, line_h, COLOR_HILITE);
+	draw_text(pixels, w, h, pitch, menu_x + 10, y + 2, "[Cancel]", COLOR_TEXT, 0);
+
+	// Help text
+	draw_text(pixels, w, h, pitch, menu_x + 10, menu_y + menu_h - 20,
+	          "Type name, L/R:Adjust, Enter:Select", COLOR_SEP, 0);
+}
+
+// Handle keys in Create HDD view. Returns 1 to close OSD.
+static int handle_create_hdd_key(OSD *osd, int keycode)
+{
+	switch (keycode) {
+	case SC_UP:
+		if (osd->create_sel > 0) osd->create_sel--;
+		break;
+	case SC_DOWN:
+		if (osd->create_sel < 4) osd->create_sel++;
+		break;
+	case SC_LEFT:
+		if (osd->create_sel == 1) {
+			// Cycle size left
+			if (osd->create_size_idx > 0)
+				osd->create_size_idx--;
+			else
+				osd->create_size_idx = HDD_SIZE_COUNT - 1;
+		} else if (osd->create_sel == 2) {
+			osd->create_fs_type = !osd->create_fs_type;
+		}
+		break;
+	case SC_RIGHT:
+		if (osd->create_sel == 1) {
+			// Cycle size right
+			if (osd->create_size_idx < HDD_SIZE_COUNT - 1)
+				osd->create_size_idx++;
+			else
+				osd->create_size_idx = 0;
+		} else if (osd->create_sel == 2) {
+			osd->create_fs_type = !osd->create_fs_type;
+		}
+		break;
+	case SC_ENTER:
+		if (osd->create_sel == 3) {
+			do_create_hdd(osd);
+		} else if (osd->create_sel == 4) {
+			osd->view = VIEW_MOUNTING;
+		}
+		break;
+	case SC_ESC:
+		osd->view = VIEW_MOUNTING;
+		break;
+	case SC_BACKSPACE:
+		if (osd->create_sel == 0 && osd->create_name_len > 0) {
+			osd->create_name_len--;
+			osd->create_name[osd->create_name_len] = '\0';
+		}
+		break;
+	default:
+		// Type characters into name field
+		if (osd->create_sel == 0) {
+			char ch = scancode_to_char(keycode);
+			if (ch && osd->create_name_len < 32) {
+				osd->create_name[osd->create_name_len++] = ch;
+				osd->create_name[osd->create_name_len] = '\0';
+			}
+		}
+		break;
+	}
+	return 0;
 }
 
 // Render help screen (keyboard shortcuts)
@@ -816,7 +1133,10 @@ static void render_browser(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		// Format entry with icon
 		char line[MAX_FILENAME + 4];
 		uint16_t color = COLOR_TEXT;
-		if (osd->files[i].is_dir == FILE_TYPE_EJECT) {
+		if (osd->files[i].is_dir == FILE_TYPE_CREATE_HERE) {
+			snprintf(line, sizeof(line), "  %s", osd->files[i].name);
+			color = COLOR_TITLE;  // Yellow for action
+		} else if (osd->files[i].is_dir == FILE_TYPE_EJECT) {
 			snprintf(line, sizeof(line), "  %s", osd->files[i].name);
 			color = COLOR_EJECT;
 		} else if (osd->files[i].is_dir == FILE_TYPE_SWITCH_STORAGE) {
@@ -882,6 +1202,19 @@ static int handle_file_select(OSD *osd)
 		toast_show(msg);
 		populate_drive_paths(osd);
 		osd->view = VIEW_MOUNTING;
+		return 0;
+	}
+
+	if (f->is_dir == FILE_TYPE_CREATE_HERE) {
+		// Use current browser_path as save location → open create dialog
+		strncpy(osd->create_path, osd->browser_path, MAX_PATH_LEN - 1);
+		osd->create_path[MAX_PATH_LEN - 1] = '\0';
+		strcpy(osd->create_name, "DISK");
+		osd->create_name_len = 4;
+		osd->create_size_idx = 3;  // Default: 504 MB
+		osd->create_fs_type = 1;   // Default: FAT32
+		osd->create_sel = 0;
+		osd->view = VIEW_CREATE_HDD;
 		return 0;
 	}
 
@@ -987,6 +1320,13 @@ static int handle_mount_select(OSD *osd)
 		scan_directory(osd);
 		osd->view = VIEW_FILEBROWSER;
 		break;
+	case MOUNT_CREATE_HDD:
+		// Open file browser to pick save location, then create dialog
+		osd->browser_target = BROWSER_TARGET_CREATE_HDD;
+		strcpy(osd->browser_path, "/sdcard");
+		scan_directory(osd);
+		osd->view = VIEW_FILEBROWSER;
+		break;
 	case MOUNT_CD:
 		// CD-ROM is on slot 1 (primary slave), stored at drive_paths[3]
 		// browser_target 3 maps to: ide primary, drive (3-2)%2 = 1 (slave)
@@ -1062,12 +1402,14 @@ static int handle_main_select(OSD *osd)
 		return 1;  // Close OSD
 	case MAIN_RESTART_EMU:
 		toast_show("Restarting emulator...");
+		led_activity_off();  // Clear activity LEDs
 		// Copy new HDA path to globals for esp_main to use
 		strncpy(globals.emu_new_hda_path, osd->hda_path, sizeof(globals.emu_new_hda_path) - 1);
 		globals.emu_new_hda_path[sizeof(globals.emu_new_hda_path) - 1] = '\0';
 		globals.emu_restart_pending = true;  // Signal emulator restart (reload config)
 		return 1;  // Close OSD
 	case MAIN_EXIT_LAUNCHER:
+		led_activity_off();  // Clear activity LEDs
 		i2s_shutdown();  // Silence audio before restart
 		esp_restart();
 		break;
@@ -1472,6 +1814,9 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 			break;
 		}
 		break;
+
+	case VIEW_CREATE_HDD:
+		return handle_create_hdd_key(osd, keycode);
 	}
 
 	return 0;
@@ -1518,6 +1863,9 @@ void osd_render(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		break;
 	case VIEW_DELETE_CONFIRM:
 		render_delete_confirm(osd, pixels, w, h, pitch);
+		break;
+	case VIEW_CREATE_HDD:
+		render_create_hdd(osd, pixels, w, h, pitch);
 		break;
 	}
 }

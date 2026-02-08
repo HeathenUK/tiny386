@@ -887,6 +887,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 		ide_attach_usb(pc->ide2, 0);
 	}
 
+	pc->fill_cmos = conf->fill_cmos;
 	if (conf->fill_cmos)
 		ide_fill_cmos(pc->ide, pc->cmos, cmos_set);
 
@@ -1067,6 +1068,11 @@ void pc_reset(PC *pc)
 	memset(pc->phys_mem, 0, 0xa0000);
 	// Reset keyboard controller and clear any pending input
 	i8042_reset(pc->i8042);
+	// Reset port 92 (A20 gate)
+	pc->port92 = 0x2;
+	// Update CMOS disk geometry (may have changed via OSD disk swap)
+	if (pc->fill_cmos)
+		ide_fill_cmos(pc->ide, pc->cmos, cmos_set);
 	// Reload BIOS and reset CPU
 	load_bios_and_reset(pc);
 }
