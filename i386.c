@@ -683,6 +683,11 @@ static int pte_lookup[2][4][2][2] = { //[wp != 0][(pte >> 1) & 3][cpl > 0][rwm >
 	}
 };
 
+static bool translate_laddr(CPUI386 *cpu, OptAddr *res, int rwm, uword laddr, int size, int cpl);
+static u32 load32(CPUI386 *cpu, OptAddr *res);
+static bool translate(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr, int size, int cpl);
+static u8 load8(CPUI386 *cpu, OptAddr *res);
+
 static bool IRAM_ATTR tlb_refill(CPUI386 *cpu, struct tlb_entry *ent, uword lpgno)
 {
 	uint32_t a20 = cpu->a20_mask;
@@ -779,6 +784,79 @@ static void dump_pf_walk(CPUI386 *cpu, uword laddr, const char *tag)
 		!!(pte & (1 << 5)), !!(pte & (1 << 6)), phys);
 }
 
+static void dump_idt_vector(CPUI386 *cpu, int vec, const char *tag)
+{
+	uword off = (uword)vec << 3;
+	if (off + 7 > cpu->idt.limit) {
+		dolog("=== %s: IDT[%02x] OOB (limit=%x) ===\n", tag, vec, cpu->idt.limit);
+		return;
+	}
+
+	OptAddr meml;
+	if (!translate_laddr(cpu, &meml, 1, cpu->idt.base + off, 4, 0)) {
+		dolog("=== %s: IDT[%02x] read fail @%08x ===\n", tag, vec, cpu->idt.base + off);
+		return;
+	}
+	uword w1 = load32(cpu, &meml);
+	if (!translate_laddr(cpu, &meml, 1, cpu->idt.base + off + 4, 4, 0)) {
+		dolog("=== %s: IDT[%02x] read fail @%08x ===\n", tag, vec, cpu->idt.base + off + 4);
+		return;
+	}
+	uword w2 = load32(cpu, &meml);
+
+	int gt = (w2 >> 8) & 0xf;
+	int dpl = (w2 >> 13) & 0x3;
+	int p = (w2 >> 15) & 1;
+	uword newcs = (w1 >> 16) & 0xffff;
+	uword newip = (w1 & 0xffff) | (w2 & 0xffff0000);
+
+	dolog("=== %s: IDT[%02x] raw=%08x %08x ===\n", tag, vec, w1, w2);
+	dolog("  type=%x dpl=%d p=%d target=%04x:%08x cpl=%d CS=%04x EIP=%08x\n",
+		gt, dpl, p, newcs, newip, cpu->cpl, cpu->seg[SEG_CS].sel, cpu->ip);
+}
+
+/* Side-effect-safe IDT gate read for diagnostics. */
+static bool read_idt_vector_raw_noexcept(CPUI386 *cpu, int vec, uword *w1, uword *w2)
+{
+	uword saved_cr2 = cpu->cr2;
+	uword saved_excno = cpu->excno;
+	uword saved_excerr = cpu->excerr;
+	OptAddr meml;
+	uword off = (uword)vec << 3;
+	bool ok = false;
+
+	if (off + 7 > cpu->idt.limit)
+		goto out;
+	if (!translate_laddr(cpu, &meml, 1, cpu->idt.base + off, 4, 0))
+		goto out;
+	*w1 = load32(cpu, &meml);
+	if (!translate_laddr(cpu, &meml, 1, cpu->idt.base + off + 4, 4, 0))
+		goto out;
+	*w2 = load32(cpu, &meml);
+	ok = true;
+
+out:
+	cpu->cr2 = saved_cr2;
+	cpu->excno = saved_excno;
+	cpu->excerr = saved_excerr;
+	return ok;
+}
+
+static void dump_cs_bytes(CPUI386 *cpu, const char *tag, int nbytes)
+{
+	dolog("%s", tag);
+	for (int i = 0; i < nbytes; i++) {
+		OptAddr b;
+		if (translate(cpu, &b, 1, SEG_CS, cpu->ip + i, 1, cpu->cpl))
+			dolog(" %02x", load8(cpu, &b));
+		else {
+			dolog(" ??");
+			break;
+		}
+	}
+	dolog("\n");
+}
+
 static bool IRAM_ATTR translate_lpgno(CPUI386 *cpu, int rwm, uword lpgno, uword laddr, int cpl, uword *paddr)
 {
 	struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
@@ -841,18 +919,10 @@ static bool IRAM_ATTR segcheck(CPUI386 *cpu, int rwm, int seg, uword addr, int s
 		/* null selector check */
 		if (cpu->seg[seg].limit == 0 && (cpu->seg[seg].sel & ~0x3) == 0) {
 //			dolog("segcheck: seg %d is null %x\n", seg, cpu->seg[seg].sel);
-			THROW(EX_GP, 0);
+			THROW(seg == SEG_SS ? EX_SS : EX_GP, 0);
 		}
-		/* limit check - DISABLED: causes spurious #GP in some DOS/DPMI games */
-#if 0
-		bool expand_down = (cpu->seg[seg].flags & 0xc) == 0x4;
-		bool over = addr + size - 1 > cpu->seg[seg].limit;
-		if (expand_down)
-			over = addr <= cpu->seg[seg].limit;
-		if (over) {
-			THROW(EX_GP, 0);
-		}
-#endif
+		/* Limit checks remain disabled for compatibility with existing DPMI/Win9x
+		 * workloads in this emulator. Keep null-selector faults only. */
 		/* todo: readonly check */
 	}
 	return true;
@@ -865,6 +935,9 @@ static bool IRAM_ATTR translate(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uw
 
 	/* Fast path: when ALL segments are flat, skip per-segment check entirely */
 	if (likely(cpu->all_segs_flat)) {
+		/* Null selectors are still invalid in protected mode even if every
+		 * segment currently looks flat; keep architectural fault behavior. */
+		TRYL(segcheck(cpu, rwm, seg, addr, size));
 		return translate_laddr(cpu, res, rwm, addr, size, cpl);
 	}
 
@@ -885,6 +958,7 @@ static bool IRAM_ATTR translate8r(CPUI386 *cpu, OptAddr *res, int seg, uword add
 
 	/* Fast path: all segments flat → addr IS the linear address */
 	if (likely(cpu->all_segs_flat)) {
+		TRYL(segcheck(cpu, 1, seg, addr, 1));
 		laddr = addr;
 	} else if (likely(SEG_IS_FLAT(cpu, seg))) {
 		laddr = addr;
@@ -5955,7 +6029,8 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 	}
 
 	int dpl = (w2 >> 13) & 0x3;
-	if (!ext && dpl < cpu->cpl) THROW(EX_GP, off | 2);
+	if (!ext && dpl < cpu->cpl)
+		THROW(EX_GP, off | 2);
 
 	int p = (w2 >> 15) & 1;
 	if (!p) {
@@ -6032,6 +6107,11 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		int newpl = csdpl;
 		uword oldss = cpu->seg[SEG_SS].sel;
 		uword oldsp = REGi(4);
+		uword saved_ss_sel = cpu->seg[SEG_SS].sel;
+		uword saved_ss_base = cpu->seg[SEG_SS].base;
+		uword saved_ss_limit = cpu->seg[SEG_SS].limit;
+		uword saved_ss_flags = cpu->seg[SEG_SS].flags;
+		uword saved_sp_mask = cpu->sp_mask;
 		uword newss, newsp;
 		if (cpu->seg[SEG_TR].flags & 0x8) {
 			TRY(translate(cpu, &msp0, 1, SEG_TR, 4 + 8 * newpl, 4, 0));
@@ -6046,18 +6126,21 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		}
 
 		REGi(4) = newsp;
-		TRY(set_seg(cpu, SEG_SS, newss));
+		if (!set_seg(cpu, SEG_SS, newss)) {
+			REGi(4) = oldsp;
+			return false;
+		}
 		uword sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
 		OptAddr meml1, meml2, meml3, meml4, meml5, meml6;
 		uword sp = lreg32(4);
 		if (gate16) {
-			TRY(translate(cpu, &meml1, 2, SEG_SS, (sp - 2 * 1) & sp_mask, 2, 0));
-			TRY(translate(cpu, &meml2, 2, SEG_SS, (sp - 2 * 2) & sp_mask, 2, 0));
-			TRY(translate(cpu, &meml3, 2, SEG_SS, (sp - 2 * 3) & sp_mask, 2, 0));
-			TRY(translate(cpu, &meml4, 2, SEG_SS, (sp - 2 * 4) & sp_mask, 2, 0));
-			TRY(translate(cpu, &meml5, 2, SEG_SS, (sp - 2 * 5) & sp_mask, 2, 0));
+			if (!translate(cpu, &meml1, 2, SEG_SS, (sp - 2 * 1) & sp_mask, 2, 0)) goto inter_pvl_fail;
+			if (!translate(cpu, &meml2, 2, SEG_SS, (sp - 2 * 2) & sp_mask, 2, 0)) goto inter_pvl_fail;
+			if (!translate(cpu, &meml3, 2, SEG_SS, (sp - 2 * 3) & sp_mask, 2, 0)) goto inter_pvl_fail;
+			if (!translate(cpu, &meml4, 2, SEG_SS, (sp - 2 * 4) & sp_mask, 2, 0)) goto inter_pvl_fail;
+			if (!translate(cpu, &meml5, 2, SEG_SS, (sp - 2 * 5) & sp_mask, 2, 0)) goto inter_pvl_fail;
 			if (pusherr) {
-				TRY(translate(cpu, &meml6, 2, SEG_SS, (sp - 2 * 6) & sp_mask, 2, 0));
+				if (!translate(cpu, &meml6, 2, SEG_SS, (sp - 2 * 6) & sp_mask, 2, 0)) goto inter_pvl_fail;
 			}
 			saddr16(&meml1, oldss);
 			saddr16(&meml2, oldsp);
@@ -6075,13 +6158,13 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 				set_sp(sp - 2 * 5, sp_mask);
 			}
 		} else {
-			TRY(translate(cpu, &meml1, 2, SEG_SS, (sp - 4 * 1) & sp_mask, 4, 0));
-			TRY(translate(cpu, &meml2, 2, SEG_SS, (sp - 4 * 2) & sp_mask, 4, 0));
-			TRY(translate(cpu, &meml3, 2, SEG_SS, (sp - 4 * 3) & sp_mask, 4, 0));
-			TRY(translate(cpu, &meml4, 2, SEG_SS, (sp - 4 * 4) & sp_mask, 4, 0));
-			TRY(translate(cpu, &meml5, 2, SEG_SS, (sp - 4 * 5) & sp_mask, 4, 0));
+			if (!translate(cpu, &meml1, 2, SEG_SS, (sp - 4 * 1) & sp_mask, 4, 0)) goto inter_pvl_fail;
+			if (!translate(cpu, &meml2, 2, SEG_SS, (sp - 4 * 2) & sp_mask, 4, 0)) goto inter_pvl_fail;
+			if (!translate(cpu, &meml3, 2, SEG_SS, (sp - 4 * 3) & sp_mask, 4, 0)) goto inter_pvl_fail;
+			if (!translate(cpu, &meml4, 2, SEG_SS, (sp - 4 * 4) & sp_mask, 4, 0)) goto inter_pvl_fail;
+			if (!translate(cpu, &meml5, 2, SEG_SS, (sp - 4 * 5) & sp_mask, 4, 0)) goto inter_pvl_fail;
 			if (pusherr) {
-				TRY(translate(cpu, &meml6, 2, SEG_SS, (sp - 4 * 6) & sp_mask, 4, 0));
+				if (!translate(cpu, &meml6, 2, SEG_SS, (sp - 4 * 6) & sp_mask, 4, 0)) goto inter_pvl_fail;
 			}
 			saddr32(&meml1, oldss);
 			saddr32(&meml2, oldsp);
@@ -6101,6 +6184,15 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		}
 		newcs = (newcs & (~3)) | newpl;
 		break;
+	inter_pvl_fail:
+		cpu->seg[SEG_SS].sel = saved_ss_sel;
+		cpu->seg[SEG_SS].base = saved_ss_base;
+		cpu->seg[SEG_SS].limit = saved_ss_limit;
+		cpu->seg[SEG_SS].flags = saved_ss_flags;
+		cpu->sp_mask = saved_sp_mask;
+		update_seg_flat(cpu, SEG_SS);
+		REGi(4) = oldsp;
+		return false;
 	}
 	case 3: /* from v8086 */ {
 //		dolog("int from v8086\n");
@@ -6443,11 +6535,35 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		dump_exc_ring("2s post-LDT-PF");
 	}
 
+	/* Track live changes to IDT[0x41] (VxD call path) to catch descriptor clobbering. */
+	if (cpu->cr0 & 1) {
+		static bool idt41_have_last = false;
+		static uword idt41_last_w1 = 0, idt41_last_w2 = 0;
+		static int idt41_diag_gen = -1;
+		uword w1, w2;
+		if (idt41_diag_gen != cpu->diag_gen) {
+			idt41_diag_gen = cpu->diag_gen;
+			idt41_have_last = false;
+		}
+		if (read_idt_vector_raw_noexcept(cpu, 0x41, &w1, &w2)) {
+			if (!idt41_have_last || w1 != idt41_last_w1 || w2 != idt41_last_w2) {
+				dolog("=== IDT[41] change ===\n");
+				dolog("  from %08x %08x\n", idt41_last_w1, idt41_last_w2);
+				dolog("  to   %08x %08x at CS:EIP=%04x:%08x CPL=%d\n",
+					w1, w2, cpu->seg[SEG_CS].sel, cpu->ip, cpu->cpl);
+				idt41_last_w1 = w1;
+				idt41_last_w2 = w2;
+				idt41_have_last = true;
+			}
+		}
+	}
+
 	if (!cpu_exec1(cpu, stepcount)) {
 		bool pusherr = false;
 		switch (cpu->excno) {
 		case EX_DF: case EX_TS: case EX_NP: case EX_SS: case EX_GP:
 		case EX_PF:
+		case 17: /* #AC pushes error code 0 */
 			pusherr = true;
 		}
 		int orig_exc = cpu->excno;
@@ -6471,13 +6587,53 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 					cpu->seg[SEG_CS].sel, cpu->ip, cpu->excerr, cpu->cpl, cpu->flags);
 				dump_pf_walk(cpu, cpu->cr2, "FIRST BFF #PF");
 			}
-			if (!pf_target_dumped && cpu->cr2 == 0xbff9809f) {
+			if (!pf_target_dumped && cpu->cr2 >= 0xbff98000 && cpu->cr2 < 0xbff99000) {
 				pf_target_dumped = true;
 				refresh_flags(cpu);
-				dolog("=== TARGET #PF CR2=BFF9809F ===\n");
+				dolog("=== TARGET #PF CR2 in BFF98000..BFF98FFF ===\n");
 				dolog("  fault @ CS:EIP=%04x:%08x err=%x CPL=%d FL=%08x\n",
 					cpu->seg[SEG_CS].sel, cpu->ip, cpu->excerr, cpu->cpl, cpu->flags);
 				dump_pf_walk(cpu, cpu->cr2, "TARGET #PF");
+			}
+		}
+
+		/* One-shot: diagnose IDT-referenced #GP (e.g., err=20a -> vector 0x41). */
+		if (orig_exc == EX_GP && (cpu->excerr & 0x2)) {
+			static bool gp_idt_dumped = false;
+			static int gp_diag_gen = -1;
+			if (gp_diag_gen != cpu->diag_gen) {
+				gp_diag_gen = cpu->diag_gen;
+				gp_idt_dumped = false;
+			}
+			if (!gp_idt_dumped) {
+				int vec = (cpu->excerr >> 3) & 0x1fff;
+				gp_idt_dumped = true;
+				refresh_flags(cpu);
+				dolog("=== FIRST #GP with IDT err=%x (vec=%x) ===\n", cpu->excerr, vec);
+				dolog("  at CS:EIP=%04x:%08x CPL=%d FL=%08x\n",
+					cpu->seg[SEG_CS].sel, cpu->ip, cpu->cpl, cpu->flags);
+				if (vec < 256) dump_idt_vector(cpu, vec, "FIRST GP(IDT)");
+				dump_cs_bytes(cpu, "  opcodes @CS:EIP:", 8);
+			}
+		}
+
+		/* One-shot: diagnose alignment-check exception context. */
+		if (orig_exc == 17) {
+			static bool ac_dumped = false;
+			static int ac_diag_gen = -1;
+			if (ac_diag_gen != cpu->diag_gen) {
+				ac_diag_gen = cpu->diag_gen;
+				ac_dumped = false;
+			}
+			if (!ac_dumped) {
+				ac_dumped = true;
+				refresh_flags(cpu);
+				dolog("=== FIRST #AC ===\n");
+				dolog("  CS:EIP=%04x:%08x SS:ESP=%04x:%08x CPL=%d\n",
+					cpu->seg[SEG_CS].sel, cpu->ip,
+					cpu->seg[SEG_SS].sel, REGi(4), cpu->cpl);
+				dolog("  FL=%08x CR0=%08x CR2=%08x CR3=%08x\n",
+					cpu->flags, cpu->cr0, cpu->cr2, cpu->cr3);
 			}
 		}
 
