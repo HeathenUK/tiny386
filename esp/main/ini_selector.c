@@ -15,6 +15,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <utime.h>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -39,6 +40,7 @@ static const char *TAG = "ini_sel";
 #define TITLE_Y    10
 #define LIST_Y     36
 #define FOOTER_Y  455
+#define PANEL_BOT (FOOTER_Y - 8)  /* panels stop above footer */
 
 /* Colours (RGB565) */
 #define C_BG      0x0000
@@ -83,7 +85,7 @@ static int  s_countdown;            /* seconds remaining (5→0, -1 = cancelled)
 static uint32_t s_countdown_tick;   /* timestamp of last countdown update */
 
 /* How many list entries fit on screen */
-#define VISIBLE_LINES ((FOOTER_Y - LIST_Y) / (FONT_H + 2))
+#define VISIBLE_LINES ((PANEL_BOT - LIST_Y) / (FONT_H + 2))
 
 /* ── Portrait coordinate transform (same as toast.c) ────────────── */
 static uint16_t *s_fb;
@@ -254,10 +256,8 @@ static void scan_ini_files(void)
 		if (S_ISDIR(st.st_mode)) continue;
 
 		IniFileEntry *e = &s_files[s_count];
-		strncpy(e->name, ent->d_name, MAX_INI_NAME - 1);
-		e->name[MAX_INI_NAME - 1] = '\0';
-		strncpy(e->path, fullpath, sizeof(e->path) - 1);
-		e->path[sizeof(e->path) - 1] = '\0';
+		snprintf(e->name, MAX_INI_NAME, "%s", ent->d_name);
+		snprintf(e->path, sizeof(e->path), "%s", fullpath);
 		e->mtime = st.st_mtime;
 		e->parsed = false;
 		e->valid = false;
@@ -299,8 +299,10 @@ void ini_selector_start(bool auto_boot)
 static void finish_selection(int idx)
 {
 	const char *path = "";
-	if (idx >= 0 && idx < s_count)
+	if (idx >= 0 && idx < s_count) {
 		path = s_files[idx].path;
+		utime(path, NULL);  /* bump mtime so it sorts first next boot */
+	}
 
 	if (s_auto_boot) {
 		/* Boot-time: i386_task is waiting for ini_selector_done */
@@ -407,12 +409,12 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 	sel_fill_rect(0, 28, LOG_W, 1, C_BORDER);
 
 	/* ── Left panel: file list ─────────────────────────────────── */
-	sel_fill_rect(LEFT_X - 2, LIST_Y - 2, LEFT_W + 4, FOOTER_Y - LIST_Y + 4, C_PANEL);
+	sel_fill_rect(LEFT_X - 2, LIST_Y - 2, LEFT_W + 4, PANEL_BOT - LIST_Y + 4, C_PANEL);
 	/* Border */
 	sel_fill_rect(LEFT_X - 2, LIST_Y - 2, LEFT_W + 4, 1, C_BORDER);
-	sel_fill_rect(LEFT_X - 2, FOOTER_Y + 2, LEFT_W + 4, 1, C_BORDER);
-	sel_fill_rect(LEFT_X - 2, LIST_Y - 2, 1, FOOTER_Y - LIST_Y + 5, C_BORDER);
-	sel_fill_rect(LEFT_X + LEFT_W + 1, LIST_Y - 2, 1, FOOTER_Y - LIST_Y + 5, C_BORDER);
+	sel_fill_rect(LEFT_X - 2, PANEL_BOT + 2, LEFT_W + 4, 1, C_BORDER);
+	sel_fill_rect(LEFT_X - 2, LIST_Y - 2, 1, PANEL_BOT - LIST_Y + 5, C_BORDER);
+	sel_fill_rect(LEFT_X + LEFT_W + 1, LIST_Y - 2, 1, PANEL_BOT - LIST_Y + 5, C_BORDER);
 
 	if (s_count == 0) {
 		if (s_dir_missing) {
@@ -456,7 +458,7 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 
 		/* Scroll indicator */
 		if (s_count > VISIBLE_LINES) {
-			int track_h = FOOTER_Y - LIST_Y;
+			int track_h = PANEL_BOT - LIST_Y;
 			int thumb_h = track_h * VISIBLE_LINES / s_count;
 			if (thumb_h < 8) thumb_h = 8;
 			int thumb_y = LIST_Y + (track_h - thumb_h) * s_scroll /
@@ -466,12 +468,12 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 	}
 
 	/* ── Right panel: settings preview ─────────────────────────── */
-	sel_fill_rect(RIGHT_X - 2, LIST_Y - 2, RIGHT_W + 4, FOOTER_Y - LIST_Y + 4, C_PANEL);
+	sel_fill_rect(RIGHT_X - 2, LIST_Y - 2, RIGHT_W + 4, PANEL_BOT - LIST_Y + 4, C_PANEL);
 	/* Border */
 	sel_fill_rect(RIGHT_X - 2, LIST_Y - 2, RIGHT_W + 4, 1, C_BORDER);
-	sel_fill_rect(RIGHT_X - 2, FOOTER_Y + 2, RIGHT_W + 4, 1, C_BORDER);
-	sel_fill_rect(RIGHT_X - 2, LIST_Y - 2, 1, FOOTER_Y - LIST_Y + 5, C_BORDER);
-	sel_fill_rect(RIGHT_X + RIGHT_W + 1, LIST_Y - 2, 1, FOOTER_Y - LIST_Y + 5, C_BORDER);
+	sel_fill_rect(RIGHT_X - 2, PANEL_BOT + 2, RIGHT_W + 4, 1, C_BORDER);
+	sel_fill_rect(RIGHT_X - 2, LIST_Y - 2, 1, PANEL_BOT - LIST_Y + 5, C_BORDER);
+	sel_fill_rect(RIGHT_X + RIGHT_W + 1, LIST_Y - 2, 1, PANEL_BOT - LIST_Y + 5, C_BORDER);
 
 	if (s_count > 0 && s_sel >= 0 && s_sel < s_count) {
 		IniFileEntry *e = &s_files[s_sel];
@@ -516,8 +518,8 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 	sel_fill_rect(0, FOOTER_Y - 4, LOG_W, 1, C_BORDER);
 
 	if (s_countdown >= 0 && s_count > 0) {
-		char msg[64];
-		snprintf(msg, sizeof(msg), "Auto-boot \"%s\" in %d...",
+		char msg[80];
+		snprintf(msg, sizeof(msg), "Auto-boot \"%.40s\" in %d...",
 		         s_files[0].name, s_countdown);
 		sel_draw_text(LEFT_X, FOOTER_Y + 2, msg, C_TITLE, LOG_W - 20);
 	} else {

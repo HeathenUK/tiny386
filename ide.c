@@ -335,9 +335,9 @@ struct BlockDevice {
 /* Async read state — shared between ide_status_read (poll) and io_task (producer).
  * Declared early so ide_status_read can reference it. */
 static struct {
-    volatile int pending;
-    volatile int done;
-    volatile int result;
+    int pending;                        /* atomic access via __atomic builtins */
+    int done;                           /* atomic access via __atomic builtins */
+    int result;
     void *bf;               /* BlockDeviceFile* (void* to avoid forward decl) */
     uint8_t *buf;
     uint64_t sector_num;
@@ -1792,8 +1792,9 @@ uint32_t ide_status_read(void *opaque)
     int ret;
 
     /* Phase 3: complete async read if done */
-    if (s && (s->status & BUSY_STAT) && async_read.done) {
-        async_read.done = 0;
+    if (s && (s->status & BUSY_STAT) &&
+        __atomic_load_n(&async_read.done, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&async_read.done, 0, __ATOMIC_RELAXED);
         async_read.cb(async_read.cb_opaque, async_read.result);
     }
 
@@ -2161,8 +2162,8 @@ static struct {
         uint64_t disk_sector;           /* sector_num in disk image space */
         uint32_t sd_sector;
     } meta[WCACHE_SLOTS];
-    volatile uint32_t head;             /* producer index */
-    volatile uint32_t tail;             /* consumer index */
+    uint32_t head;                      /* producer index (atomic access) */
+    uint32_t tail;                      /* consumer index (atomic access) */
     SemaphoreHandle_t not_empty;
     SemaphoreHandle_t sd_mutex;         /* protects all sdmmc_read/write calls */
     sdmmc_card_t *card;
@@ -2170,6 +2171,7 @@ static struct {
 } wcache;
 
 static uint32_t extent_lookup(BlockDeviceFile *bf, uint32_t file_sector, int *contig);
+static int wcache_lookup(BlockDeviceFile *bf, uint64_t sector_num, uint8_t *buf);
 
 static void io_task(void *arg)
 {
@@ -2178,7 +2180,7 @@ static void io_task(void *arg)
         xSemaphoreTake(wcache.not_empty, portMAX_DELAY);
 
         /* Phase 3: async reads have priority over writes */
-        if (async_read.pending) {
+        if (__atomic_load_n(&async_read.pending, __ATOMIC_ACQUIRE)) {
             BlockDeviceFile *bf = async_read.bf;
             uint8_t *buf = async_read.buf;
             uint64_t sector_num = async_read.sector_num;
@@ -2187,8 +2189,15 @@ static void io_task(void *arg)
             int result = 0;
 
             uint32_t file_sector = (uint32_t)((sector_num * SECTOR_SIZE + start_offset) / SECTOR_SIZE);
-            xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
             while (n > 0) {
+                /* Check write cache first — pending writes not yet on SD */
+                if (wcache_lookup(bf, sector_num, buf)) {
+                    buf += SECTOR_SIZE;
+                    file_sector++;
+                    sector_num++;
+                    n--;
+                    continue;
+                }
                 int contig;
                 uint32_t sd_sector = extent_lookup(bf, file_sector, &contig);
                 if (sd_sector == (uint32_t)-1) {
@@ -2196,42 +2205,58 @@ static void io_task(void *arg)
                     break;
                 }
                 int chunk = (n < contig) ? n : contig;
+                xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
                 if (sdmmc_read_sectors(bf->card, buf, sd_sector, chunk) != ESP_OK) {
+                    xSemaphoreGive(wcache.sd_mutex);
                     result = -1;
                     break;
                 }
+                xSemaphoreGive(wcache.sd_mutex);
+                /* Overlay any write-cached sectors over stale SD data */
+                for (int c = 0; c < chunk; c++)
+                    wcache_lookup(bf, sector_num + c, buf + c * SECTOR_SIZE);
                 buf += chunk * SECTOR_SIZE;
                 file_sector += chunk;
+                sector_num += chunk;
                 n -= chunk;
             }
-            xSemaphoreGive(wcache.sd_mutex);
 
             async_read.result = result;
-            async_read.pending = 0;
-            async_read.done = 1;
+            __atomic_store_n(&async_read.done, 1, __ATOMIC_RELEASE);
+            __atomic_store_n(&async_read.pending, 0, __ATOMIC_RELEASE);
             continue;  /* re-check semaphore */
         }
 
         /* Drain writes: batch adjacent SD sectors */
-        while (wcache.tail != wcache.head) {
-            uint32_t t = wcache.tail % WCACHE_SLOTS;
-            uint32_t sd_start = wcache.meta[t].sd_sector;
-            uint32_t batch = 1;
+        {
+            uint32_t local_head = __atomic_load_n(&wcache.head, __ATOMIC_ACQUIRE);
+            uint32_t local_tail = wcache.tail;  /* only io_task writes tail */
+            while (local_tail != local_head) {
+                uint32_t t = local_tail % WCACHE_SLOTS;
+                uint32_t sd_start = wcache.meta[t].sd_sector;
+                BlockDeviceFile *start_bf = wcache.meta[t].bf;
+                uint32_t batch = 1;
 
-            /* Coalesce adjacent sectors (cap at 16, don't cross ring wrap) */
-            while (batch < 16 && wcache.tail + batch < wcache.head) {
-                uint32_t next = (wcache.tail + batch) % WCACHE_SLOTS;
-                if (wcache.meta[next].sd_sector != sd_start + batch)
-                    break;
-                batch++;
+                /* Coalesce adjacent sectors: same device, sequential SD sectors,
+                 * cap at 16, don't cross ring buffer wrap boundary */
+                uint32_t max_batch = WCACHE_SLOTS - t;
+                if (max_batch > 16) max_batch = 16;
+                while (batch < max_batch && local_tail + batch < local_head) {
+                    uint32_t next = (local_tail + batch) % WCACHE_SLOTS;
+                    if (wcache.meta[next].bf != start_bf ||
+                        wcache.meta[next].sd_sector != sd_start + batch)
+                        break;
+                    batch++;
+                }
+
+                xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
+                sdmmc_write_sectors(wcache.card, wcache.data + t * SECTOR_SIZE,
+                                    sd_start, batch);
+                xSemaphoreGive(wcache.sd_mutex);
+
+                local_tail += batch;
+                __atomic_store_n(&wcache.tail, local_tail, __ATOMIC_RELEASE);
             }
-
-            xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
-            sdmmc_write_sectors(wcache.card, wcache.data + t * SECTOR_SIZE,
-                                sd_start, batch);
-            xSemaphoreGive(wcache.sd_mutex);
-
-            wcache.tail += batch;
         }
     }
 }
@@ -2263,7 +2288,7 @@ static void wcache_enqueue(BlockDeviceFile *bf, uint64_t disk_sector,
 {
     for (int i = 0; i < count; i++) {
         /* Backpressure: spin if ring full */
-        while (wcache.head - wcache.tail >= WCACHE_SLOTS)
+        while (wcache.head - __atomic_load_n(&wcache.tail, __ATOMIC_ACQUIRE) >= WCACHE_SLOTS)
             vTaskDelay(1);
 
         uint32_t slot = wcache.head % WCACHE_SLOTS;
@@ -2271,7 +2296,7 @@ static void wcache_enqueue(BlockDeviceFile *bf, uint64_t disk_sector,
         wcache.meta[slot].bf = bf;
         wcache.meta[slot].disk_sector = disk_sector + i;
         wcache.meta[slot].sd_sector = sd_sector + i;
-        wcache.head++;
+        __atomic_store_n(&wcache.head, wcache.head + 1, __ATOMIC_RELEASE);
     }
     xSemaphoreGive(wcache.not_empty);
 }
@@ -2281,8 +2306,8 @@ static void wcache_enqueue(BlockDeviceFile *bf, uint64_t disk_sector,
 static int wcache_lookup(BlockDeviceFile *bf, uint64_t sector_num, uint8_t *buf)
 {
     int found = 0;
-    uint32_t t = wcache.tail;
-    uint32_t h = wcache.head;
+    uint32_t t = __atomic_load_n(&wcache.tail, __ATOMIC_ACQUIRE);
+    uint32_t h = __atomic_load_n(&wcache.head, __ATOMIC_ACQUIRE);
     for (uint32_t i = t; i < h; i++) {
         uint32_t slot = i % WCACHE_SLOTS;
         if (wcache.meta[slot].bf == bf &&
@@ -2302,7 +2327,8 @@ static void wcache_flush(void)
     /* Wake the IO task in case it's sleeping */
     xSemaphoreGive(wcache.not_empty);
     /* Spin until drained */
-    while (wcache.tail != wcache.head)
+    while (__atomic_load_n(&wcache.tail, __ATOMIC_ACQUIRE) !=
+           __atomic_load_n(&wcache.head, __ATOMIC_ACQUIRE))
         vTaskDelay(1);
 }
 
@@ -2618,7 +2644,9 @@ static int bf_read_async(BlockDevice *bs,
             }
 
             /* Phase 3: async read — post to IO task if callback available */
-            if (wcache.active && cb && !async_read.pending && !async_read.done) {
+            if (wcache.active && cb &&
+                !__atomic_load_n(&async_read.pending, __ATOMIC_ACQUIRE) &&
+                !__atomic_load_n(&async_read.done, __ATOMIC_ACQUIRE)) {
                 async_read.bf = bf;
                 async_read.buf = buf;
                 async_read.sector_num = sector_num;
@@ -2626,8 +2654,7 @@ static int bf_read_async(BlockDevice *bs,
                 async_read.start_offset = bf->start_offset;
                 async_read.cb = cb;
                 async_read.cb_opaque = opaque;
-                async_read.done = 0;
-                async_read.pending = 1;
+                __atomic_store_n(&async_read.pending, 1, __ATOMIC_RELEASE);
                 xSemaphoreGive(wcache.not_empty);
                 return 1;  /* async — caller sets BUSY_STAT */
             }
@@ -3968,8 +3995,8 @@ void ide_fill_cmos(IDEIFState *s, void *cmos,
  * so interrupt-driven guests that HLT get their completions. */
 void ide_poll_async(void)
 {
-    if (async_read.done) {
-        async_read.done = 0;
+    if (__atomic_load_n(&async_read.done, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&async_read.done, 0, __ATOMIC_RELAXED);
         async_read.cb(async_read.cb_opaque, async_read.result);
     }
 }

@@ -545,6 +545,19 @@ void vga_task(void *arg)
 
 		// Rotate + overlay into our buffer, then DMA to panel FB at TE
 		if (globals.fb) {
+			/* Clear ghost pixels when OSD or overlay bar is dismissed.
+			 * PPA rotation only overwrites the scaled VGA region, so
+			 * pixels drawn in border areas by overlays persist. */
+			static bool had_overlay = false;
+			bool has_overlay = (globals.osd_enabled && globals.osd) ||
+			                   (globals.overlay_type != OVERLAY_NONE);
+			if (had_overlay && !has_overlay) {
+				size_t sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
+				memset(fb_rotated, 0, sz);
+				esp_cache_msync(fb_rotated, sz,
+				                ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+			}
+
 			rotate_vga_to_display((uint16_t *)globals.fb, fb_rotated);
 
 			// Render OSD overlay
@@ -558,6 +571,11 @@ void vga_task(void *arg)
 			if (!globals.osd_enabled) {
 				render_overlay_bar(fb_rotated);
 			}
+
+			/* Update overlay tracking (after render_overlay_bar may
+			 * have expired the timer and set overlay_type to NONE) */
+			had_overlay = (globals.osd_enabled && globals.osd) ||
+			              (globals.overlay_type != OVERLAY_NONE);
 
 			// Persistent stats bar (renders on top of everything including OSD)
 			render_stats_bar(fb_rotated);
