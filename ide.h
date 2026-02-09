@@ -63,4 +63,5 @@ void ide_set_geometry(IDEIFState *s, int drive, int heads, int spt);
 
 void ide_sync(IDEIFState *ide, IDEIFState *ide2);
 void ide_close_files(IDEIFState *ide, IDEIFState *ide2);
+void ide_poll_async(void);
 #endif /* IDE_H */

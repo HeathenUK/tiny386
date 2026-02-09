@@ -566,6 +566,7 @@ void pc_step(PC *pc)
 	ne2000_step(pc->ne2000);
 	i8257_dma_run(pc->isa_dma);
 	i8257_dma_run(pc->isa_hdma);
+	ide_poll_async();
 	uint32_t t1 = 0, t2 = 0;
 	bool collecting = globals.stats_collecting;
 	if (collecting) t1 = get_uticks();  /* After peripherals */

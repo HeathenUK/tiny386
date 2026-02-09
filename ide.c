@@ -38,6 +38,9 @@
 #include "esp_heap_caps.h"
 #include "ff.h"
 #include "sdmmc_cmd.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #define IDE_ACTIVITY() led_activity_hdd()
 
 //#define DEBUG_IDE_ATAPI
@@ -328,6 +331,21 @@ struct BlockDevice {
                        BlockDeviceCompletionFunc *cb, void *opaque);
     void *opaque;
 };
+
+/* Async read state — shared between ide_status_read (poll) and io_task (producer).
+ * Declared early so ide_status_read can reference it. */
+static struct {
+    volatile int pending;
+    volatile int done;
+    volatile int result;
+    void *bf;               /* BlockDeviceFile* (void* to avoid forward decl) */
+    uint8_t *buf;
+    uint64_t sector_num;
+    int count;
+    int start_offset;
+    BlockDeviceCompletionFunc *cb;
+    void *cb_opaque;
+} async_read;
 
 typedef struct IDEState IDEState;
 
@@ -1773,6 +1791,12 @@ uint32_t ide_status_read(void *opaque)
     IDEState *s = s1->cur_drive;
     int ret;
 
+    /* Phase 3: complete async read if done */
+    if (s && (s->status & BUSY_STAT) && async_read.done) {
+        async_read.done = 0;
+        async_read.cb(async_read.cb_opaque, async_read.result);
+    }
+
     if (s) {
         ret = s->status;
     } else {
@@ -2127,6 +2151,161 @@ static int bf_get_chs(BlockDevice *bs, int *cylinders, int *heads, int *sectors)
  */
 extern void *rawsd;
 
+/* ── Write-behind cache + async I/O infrastructure ── */
+#define WCACHE_SLOTS 512  /* 256KB ring buffer */
+
+static struct {
+    uint8_t *data;                      /* PSRAM buffer: WCACHE_SLOTS * 512 bytes */
+    struct {
+        BlockDeviceFile *bf;
+        uint64_t disk_sector;           /* sector_num in disk image space */
+        uint32_t sd_sector;
+    } meta[WCACHE_SLOTS];
+    volatile uint32_t head;             /* producer index */
+    volatile uint32_t tail;             /* consumer index */
+    SemaphoreHandle_t not_empty;
+    SemaphoreHandle_t sd_mutex;         /* protects all sdmmc_read/write calls */
+    sdmmc_card_t *card;
+    int active;
+} wcache;
+
+static uint32_t extent_lookup(BlockDeviceFile *bf, uint32_t file_sector, int *contig);
+
+static void io_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        xSemaphoreTake(wcache.not_empty, portMAX_DELAY);
+
+        /* Phase 3: async reads have priority over writes */
+        if (async_read.pending) {
+            BlockDeviceFile *bf = async_read.bf;
+            uint8_t *buf = async_read.buf;
+            uint64_t sector_num = async_read.sector_num;
+            int n = async_read.count;
+            int start_offset = async_read.start_offset;
+            int result = 0;
+
+            uint32_t file_sector = (uint32_t)((sector_num * SECTOR_SIZE + start_offset) / SECTOR_SIZE);
+            xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
+            while (n > 0) {
+                int contig;
+                uint32_t sd_sector = extent_lookup(bf, file_sector, &contig);
+                if (sd_sector == (uint32_t)-1) {
+                    memset(buf, 0, n * SECTOR_SIZE);
+                    break;
+                }
+                int chunk = (n < contig) ? n : contig;
+                if (sdmmc_read_sectors(bf->card, buf, sd_sector, chunk) != ESP_OK) {
+                    result = -1;
+                    break;
+                }
+                buf += chunk * SECTOR_SIZE;
+                file_sector += chunk;
+                n -= chunk;
+            }
+            xSemaphoreGive(wcache.sd_mutex);
+
+            async_read.result = result;
+            async_read.pending = 0;
+            async_read.done = 1;
+            continue;  /* re-check semaphore */
+        }
+
+        /* Drain writes: batch adjacent SD sectors */
+        while (wcache.tail != wcache.head) {
+            uint32_t t = wcache.tail % WCACHE_SLOTS;
+            uint32_t sd_start = wcache.meta[t].sd_sector;
+            uint32_t batch = 1;
+
+            /* Coalesce adjacent sectors (cap at 16, don't cross ring wrap) */
+            while (batch < 16 && wcache.tail + batch < wcache.head) {
+                uint32_t next = (wcache.tail + batch) % WCACHE_SLOTS;
+                if (wcache.meta[next].sd_sector != sd_start + batch)
+                    break;
+                batch++;
+            }
+
+            xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
+            sdmmc_write_sectors(wcache.card, wcache.data + t * SECTOR_SIZE,
+                                sd_start, batch);
+            xSemaphoreGive(wcache.sd_mutex);
+
+            wcache.tail += batch;
+        }
+    }
+}
+
+static void wcache_init(void)
+{
+    if (wcache.active)
+        return;
+    wcache.data = heap_caps_malloc(WCACHE_SLOTS * SECTOR_SIZE,
+                                   MALLOC_CAP_SPIRAM);
+    if (!wcache.data) {
+        fprintf(stderr, "wcache: failed to allocate %dKB PSRAM\n",
+                WCACHE_SLOTS * SECTOR_SIZE / 1024);
+        return;
+    }
+    wcache.sd_mutex = xSemaphoreCreateMutex();
+    wcache.not_empty = xSemaphoreCreateBinary();
+    wcache.card = (sdmmc_card_t *)rawsd;
+    wcache.head = 0;
+    wcache.tail = 0;
+    wcache.active = 1;
+    xTaskCreatePinnedToCore(io_task, "ide_io", 4096, NULL, 2, NULL, 0);
+    fprintf(stderr, "wcache: %dKB ring buffer on core 0\n",
+            WCACHE_SLOTS * SECTOR_SIZE / 1024);
+}
+
+static void wcache_enqueue(BlockDeviceFile *bf, uint64_t disk_sector,
+                           uint32_t sd_sector, const uint8_t *buf, int count)
+{
+    for (int i = 0; i < count; i++) {
+        /* Backpressure: spin if ring full */
+        while (wcache.head - wcache.tail >= WCACHE_SLOTS)
+            vTaskDelay(1);
+
+        uint32_t slot = wcache.head % WCACHE_SLOTS;
+        memcpy(wcache.data + slot * SECTOR_SIZE, buf + i * SECTOR_SIZE, SECTOR_SIZE);
+        wcache.meta[slot].bf = bf;
+        wcache.meta[slot].disk_sector = disk_sector + i;
+        wcache.meta[slot].sd_sector = sd_sector + i;
+        wcache.head++;
+    }
+    xSemaphoreGive(wcache.not_empty);
+}
+
+/* Read-through: check if a sector is pending in the write cache.
+ * Scans tail→head; later entries override. Returns 1 if found. */
+static int wcache_lookup(BlockDeviceFile *bf, uint64_t sector_num, uint8_t *buf)
+{
+    int found = 0;
+    uint32_t t = wcache.tail;
+    uint32_t h = wcache.head;
+    for (uint32_t i = t; i < h; i++) {
+        uint32_t slot = i % WCACHE_SLOTS;
+        if (wcache.meta[slot].bf == bf &&
+            wcache.meta[slot].disk_sector == sector_num) {
+            memcpy(buf, wcache.data + slot * SECTOR_SIZE, SECTOR_SIZE);
+            found = 1;
+            /* Keep scanning — later entries override */
+        }
+    }
+    return found;
+}
+
+static void wcache_flush(void)
+{
+    if (!wcache.active)
+        return;
+    /* Wake the IO task in case it's sleeping */
+    xSemaphoreGive(wcache.not_empty);
+    /* Spin until drained */
+    while (wcache.tail != wcache.head)
+        vTaskDelay(1);
+}
+
 /*
  * Read the next cluster number from the FAT via raw SD reads.
  * Handles FAT16 (2 bytes/entry) and FAT32/exFAT (4 bytes/entry).
@@ -2379,24 +2558,111 @@ static int bf_read_async(BlockDevice *bs,
 
     /* Raw SD path: bypass VFS/FatFS entirely */
     if (bf->extents) {
-        /* Convert disk-image sector to file-relative sector (account for IDE header) */
-        uint32_t file_sector = (uint32_t)((sector_num * SECTOR_SIZE + bf->start_offset) / SECTOR_SIZE);
-        while (n > 0) {
-            int contig;
-            uint32_t sd_sector = extent_lookup(bf, file_sector, &contig);
-            if (sd_sector == (uint32_t)-1) {
-                memset(buf, 0, n * SECTOR_SIZE);
-                break;
+        if (bf->cache_buf) {
+            /* Phase 1: read-ahead cache for RO raw SD (CD-ROMs) */
+            uint32_t file_sector = (uint32_t)((sector_num * SECTOR_SIZE + bf->start_offset) / SECTOR_SIZE);
+            while (n > 0) {
+                /* Check if sector is in cache */
+                if (file_sector >= (uint32_t)bf->cache_start &&
+                    file_sector < (uint32_t)(bf->cache_start + bf->cache_count)) {
+                    int cache_offset = (file_sector - (uint32_t)bf->cache_start) * SECTOR_SIZE;
+                    memcpy(buf, bf->cache_buf + cache_offset, SECTOR_SIZE);
+                    buf += SECTOR_SIZE;
+                    file_sector++;
+                    sector_num++;
+                    n--;
+                } else {
+                    /* Cache miss — read ahead DISK_CACHE_SECTORS from SD */
+                    int contig;
+                    uint32_t sd_sector = extent_lookup(bf, file_sector, &contig);
+                    if (sd_sector == (uint32_t)-1) {
+                        memset(buf, 0, n * SECTOR_SIZE);
+                        break;
+                    }
+                    int read_count = DISK_CACHE_SECTORS;
+                    if (read_count > contig) read_count = contig;
+                    if (wcache.active)
+                        xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
+                    esp_err_t err = sdmmc_read_sectors(bf->card, bf->cache_buf,
+                                                       sd_sector, read_count);
+                    if (wcache.active)
+                        xSemaphoreGive(wcache.sd_mutex);
+                    if (err != ESP_OK)
+                        return -1;
+                    bf->cache_start = file_sector;
+                    bf->cache_count = read_count;
+                    /* Loop will hit cache on next iteration */
+                }
             }
-            int chunk = (n < contig) ? n : contig;
-            if (sdmmc_read_sectors(bf->card, buf, sd_sector, chunk) != ESP_OK) {
-                return -1;
-            }
-            buf += chunk * SECTOR_SIZE;
-            file_sector += chunk;
-            n -= chunk;
+            return 0;
         }
-        return 0;
+        /* RW raw SD path — write-cache read-through + async */
+        {
+            /* First check if any sectors are in the write cache */
+            int all_cached = 1;
+            if (wcache.active) {
+                uint64_t sn = sector_num;
+                uint8_t *b = buf;
+                int remaining = n;
+                while (remaining > 0) {
+                    if (!wcache_lookup(bf, sn, b)) {
+                        all_cached = 0;
+                        break;
+                    }
+                    b += SECTOR_SIZE;
+                    sn++;
+                    remaining--;
+                }
+                if (all_cached)
+                    return 0;
+            }
+
+            /* Phase 3: async read — post to IO task if callback available */
+            if (wcache.active && cb && !async_read.pending && !async_read.done) {
+                async_read.bf = bf;
+                async_read.buf = buf;
+                async_read.sector_num = sector_num;
+                async_read.count = n;
+                async_read.start_offset = bf->start_offset;
+                async_read.cb = cb;
+                async_read.cb_opaque = opaque;
+                async_read.done = 0;
+                async_read.pending = 1;
+                xSemaphoreGive(wcache.not_empty);
+                return 1;  /* async — caller sets BUSY_STAT */
+            }
+
+            /* Synchronous fallback */
+            uint32_t file_sector = (uint32_t)((sector_num * SECTOR_SIZE + bf->start_offset) / SECTOR_SIZE);
+            while (n > 0) {
+                if (wcache.active && wcache_lookup(bf, sector_num, buf)) {
+                    buf += SECTOR_SIZE;
+                    file_sector++;
+                    sector_num++;
+                    n--;
+                    continue;
+                }
+                int contig;
+                uint32_t sd_sector = extent_lookup(bf, file_sector, &contig);
+                if (sd_sector == (uint32_t)-1) {
+                    memset(buf, 0, n * SECTOR_SIZE);
+                    break;
+                }
+                int chunk = (n < contig) ? n : contig;
+                if (wcache.active)
+                    xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
+                esp_err_t err = sdmmc_read_sectors(bf->card, buf, sd_sector, chunk);
+                if (wcache.active)
+                    xSemaphoreGive(wcache.sd_mutex);
+                if (err != ESP_OK)
+                    return -1;
+                buf += chunk * SECTOR_SIZE;
+                file_sector += chunk;
+                sector_num += chunk;
+                n -= chunk;
+            }
+            return 0;
+        }
     }
 
     if (!bf->f)
@@ -2467,17 +2733,34 @@ static int bf_write_async(BlockDevice *bs,
         if (bf->mode == BF_MODE_RO)
             return -1;
         uint32_t file_sector = (uint32_t)((sector_num * SECTOR_SIZE + bf->start_offset) / SECTOR_SIZE);
-        while (n > 0) {
-            int contig;
-            uint32_t sd_sector = extent_lookup(bf, file_sector, &contig);
-            if (sd_sector == (uint32_t)-1)
-                return -1;
-            int chunk = (n < contig) ? n : contig;
-            if (sdmmc_write_sectors(bf->card, buf, sd_sector, chunk) != ESP_OK)
-                return -1;
-            buf += chunk * SECTOR_SIZE;
-            file_sector += chunk;
-            n -= chunk;
+        if (wcache.active) {
+            /* Write-behind: enqueue to ring buffer, IO task drains async */
+            while (n > 0) {
+                int contig;
+                uint32_t sd_sector = extent_lookup(bf, file_sector, &contig);
+                if (sd_sector == (uint32_t)-1)
+                    return -1;
+                int chunk = (n < contig) ? n : contig;
+                wcache_enqueue(bf, sector_num, sd_sector, buf, chunk);
+                buf += chunk * SECTOR_SIZE;
+                file_sector += chunk;
+                sector_num += chunk;
+                n -= chunk;
+            }
+        } else {
+            /* Fallback: direct synchronous write */
+            while (n > 0) {
+                int contig;
+                uint32_t sd_sector = extent_lookup(bf, file_sector, &contig);
+                if (sd_sector == (uint32_t)-1)
+                    return -1;
+                int chunk = (n < contig) ? n : contig;
+                if (sdmmc_write_sectors(bf->card, buf, sd_sector, chunk) != ESP_OK)
+                    return -1;
+                buf += chunk * SECTOR_SIZE;
+                file_sector += chunk;
+                n -= chunk;
+            }
         }
         return 0;
     }
@@ -2644,7 +2927,7 @@ static BlockDevice *block_device_init(const char *filename,
      * On success: close stdio FILE, skip cache — all I/O goes direct to SD.
      * On failure: fall back to stdio + read-ahead cache. */
     if (mode != BF_MODE_SNAPSHOT && build_extent_map(bf) == 0) {
-        /* Raw SD active — close stdio handle, no cache needed */
+        /* Raw SD active — close stdio handle */
         fclose(f);
         bf->f = NULL;
         /* Remove 2GB cap — raw SD reads use 32-bit sector numbers directly,
@@ -2666,6 +2949,14 @@ static BlockDevice *block_device_init(const char *filename,
                 }
                 free(fil2);
             }
+        }
+        /* Initialize write-behind cache infrastructure (idempotent) */
+        wcache_init();
+        /* Allocate read-ahead cache for RO raw SD (CD-ROMs) */
+        if (mode == BF_MODE_RO) {
+            bf->cache_buf = malloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
+            bf->cache_start = -1;
+            bf->cache_count = 0;
         }
     } else {
         /* Fallback: allocate read-ahead cache for stdio path */
@@ -2910,10 +3201,14 @@ static int espsd_read_async(BlockDevice *bs,
                 read_buf = buf + read_start * 512;
             }
 
-            // Read from SD card
+            // Read from SD card (under sd_mutex if wcache active)
+            if (wcache.active)
+                xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
             ret = sdmmc_read_sectors(bf->card, read_buf,
                                       bf->start_sector + sector_num + read_start,
                                       total_read);
+            if (wcache.active)
+                xSemaphoreGive(wcache.sd_mutex);
             if (ret != 0) {
                 if (temp_buf) free(temp_buf);
                 return -1;
@@ -2969,7 +3264,11 @@ static int espsd_write_async(BlockDevice *bs,
     }
 
     esp_err_t ret;
+    if (wcache.active)
+        xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
     ret = sdmmc_write_sectors(bf->card, buf, bf->start_sector + sector_num, n);
+    if (wcache.active)
+        xSemaphoreGive(wcache.sd_mutex);
     if (ret != 0)
         return -1;
     return 0;
@@ -3298,6 +3597,39 @@ static void block_device_reinit(BlockDevice *bs, const char *filename)
     bf->path[sizeof(bf->path) - 1] = '\0';
     bf->cache_start = -1;
     bf->cache_count = 0;
+
+    /* Free old extent map if any */
+    if (bf->extents) {
+        free(bf->extents);
+        bf->extents = NULL;
+        bf->num_extents = 0;
+    }
+    /* Try raw SD acceleration for new file */
+    if (build_extent_map(bf) == 0) {
+        fclose(bf->f);
+        bf->f = NULL;
+        /* Remove 2GB cap via FatFS */
+        FIL *fil2 = malloc(sizeof(FIL));
+        if (fil2) {
+            char fatfs_path[256];
+            snprintf(fatfs_path, sizeof(fatfs_path), "0:/%s",
+                     filename + strlen("/sdcard/"));
+            if (f_open(fil2, fatfs_path, FA_READ) == FR_OK) {
+                int64_t real_size = (int64_t)f_size(fil2);
+                f_close(fil2);
+                if (real_size > 0)
+                    bf->nb_sectors = real_size / SECTOR_SIZE;
+            }
+            free(fil2);
+        }
+        wcache_init();
+        /* RO raw SD gets read-ahead cache */
+        if (!bf->cache_buf) {
+            bf->cache_buf = malloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
+            bf->cache_start = -1;
+            bf->cache_count = 0;
+        }
+    }
 }
 
 void ide_change_cd(IDEIFState *sif, int drive, const char *filename)
@@ -3313,6 +3645,13 @@ void ide_change_cd(IDEIFState *sif, int drive, const char *filename)
     IDEState *s = sif->drives[drive];
     fprintf(stderr, "ide_change_cd: s=%p\n", (void*)s);
 
+    /* Sanity: back-pointer must match parent (catches stale PSRAM after reflash) */
+    if (s && s->ide_if != sif) {
+        fprintf(stderr, "ide_change_cd: stale pointer (ide_if=%p != sif=%p), skipping\n",
+                (void*)s->ide_if, (void*)sif);
+        return;
+    }
+
     if (s && s->drive_kind == IDE_CD && s->bs) {
         fprintf(stderr, "ide_change_cd: drive is CD, bs=%p\n", (void*)s->bs);
         // Reinitialize with new image (or eject if filename is empty)
@@ -3325,8 +3664,8 @@ void ide_change_cd(IDEIFState *sif, int drive, const char *filename)
         ide_set_irq(s);
         fprintf(stderr, "ide_change_cd: done\n");
     } else {
-        fprintf(stderr, "ide_change_cd: not a CD drive (s=%p, kind=%d)\n",
-                (void*)s, s ? s->drive_kind : -1);
+        fprintf(stderr, "ide_change_cd: not a CD drive (s=%p, kind=%d, bs=%p)\n",
+                (void*)s, s ? s->drive_kind : -1, s ? (void*)s->bs : NULL);
     }
 }
 
@@ -3367,6 +3706,14 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
     }
 
     IDEState *s = sif->drives[drive];
+
+    /* Sanity: back-pointer must match parent (catches stale PSRAM after reflash) */
+    if (s && s->ide_if != sif) {
+        fprintf(stderr, "ide_change_hdd: stale pointer (ide_if=%p != sif=%p)\n",
+                (void*)s->ide_if, (void*)sif);
+        sif->drives[drive] = NULL;
+        s = NULL;
+    }
 
     /* If no drive exists yet, create one (for hot-mounting via OSD) */
     if (!s) {
@@ -3531,6 +3878,7 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
             }
             free(fil2);
         }
+        wcache_init();
     } else if (!bf->cache_buf) {
         /* Allocate read-ahead cache if not already present */
         bf->cache_buf = malloc(DISK_CACHE_SECTORS * SECTOR_SIZE);
@@ -3616,6 +3964,16 @@ void ide_fill_cmos(IDEIFState *s, void *cmos,
     set(cmos, 0x12, d_0x12);
 }
 
+/* Poll for completed async reads — call from main emulation loop
+ * so interrupt-driven guests that HLT get their completions. */
+void ide_poll_async(void)
+{
+    if (async_read.done) {
+        async_read.done = 0;
+        async_read.cb(async_read.cb_opaque, async_read.result);
+    }
+}
+
 /* Sync all open disk files to physical media.
  * Call periodically to limit data loss on unexpected power-off. */
 static void ide_sync_if(IDEIFState *s)
@@ -3634,6 +3992,7 @@ static void ide_sync_if(IDEIFState *s)
 
 void ide_sync(IDEIFState *ide, IDEIFState *ide2)
 {
+    wcache_flush();
     ide_sync_if(ide);
     ide_sync_if(ide2);
 }
