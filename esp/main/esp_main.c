@@ -136,15 +136,15 @@ static void stub(void *opaque)
 /* Default INI file content */
 static const char *default_ini_content =
 	"[pc]\n"
-	"bios = /sdcard/bios.bin\n"
-	"vga_bios = /sdcard/vgabios.bin\n"
+	"bios = /sdcard/tiny386/bios.bin\n"
+	"vga_bios = /sdcard/tiny386/vgabios.bin\n"
 	"mem_size = 16M\n"
 	"vga_mem_size = 2M\n"
 	"fill_cmos = 1\n"
 	"; Uncomment and set paths to your disk images:\n"
-	"; hda = /sdcard/hdd.img\n"
-	"; cda = /sdcard/cdrom.iso\n"
-	"; fda = /sdcard/floppy.img\n"
+	"; hda = /sdcard/tiny386/hdd.img\n"
+	"; cda = /sdcard/tiny386/cdrom.iso\n"
+	"; fda = /sdcard/tiny386/floppy.img\n"
 	"\n"
 	"[cpu]\n"
 	"gen = 5\n"
@@ -442,8 +442,9 @@ static void i386_task(void *arg)
 
 	const char *ini_path = globals.ini_selected_path;
 	if (!ini_path[0]) {
-		/* No .ini found — create a default */
-		const char *def = "/sdcard/tiny386.ini";
+		/* No .ini found — ensure directory exists and create a default */
+		mkdir("/sdcard/tiny386", 0755);
+		const char *def = "/sdcard/tiny386/tiny386.ini";
 		if (!file_exists(def))
 			create_default_ini(def);
 		ini_path = def;

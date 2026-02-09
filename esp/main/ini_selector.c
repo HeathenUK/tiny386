@@ -1,6 +1,6 @@
 /*
  * INI File Selector Screen
- * Scans /sdcard root for .ini files, displays them sorted by modification time
+ * Scans /sdcard/tiny386 for .ini files, displays them sorted by modification time
  * (newest first), and shows a settings preview panel for the highlighted file.
  * Supports 5-second auto-boot countdown at startup.
  */
@@ -220,15 +220,19 @@ static int cmp_by_mtime_desc(const void *a, const void *b)
 	return strcasecmp(ea->name, eb->name);
 }
 
+static bool s_dir_missing;  /* true when /sdcard/tiny386 doesn't exist */
+
 static void scan_ini_files(void)
 {
 	s_count = 0;
 	s_sel = 0;
 	s_scroll = 0;
+	s_dir_missing = false;
 
-	DIR *dir = opendir("/sdcard");
+	DIR *dir = opendir("/sdcard/tiny386");
 	if (!dir) {
-		ESP_LOGE(TAG, "Failed to open /sdcard");
+		ESP_LOGE(TAG, "Failed to open /sdcard/tiny386 — directory missing");
+		s_dir_missing = true;
 		return;
 	}
 
@@ -243,7 +247,7 @@ static void scan_ini_files(void)
 		if (strcasecmp(ext, ".ini") != 0) continue;
 
 		char fullpath[256];
-		snprintf(fullpath, sizeof(fullpath), "/sdcard/%s", ent->d_name);
+		snprintf(fullpath, sizeof(fullpath), "/sdcard/tiny386/%s", ent->d_name);
 
 		struct stat st;
 		if (stat(fullpath, &st) != 0) continue;
@@ -411,10 +415,17 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 	sel_fill_rect(LEFT_X + LEFT_W + 1, LIST_Y - 2, 1, FOOTER_Y - LIST_Y + 5, C_BORDER);
 
 	if (s_count == 0) {
-		sel_draw_text(LEFT_X + 8, LIST_Y + 20, "No .ini files found", C_DIM, 0);
-		sel_draw_text(LEFT_X + 8, LIST_Y + 40, "on SD card root.", C_DIM, 0);
-		sel_draw_text(LEFT_X + 8, LIST_Y + 70, "Press Enter to create", C_TEXT, 0);
-		sel_draw_text(LEFT_X + 8, LIST_Y + 88, "a default config.", C_TEXT, 0);
+		if (s_dir_missing) {
+			sel_draw_text(LEFT_X + 8, LIST_Y + 20, "ERROR: /sdcard/tiny386", 0xF800, 0);
+			sel_draw_text(LEFT_X + 8, LIST_Y + 38, "directory not found!", 0xF800, 0);
+			sel_draw_text(LEFT_X + 8, LIST_Y + 68, "Press Enter to create", C_TEXT, 0);
+			sel_draw_text(LEFT_X + 8, LIST_Y + 86, "it with a default INI.", C_TEXT, 0);
+		} else {
+			sel_draw_text(LEFT_X + 8, LIST_Y + 20, "No .ini files found in", C_DIM, 0);
+			sel_draw_text(LEFT_X + 8, LIST_Y + 40, "/sdcard/tiny386/", C_DIM, 0);
+			sel_draw_text(LEFT_X + 8, LIST_Y + 70, "Press Enter to create", C_TEXT, 0);
+			sel_draw_text(LEFT_X + 8, LIST_Y + 88, "a default config.", C_TEXT, 0);
+		}
 	} else {
 		/* Adjust scroll to keep selection visible */
 		if (s_sel < s_scroll) s_scroll = s_sel;
