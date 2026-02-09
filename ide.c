@@ -3637,3 +3637,25 @@ void ide_sync(IDEIFState *ide, IDEIFState *ide2)
     ide_sync_if(ide);
     ide_sync_if(ide2);
 }
+
+/* Close all open file handles on an IDE interface (for teardown). */
+static void ide_close_files_if(IDEIFState *s)
+{
+    if (!s) return;
+    for (int i = 0; i < 2; i++) {
+        if (!s->drives[i] || !s->drives[i]->bs) continue;
+        BlockDeviceFile *bf = s->drives[i]->bs->opaque;
+        if (bf && bf->f) {
+            fflush(bf->f);
+            fsync(fileno(bf->f));
+            fclose(bf->f);
+            bf->f = NULL;
+        }
+    }
+}
+
+void ide_close_files(IDEIFState *ide, IDEIFState *ide2)
+{
+    ide_close_files_if(ide);
+    ide_close_files_if(ide2);
+}

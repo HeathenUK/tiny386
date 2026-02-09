@@ -20,6 +20,7 @@
 #include "bsp/display.h"
 #include "bsp/audio.h"
 #include "esp_log.h"  // For esp_log_timestamp()
+#include "ini_selector.h"
 
 static const char *TAG = "input_bsp";
 
@@ -65,6 +66,9 @@ static uint32_t repeat_next_ms = 0; // When to fire next repeat
 // Ctrl key scancode
 #define SC_LEFT_CTRL  0x1D
 
+// Track whether OSD has been attached to the PC once
+static bool osd_pc_attached = false;
+
 static bool is_osd_repeatable(uint8_t code)
 {
 	return code == 0x48 || code == 0x50 || code == 0x4B || code == 0x4D;
@@ -95,7 +99,7 @@ static void handle_scancode(uint8_t code, int is_down)
 			repeat_keycode = 0;
 			ESP_LOGI(TAG, "OSD disabled");
 		}
-	} else {
+	} else if (globals.kbd) {
 		repeat_keycode = 0;
 		ps2_put_keycode(globals.kbd, is_down, code);
 	}
@@ -127,6 +131,7 @@ static void adjust_volume(int delta)
 
 static void toggle_osd(void)
 {
+	if (!globals.pc) return;  // Can't open OSD without a running PC
 	globals.osd_enabled = !globals.osd_enabled;
 	if (globals.osd_enabled) {
 		// Attach PC components to OSD and refresh buffers
@@ -137,6 +142,20 @@ static void toggle_osd(void)
 		osd_refresh(globals.osd);
 	}
 	ESP_LOGI(TAG, "OSD %s", globals.osd_enabled ? "enabled" : "disabled");
+}
+
+/* Route a key-down scancode to the INI selector (queue-based) */
+static void route_to_ini_selector(uint8_t code, int is_down)
+{
+	if (!is_down) return;  /* selector only cares about key-down */
+	/* Also support key repeat for navigation */
+	if (is_osd_repeatable(code)) {
+		repeat_keycode = code;
+		repeat_next_ms = esp_log_timestamp() + KEY_REPEAT_DELAY_MS;
+	} else if (!is_down && code == repeat_keycode) {
+		repeat_keycode = 0;
+	}
+	ini_selector_handle_key(code);
 }
 
 static void input_task(void *arg)
@@ -167,34 +186,40 @@ static void input_task(void *arg)
 	memset(globals.key_pressed, 0, sizeof(globals.key_pressed));
 	mouse_emu_init();
 
-	// Wait for PC to be initialized
-	xEventGroupWaitBits(global_event_group,
-			    BIT0,
-			    pdFALSE,
-			    pdFALSE,
-			    portMAX_DELAY);
-
-	// Attach console to OSD for button callbacks
-	osd_attach_console(globals.osd, NULL);
-
-	// Apply initial settings from config (globals set by esp_main.c before BIT0)
-	osd_set_system_config(globals.osd, globals.cpu_gen, globals.fpu,
-	                      (long)globals.mem_size_mb * 1024 * 1024);
-	bsp_display_set_backlight_brightness((uint8_t)globals.brightness);
-	bsp_audio_set_volume((float)globals.volume);
-
-	ESP_LOGI(TAG, "Input task started, brightness=%d%%, volume=%d%%",
-	         globals.brightness, globals.volume);
+	ESP_LOGI(TAG, "Input task started (waiting for PC or INI selector)");
 
 	bsp_input_event_t event;
 	while (1) {
+		/* Lazy one-time OSD setup after PC becomes available */
+		if (!osd_pc_attached && globals.pc) {
+			osd_attach_console(globals.osd, NULL);
+			osd_set_system_config(globals.osd, globals.cpu_gen, globals.fpu,
+			                      (long)globals.mem_size_mb * 1024 * 1024);
+			bsp_display_set_backlight_brightness((uint8_t)globals.brightness);
+			bsp_audio_set_volume((float)globals.volume);
+			osd_pc_attached = true;
+			ESP_LOGI(TAG, "OSD attached to PC, brightness=%d%%, volume=%d%%",
+			         globals.brightness, globals.volume);
+		}
+		/* Reset flag when PC goes away (INI switch teardown) */
+		if (osd_pc_attached && !globals.pc) {
+			osd_pc_attached = false;
+			globals.osd_enabled = false;
+		}
+
 		// Use short timeout when key repeat is active, otherwise block
 		TickType_t wait_ticks = portMAX_DELAY;
-		if (repeat_keycode && globals.osd_enabled) {
+		bool repeat_active = (repeat_keycode != 0) &&
+		                     (globals.osd_enabled || globals.ini_selector_active);
+		if (repeat_active) {
 			uint32_t now = esp_log_timestamp();
 			if (now >= repeat_next_ms) {
 				// Fire repeat event
-				osd_handle_key(globals.osd, repeat_keycode, 1);
+				if (globals.ini_selector_active) {
+					ini_selector_handle_key(repeat_keycode);
+				} else if (globals.osd_enabled) {
+					osd_handle_key(globals.osd, repeat_keycode, 1);
+				}
 				repeat_next_ms = now + KEY_REPEAT_INTERVAL_MS;
 			}
 			int remaining = (int)(repeat_next_ms - esp_log_timestamp());
@@ -204,6 +229,32 @@ static void input_task(void *arg)
 			// The BSP provides scancodes in AT keyboard format
 			if (event.type == INPUT_EVENT_TYPE_SCANCODE) {
 				uint16_t scancode = event.args_scancode.scancode;
+
+				/* ── INI selector active: simple routing ──────── */
+				if (globals.ini_selector_active) {
+					uint16_t base_scancode = scancode & ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
+					if (base_scancode == SC_OSD_TOGGLE) {
+						vTaskDelay(5 / portTICK_PERIOD_MS);
+						continue;  // Ignore Meta key in selector
+					}
+					uint8_t code;
+					int is_down;
+					if (scancode >= 0xE000) {
+						code = scancode & 0xFF;
+						is_down = !(code & BSP_INPUT_SCANCODE_RELEASE_MODIFIER);
+						code &= ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
+					} else {
+						code = scancode & 0xFF;
+						is_down = !(code & BSP_INPUT_SCANCODE_RELEASE_MODIFIER);
+						code &= ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
+					}
+					route_to_ini_selector(code, is_down);
+					/* Clear repeat on key-up */
+					if (!is_down && code == repeat_keycode)
+						repeat_keycode = 0;
+					vTaskDelay(5 / portTICK_PERIOD_MS);
+					continue;
+				}
 
 				// Check for Meta key - track state for META+arrow shortcuts
 				uint16_t base_scancode = scancode & ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
@@ -269,7 +320,7 @@ static void input_task(void *arg)
 					}
 
 					// Send E0 prefix to emulator if not in OSD mode
-					if (!globals.osd_enabled) {
+					if (!globals.osd_enabled && globals.kbd) {
 						ps2_put_keycode(globals.kbd, 1, 0xE0);
 						vTaskDelay(1 / portTICK_PERIOD_MS);
 					}
@@ -316,7 +367,7 @@ static void input_task(void *arg)
 				bool pressed = event.args_navigation.state;
 
 				// Don't process mouse input when OSD is open
-				if (!globals.osd_enabled) {
+				if (!globals.osd_enabled && !globals.ini_selector_active) {
 					// Let mouse_emu handle navigation keys
 					// Returns true if consumed (mouse mode active or F6 toggle)
 					if (mouse_emu_handle_nav_key(nav_key, pressed)) {
@@ -342,5 +393,6 @@ void input_bsp_init(void)
 // Called by OSD to send keypresses to emulator
 void console_send_kbd(void *opaque, int keypress, int keycode)
 {
-	ps2_put_keycode(globals.kbd, keypress, keycode);
+	if (globals.kbd)
+		ps2_put_keycode(globals.kbd, keypress, keycode);
 }

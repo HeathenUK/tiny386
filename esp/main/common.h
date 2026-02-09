@@ -61,6 +61,16 @@ struct Globals {
 	int cpu_gen;                  // CPU generation (3=386, 4=486, 5=586)
 	int fpu;                      // FPU enabled (0/1)
 	int mem_size_mb;              // Guest RAM in MB (actual, after PSRAM cap)
+
+	// INI selector state
+	bool ini_selector_active;     // INI selector screen is showing
+	bool ini_selector_done;       // Selection complete, path is ready
+	char ini_selected_path[256];  // Selected INI path (result from selector)
+
+	// INI switch (runtime)
+	bool ini_switch_pending;      // Switch to different INI requested
+	char ini_switch_path[256];    // Path to new INI file
+	char current_ini_path[256];   // Currently loaded INI path
 };
 
 extern EventGroupHandle_t global_event_group;

@@ -698,6 +698,18 @@ EMULINK *emulink_init()
 	return e;
 }
 
+void emulink_close(EMULINK *e)
+{
+	if (!e) return;
+	for (int i = 0; i < 2; i++) {
+		if (e->fdd[i]) {
+			fclose(e->fdd[i]);
+			e->fdd[i] = NULL;
+		}
+		e->fdd_path[i][0] = '\0';
+	}
+}
+
 int emulink_attach_floppy(EMULINK *e, int i, const char *filename)
 {
 	if (i >= 0 && i < 2) {

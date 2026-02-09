@@ -29,6 +29,7 @@
 #include "tanmatsu_osd.h"
 #include "toast.h"
 #include "led_activity.h"
+#include "ini_selector.h"
 #include "esp_cache.h"
 #include "vga_font_8x16.h"
 
@@ -514,16 +515,31 @@ void vga_task(void *arg)
 
 	xEventGroupSetBits(global_event_group, BIT1);  // Signal display ready
 
-	// Wait for PC emulator to be ready
-	xEventGroupWaitBits(global_event_group,
-			    BIT0,
-			    pdFALSE,
-			    pdFALSE,
-			    portMAX_DELAY);
-
 	ESP_LOGI(TAG, "Starting display loop");
 
 	while (1) {
+		/* ── INI selector screen (no PC running yet) ──────────── */
+		if (globals.ini_selector_active) {
+			ini_selector_render(fb_rotated,
+			                    DISPLAY_WIDTH, DISPLAY_HEIGHT,
+			                    DISPLAY_WIDTH * sizeof(uint16_t));
+			toast_render(fb_rotated);
+
+			if (xSemaphoreTake(te_sem, pdMS_TO_TICKS(100)) != pdTRUE) {
+				ESP_LOGW(TAG, "TE signal timeout — blitting without vsync");
+			}
+			bsp_display_blit(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, fb_rotated);
+			vTaskDelay(pdMS_TO_TICKS(33));  /* ~30 fps for selector */
+			continue;
+		}
+
+		/* ── PC not ready — idle until BIT0 ──────────────────── */
+		if (!globals.pc) {
+			vTaskDelay(pdMS_TO_TICKS(50));
+			continue;
+		}
+
+		/* ── Normal VGA rendering ────────────────────────────── */
 		// Step the VGA emulator (vga_step + vga_refresh)
 		pc_vga_step(globals.pc);
 

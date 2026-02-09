@@ -20,7 +20,10 @@
 #include "../../ini.h"
 #include "../../pc.h"
 #include "../../vga.h"
+#include "../../ide.h"
+#include "../../misc.h"
 #include "common.h"
+#include "ini_selector.h"
 #include <errno.h>
 #include <sys/stat.h>
 
@@ -133,15 +136,15 @@ static void stub(void *opaque)
 /* Default INI file content */
 static const char *default_ini_content =
 	"[pc]\n"
-	"bios = /sdcard/bios.bin\n"
-	"vga_bios = /sdcard/vgabios.bin\n"
+	"bios = /sdcard/tiny386/bios.bin\n"
+	"vga_bios = /sdcard/tiny386/vgabios.bin\n"
 	"mem_size = 16M\n"
 	"vga_mem_size = 2M\n"
 	"fill_cmos = 1\n"
 	"; Uncomment and set paths to your disk images:\n"
-	"; hda = /sdcard/hdd.img\n"
-	"; cda = /sdcard/cdrom.iso\n"
-	"; fda = /sdcard/floppy.img\n"
+	"; hda = /sdcard/tiny386/hdd.img\n"
+	"; cda = /sdcard/tiny386/cdrom.iso\n"
+	"; fda = /sdcard/tiny386/floppy.img\n"
 	"\n"
 	"[cpu]\n"
 	"gen = 5\n"
@@ -178,6 +181,7 @@ static bool create_default_ini(const char *path)
 	return true;
 }
 
+/* Returns: 0 = normal shutdown, 1 = INI switch requested, <0 = error */
 static int pc_main(const char *file)
 {
 	PCConfig conf;
@@ -211,7 +215,10 @@ static int pc_main(const char *file)
 		}
 		return err;
 	}
-	conf.ini_path = file;  // Store ini path for saving settings
+	/* Track which INI is loaded (copy to stable buffer before using as pointer) */
+	strncpy(globals.current_ini_path, file, sizeof(globals.current_ini_path) - 1);
+	globals.current_ini_path[sizeof(globals.current_ini_path) - 1] = '\0';
+	conf.ini_path = globals.current_ini_path;  // Stable pointer for save_settings
 
 	/* Validate mem_size - must be at least 1M */
 	if (conf.mem_size < 1024 * 1024) {
@@ -254,6 +261,7 @@ static int pc_main(const char *file)
 
 	load_bios_and_reset(pc);
 
+	int ret = 0;
 	pc->boot_start_time = get_uticks();
 	uint32_t last_delay_time = get_uticks();
 	uint32_t last_sync_time = get_uticks();
@@ -264,6 +272,15 @@ static int pc_main(const char *file)
 		if (now_mouse - last_mouse_tick >= 16667) {  // ~60Hz
 			last_mouse_tick = now_mouse;
 			mouse_emu_tick();
+		}
+
+		// Check for INI switch request (full teardown + reload)
+		if (globals.ini_switch_pending) {
+			globals.ini_switch_pending = false;
+			fprintf(stderr, "INI switch: tearing down for %s\n",
+			        globals.ini_switch_path);
+			ret = 1;
+			break;
 		}
 
 		// Check for soft reset request from OSD
@@ -322,9 +339,25 @@ static int pc_main(const char *file)
 			ide_sync(pc->ide, pc->ide2);
 		}
 	}
-	/* Final sync on emulator exit */
+
+	/* Clean up: sync and close all disk file handles */
 	ide_sync(pc->ide, pc->ide2);
-	return 0;
+	ide_close_files(pc->ide, pc->ide2);
+	emulink_close(pc->emulink);
+
+	/* Invalidate globals so other tasks stop using stale pointers */
+	globals.pc = NULL;
+	globals.kbd = NULL;
+	globals.mouse = NULL;
+
+	/* Clear framebuffers */
+	if (globals.fb && globals.vga_width > 0 && globals.vga_height > 0)
+		memset(globals.fb, 0, globals.vga_width * globals.vga_height * sizeof(uint16_t));
+	if (globals.fb_rotated)
+		memset(globals.fb_rotated, 0, 480 * 800 * sizeof(uint16_t));
+
+	free(console);
+	return ret;
 }
 
 void *esp_psram_get(size_t *size);
@@ -341,13 +374,9 @@ void bsp_device_restart_to_launcher(void) {
 }
 void storage_init(void);
 
-struct esp_ini_config {
-	const char *filename;
-};
-
 static void i386_task(void *arg)
 {
-	struct esp_ini_config *config = arg;
+	(void)arg;
 	int core_id = esp_cpu_get_core_id();
 	fprintf(stderr, "main runs on core %d\n", core_id);
 
@@ -397,7 +426,59 @@ static void i386_task(void *arg)
 		}
 	}
 
-	pc_main(config->filename);
+	/* Wait briefly for input_task to be ready (it sets input_queue after BIT1) */
+	for (int i = 0; i < 50 && !globals.input_queue; i++)
+		vTaskDelay(pdMS_TO_TICKS(20));
+
+	/* ── Boot-time INI selector ─────────────────────────────────── */
+	/* Show the selector with a 5-second auto-boot countdown.
+	 * If only one INI exists, it will auto-select immediately after
+	 * the countdown.  If none exist, we fall through and create one. */
+	ini_selector_start(true);
+
+	/* Block until the user picks a file (or countdown auto-selects) */
+	while (!globals.ini_selector_done)
+		vTaskDelay(pdMS_TO_TICKS(50));
+
+	const char *ini_path = globals.ini_selected_path;
+	if (!ini_path[0]) {
+		/* No .ini found — ensure directory exists and create a default */
+		mkdir("/sdcard/tiny386", 0755);
+		const char *def = "/sdcard/tiny386/tiny386.ini";
+		if (!file_exists(def))
+			create_default_ini(def);
+		ini_path = def;
+	}
+
+	/* Save initial pcram offset so we can rewind on INI switch */
+	long pcram_off_base = pcram_off;
+
+	/* ── Main emulation loop (re-enters on INI switch) ──────────── */
+	for (;;) {
+		fprintf(stderr, "Loading INI: %s\n", ini_path);
+		int ret = pc_main(ini_path);
+
+		if (ret != 1) {
+			/* Normal shutdown or error — stop */
+			break;
+		}
+
+		/* INI switch requested — tear down and reinitialise */
+		fprintf(stderr, "INI switch: resetting pcram (%ld -> %ld)\n",
+		        pcram_off, pcram_off_base);
+		pcram_off = pcram_off_base;
+		memset(pcram + pcram_off_base, 0,
+		       pcram_len - pcram_off_base);
+
+		/* Clear BIT0 so that vga_task / input_task know PC is gone */
+		xEventGroupClearBits(global_event_group, BIT0);
+
+		/* Pick up the new path that was set by the OSD or selector */
+		ini_path = globals.ini_switch_path;
+
+		fprintf(stderr, "Restarting with: %s\n", ini_path);
+	}
+
 	vTaskDelete(NULL);
 }
 
@@ -431,16 +512,6 @@ void *fbmalloc(long size)
 		abort();
 	}
 	return fb;
-}
-
-static int parse_ini(void* user, const char* section,
-		     const char* name, const char* value)
-{
-	(void)user;
-	(void)section;
-	(void)name;
-	(void)value;
-	return 1;
 }
 
 static void wifi_task(void *arg)
@@ -516,45 +587,8 @@ void app_main(void)
 	}
 	fprintf(stderr, "PSRAM pool: %ldMB allocated\n", psram_len / (1024 * 1024));
 
-	/* INI file handling with fallback creation */
-	const char *ini_path = "/sdcard/tiny386.ini";
-	static struct esp_ini_config config;
-
-	if (!file_exists(ini_path)) {
-		fprintf(stderr, "INI file not found: %s\n", ini_path);
-		if (!create_default_ini(ini_path)) {
-			fprintf(stderr, "\n");
-			fprintf(stderr, "==========================================\n");
-			fprintf(stderr, "ERROR: Could not create default INI file!\n");
-			fprintf(stderr, "Check SD card is writable.\n");
-			fprintf(stderr, "Resetting in 5 seconds...\n");
-			fprintf(stderr, "==========================================\n");
-			vTaskDelay(pdMS_TO_TICKS(5000));
-			esp_restart();
-		}
-	}
-
-	int ini_err = ini_parse(ini_path, parse_ini, &config);
-	if (ini_err != 0) {
-		fprintf(stderr, "\n");
-		fprintf(stderr, "==========================================\n");
-		if (ini_err == -1) {
-			fprintf(stderr, "ERROR: Cannot open INI file: %s\n", ini_path);
-		} else if (ini_err == -2) {
-			fprintf(stderr, "ERROR: Memory allocation failed parsing INI\n");
-		} else {
-			fprintf(stderr, "ERROR: INI parse error on line %d\n", ini_err);
-			fprintf(stderr, "Please check %s for syntax errors.\n", ini_path);
-		}
-		fprintf(stderr, "Resetting in 5 seconds...\n");
-		fprintf(stderr, "==========================================\n");
-		vTaskDelay(pdMS_TO_TICKS(5000));
-		esp_restart();
-	}
-	config.filename = ini_path;
-
 	if (psram) {
-		xTaskCreatePinnedToCore(i386_task, "i386_main", 8192, &config, 3, NULL, 1);
+		xTaskCreatePinnedToCore(i386_task, "i386_main", 8192, NULL, 3, NULL, 1);
 		xTaskCreatePinnedToCore(vga_task, "vga_task", 12288, NULL, 0, NULL, 0);
 		// Start input task after vga_task (which initializes BSP)
 		input_bsp_init();
