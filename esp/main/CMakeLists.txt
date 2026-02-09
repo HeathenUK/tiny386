@@ -26,7 +26,7 @@ set(OPL_SRCS
 )
 
 # Tanmatsu (ESP32-P4) sources
-set(BOARD_SRCS "lcd_bsp.c" "input_bsp.c" "tanmatsu_osd.c" "toast.c" "led_activity.c" "mouse_emu.c" "vga_pie.S" "usb_host.c" "wifi.c")
+set(BOARD_SRCS "lcd_bsp.c" "input_bsp.c" "tanmatsu_osd.c" "toast.c" "led_activity.c" "mouse_emu.c" "vga_pie.S" "usb_host.c" "wifi.c" "ini_selector.c")
 set(BOARD_HEADER "board_tanmatsu.h")
 
 idf_component_register(SRCS ${COMMON_SRCS} ${OPL_SRCS} ${BOARD_SRCS}

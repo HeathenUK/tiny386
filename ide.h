@@ -62,4 +62,5 @@ void ide_fill_cmos(IDEIFState *s, void *cmos,
 void ide_set_geometry(IDEIFState *s, int drive, int heads, int spt);
 
 void ide_sync(IDEIFState *ide, IDEIFState *ide2);
+void ide_close_files(IDEIFState *ide, IDEIFState *ide2);
 #endif /* IDE_H */

@@ -41,6 +41,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 
 typedef struct EMULINK EMULINK;
 EMULINK *emulink_init();
+void emulink_close(EMULINK *e);
 
 int emulink_attach_floppy(EMULINK *e, int i, const char *filename);
 const char *emulink_get_floppy_path(EMULINK *e, int i);

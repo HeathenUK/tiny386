@@ -36,6 +36,7 @@
 #include "../../pc.h"
 #include "esp_vfs_fat.h"
 #include "led_activity.h"
+#include "ini_selector.h"
 
 // Audio shutdown for clean exit
 extern void i2s_shutdown(void);
@@ -61,6 +62,7 @@ typedef enum {
 	MAIN_SEP1,
 	MAIN_BOOT_ORDER,
 	MAIN_SAVE_INI,
+	MAIN_SWITCH_INI,
 	MAIN_SEP2,
 	MAIN_CTRLALTDEL,
 	MAIN_RESTART_EMU,
@@ -582,6 +584,11 @@ static void render_main_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 			boot_order_val = boot_order_names[order];
 	}
 
+	/* Show the currently loaded INI filename for the Switch INI item */
+	const char *cur_ini = basename_ptr(globals.current_ini_path);
+	char switch_val[32];
+	snprintf(switch_val, sizeof(switch_val), "%.20s", cur_ini[0] ? cur_ini : "(none)");
+
 	MenuEntry entries[MAIN_COUNT] = {
 		{ "Mounting", 0, 1, NULL },
 		{ "Audio/Visual", 0, 1, NULL },
@@ -590,6 +597,7 @@ static void render_main_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ NULL, 1, 0, NULL },  // SEP1
 		{ "Boot Order:", 0, 0, boot_order_val },
 		{ "Save Settings", 0, 0, NULL },
+		{ "Switch INI:", 0, 0, switch_val },
 		{ NULL, 1, 0, NULL },  // SEP2
 		{ "Ctrl+Alt+Del", 0, 0, NULL },
 		{ "Restart Emulator", 0, 0, NULL },
@@ -1396,6 +1404,12 @@ static int handle_main_select(OSD *osd)
 			toast_show("Settings saved");
 		}
 		break;
+	case MAIN_SWITCH_INI:
+		// Close OSD and activate the INI selector (no auto-boot countdown)
+		toast_show("Select a configuration...");
+		led_activity_off();
+		ini_selector_start(false);  // No countdown for manual switch
+		return 1;  // Close OSD — selector takes over the screen
 	case MAIN_CTRLALTDEL:
 		toast_show("Ctrl+Alt+Del sent");
 		globals.reset_pending = true;  // Signal soft reset
