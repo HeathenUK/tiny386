@@ -94,7 +94,7 @@ struct CPUI386 {
 		uword limit;
 	} idt, gdt;
 
-	uword cr0, cr2, cr3;
+	uword cr0, cr2, cr3, cr4;
 	uint32_t a20_mask;  /* 0xFFFFFFFF when A20 enabled, 0xFFEFFFFF when disabled */
 
 	uword dr[8];
@@ -649,6 +649,7 @@ static inline int get_IOPL(CPUI386 *cpu)
 /* MMU */
 #define CR0_PG (1<<31)
 #define CR0_WP (0x10000)
+#define CR4_PSE (1<<4)
 #define tlb_size 1024
 typedef struct {
 	enum {
@@ -690,25 +691,92 @@ static bool IRAM_ATTR tlb_refill(CPUI386 *cpu, struct tlb_entry *ent, uword lpgn
 	uword j = lpgno & 1023;
 
 	u8 *mem = (u8 *) cpu->phys_mem;
-	uword pde = pload32(cpu, base_addr + i * 4);
+	uword pde_addr = base_addr + i * 4;
+	if ((uint64_t)pde_addr + 4 > (uint64_t)cpu->phys_mem_size)
+		return false;
+	uword pde = pload32(cpu, pde_addr);
 	if (!(pde & 1))
 		return false;
-	mem[base_addr + i * 4] |= 1 << 5; // accessed
+	mem[pde_addr] |= 1 << 5; // accessed
+
+	/* 4MB pages (PSE): map this linear 4KB page directly from PDE */
+	if ((cpu->cr4 & CR4_PSE) && (pde & (1 << 7))) {
+		uword phys_page = (pde & 0xffc00000) | ((lpgno & 0x3ff) << 12);
+		ent->lpgno = lpgno;
+		ent->xaddr = (phys_page & a20) ^ (lpgno << 12);
+		ent->pte_lookup = pte_lookup[!!(cpu->cr0 & CR0_WP)][(pde >> 1) & 3];
+		ent->ppte = &(mem[pde_addr]); /* dirty bit lives in PDE for 4MB pages */
+		return true;
+	}
 
 	uword base_addr2 = (pde & ~0xfff) & a20;
-	uword pte = pload32(cpu, base_addr2 + j * 4);
+	uword pte_addr = base_addr2 + j * 4;
+	if ((uint64_t)pte_addr + 4 > (uint64_t)cpu->phys_mem_size)
+		return false;
+	uword pte = pload32(cpu, pte_addr);
 	if (!(pte & 1))
 		return false;
 
-	mem[base_addr2 + j * 4] |= 1 << 5; // accessed
+	mem[pte_addr] |= 1 << 5; // accessed
 //	mem[base_addr2 + j * 4] |= 1 << 6; // dirty
 
 	ent->lpgno = lpgno;
 	ent->xaddr = ((pte & ~0xfff) & a20) ^ (lpgno << 12);
 	pte = pte & ((pde & 7) | 0xfffffff8);
 	ent->pte_lookup = pte_lookup[!!(cpu->cr0 & CR0_WP)][(pte >> 1) & 3];
-	ent->ppte = &(mem[base_addr2 + j * 4]);
+	ent->ppte = &(mem[pte_addr]);
 	return true;
+}
+
+/* One-shot diagnostic helper: dump raw page-walk state for a linear address. */
+static void dump_pf_walk(CPUI386 *cpu, uword laddr, const char *tag)
+{
+	uword a20 = cpu->a20_mask;
+	uword cr3_base = (cpu->cr3 & ~0xfff) & a20;
+	uword pdi = (laddr >> 22) & 0x3ff;
+	uword pti = (laddr >> 12) & 0x3ff;
+	uword pde_addr = cr3_base + pdi * 4;
+
+	dolog("=== %s: PF walk LA=%08x CR2=%08x CR3=%08x CR4=%08x ===\n",
+		tag, laddr, cpu->cr2, cpu->cr3, cpu->cr4);
+	dolog("  CR3.base=%08x A20=%08x PDI=%03x PTI=%03x\n",
+		cr3_base, a20, pdi, pti);
+
+	if ((uint64_t)pde_addr + 4 > (uint64_t)cpu->phys_mem_size) {
+		dolog("  PDE addr OOB: %08x (phys_mem_size=%u)\n",
+			pde_addr, cpu->phys_mem_size);
+		return;
+	}
+
+	uword pde = pload32(cpu, pde_addr);
+	dolog("  PDE[%03x] @ %08x = %08x P=%d RW=%d US=%d A=%d D=%d PS=%d\n",
+		pdi, pde_addr, pde,
+		!!(pde & 1), !!(pde & 2), !!(pde & 4),
+		!!(pde & (1 << 5)), !!(pde & (1 << 6)), !!(pde & (1 << 7)));
+
+	if (!(pde & 1))
+		return;
+
+	if ((cpu->cr4 & CR4_PSE) && (pde & (1 << 7))) {
+		uword phys = (pde & 0xffc00000) | (laddr & 0x003fffff);
+		dolog("  4MB map: phys=%08x (from PDE)\n", phys & a20);
+		return;
+	}
+
+	uword pt_base = (pde & ~0xfff) & a20;
+	uword pte_addr = pt_base + pti * 4;
+	if ((uint64_t)pte_addr + 4 > (uint64_t)cpu->phys_mem_size) {
+		dolog("  PTE addr OOB: %08x (pt_base=%08x phys_mem_size=%u)\n",
+			pte_addr, pt_base, cpu->phys_mem_size);
+		return;
+	}
+
+	uword pte = pload32(cpu, pte_addr);
+	uword phys = ((pte & ~0xfff) & a20) | (laddr & 0xfff);
+	dolog("  PTE[%03x] @ %08x = %08x P=%d RW=%d US=%d A=%d D=%d -> phys=%08x\n",
+		pti, pte_addr, pte,
+		!!(pte & 1), !!(pte & 2), !!(pte & 4),
+		!!(pte & (1 << 5)), !!(pte & (1 << 6)), phys);
 }
 
 static bool IRAM_ATTR translate_lpgno(CPUI386 *cpu, int rwm, uword lpgno, uword laddr, int cpl, uword *paddr)
@@ -1422,40 +1490,6 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 {
 	sel = sel & 0xffff;
 	if (!(cpu->cr0 & 1) || (cpu->flags & VM)) {
-		if ((cpu->flags & VM) && seg == SEG_DS && sel < 0x40 && sel != 0) {
-			static int ds_dump_done = 0;
-			static int ds_diag_gen = -1;
-			if (ds_diag_gen != cpu->diag_gen) { ds_diag_gen = cpu->diag_gen; ds_dump_done = 0; }
-			if (!ds_dump_done) {
-				ds_dump_done = 1;
-				dolog("=== V86 DS=%04x — one-shot dump ===\n", sel);
-				dolog("CS:IP=%04x:%04x  prev DS=%04x (base=%08x)\n",
-				      cpu->seg[SEG_CS].sel, cpu->ip & 0xffff,
-				      cpu->seg[SEG_DS].sel, cpu->seg[SEG_DS].base);
-				dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
-				      REGi(0), REGi(3), REGi(1), REGi(2));
-				dolog("ESI=%08x EDI=%08x EBP=%08x ESP=%08x\n",
-				      REGi(6), REGi(7), REGi(5), REGi(4));
-				dolog("ES=%04x SS=%04x FS=%04x GS=%04x FL=%08x\n",
-				      cpu->seg[SEG_ES].sel, cpu->seg[SEG_SS].sel,
-				      cpu->seg[SEG_FS].sel, cpu->seg[SEG_GS].sel,
-				      cpu->flags);
-				dolog("CR0=%08x CR2=%08x CR3=%08x CPL=%d\n",
-				      cpu->cr0, cpu->cr2, cpu->cr3, cpu->cpl);
-				/* Try to read opcode bytes at CS:IP to identify the instruction */
-				uword lin = (uword)(cpu->seg[SEG_CS].sel) * 16 + (cpu->ip & 0xffff);
-				uint8_t opcodes[8] = {0};
-				for (int i = 0; i < 8; i++) {
-					OptAddr oa;
-					if (translate16(cpu, &oa, 1, SEG_CS, (cpu->ip + i) & 0xffff) == 0)
-						opcodes[i] = load8(cpu, &oa);
-				}
-				dolog("Opcodes at CS:IP: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-				      opcodes[0], opcodes[1], opcodes[2], opcodes[3],
-				      opcodes[4], opcodes[5], opcodes[6], opcodes[7]);
-				dolog("Linear addr of CS:IP: %08x\n", lin);
-			}
-		}
 		cpu->seg[seg].sel = sel;
 		cpu->seg[seg].base = sel << 4;
 		cpu->seg[seg].limit = 0xffff;
@@ -2675,7 +2709,7 @@ static inline void clear_segs(CPUI386 *cpu)
 	} else if (reg == 3) { \
 		sreg32(rm, cpu->cr3); \
 	} else if (reg == 4) { \
-		sreg32(rm, 0); \
+		sreg32(rm, cpu->cr4); \
 	} else THROW0(EX_UD);
 
 #define MOVTC() \
@@ -2702,6 +2736,12 @@ static inline void clear_segs(CPUI386 *cpu)
 		tlb_clear(cpu); \
 		SEQ_INVALIDATE(cpu); \
 	} else if (reg == 4) { \
+		u32 new_cr4 = lreg32(rm) & CR4_PSE; \
+		if ((new_cr4 ^ cpu->cr4) & CR4_PSE) { \
+			tlb_clear(cpu); \
+			SEQ_INVALIDATE(cpu); \
+		} \
+		cpu->cr4 = new_cr4; \
 	} else THROW0(EX_UD);
 
 #define INT3() \
@@ -3866,7 +3906,8 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 #define LMSW(addr, laddr, saddr) \
 	if (cpu->cpl != 0) THROW(EX_GP, 0); \
 	{ u32 __lmsw_val = (cpu->cr0 & ((~0xf) | 1)) | (laddr(addr) & 0xf); \
-	if ((__lmsw_val ^ cpu->cr0) & 1) { cpu->int8_cache_valid = false; cpu->int8_warmup_counter = 0; } \
+	if ((__lmsw_val ^ cpu->cr0) & 1) { cpu->int8_cache_valid = false; cpu->int8_warmup_counter = 0; \
+	tlb_clear(cpu); SEQ_INVALIDATE(cpu); } \
 	cpu->cr0 = __lmsw_val; }
 
 #define LSEGd(NAME, reg, addr, lreg32, sreg32, laddr32, saddr32) \
@@ -5750,17 +5791,6 @@ static int __call_isr_check_cs(CPUI386 *cpu, int sel, int ext, int *csdpl)
 				return 3;
 			}
 		}
-	} else if (conforming && dpl == 0 && cpu->cpl > 0) {
-		/* Conforming code segment with DPL=0 called from ring > 0.
-		 * Per x86 spec, this should be intra-PVL (no stack switch).
-		 * However, DOS extenders (DOSX) expect DPMI-like behavior where
-		 * exception handlers always get ring 0 access. Without a real
-		 * DPMI host, force inter-PVL to make this work. */
-		if (!(cpu->flags & VM)) {
-			return 2;
-		} else {
-			return 3;
-		}
 	} else {
 		if (cpu->flags & VM) {
 			THROW(EX_GP, (sel & ~0x3) | ext);
@@ -5776,141 +5806,59 @@ static int __call_isr_check_cs(CPUI386 *cpu, int sel, int ext, int *csdpl)
 }
 
 /* Exception ring buffer — file-scope for post-mortem dump from cpui386_step */
-static struct { uint8_t no; uint8_t mode; uint16_t cs; uint32_t ip; uint32_t err; } exc_ring[128];
+static struct { uint8_t no; uint8_t mode; uint16_t cs; uint32_t ip; uint32_t err; uint32_t cr2; } exc_ring[256];
 static int exc_ring_pos = 0;
 /* Delayed ring buffer dump: set to wall-clock time when a trigger fires;
  * cpui386_step checks and dumps 2 seconds later to capture post-trigger events. */
 static uint32_t exc_ring_delayed_dump_time = 0;
+static int exc_ring_frozen = 0;  /* freeze recording after trigger fires */
 
 static void dump_exc_ring(const char *label) {
-	int n = exc_ring_pos > 128 ? 128 : exc_ring_pos;
+	int n = exc_ring_pos > 256 ? 256 : exc_ring_pos;
 	int start = exc_ring_pos - n;
 	dolog("=== %s: Last %d exceptions ===\n", label, n);
 	for (int i = start; i < exc_ring_pos; i++) {
-		int j = i & 127;
-		dolog("  %c exc %2d @ %04x:%08x err=%x\n",
-			exc_ring[j].mode, exc_ring[j].no,
-			exc_ring[j].cs, exc_ring[j].ip, exc_ring[j].err);
+		int j = i & 255;
+		if (exc_ring[j].no == 14)
+			dolog("  %c exc %2d @ %04x:%08x err=%x CR2=%08x\n",
+				exc_ring[j].mode, exc_ring[j].no,
+				exc_ring[j].cs, exc_ring[j].ip, exc_ring[j].err, exc_ring[j].cr2);
+		else
+			dolog("  %c exc %2d @ %04x:%08x err=%x\n",
+				exc_ring[j].mode, exc_ring[j].no,
+				exc_ring[j].cs, exc_ring[j].ip, exc_ring[j].err);
 	}
 }
 
 static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 {
-	/* Exception ring buffer — records last 32 exceptions for post-mortem.
-	 * Uses a generation counter so traps reset when cpui386_reset() is called. */
+	/* Exception ring buffer — lightweight recording for post-mortem analysis.
+	 * NO serial output here — just struct writes. Dump triggered later. */
 	{
 		static int diag_generation = -1;
-		static bool de_dumped, ud_dumped, gp0_dumped, pf0_dumped;
-		static int post_ud_trace_count = 0;
-		/* Reset diagnostics on CPU reset (generation change) */
 		if (diag_generation != cpu->diag_gen) {
 			diag_generation = cpu->diag_gen;
 			exc_ring_pos = 0;
 			exc_ring_delayed_dump_time = 0;
-			de_dumped = ud_dumped = gp0_dumped = pf0_dumped = false;
-			post_ud_trace_count = 0;
+			exc_ring_frozen = 0;
 		}
-		/* Record this exception (only faults/traps, not software INTs) */
-		if (ext || no < 32) {
-			int idx = exc_ring_pos & 127;
+		/* Record exception in ring buffer (only faults/traps, not software INTs).
+		 * Stop recording once trigger fires to preserve crash context. */
+		if (!exc_ring_frozen && (ext || no < 32)) {
+			int idx = exc_ring_pos & 255;
 			exc_ring[idx].no = no;
 			exc_ring[idx].mode = (cpu->flags & VM) ? 'V' : ((cpu->cr0 & 1) ? 'P' : 'R');
 			exc_ring[idx].cs = cpu->seg[SEG_CS].sel;
 			exc_ring[idx].ip = cpu->ip;
 			exc_ring[idx].err = pusherr ? cpu->excerr : 0;
+			exc_ring[idx].cr2 = (no == 14) ? cpu->cr2 : 0;
 			exc_ring_pos++;
-			/* Post-#UD trace: log first 10 exceptions after #UD delivery */
-			if (post_ud_trace_count > 0) {
-				dolog("  post-#UD[%d]: %c exc %2d @ %04x:%08x err=%x CPL=%d\n",
-					11 - post_ud_trace_count,
-					(cpu->flags & VM) ? 'V' : ((cpu->cr0 & 1) ? 'P' : 'R'),
-					no, cpu->seg[SEG_CS].sel, cpu->ip,
-					pusherr ? cpu->excerr : 0, cpu->cpl);
-				post_ud_trace_count--;
-			}
 		}
-		/* One-shot dump of #DE (divide error) — classic Win95 timing-loop crash */
-		if (no == 0 && (cpu->cr0 & 1) && !de_dumped) {
-			de_dumped = true;
-			dolog("=== #DE (divide error) in %s mode ===\n",
-				(cpu->flags & VM) ? "V86" : "PM");
-			dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x\n",
-				cpu->seg[SEG_CS].sel, cpu->ip,
-				cpu->seg[SEG_SS].sel, REGi(4), cpu->flags);
-			dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
-				REGi(0), REGi(3), REGi(1), REGi(2));
-			dolog("ESI=%08x EDI=%08x EBP=%08x\n",
-				REGi(6), REGi(7), REGi(5));
-		}
-		/* One-shot dump of #UD (invalid opcode) — only in PM, skip V86 */
-		if (no == 6 && (cpu->cr0 & 1) && !(cpu->flags & VM) && !ud_dumped) {
-			ud_dumped = true;
-			dolog("=== #UD (invalid opcode) in PM ===\n");
-			dolog("CS:EIP=%04x:%08x FL=%08x CPL=%d\n",
-				cpu->seg[SEG_CS].sel, cpu->ip, cpu->flags, cpu->cpl);
-			dolog("Code:");
-			for (int i = 0; i < 8; i++) {
-				u8 b;
-				if (cpu_load8(cpu, SEG_CS, (cpu->ip + i) & 0xffffffff, &b))
-					dolog(" %02x", b);
-				else
-					dolog(" ??");
-			}
-			dolog("\n");
-			dump_exc_ring("at #UD");
-			/* Dump IDT entry for vector 6 to verify handler address */
-			{
-				int idt_off = 6 << 3;
-				if (idt_off + 7 <= cpu->idt.limit) {
-					OptAddr idt_meml;
-					if (translate_laddr(cpu, &idt_meml, 1, cpu->idt.base + idt_off, 4, 0)) {
-						uword idt_w1 = load32(cpu, &idt_meml);
-						if (translate_laddr(cpu, &idt_meml, 1, cpu->idt.base + idt_off + 4, 4, 0)) {
-							uword idt_w2 = load32(cpu, &idt_meml);
-							int idt_gt = (idt_w2 >> 8) & 0xf;
-							int idt_dpl = (idt_w2 >> 13) & 3;
-							int idt_p = (idt_w2 >> 15) & 1;
-							int handler_cs = idt_w1 >> 16;
-							uword handler_eip = (idt_w1 & 0xffff) | (idt_w2 & 0xffff0000);
-							dolog("IDT[6]: type=%x DPL=%d P=%d => %04x:%08x\n",
-								idt_gt, idt_dpl, idt_p, handler_cs, handler_eip);
-						}
-					}
-				}
-			}
-			/* Schedule a delayed dump 300ms from now to capture post-#UD events */
+		/* Trigger delayed dump on CS=0137 #PF (Win95 flat user-mode LDT selector).
+		 * Freeze ring buffer immediately to preserve crash context. */
+		if (no == 14 && cpu->seg[SEG_CS].sel == 0x0137) {
 			exc_ring_delayed_dump_time = get_uticks();
-			/* Trace first 10 exceptions after this #UD delivery */
-			post_ud_trace_count = 10;
-		}
-		/* One-shot dump of #GP at CPL=0 (kernel GP fault) */
-		if (no == 13 && (cpu->cr0 & 1) && cpu->cpl == 0 && !gp0_dumped) {
-			gp0_dumped = true;
-			dolog("=== #GP at CPL=0 (kernel mode) err=%04x ===\n", cpu->excerr);
-			dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x\n",
-				cpu->seg[SEG_CS].sel, cpu->ip,
-				cpu->seg[SEG_SS].sel, REGi(4), cpu->flags);
-			dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
-				REGi(0), REGi(3), REGi(1), REGi(2));
-			dolog("DS=%04x ES=%04x FS=%04x GS=%04x CPL=%d\n",
-				cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
-				cpu->seg[SEG_FS].sel, cpu->seg[SEG_GS].sel, cpu->cpl);
-			dump_exc_ring("#GP CPL=0");
-		}
-		/* One-shot dump of #PF at CPL=0 (kernel page fault) */
-		if (no == 14 && (cpu->cr0 & 1) && cpu->cpl == 0 && !pf0_dumped) {
-			pf0_dumped = true;
-			dolog("=== #PF at CPL=0 (kernel mode) err=%04x CR2=%08x ===\n",
-				cpu->excerr, cpu->cr2);
-			dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x\n",
-				cpu->seg[SEG_CS].sel, cpu->ip,
-				cpu->seg[SEG_SS].sel, REGi(4), cpu->flags);
-			dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
-				REGi(0), REGi(3), REGi(1), REGi(2));
-			dolog("DS=%04x ES=%04x FS=%04x GS=%04x CPL=%d\n",
-				cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
-				cpu->seg[SEG_FS].sel, cpu->seg[SEG_GS].sel, cpu->cpl);
-			dump_exc_ring("#PF CPL=0");
+			exc_ring_frozen = 1;
 		}
 	}
 
@@ -6049,7 +5997,7 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 			saddr16(&meml2, cpu->seg[SEG_CS].sel);
 			saddr16(&meml3, cpu->ip);
 			if (pusherr) {
-				saddr32(&meml4, cpu->excerr);
+				saddr16(&meml4, cpu->excerr);
 				set_sp(sp - 2 * 4, sp_mask);
 			} else {
 				set_sp(sp - 2 * 3, sp_mask);
@@ -6146,9 +6094,9 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 			saddr32(&meml5, cpu->ip);
 			if (pusherr) {
 				saddr32(&meml6, cpu->excerr);
-				sreg32(4, sp - 4 * 6);
+				set_sp(sp - 4 * 6, sp_mask);
 			} else {
-				sreg32(4, sp - 4 * 5);
+				set_sp(sp - 4 * 5, sp_mask);
 			}
 		}
 		newcs = (newcs & (~3)) | newpl;
@@ -6476,16 +6424,23 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		return;
 	}
 
-	/* Delayed ring buffer dump: fires 2 seconds after a trigger (e.g., #UD)
-	 * to capture what exceptions happen AFTER the trigger event. */
+	/* Delayed ring buffer dump: fires 2s after last non-009f LDT #PF.
+	 * This captures the crash aftermath without affecting timing. */
 	if (exc_ring_delayed_dump_time != 0 &&
-	    (get_uticks() - exc_ring_delayed_dump_time) > 300000) {
+	    (get_uticks() - exc_ring_delayed_dump_time) > 2000000) {
 		exc_ring_delayed_dump_time = 0;
-		dolog("=== Delayed ring buffer dump (300ms post-trigger) ===\n");
-		dolog("CS:EIP=%04x:%08x FL=%08x CPL=%d %s\n",
-			cpu->seg[SEG_CS].sel, cpu->ip, cpu->flags, cpu->cpl,
+		exc_ring_frozen = 0;  /* allow re-triggering */
+		refresh_flags(cpu);
+		dolog("=== Ring buffer dump (2s after last LDT #PF) ===\n");
+		dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x CPL=%d %s\n",
+			cpu->seg[SEG_CS].sel, cpu->ip,
+			cpu->seg[SEG_SS].sel, REGi(4),
+			cpu->flags, cpu->cpl,
 			(cpu->flags & VM) ? "V86" : ((cpu->cr0 & 1) ? "PM" : "RM"));
-		dump_exc_ring("2s post-trigger");
+		dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
+			REGi(0), REGi(3), REGi(1), REGi(2));
+		dolog("CR2=%08x CR3=%08x\n", cpu->cr2, cpu->cr3);
+		dump_exc_ring("2s post-LDT-PF");
 	}
 
 	if (!cpu_exec1(cpu, stepcount)) {
@@ -6496,49 +6451,33 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 			pusherr = true;
 		}
 		int orig_exc = cpu->excno;
-		bool orig_vm = !!(cpu->flags & VM);  /* save before call_isr clears VM */
 		cpu->next_ip = cpu->ip;
 
-		/* One-shot full state dump on the first #GP that looks like
-		 * the sel c0fe cascade (err code = sel & ~3 = 0xc0fc).
-		 * This captures the CPU state BEFORE exception delivery
-		 * corrupts it further via the cascade. */
-		{
-			static bool gp_dumped = false;
-			static int gp_diag_gen = -1;
-			if (gp_diag_gen != cpu->diag_gen) { gp_diag_gen = cpu->diag_gen; gp_dumped = false; }
-			if (!gp_dumped && orig_exc == EX_GP && cpu->excerr == 0xc0fc) {
-				gp_dumped = true;
+		/* One-shot deep PF diagnostics for Win95 shared-user range faults. */
+		if (orig_exc == EX_PF) {
+			static bool pf_bff_dumped = false;
+			static bool pf_target_dumped = false;
+			static int pf_diag_gen = -1;
+			if (pf_diag_gen != cpu->diag_gen) {
+				pf_diag_gen = cpu->diag_gen;
+				pf_bff_dumped = false;
+				pf_target_dumped = false;
+			}
+			if (!pf_bff_dumped && cpu->cr2 >= 0xbff00000 && cpu->cr2 < 0xc0000000) {
+				pf_bff_dumped = true;
 				refresh_flags(cpu);
-				dolog("=== FIRST #GP(c0fc) — full state dump ===\n");
-				dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x CR0=%08x\n",
-					cpu->seg[SEG_CS].sel, cpu->ip,
-					cpu->seg[SEG_SS].sel, REGi(4),
-					cpu->flags, cpu->cr0);
-				dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
-					REGi(0), REGi(3), REGi(1), REGi(2));
-				dolog("ESI=%08x EDI=%08x EBP=%08x\n",
-					REGi(6), REGi(7), REGi(5));
-				dolog("DS=%04x ES=%04x FS=%04x GS=%04x\n",
-					cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
-					cpu->seg[SEG_FS].sel, cpu->seg[SEG_GS].sel);
-				dolog("LDT sel=%04x base=%08x limit=%x\n",
-					cpu->seg[SEG_LDT].sel, cpu->seg[SEG_LDT].base,
-					cpu->seg[SEG_LDT].limit);
-				dolog("CR2=%08x CR3=%08x CPL=%d\n",
-					cpu->cr2, cpu->cr3, cpu->cpl);
-				/* Dump top of stack (8 dwords) */
-				dolog("Stack:");
-				for (int i = 0; i < 8; i++) {
-					OptAddr stk;
-					uword sp = (REGi(4) + i * 4) & 0xffffffff;
-					if (translate_laddr(cpu, &stk, 1,
-					    cpu->seg[SEG_SS].base + sp, 4, 0))
-						dolog(" %08x", load32(cpu, &stk));
-					else
-						dolog(" ????????");
-				}
-				dolog("\n");
+				dolog("=== FIRST BFF #PF ===\n");
+				dolog("  fault @ CS:EIP=%04x:%08x err=%x CPL=%d FL=%08x\n",
+					cpu->seg[SEG_CS].sel, cpu->ip, cpu->excerr, cpu->cpl, cpu->flags);
+				dump_pf_walk(cpu, cpu->cr2, "FIRST BFF #PF");
+			}
+			if (!pf_target_dumped && cpu->cr2 == 0xbff9809f) {
+				pf_target_dumped = true;
+				refresh_flags(cpu);
+				dolog("=== TARGET #PF CR2=BFF9809F ===\n");
+				dolog("  fault @ CS:EIP=%04x:%08x err=%x CPL=%d FL=%08x\n",
+					cpu->seg[SEG_CS].sel, cpu->ip, cpu->excerr, cpu->cpl, cpu->flags);
+				dump_pf_walk(cpu, cpu->cr2, "TARGET #PF");
 			}
 		}
 
@@ -6597,32 +6536,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 				goto triple_fault;
 			}
 		}
-		/* One-shot: dump CPU state after #UD delivery to verify handler setup */
-		{
-			static bool ud_post_dumped = false;
-			static int upd_gen = -1;
-			if (upd_gen != cpu->diag_gen) { upd_gen = cpu->diag_gen; ud_post_dumped = false; }
-			if (!ud_post_dumped && orig_exc == EX_UD && !orig_vm) {
-				ud_post_dumped = true;
-				dolog("=== After #UD delivery ===\n");
-				dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x CPL=%d\n",
-					cpu->seg[SEG_CS].sel, cpu->ip,
-					cpu->seg[SEG_SS].sel, REGi(4),
-					cpu->flags, cpu->cpl);
-				/* Dump the stack frame the handler will see */
-				dolog("Handler stack:");
-				for (int i = 0; i < 8; i++) {
-					OptAddr stk;
-					uword sp = (REGi(4) + i * 4) & 0xffffffff;
-					if (translate_laddr(cpu, &stk, 1,
-					    cpu->seg[SEG_SS].base + sp, 4, 0))
-						dolog(" %08x", load32(cpu, &stk));
-					else
-						dolog(" ????????");
-				}
-				dolog("\n");
-			}
-		}
+		/* (diagnostic dumps removed — using lightweight ring buffer only) */
 	}
 	return;
 
@@ -6733,6 +6647,7 @@ void cpui386_reset(CPUI386 *cpu)
 	cpu->cr0 = cpu->fpu ? 0x10 : 0;
 	cpu->cr2 = 0;
 	cpu->cr3 = 0;
+	cpu->cr4 = 0;
 	cpu->a20_mask = 0xFFEFFFFF;  /* A20 disabled at reset (real hardware behavior) */
 	for (int i = 0; i < 8; i++)
 		cpu->dr[i] = 0;
@@ -6889,12 +6804,12 @@ static void cpu_debug(CPUI386 *cpu)
 	bool code32 = cpu->seg[SEG_CS].flags & SEG_D_BIT;
 	bool stack32 = cpu->seg[SEG_SS].flags & SEG_B_BIT;
 
-	dolog("IP %08x|AX %08x|CX %08x|DX %08x|BX %08x|SP %08x|BP %08x|SI %08x|DI %08x|FL %08x|CS %04x|DS %04x|SS %04x|ES %04x|FS %04x|GS %04x|CR0 %08x|CR2 %08x|CR3 %08x|CPL %d|IOPL %d|CSBASE %08x/%08x|DSBASE %08x/%08x|SSBASE %08x/%08x|ESBASE %08x/%08x|GSBASE %08x/%08x %c%c\n",
+	dolog("IP %08x|AX %08x|CX %08x|DX %08x|BX %08x|SP %08x|BP %08x|SI %08x|DI %08x|FL %08x|CS %04x|DS %04x|SS %04x|ES %04x|FS %04x|GS %04x|CR0 %08x|CR2 %08x|CR3 %08x|CR4 %08x|CPL %d|IOPL %d|CSBASE %08x/%08x|DSBASE %08x/%08x|SSBASE %08x/%08x|ESBASE %08x/%08x|GSBASE %08x/%08x %c%c\n",
 		cpu->ip, REGi(0), REGi(1), REGi(2), REGi(3),
 		REGi(4), REGi(5), REGi(6), REGi(7),
 		cpu->flags, SEGi(SEG_CS), SEGi(SEG_DS), SEGi(SEG_SS),
 		SEGi(SEG_ES), SEGi(SEG_FS), SEGi(SEG_GS),
-		cpu->cr0, cpu->cr2, cpu->cr3, cpu->cpl, get_IOPL(cpu),
+		cpu->cr0, cpu->cr2, cpu->cr3, cpu->cr4, cpu->cpl, get_IOPL(cpu),
 		cpu->seg[SEG_CS].base, cpu->seg[SEG_CS].limit,
 		cpu->seg[SEG_DS].base, cpu->seg[SEG_DS].limit,
 		cpu->seg[SEG_SS].base, cpu->seg[SEG_SS].limit,

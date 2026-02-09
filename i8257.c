@@ -409,22 +409,21 @@ int i8257_dma_read_memory(IsaDma *obj, int nchan, void *buf, int pos,
 
     uint8_t *p = buf;
     if (r->mode & 0x20) {
-        for (hwaddr i = 0;
-             addr - pos - len + i < d->phys_mem_size && i < len;
-             i++) {
-            p[i] = d->phys_mem[addr - pos - len + i];
-        }
-        //cpu_physical_memory_read (d->phys_mem + addr - pos - len, buf, len);
-        /* What about 16bit transfers? */
-        for (int i = 0; i < len >> 1; i++) {
-            uint8_t b = p[len - i - 1];
-            p[i] = b;
+        /* Decrement mode: transfer stream order from addr-(pos+i). */
+        for (int i = 0; i < len; i++) {
+            uint64_t off = (uint64_t)pos + (uint64_t)i;
+            if (off > (uint64_t)addr)
+                break;
+            hwaddr a = (hwaddr)((uint64_t)addr - off);
+            if (a < d->phys_mem_size)
+                p[i] = d->phys_mem[a];
         }
     } else {
-        for (hwaddr i = 0;
-             addr + pos + i < d->phys_mem_size && i < len;
-             i++) {
-            p[i] = d->phys_mem[addr + pos + i];
+        for (int i = 0; i < len; i++) {
+            uint64_t a64 = (uint64_t)addr + (uint64_t)pos + (uint64_t)i;
+            if (a64 >= (uint64_t)d->phys_mem_size)
+                break;
+            p[i] = d->phys_mem[(hwaddr)a64];
         }
         //cpu_physical_memory_read (addr + pos, buf, len);
     }
@@ -445,22 +444,21 @@ int i8257_dma_write_memory(IsaDma *obj, int nchan, void *buf, int pos,
 
     uint8_t *p = buf;
     if (r->mode & 0x20) {
-        for (hwaddr i = 0;
-             addr - pos - len + i < s->phys_mem_size && i < len;
-             i++) {
-            s->phys_mem[addr - pos - len + i] = p[i];
-        }
-        //cpu_physical_memory_write (addr - pos - len, buf, len);
-        /* What about 16bit transfers? */
+        /* Decrement mode: consume stream order, write to addr-(pos+i). */
         for (int i = 0; i < len; i++) {
-            uint8_t b = p[len - i - 1];
-            p[i] = b;
+            uint64_t off = (uint64_t)pos + (uint64_t)i;
+            if (off > (uint64_t)addr)
+                break;
+            hwaddr a = (hwaddr)((uint64_t)addr - off);
+            if (a < s->phys_mem_size)
+                s->phys_mem[a] = p[i];
         }
     } else {
-        for (hwaddr i = 0;
-             addr + pos + i < s->phys_mem_size && i < len;
-             i++) {
-            s->phys_mem[addr + pos + i] = p[i];
+        for (int i = 0; i < len; i++) {
+            uint64_t a64 = (uint64_t)addr + (uint64_t)pos + (uint64_t)i;
+            if (a64 >= (uint64_t)s->phys_mem_size)
+                break;
+            s->phys_mem[(hwaddr)a64] = p[i];
         }
         //cpu_physical_memory_write (addr + pos, buf, len);
     }
