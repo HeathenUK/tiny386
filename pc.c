@@ -279,6 +279,7 @@ static void pc_io_write(void *o, int addr, u8 val)
 		return;
 	case 0x92:
 		pc->port92 = val;
+		cpui386_set_a20(pc->cpu, (val >> 1) & 1);
 		return;
 	case 0x60:
 		kbd_write_data(pc->i8042, addr, val);
@@ -804,6 +805,18 @@ static void pc_reset_request(void *p)
 	pc->reset_request = 1;
 }
 
+static void pc_set_a20(void *p, int val)
+{
+	PC *pc = p;
+	cpui386_set_a20(pc->cpu, val);
+}
+
+static int pc_get_a20(void *p)
+{
+	PC *pc = p;
+	return cpui386_get_a20(pc->cpu);
+}
+
 /* Callback for direct VGA writes - marks lines dirty for rendering */
 static void vga_direct_write_notify(void *iomem, uword addr, int len)
 {
@@ -961,6 +974,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	pc->i8042 = i8042_init(&(pc->kbd), &(pc->mouse),
 			       1, 12, pc->pic, set_irq,
 			       pc, pc_reset_request);
+	i8042_set_a20_cb(pc->i8042, pc_set_a20, pc_get_a20);
 	pc->adlib = adlib_new();
 	pc->ne2000 = isa_ne2000_init(0x300, 9, pc->pic, set_irq);
 	pc->isa_dma = i8257_new(pc->phys_mem, pc->phys_mem_size,
@@ -971,7 +985,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 			    pc->isa_dma, pc->isa_hdma,
 			    pc->pic, set_irq);
 	pc->pcspk = pcspk_init(pc->pit);
-	pc->port92 = 0x2;
+	pc->port92 = 0;  /* A20 disabled at reset (bit 1 = 0) */
 	pc->shutdown_state = 0;
 	pc->reset_request = 0;
 	return pc;
@@ -1069,7 +1083,7 @@ void pc_reset(PC *pc)
 	// Reset keyboard controller and clear any pending input
 	i8042_reset(pc->i8042);
 	// Reset port 92 (A20 gate)
-	pc->port92 = 0x2;
+	pc->port92 = 0;  /* A20 disabled at reset (bit 1 = 0) */
 	// Update CMOS disk geometry (may have changed via OSD disk swap)
 	if (pc->fill_cmos)
 		ide_fill_cmos(pc->ide, pc->cmos, cmos_set);

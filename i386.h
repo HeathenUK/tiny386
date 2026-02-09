@@ -67,6 +67,8 @@ void cpui386_step(CPUI386 *cpu, int stepcount);
 void cpui386_raise_irq(CPUI386 *cpu);
 void cpui386_set_gpr(CPUI386 *cpu, int i, u32 val);
 long cpui386_get_cycle(CPUI386 *cpu);
+void cpui386_set_a20(CPUI386 *cpu, int enabled);
+int cpui386_get_a20(CPUI386 *cpu);
 
 bool cpu_load8(CPUI386 *cpu, int seg, uword addr, u8 *res);
 bool cpu_store8(CPUI386 *cpu, int seg, uword addr, u8 val);

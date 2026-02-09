@@ -105,14 +105,18 @@ struct KBDState {
     void (*set_irq)(void *pic, int irq, int level);
     void *sys;
     void (*system_reset_request)(void *sys);
+    void (*set_a20)(void *sys, int val);
+    int (*get_a20)(void *sys);
 };
 
-static void ioport_set_a20(int val)
+static void ioport_set_a20(KBDState *s, int val)
 {
+    if (s->set_a20) s->set_a20(s->sys, val);
 }
 
-static int ioport_get_a20(void)
+static int ioport_get_a20(KBDState *s)
 {
+    if (s->get_a20) return s->get_a20(s->sys);
     return 1;
 }
 
@@ -231,7 +235,7 @@ void kbd_write_command(void *opaque, uint32_t addr, uint32_t val)
         break;
     case KBD_CCMD_READ_OUTPORT:
         /* XXX: check that */
-        val = 0x01 | (ioport_get_a20() << 1);
+        val = 0x01 | (ioport_get_a20(s) << 1);
         if (s->status & KBD_STAT_OBF)
             val |= 0x10;
         if (s->status & KBD_STAT_MOUSE_OBF)
@@ -239,10 +243,10 @@ void kbd_write_command(void *opaque, uint32_t addr, uint32_t val)
         kbd_queue(s, val, 0);
         break;
     case KBD_CCMD_ENABLE_A20:
-        ioport_set_a20(1);
+        ioport_set_a20(s, 1);
         break;
     case KBD_CCMD_DISABLE_A20:
-        ioport_set_a20(0);
+        ioport_set_a20(s, 0);
         break;
     case KBD_CCMD_RESET:
         s->system_reset_request(s->sys);
@@ -295,7 +299,7 @@ void kbd_write_data(void *opaque, uint32_t addr, uint32_t val)
         kbd_queue(s, val, 1);
         break;
     case KBD_CCMD_WRITE_OUTPORT:
-        ioport_set_a20((val >> 1) & 1);
+        ioport_set_a20(s, (val >> 1) & 1);
         if (!(val & 1)) {
             s->system_reset_request(s->sys);
         }
@@ -347,6 +351,14 @@ KBDState *i8042_init(PS2KbdState **pkbd,
     *pkbd = s->kbd;
     *pmouse = s->mouse;
     return s;
+}
+
+void i8042_set_a20_cb(KBDState *s,
+                      void (*set_a20)(void *sys, int val),
+                      int (*get_a20)(void *sys))
+{
+    s->set_a20 = set_a20;
+    s->get_a20 = get_a20;
 }
 
 /*

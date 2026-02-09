@@ -314,6 +314,9 @@ uint8_t cmos_ioport_read(CMOS *cmos, int addr)
 		return 0xff;
 	cmos_update_time(cmos);
 	uint8_t val = cmos->data[cmos->index];
+	/* Reading Register C clears interrupt flags and deasserts IRQ 8 */
+	if (cmos->index == RTC_REG_C)
+		cmos->data[RTC_REG_C] = 0;
 	return val;
 }
 

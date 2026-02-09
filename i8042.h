@@ -33,5 +33,8 @@ KBDState *i8042_init(PS2KbdState **pkbd,
                      void (*system_reset_request)(void *sys));
 
 void i8042_reset(KBDState *s);
+void i8042_set_a20_cb(KBDState *s,
+                      void (*set_a20)(void *sys, int val),
+                      int (*get_a20)(void *sys));
 
 #endif /* I8042_H */

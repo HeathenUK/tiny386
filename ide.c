@@ -464,11 +464,11 @@ static void ide_identify(IDEState *s)
     stw(tab + 60, s->nb_sectors);
     stw(tab + 61, s->nb_sectors >> 16);
     stw(tab + 80, (1 << 1) | (1 << 2));
-    stw(tab + 82, (1 << 14));
-    stw(tab + 83, (1 << 14));
+    stw(tab + 82, (1 << 14) | (1 << 3)); /* power management supported */
+    stw(tab + 83, (1 << 14) | (1 << 12)); /* flush cache supported */
     stw(tab + 84, (1 << 14));
-    stw(tab + 85, (1 << 14));
-    stw(tab + 86, 0);
+    stw(tab + 85, (1 << 14) | (1 << 3)); /* power management enabled */
+    stw(tab + 86, (1 << 12)); /* flush cache enabled */
     stw(tab + 87, (1 << 14));
 }
 
@@ -487,7 +487,7 @@ static void ide_atapi_identify(IDEState *s)
     stw(tab + 48, 1); /* dword I/O (XXX: should not be set on CDROM) */
     stw(tab + 49, 1 << 9); /* LBA supported, no DMA */
     stw(tab + 53, 3); /* words 64-70, 54-58 valid */
-    stw(tab + 63, 0x103); /* DMA modes XXX: may be incorrect */
+    stw(tab + 63, 0x0); /* no DMA modes supported (no bus master DMA) */
     stw(tab + 64, 1); /* PIO modes */
     stw(tab + 65, 0xb4); /* minimum DMA multiword tx cycle time */
     stw(tab + 66, 0xb4); /* recommended DMA multiword tx cycle time */
@@ -837,6 +837,69 @@ static void ide_exec_cmd(IDEState *s, int val)
          * Clamp to MAX_MULT_SECTORS to prevent io_buffer overflow. */
         s->req_nb_sectors = MAX_MULT_SECTORS;
         ide_sector_write(s);
+        break;
+    case WIN_VERIFY:
+    case WIN_VERIFY_ONCE:
+        /* Verify sectors — advance position like a real read, no data transfer */
+        { int n = s->nsector ? s->nsector : 256;
+          ide_set_sector(s, ide_get_sector(s) + n);
+          s->nsector = 0; }
+        s->error = 0;
+        s->status = READY_STAT | SEEK_STAT;
+        ide_set_irq(s);
+        break;
+    case WIN_DIAGNOSE:
+        /* Execute drive diagnostics — set device signature and return no error */
+        ide_set_signature(s);
+        s->error = 0x01;
+        s->status = READY_STAT | SEEK_STAT;
+        ide_set_irq(s);
+        break;
+    case WIN_FLUSH_CACHE:
+    case WIN_FLUSH_CACHE_EXT:
+        /* Flush cache — data is always written through, just succeed */
+        s->status = READY_STAT | SEEK_STAT;
+        ide_set_irq(s);
+        break;
+    case WIN_SETFEATURES:
+        if (s->feature == 0x03) {
+            /* Set transfer mode — reject DMA/UDMA (nsector >> 3 >= 2) */
+            if ((s->nsector >> 3) >= 2) {
+                ide_abort_command(s);
+                ide_set_irq(s);
+                break;
+            }
+        }
+        s->error = 0;
+        s->status = READY_STAT | SEEK_STAT;
+        ide_set_irq(s);
+        break;
+    case WIN_SEEK:
+        /* Seek — just report success */
+        s->status = READY_STAT | SEEK_STAT;
+        ide_set_irq(s);
+        break;
+    case WIN_NOP:
+        s->status = READY_STAT | SEEK_STAT;
+        ide_set_irq(s);
+        break;
+    case WIN_CHECKPOWERMODE1:
+    case WIN_CHECKPOWERMODE2:
+        s->nsector = 0xFF;  /* 0xFF = device is active/idle */
+        s->status = READY_STAT | SEEK_STAT;
+        ide_set_irq(s);
+        break;
+    case WIN_STANDBYNOW1:
+    case WIN_STANDBYNOW2:
+    case WIN_IDLEIMMEDIATE:
+    case WIN_SETIDLE1:
+    case WIN_SETIDLE2:
+    case WIN_SLEEPNOW1:
+    case WIN_SLEEPNOW2:
+    case WIN_STANDBY:
+    case WIN_STANDBY2:
+        s->status = READY_STAT | SEEK_STAT;
+        ide_set_irq(s);
         break;
     default:
         ide_abort_command(s);

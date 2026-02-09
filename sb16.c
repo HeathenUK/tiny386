@@ -136,6 +136,10 @@ struct SB16State {
     int adpcm_reference;         /* Current reference sample (0-255) */
     int adpcm_step;              /* Current step index */
     int adpcm_have_ref;          /* Flag: have we read the reference byte? */
+
+    /* Silence timer (DSP command 0x80) */
+    uint64_t silence_end_us;     /* Target time in microseconds */
+    int silence_pending;         /* Silence IRQ pending */
 };
 
 static void AUD_set_active_out (SB16State *s, int i)
@@ -1047,27 +1051,21 @@ static void complete (SB16State *s)
         case 0x80:
             {
                 int freq, samples, bytes;
-                int64_t ticks;
+                uint64_t duration_us;
 
                 freq = s->freq > 0 ? s->freq : 11025;
                 samples = dsp_get_lohi (s) + 1;
                 bytes = samples << s->fmt_stereo << (s->fmt_bits == 16);
-                ticks = muldiv64(bytes, NANOSECONDS_PER_SECOND, freq);
-                if (ticks < NANOSECONDS_PER_SECOND / 1024) {
+                duration_us = muldiv64(bytes, 1000000, freq);
+                if (duration_us < 1000) {
+                    /* Very short silence — fire IRQ immediately */
                     s->set_irq(s->pic, s->irq, 0);
                     s->set_irq(s->pic, s->irq, 1);
                 } else {
-                    dolog("TODO: aux_ts\n");
+                    s->silence_end_us = sb_get_time_us() + duration_us;
+                    s->silence_pending = 1;
                 }
-//                else {
-//                    if (s->aux_ts) {
-//                        timer_mod (
-//                            s->aux_ts,
-//                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ticks
-//                            );
-//                    }
-//                }
-                ldebug ("mix silence %d %d %" PRId64 "\n", samples, bytes, ticks);
+                ldebug ("mix silence %d %d %" PRIu64 "us\n", samples, bytes, duration_us);
             }
             break;
 
@@ -1840,6 +1838,13 @@ void sb16_audio_callback (void *opaque, uint8_t *stream, int free)
 {
     SB16State *s = opaque;
     s->audio_free = free;
+
+    /* Check silence timer (DSP command 0x80) */
+    if (s->silence_pending && sb_get_time_us() >= s->silence_end_us) {
+        s->silence_pending = 0;
+        s->set_irq(s->pic, s->irq, 0);
+        s->set_irq(s->pic, s->irq, 1);
+    }
 
     if (!s->active_out)
         return;

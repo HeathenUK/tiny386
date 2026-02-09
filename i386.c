@@ -95,6 +95,7 @@ struct CPUI386 {
 	} idt, gdt;
 
 	uword cr0, cr2, cr3;
+	uint32_t a20_mask;  /* 0xFFFFFFFF when A20 enabled, 0xFFEFFFFF when disabled */
 
 	uword dr[8];
 
@@ -683,7 +684,8 @@ static int pte_lookup[2][4][2][2] = { //[wp != 0][(pte >> 1) & 3][cpl > 0][rwm >
 
 static bool IRAM_ATTR tlb_refill(CPUI386 *cpu, struct tlb_entry *ent, uword lpgno)
 {
-	uword base_addr = cpu->cr3 & ~0xfff;
+	uint32_t a20 = cpu->a20_mask;
+	uword base_addr = (cpu->cr3 & ~0xfff) & a20;
 	uword i = lpgno >> 10;
 	uword j = lpgno & 1023;
 
@@ -693,7 +695,7 @@ static bool IRAM_ATTR tlb_refill(CPUI386 *cpu, struct tlb_entry *ent, uword lpgn
 		return false;
 	mem[base_addr + i * 4] |= 1 << 5; // accessed
 
-	uword base_addr2 = pde & ~0xfff;
+	uword base_addr2 = (pde & ~0xfff) & a20;
 	uword pte = pload32(cpu, base_addr2 + j * 4);
 	if (!(pte & 1))
 		return false;
@@ -702,7 +704,7 @@ static bool IRAM_ATTR tlb_refill(CPUI386 *cpu, struct tlb_entry *ent, uword lpgn
 //	mem[base_addr2 + j * 4] |= 1 << 6; // dirty
 
 	ent->lpgno = lpgno;
-	ent->xaddr = (pte & ~0xfff) ^ (lpgno << 12);
+	ent->xaddr = ((pte & ~0xfff) & a20) ^ (lpgno << 12);
 	pte = pte & ((pde & 7) | 0xfffffff8);
 	ent->pte_lookup = pte_lookup[!!(cpu->cr0 & CR0_WP)][(pte >> 1) & 3];
 	ent->ppte = &(mem[base_addr2 + j * 4]);
@@ -760,7 +762,7 @@ static bool IRAM_ATTR translate_laddr(CPUI386 *cpu, OptAddr *res, int rwm, uword
 		}
 	} else {
 		res->res = ADDR_OK1;
-		res->addr1 = laddr;
+		res->addr1 = laddr & cpu->a20_mask;
 	}
 	return true;
 }
@@ -849,7 +851,7 @@ static bool IRAM_ATTR translate8r(CPUI386 *cpu, OptAddr *res, int seg, uword add
 		res->addr1 = ent->xaddr ^ laddr;
 	} else {
 		res->res = ADDR_OK1;
-		res->addr1 = laddr;
+		res->addr1 = laddr & cpu->a20_mask;
 	}
 
 	return true;
@@ -6731,6 +6733,7 @@ void cpui386_reset(CPUI386 *cpu)
 	cpu->cr0 = cpu->fpu ? 0x10 : 0;
 	cpu->cr2 = 0;
 	cpu->cr3 = 0;
+	cpu->a20_mask = 0xFFEFFFFF;  /* A20 disabled at reset (real hardware behavior) */
 	for (int i = 0; i < 8; i++)
 		cpu->dr[i] = 0;
 
@@ -6780,6 +6783,24 @@ void IRAM_ATTR cpui386_raise_irq(CPUI386 *cpu)
 void cpui386_set_gpr(CPUI386 *cpu, int i, u32 val)
 {
 	sreg32(i, val);
+}
+
+void cpui386_set_a20(CPUI386 *cpu, int enabled)
+{
+	uint32_t new_mask = enabled ? 0xFFFFFFFF : 0xFFEFFFFF;
+	if (cpu->a20_mask != new_mask) {
+		cpu->a20_mask = new_mask;
+		tlb_clear(cpu);
+		cpu->ifetch.laddr = -1;
+#ifdef I386_SEQ_FASTPATH
+		cpu->seq_active = false;
+#endif
+	}
+}
+
+int cpui386_get_a20(CPUI386 *cpu)
+{
+	return (cpu->a20_mask >> 20) & 1;
 }
 
 long IRAM_ATTR cpui386_get_cycle(CPUI386 *cpu)
