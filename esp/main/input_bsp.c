@@ -234,7 +234,6 @@ static void input_task(void *arg)
 				if (globals.ini_selector_active) {
 					uint16_t base_scancode = scancode & ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
 					if (base_scancode == SC_OSD_TOGGLE) {
-						vTaskDelay(5 / portTICK_PERIOD_MS);
 						continue;  // Ignore Meta key in selector
 					}
 					uint8_t code;
@@ -252,7 +251,6 @@ static void input_task(void *arg)
 					/* Clear repeat on key-up */
 					if (!is_down && code == repeat_keycode)
 						repeat_keycode = 0;
-					vTaskDelay(5 / portTICK_PERIOD_MS);
 					continue;
 				}
 
@@ -270,7 +268,6 @@ static void input_task(void *arg)
 						}
 						meta_held = false;
 					}
-					vTaskDelay(5 / portTICK_PERIOD_MS);
 					continue;  // Don't pass meta key to emulator
 				}
 
@@ -286,7 +283,6 @@ static void input_task(void *arg)
 					if (mouse_emu_is_active() && !globals.osd_enabled) {
 						if (code == SC_ARROW_UP || code == SC_ARROW_DOWN ||
 						    code == SC_ARROW_LEFT || code == SC_ARROW_RIGHT) {
-							vTaskDelay(5 / portTICK_PERIOD_MS);
 							continue;
 						}
 					}
@@ -314,7 +310,6 @@ static void input_task(void *arg)
 						}
 						if (handled) {
 							meta_consumed = true;
-							vTaskDelay(5 / portTICK_PERIOD_MS);
 							continue;
 						}
 					}
@@ -336,7 +331,6 @@ static void input_task(void *arg)
 					// (mouse_emu handles L/M/R sections via navigation events)
 					if (mouse_emu_is_active() && !globals.osd_enabled) {
 						if (code == BSP_INPUT_SCANCODE_SPACE) {
-							vTaskDelay(5 / portTICK_PERIOD_MS);
 							continue;
 						}
 					}
@@ -351,14 +345,11 @@ static void input_task(void *arg)
 					if (meta_held && is_down && code == SC_LEFT_CTRL) {
 						mouse_emu_toggle();
 						meta_consumed = true;
-						vTaskDelay(5 / portTICK_PERIOD_MS);
 						continue;  // Don't pass Ctrl to emulator
 					}
 
 					handle_scancode(code, is_down);
 				}
-
-				vTaskDelay(5 / portTICK_PERIOD_MS);
 			}
 			else if (event.type == INPUT_EVENT_TYPE_NAVIGATION) {
 				// Handle navigation events for mouse emulation
@@ -371,13 +362,11 @@ static void input_task(void *arg)
 					// Let mouse_emu handle navigation keys
 					// Returns true if consumed (mouse mode active or F6 toggle)
 					if (mouse_emu_handle_nav_key(nav_key, pressed)) {
-						vTaskDelay(5 / portTICK_PERIOD_MS);
 						continue;
 					}
 				}
 				// If not consumed by mouse_emu, navigation events are
 				// redundant with scancodes, so we can ignore them
-				vTaskDelay(5 / portTICK_PERIOD_MS);
 			}
 		}
 	}

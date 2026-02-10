@@ -56,7 +56,6 @@ static void i2s_bsp_task(void *arg)
 	i2s_channel_enable(tx_chan);
 	for (;;) {
 		size_t bwritten;
-		memset(buf, 0, 128 * 2);
 		mixer_callback(globals.pc, (uint8_t *) buf, 128 * 2);
 		for (int i = 0; i < 128; i++) {
 			buf[i] = buf[i] / 2;
