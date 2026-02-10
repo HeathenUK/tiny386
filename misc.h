@@ -29,6 +29,11 @@ void cmos_set_boot_order(CMOS *cmos, int order_index);
 int cmos_get_boot_order(CMOS *cmos);
 
 // Save all settings to ini file
+// Sound device constants
+#define SOUND_DEVICE_SB16 0
+#define SOUND_DEVICE_GUS  1
+extern const char *sound_device_names[];
+
 int save_settings_to_ini(const char *ini_path, int boot_order,
                          const char *hda,
                          const char *fda, const char *fdb,
@@ -37,7 +42,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
                          int cpu_gen, int fpu, long mem_size,
                          int brightness, int volume, int frame_skip,
                          int batch_size, int mouse_speed,
-                         int usb_passthru);
+                         int usb_passthru, int sound_device);
 
 typedef struct EMULINK EMULINK;
 EMULINK *emulink_init();

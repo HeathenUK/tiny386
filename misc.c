@@ -365,6 +365,11 @@ const int boot_orders[BOOT_ORDER_COUNT][3] = {
 	{3, 1, 2},  // CD, Floppy, HDD
 };
 
+const char *sound_device_names[] = {
+	"sb16",
+	"gus",
+};
+
 const char *boot_order_names[BOOT_ORDER_COUNT] = {
 	"HDD, Floppy, CD",
 	"HDD, CD, Floppy",
@@ -424,7 +429,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
                          int cpu_gen, int fpu, long mem_size,
                          int brightness, int volume, int frame_skip,
                          int batch_size, int mouse_speed,
-                         int usb_passthru)
+                         int usb_passthru, int sound_device)
 {
 	if (!ini_path) return -1;
 	if (boot_order < 0 || boot_order >= BOOT_ORDER_COUNT)
@@ -454,7 +459,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	int found_mem_size = -1;
 	int found_gen = -1, found_fpu = -1, found_batch_size = -1;
 	int found_brightness = -1, found_volume = -1, found_frame_skip = -1;
-	int found_mouse_speed = -1, found_usb_passthru = -1;
+	int found_mouse_speed = -1, found_usb_passthru = -1, found_sound_device = -1;
 
 	while (line_count < 64 && fgets(lines[line_count], 256, f)) {
 		// Check for section headers
@@ -501,6 +506,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			else if (line_starts_with(lines[line_count], "frame_skip")) found_frame_skip = line_count;
 			else if (line_starts_with(lines[line_count], "mouse_speed")) found_mouse_speed = line_count;
 			else if (line_starts_with(lines[line_count], "usb_passthru")) found_usb_passthru = line_count;
+			else if (line_starts_with(lines[line_count], "sound_device")) found_sound_device = line_count;
 		}
 
 		// Check for existing settings in [cpu] section
@@ -564,6 +570,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			fprintf(f, "mouse_speed = %d\n", mouse_speed);
 		} else if (i == found_usb_passthru) {
 			fprintf(f, "usb_passthru = %d\n", usb_passthru);
+		} else if (i == found_sound_device) {
+			fprintf(f, "sound_device = %s\n", sound_device_names[sound_device & 1]);
 		} else if (i == found_gen) {
 			fprintf(f, "gen = %d\n", cpu_gen);
 		} else if (i == found_fpu) {
@@ -605,6 +613,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 				fprintf(f, "mouse_speed = %d\n", mouse_speed);
 			if (found_usb_passthru < 0)
 				fprintf(f, "usb_passthru = %d\n", usb_passthru);
+			if (found_sound_device < 0)
+				fprintf(f, "sound_device = %s\n", sound_device_names[sound_device & 1]);
 		}
 
 		// Add new settings at end of [cpu] section

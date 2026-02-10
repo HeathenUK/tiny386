@@ -12,6 +12,7 @@
 // Batch size setting: 0=auto (dynamic), or fixed value 512-4096
 int pc_batch_size_setting = 0;
 
+
 #define cpu_raise_irq cpui386_raise_irq
 #define cpu_get_cycle cpui386_get_cycle
 
@@ -85,7 +86,10 @@ static u8 pc_io_read(void *o, int addr)
 		return val;
 	case 0x220: case 0x221: case 0x222: case 0x223:
 	case 0x228: case 0x229:
+		if (pc->adlib) return adlib_read(pc->adlib, addr);
+		return 0xff;
 	case 0x388: case 0x389: case 0x38a: case 0x38b:
+		if (pc->gus) return gus_adlib_read(pc->gus, addr);
 		return adlib_read(pc->adlib, addr);
 	case 0xcfc: case 0xcfd: case 0xcfe: case 0xcff:
 		val = i440fx_read_data(pc->i440fx, addr - 0xcfc, 0);
@@ -131,11 +135,11 @@ static u8 pc_io_read(void *o, int addr)
 		val = i8257_read_pageh(pc->isa_hdma, addr - 0x488);
 		return val;
 	case 0x225:
-		val = sb16_mixer_read(pc->sb16, addr);
-		return val;
+		if (pc->sb16) { val = sb16_mixer_read(pc->sb16, addr); return val; }
+		return 0xff;
 	case 0x226: case 0x22a: case 0x22c: case 0x22d: case 0x22e: case 0x22f:
-		val = sb16_dsp_read(pc->sb16, addr);
-		return val;
+		if (pc->sb16) { val = sb16_dsp_read(pc->sb16, addr); return val; }
+		return 0xff;
 	case 0x240: case 0x246: case 0x248: case 0x24f:
 		if (pc->gus) return gus_read(pc->gus, addr);
 		return 0xff;
@@ -178,7 +182,8 @@ static u16 pc_io_read16(void *o, int addr)
 		val = ne2000_asic_ioport_read(pc->ne2000, addr);
 		return val;
 	case 0x220:
-		return adlib_read(pc->adlib, addr);
+		if (pc->adlib) return adlib_read(pc->adlib, addr);
+		return 0xffff;
 	case 0x344:
 		if (pc->gus) return gus_read_gf1_16(pc->gus, addr);
 		return 0xffff;
@@ -302,7 +307,10 @@ static void pc_io_write(void *o, int addr, u8 val)
 		return;
 	case 0x220: case 0x221: case 0x222: case 0x223:
 	case 0x228: case 0x229:
+		if (pc->adlib) adlib_write(pc->adlib, addr, val);
+		return;
 	case 0x388: case 0x389: case 0x38a: case 0x38b:
+		if (pc->gus) { gus_adlib_write(pc->gus, addr, val); return; }
 		adlib_write(pc->adlib, addr, val);
 		return;
 	case 0x8900:
@@ -362,13 +370,13 @@ static void pc_io_write(void *o, int addr, u8 val)
 		i8257_write_pageh(pc->isa_hdma, addr - 0x488, val);
 		return;
 	case 0x224:
-		sb16_mixer_write_indexb(pc->sb16, addr, val);
+		if (pc->sb16) sb16_mixer_write_indexb(pc->sb16, addr, val);
 		return;
 	case 0x225:
-		sb16_mixer_write_datab(pc->sb16, addr, val);
+		if (pc->sb16) sb16_mixer_write_datab(pc->sb16, addr, val);
 		return;
 	case 0x226: case 0x22c:
-		sb16_dsp_write(pc->sb16, addr, val);
+		if (pc->sb16) sb16_dsp_write(pc->sb16, addr, val);
 		return;
 	case 0x240: case 0x248: case 0x249: case 0x24b: case 0x24f:
 		if (pc->gus) gus_write(pc->gus, addr, val);
@@ -996,17 +1004,25 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 			       1, 12, pc->pic, set_irq,
 			       pc, pc_reset_request);
 	i8042_set_a20_cb(pc->i8042, pc_set_a20, pc_get_a20);
-	pc->adlib = adlib_new();
 	pc->ne2000 = isa_ne2000_init(0x300, 9, pc->pic, set_irq);
 	pc->isa_dma = i8257_new(pc->phys_mem, pc->phys_mem_size,
 				0x00, 0x80, 0x480, 0);
 	pc->isa_hdma = i8257_new(pc->phys_mem, pc->phys_mem_size,
 				 0xc0, 0x88, 0x488, 1);
-	pc->sb16 = sb16_new(0x220, 5,
-			    pc->isa_dma, pc->isa_hdma,
-			    pc->pic, set_irq);
-	pc->gus = gus_new(0x240, 7, 3,
-			   pc->isa_dma, pc->pic, set_irq);
+	if (conf->sound_device == 1) {
+		/* GUS mode: no SB16 or AdLib (GUS Classic had no OPL chip) */
+		pc->adlib = NULL;
+		pc->sb16 = NULL;
+		pc->gus = gus_new(0x240, 7, 3,
+				   pc->isa_dma, pc->pic, set_irq);
+	} else {
+		/* SB16 mode (default): SB16 + AdLib/OPL */
+		pc->adlib = adlib_new();
+		pc->sb16 = sb16_new(0x220, 5,
+				    pc->isa_dma, pc->isa_hdma,
+				    pc->pic, set_irq);
+		pc->gus = NULL;
+	}
 	pc->pcspk = pcspk_init(pc->pit);
 	pc->port92 = 0;  /* A20 disabled at reset (bit 1 = 0) */
 	pc->shutdown_state = 0;
@@ -1024,56 +1040,41 @@ void mixer_callback (void *opaque, uint8_t *stream, int free)
 		return;
 	}
 	assert(free / 2 <= MIXER_BUF_LEN);
-	memset(tmpbuf, 0, MIXER_BUF_LEN);
-	if (!pc->adlib || !pc->sb16 || !pc->pcspk) {
-		memset(stream, 0, free);
-		return;
-	}
-	adlib_callback(pc->adlib, tmpbuf, free / 2); // s16, mono
-	sb16_audio_callback(pc->sb16, stream, free); // s16, stereo
-
-	/* Get volume levels from SB16 mixer (0-7 scale per channel) */
-	int fm_vol_l, fm_vol_r;
-	int voice_vol_l, voice_vol_r;
-	int master_vol_l, master_vol_r;
-	sb16_get_fm_volume(pc->sb16, &fm_vol_l, &fm_vol_r);
-	sb16_get_voice_volume(pc->sb16, &voice_vol_l, &voice_vol_r);
-	sb16_get_master_volume(pc->sb16, &master_vol_l, &master_vol_r);
-
+	memset(stream, 0, free);
 	int16_t *d2 = (int16_t *) stream;
-	int16_t *d1 = (int16_t *) tmpbuf;
-	for (int i = 0; i < free / 2; i += 2) {
-		/* Apply FM volume to OPL samples (0-7 range, 7 = full volume) */
-		int fm_l = (d1[i / 2] * fm_vol_l) / 7;
-		int fm_r = (d1[i / 2] * fm_vol_r) / 7;
-		/* Apply voice volume to SB16 digital audio */
-		int voice_l = (d2[i] * voice_vol_l) / 7;
-		int voice_r = (d2[i + 1] * voice_vol_r) / 7;
-		/* Mix FM with voice */
-		int mix_l = voice_l + fm_l;
-		int mix_r = voice_r + fm_r;
-		/* Apply master volume */
-		mix_l = (mix_l * master_vol_l) / 7;
-		mix_r = (mix_r * master_vol_r) / 7;
-		/* Clamp to 16-bit range */
-		if (mix_l > 32767) mix_l = 32767;
-		if (mix_l < -32768) mix_l = -32768;
-		if (mix_r > 32767) mix_r = 32767;
-		if (mix_r < -32768) mix_r = -32768;
-		d2[i] = mix_l;
-		d2[i + 1] = mix_r;
-	}
 
-	/* GUS has its own volume/pan - mix independently of SB16 mixer */
 	if (pc->gus) {
-		int16_t gus_buf[MIXER_BUF_LEN];
-		memset(gus_buf, 0, sizeof(gus_buf));
-		gus_audio_callback(pc->gus, (uint8_t *)gus_buf, free);
-		for (int i = 0; i < free / 2; i++) {
-			int mix = d2[i] + gus_buf[i];
-			if (mix > 32767) mix = 32767;
-			if (mix < -32768) mix = -32768;
-			d2[i] = mix;
+		/* GUS mode: GUS produces stereo output with its own volume/pan */
+		gus_audio_callback(pc->gus, stream, free);
+	} else if (pc->adlib && pc->sb16) {
+		/* SB16 mode: mix AdLib (FM) + SB16 (digital) with mixer volumes */
+		memset(tmpbuf, 0, MIXER_BUF_LEN);
+		adlib_callback(pc->adlib, tmpbuf, free / 2); // s16, mono
+		sb16_audio_callback(pc->sb16, stream, free); // s16, stereo
+
+		int fm_vol_l, fm_vol_r;
+		int voice_vol_l, voice_vol_r;
+		int master_vol_l, master_vol_r;
+		sb16_get_fm_volume(pc->sb16, &fm_vol_l, &fm_vol_r);
+		sb16_get_voice_volume(pc->sb16, &voice_vol_l, &voice_vol_r);
+		sb16_get_master_volume(pc->sb16, &master_vol_l, &master_vol_r);
+
+		int16_t *d1 = (int16_t *) tmpbuf;
+		for (int i = 0; i < free / 2; i += 2) {
+			int fm_l = (d1[i / 2] * fm_vol_l) / 7;
+			int fm_r = (d1[i / 2] * fm_vol_r) / 7;
+			int voice_l = (d2[i] * voice_vol_l) / 7;
+			int voice_r = (d2[i + 1] * voice_vol_r) / 7;
+			int mix_l = voice_l + fm_l;
+			int mix_r = voice_r + fm_r;
+			mix_l = (mix_l * master_vol_l) / 7;
+			mix_r = (mix_r * master_vol_r) / 7;
+			if (mix_l > 32767) mix_l = 32767;
+			if (mix_l < -32768) mix_l = -32768;
+			if (mix_r > 32767) mix_r = 32767;
+			if (mix_r < -32768) mix_r = -32768;
+			d2[i] = mix_l;
+			d2[i + 1] = mix_r;
 		}
 	}
 
@@ -1257,6 +1258,11 @@ int parse_conf_ini(void* user, const char* section,
 			if (conf->mouse_speed > 10) conf->mouse_speed = 10;
 		} else if (NAME("usb_passthru")) {
 			conf->usb_passthru = atoi(value) ? 1 : 0;
+		} else if (NAME("sound_device")) {
+			if (strcasecmp(value, "gus") == 0)
+				conf->sound_device = 1;
+			else
+				conf->sound_device = 0;  /* sb16 (default) */
 		}
 	} else if (SEC("display")) {
 		if (NAME("width")) {

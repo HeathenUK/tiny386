@@ -238,8 +238,8 @@ static void gus_raise_wave_irq(GUSState *s, int voice)
     if (!(s->reset_reg & RESET_MASTER_IRQ))
         return;
     s->irq_status |= IRQ_STAT_WAVE;
-    /* Queue entry: voice number in bits 0-4, bit 5 clear = wave IRQ */
-    gus_irq_queue_push(s, (voice & 0x1F));
+    /* Queue entry: voice number in bits 0-4, bit 6 set = not ramp, bit 5 clear = wave */
+    gus_irq_queue_push(s, (voice & 0x1F) | 0x40);
     gus_update_irq(s);
 }
 
@@ -540,10 +540,14 @@ void gus_audio_callback(void *opaque, uint8_t *stream, int free)
                 int32_t sample = gus_fetch_sample(s, voice);
                 sample = gus_apply_volume(s, voice, sample);
 
-                /* Apply panning: 0=full left, 15=full right */
+                /* Apply panning: 0=full left, 7-8=center, 15=full right.
+                 * Split at midpoint so center gives equal amplitude. */
                 int pan = voice->pan & 0x0F;
-                mix_left  += (sample * (15 - pan)) / 15;
-                mix_right += (sample * pan) / 15;
+                int ls, rs;
+                if (pan <= 7) { ls = 7; rs = pan; }
+                else { ls = 15 - pan; rs = 7; }
+                mix_left  += (sample * ls) / 7;
+                mix_right += (sample * rs) / 7;
 
                 /* Advance voice position */
                 gus_advance_voice(s, voice, v);
@@ -953,14 +957,51 @@ void gus_write_gf1_16(void *opaque, uint32_t port, uint32_t val)
 }
 
 /* ----------------------------------------------------------------
- * AdLib timer forwarding (called from pc.c for ports 0x388/0x389)
+ * AdLib-compatible timer ports (0x388/0x389)
+ * When GUS is active, these ports are handled by the GUS instead of
+ * the OPL chip, providing timer functionality for GUS drivers.
  * ---------------------------------------------------------------- */
+static uint8_t adlib_reg_select; /* Latched AdLib register address */
 
-/* Check if this is a GUS timer-related AdLib write.
- * Returns 1 if handled by GUS, 0 if it should go to OPL as well. */
+uint32_t gus_adlib_read(void *opaque, uint32_t port)
+{
+    GUSState *s = opaque;
+    /* Port 0x388: AdLib status register
+     * Bit 7: IRQ flag (any timer)
+     * Bit 6: Timer 1 overflow
+     * Bit 5: Timer 2 overflow */
+    uint8_t ret = 0;
+    if (s->irq_status & IRQ_STAT_TIMER1)
+        ret |= 0xC0;
+    if (s->irq_status & IRQ_STAT_TIMER2)
+        ret |= 0xA0;
+    return ret;
+}
 
-/* Note: The GUS responds on the AdLib ports for timer compatibility.
- * This is handled by routing the relevant timer writes from pc.c. */
+void gus_adlib_write(void *opaque, uint32_t port, uint32_t val)
+{
+    GUSState *s = opaque;
+    if ((port & 0xF) == 0x8) {
+        /* Port 0x388: register address select */
+        adlib_reg_select = val;
+    } else {
+        /* Port 0x389: register data write */
+        if (adlib_reg_select == 0x04) {
+            /* AdLib register 0x04 = timer control */
+            s->adlib_timer_ctrl = val;
+            if (val & 0x80) {
+                /* Reset timer IRQ flags */
+                s->irq_status &= ~(IRQ_STAT_TIMER1 | IRQ_STAT_TIMER2);
+                gus_update_irq(s);
+            }
+            s->timer1_running = (val & 0x01) ? 1 : 0;
+            s->timer2_running = (val & 0x02) ? 1 : 0;
+        }
+        /* Other AdLib registers (0x01, 0x02, 0x03) are timer count values
+         * on the real OPL chip, but GUS uses its own GF1 registers (0x46/0x47)
+         * for timer counts, so we ignore non-0x04 writes here. */
+    }
+}
 
 /* ----------------------------------------------------------------
  * Initialization

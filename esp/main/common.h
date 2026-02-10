@@ -61,6 +61,7 @@ struct Globals {
 	int cpu_gen;                  // CPU generation (3=386, 4=486, 5=586)
 	int fpu;                      // FPU enabled (0/1)
 	int mem_size_mb;              // Guest RAM in MB (actual, after PSRAM cap)
+	int sound_device;             // 0=SB16+AdLib, 1=GUS (requires restart)
 
 	// INI selector state
 	bool ini_selector_active;     // INI selector screen is showing

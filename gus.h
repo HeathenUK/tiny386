@@ -17,6 +17,10 @@ void gus_write_gf1(void *opaque, uint32_t port, uint32_t val);
 uint32_t gus_read_gf1_16(void *opaque, uint32_t port);
 void gus_write_gf1_16(void *opaque, uint32_t port, uint32_t val);
 
+/* AdLib-compatible timer port handlers (0x388/0x389) */
+uint32_t gus_adlib_read(void *opaque, uint32_t port);
+void gus_adlib_write(void *opaque, uint32_t port, uint32_t val);
+
 /* Audio callback - produces stereo int16 output at 44100 Hz */
 void gus_audio_callback(void *opaque, uint8_t *stream, int free);
 
