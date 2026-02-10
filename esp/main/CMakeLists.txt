@@ -15,6 +15,7 @@ set(COMMON_SRCS
     "../../ne2000.c"
     "../../i8257.c"
     "../../sb16.c"
+    "../../gus.c"
     "../../pcspk.c"
     "i2s.c"
     "storage.c"
@@ -45,6 +46,7 @@ set_source_files_properties("../../i8259.c" PROPERTIES COMPILE_FLAGS "-Wno-all -
 # Audio: -O3 for OPL/SB16 performance
 set_source_files_properties("../../adlib.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("../../sb16.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
+set_source_files_properties("../../gus.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("../../pcspk.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 
 # OPL2 emulation (fmopl): -O3

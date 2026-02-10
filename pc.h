@@ -16,6 +16,7 @@
 #include "ne2000.h"
 #include "i8257.h"
 #include "sb16.h"
+#include "gus.h"
 #include "pcspk.h"
 #include "pci.h"
 #include "ini.h"
@@ -59,6 +60,7 @@ typedef struct {
 	NE2000State *ne2000;
 	I8257State *isa_dma, *isa_hdma;
 	SB16State *sb16;
+	GUSState *gus;
 	PCSpkState *pcspk;
 
 	I440FXState *i440fx;

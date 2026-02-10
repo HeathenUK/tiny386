@@ -136,6 +136,13 @@ static u8 pc_io_read(void *o, int addr)
 	case 0x226: case 0x22a: case 0x22c: case 0x22d: case 0x22e: case 0x22f:
 		val = sb16_dsp_read(pc->sb16, addr);
 		return val;
+	case 0x240: case 0x246: case 0x248: case 0x24f:
+		if (pc->gus) return gus_read(pc->gus, addr);
+		return 0xff;
+	case 0x340: case 0x341: case 0x342: case 0x343:
+	case 0x345: case 0x347:
+		if (pc->gus) return gus_read_gf1(pc->gus, addr);
+		return 0xff;
 	case 0xf1f4:
 		val = 0;
 		emulink_data_read_string(pc->emulink, &val, 1, 1);
@@ -172,6 +179,9 @@ static u16 pc_io_read16(void *o, int addr)
 		return val;
 	case 0x220:
 		return adlib_read(pc->adlib, addr);
+	case 0x344:
+		if (pc->gus) return gus_read_gf1_16(pc->gus, addr);
+		return 0xffff;
 	default:
 #ifdef DEBUG_IO
 		fprintf(stderr, "inw 0x%x <= 0x%x\n", addr, 0xffff);
@@ -360,6 +370,13 @@ static void pc_io_write(void *o, int addr, u8 val)
 	case 0x226: case 0x22c:
 		sb16_dsp_write(pc->sb16, addr, val);
 		return;
+	case 0x240: case 0x248: case 0x249: case 0x24b: case 0x24f:
+		if (pc->gus) gus_write(pc->gus, addr, val);
+		return;
+	case 0x340: case 0x341: case 0x342: case 0x343:
+	case 0x345: case 0x347:
+		if (pc->gus) gus_write_gf1(pc->gus, addr, val);
+		return;
 	case 0xf1f4:
 		emulink_data_write_string(pc->emulink, &val, 1, 1);
 		return;
@@ -398,6 +415,9 @@ static void pc_io_write16(void *o, int addr, u16 val)
 		return;
 	case 0x310:
 		ne2000_asic_ioport_write(pc->ne2000, addr, val);
+		return;
+	case 0x344:
+		if (pc->gus) gus_write_gf1_16(pc->gus, addr, val);
 		return;
 	default:
 #ifdef DEBUG_IO
@@ -985,6 +1005,8 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	pc->sb16 = sb16_new(0x220, 5,
 			    pc->isa_dma, pc->isa_hdma,
 			    pc->pic, set_irq);
+	pc->gus = gus_new(0x240, 7, 3,
+			   pc->isa_dma, pc->pic, set_irq);
 	pc->pcspk = pcspk_init(pc->pit);
 	pc->port92 = 0;  /* A20 disabled at reset (bit 1 = 0) */
 	pc->shutdown_state = 0;
@@ -1040,6 +1062,19 @@ void mixer_callback (void *opaque, uint8_t *stream, int free)
 		if (mix_r < -32768) mix_r = -32768;
 		d2[i] = mix_l;
 		d2[i + 1] = mix_r;
+	}
+
+	/* GUS has its own volume/pan - mix independently of SB16 mixer */
+	if (pc->gus) {
+		int16_t gus_buf[MIXER_BUF_LEN];
+		memset(gus_buf, 0, sizeof(gus_buf));
+		gus_audio_callback(pc->gus, (uint8_t *)gus_buf, free);
+		for (int i = 0; i < free / 2; i++) {
+			int mix = d2[i] + gus_buf[i];
+			if (mix > 32767) mix = 32767;
+			if (mix < -32768) mix = -32768;
+			d2[i] = mix;
+		}
 	}
 
 	/* PC Speaker bypasses SB16 mixer (separate circuit on real hardware) */
