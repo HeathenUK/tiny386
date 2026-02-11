@@ -97,6 +97,15 @@ struct CPUI386 {
 	uword cr0, cr2, cr3, cr4;
 	uint32_t a20_mask;  /* 0xFFFFFFFF when A20 enabled, 0xFFEFFFFF when disabled */
 
+	/* Debug registers: storage only.  Hardware breakpoint matching (DR0-DR3
+	 * address comparison on every memory access / instruction fetch) and #DB
+	 * generation from DR7 enable bits are deliberately NOT implemented.
+	 * The per-access cost is incompatible with the ESP32-P4 performance
+	 * budget — it would add branches inside translate() / translate8r() and
+	 * defeat the flat-segment fast paths.  MOV to/from DRn works so that
+	 * guest OS context-switch code doesn't fault; the values are simply
+	 * never acted upon.  TF-based single-step (#DB from EFLAGS.TF) is a
+	 * separate issue tracked elsewhere and is NOT blocked by this decision. */
 	uword dr[8];
 
 	struct {
