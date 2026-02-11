@@ -6690,6 +6690,10 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 				}
 			}
 		}
+
+		/* Dump IDT[14] (#PF handler) and IDT[13] (#GP handler) to verify integrity */
+		dump_idt_vector(cpu, 14, "IDT at crash");
+		dump_idt_vector(cpu, 13, "IDT at crash");
 	}
 
 	/* Track live changes to IDT[0x41] (VxD call path) to catch descriptor clobbering. */
