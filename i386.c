@@ -5976,6 +5976,40 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 			exc_ring[idx].cr2 = (no == 14) ? cpu->cr2 : 0;
 			exc_ring_pos++;
 		}
+		/* Track repeated BFF-range page faults (same page faulting twice = handler failed).
+		 * This detects demand-paging failures where the PF handler can't resolve the fault. */
+		if (no == 14 && !exc_ring_frozen) {
+			uword fault_page = cpu->cr2 >> 12;
+			static uword last_bff_fault_page = 0;
+			static int bff_repeat_count = 0;
+			static bool bff_repeat_dumped = false;
+			static int bff_diag_gen = -1;
+			if (bff_diag_gen != cpu->diag_gen) {
+				bff_diag_gen = cpu->diag_gen;
+				last_bff_fault_page = 0;
+				bff_repeat_count = 0;
+				bff_repeat_dumped = false;
+			}
+			if (fault_page >= 0xBFF00 && fault_page < 0xC0000) {
+				if (fault_page == last_bff_fault_page) {
+					bff_repeat_count++;
+					if (bff_repeat_count == 1 && !bff_repeat_dumped) {
+						bff_repeat_dumped = true;
+						dolog("=== BFF REPEAT FAULT ===\n");
+						dolog("  page=%05x (LA=%08x) faulted %d times\n",
+							fault_page, cpu->cr2, bff_repeat_count + 1);
+						dolog("  CS:EIP=%04x:%08x err=%x CPL=%d\n",
+							cpu->seg[SEG_CS].sel, cpu->ip, pusherr ? cpu->excerr : 0, cpu->cpl);
+						/* Walk the PTE to see if it's still not-present */
+						dump_pf_walk(cpu, cpu->cr2, "BFF REPEAT");
+					}
+				} else {
+					last_bff_fault_page = fault_page;
+					bff_repeat_count = 0;
+				}
+			}
+		}
+
 		/* Trigger delayed dump on CS=0137 #PF (Win95 flat user-mode LDT selector).
 		 * Freeze ring buffer immediately to preserve crash context. */
 		if (no == 14 && cpu->seg[SEG_CS].sel == 0x0137) {
@@ -6583,6 +6617,79 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 			REGi(0), REGi(3), REGi(1), REGi(2));
 		dolog("CR2=%08x CR3=%08x\n", cpu->cr2, cpu->cr3);
 		dump_exc_ring("2s post-LDT-PF");
+
+		/* Memory-state diagnostic: understand physical page usage and
+		 * BFF-range PTE states at crash time. */
+		{
+			uword a20 = cpu->a20_mask;
+			uword cr3_base = (cpu->cr3 & ~0xfff) & a20;
+			dolog("=== Memory State at crash ===\n");
+			dolog("  phys_mem_size=%lu (%lu KB, %lu MB)\n",
+				(unsigned long)cpu->phys_mem_size,
+				(unsigned long)cpu->phys_mem_size / 1024,
+				(unsigned long)cpu->phys_mem_size / (1024 * 1024));
+
+			/* Count present PDEs and total present PTEs */
+			int pde_present = 0, pte_present = 0, pte_not_present_nonzero = 0;
+			for (int pdi = 0; pdi < 1024; pdi++) {
+				uword pde_addr = cr3_base + pdi * 4;
+				if ((uint64_t)pde_addr + 4 > (uint64_t)cpu->phys_mem_size) continue;
+				uword pde = pload32(cpu, pde_addr);
+				if (!(pde & 1)) continue;
+				pde_present++;
+				if ((cpu->cr4 & CR4_PSE) && (pde & (1 << 7))) {
+					pte_present += 1024; /* 4MB page = 1024 4KB pages */
+					continue;
+				}
+				uword pt_base = (pde & ~0xfff) & a20;
+				for (int pti = 0; pti < 1024; pti++) {
+					uword pte_addr = pt_base + pti * 4;
+					if ((uint64_t)pte_addr + 4 > (uint64_t)cpu->phys_mem_size) continue;
+					uword pte = pload32(cpu, pte_addr);
+					if (pte & 1) pte_present++;
+					else if (pte) pte_not_present_nonzero++;
+				}
+			}
+			dolog("  PDEs present: %d/1024\n", pde_present);
+			dolog("  PTEs present: %d (~%d KB mapped)\n",
+				pte_present, pte_present * 4);
+			dolog("  PTEs not-present but non-zero: %d (demand-page/swapped)\n",
+				pte_not_present_nonzero);
+			dolog("  Phys pages available: %lu\n",
+				(unsigned long)(cpu->phys_mem_size / 4096));
+
+			/* Dump BFF range PTEs (KERNEL32.DLL area) */
+			uword bff_pdi = 0xBFF00000 >> 22; /* PDI for BFF range = 0x2FF */
+			uword bff_pde_addr = cr3_base + bff_pdi * 4;
+			if ((uint64_t)bff_pde_addr + 4 <= (uint64_t)cpu->phys_mem_size) {
+				uword bff_pde = pload32(cpu, bff_pde_addr);
+				dolog("  BFF PDE[%03x] = %08x P=%d\n", bff_pdi, bff_pde, !!(bff_pde & 1));
+				if (bff_pde & 1) {
+					uword bff_pt_base = (bff_pde & ~0xfff) & a20;
+					int bff_present = 0, bff_swapped = 0;
+					/* Scan PTI range 0x300-0x3FF (BFF00000-BFFFFFFF) */
+					for (int pti = 0x300; pti < 0x400; pti++) {
+						uword pte_addr = bff_pt_base + pti * 4;
+						if ((uint64_t)pte_addr + 4 > (uint64_t)cpu->phys_mem_size) continue;
+						uword pte = pload32(cpu, pte_addr);
+						if (pte & 1) bff_present++;
+						else if (pte) bff_swapped++;
+					}
+					dolog("  BFF PTEs (300-3FF): %d present, %d swapped/demand\n",
+						bff_present, bff_swapped);
+					/* Dump specific crash-area PTEs */
+					int interesting[] = { 0x370, 0x371, 0x398, 0x399, 0x39A, 0x39B, 0x3BB, 0x3BC };
+					for (int k = 0; k < 8; k++) {
+						int pti = interesting[k];
+						uword pte_addr = bff_pt_base + pti * 4;
+						if ((uint64_t)pte_addr + 4 > (uint64_t)cpu->phys_mem_size) continue;
+						uword pte = pload32(cpu, pte_addr);
+						dolog("  BFF PTE[%03x] (LA=%08x) = %08x P=%d\n",
+							pti, (bff_pdi << 22) | (pti << 12), pte, !!(pte & 1));
+					}
+				}
+			}
+		}
 	}
 
 	/* Track live changes to IDT[0x41] (VxD call path) to catch descriptor clobbering. */
