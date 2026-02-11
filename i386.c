@@ -79,6 +79,7 @@ struct CPUI386 {
 	bool code16;
 	uword sp_mask;
 	bool halt;
+	bool tf_trap_pending; /* TF single-step: #DB pending after previous insn */
 
 	FPU *fpu;
 
@@ -268,6 +269,33 @@ void cpu_abort(CPUI386 *cpu, int code)
 	dolog("abort: %d %x cycle %ld\n", code, code, cpu->cycle);
 	cpu_debug(cpu);
 	abort();
+}
+
+/* Intel 386 exception classification for double-fault escalation.
+ * Per 386 Programmer's Reference Manual, Table 9-3:
+ *   Contributory: #DE(0), #TS(10), #NP(11), #SS(12), #GP(13)
+ *   Page Fault:   #PF(14)
+ *   Benign:       everything else (#DB, #NMI, #BP, #OF, #BR, #UD, #NM, #MF)
+ */
+static inline int exc_class_386(int exc) {
+	switch (exc) {
+	case EX_DE: case EX_TS: case EX_NP: case EX_SS: case EX_GP:
+		return 1; /* contributory */
+	case EX_PF:
+		return 2; /* page fault */
+	default:
+		return 0; /* benign */
+	}
+}
+
+static inline bool exc_pushes_error_code(int exc) {
+	switch (exc) {
+	case EX_DF: case EX_TS: case EX_NP: case EX_SS: case EX_GP:
+	case EX_PF: case 17:
+		return true;
+	default:
+		return false;
+	}
 }
 
 static uword sext8(u8 a)
@@ -4592,7 +4620,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 #ifndef I386_OPT2
 #define eswitch(b) switch(b)
 #define ecase(a)   case a
-#define ebreak     break
+#define ebreak     do { if (unlikely(insn_tf)) cpu->tf_trap_pending = true; } while(0); break
 #define edefault   default
 #define default_ud cpu_debug(cpu); THROW0(EX_UD)
 #undef CX
@@ -4600,7 +4628,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 #else
 #define eswitch(b)
 #define ecase(a)   f ## a
-#define ebreak     continue
+#define ebreak     do { if (unlikely(insn_tf)) cpu->tf_trap_pending = true; } while(0); continue
 #define edefault   f0xf1
 #define default_ud THROW0(EX_UD)
 #undef CX
@@ -4614,11 +4642,23 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	/* seq_active persists across cpu_exec1 calls:
 	 * ip check at iteration top handles cross-call correctness */
 	for (; stepcount > 0; stepcount--) {
+	/* TF single-step: #DB trap fires after the previous instruction completed.
+	 * Must check BEFORE the next instruction starts so ip points to next insn. */
+	if (unlikely(cpu->tf_trap_pending)) {
+		cpu->tf_trap_pending = false;
+		cpu->ip = cpu->next_ip;
+		THROW0(EX_DB);
+	}
+
 	bool code16 = cpu->code16;
 	uword sp_mask = cpu->sp_mask;
 
 	if (code16) cpu->next_ip &= 0xffff;
 	cpu->ip = cpu->next_ip;
+
+	/* Save TF before this instruction — POPF/IRET may change it, but
+	 * the trap fires based on TF state when the instruction started. */
+	bool insn_tf = !!(cpu->flags & TF);
 
 	/* Initialize prefix state early (before seq dispatch which skips prefix parsing) */
 	bool opsz16 = code16;
@@ -5542,7 +5582,7 @@ static bool task_switch(CPUI386 *cpu, int tss, int sw_type)
 	OptAddr meml;
 	int oldtss = cpu->seg[SEG_TR].sel;
 	int tr_type = cpu->seg[SEG_TR].flags & 0xf;
-	assert (tr_type == 9 || tr_type == 11);
+	if (tr_type != 9 && tr_type != 11) THROW(EX_TS, cpu->seg[SEG_TR].sel & ~0x3);
 
 	TRY1(translate(cpu, &meml, 2, SEG_TR, 0x20, 4, 0));
 	store32(cpu, &meml, cpu->next_ip);
@@ -5573,7 +5613,7 @@ static bool task_switch(CPUI386 *cpu, int tss, int sw_type)
 
 	TRY1(set_seg(cpu, SEG_TR, tss));
 	int new_tr_type = cpu->seg[SEG_TR].flags & 0xf;
-	assert(new_tr_type == 9 || new_tr_type == 11);
+	if (new_tr_type != 9 && new_tr_type != 11) THROW(EX_TS, tss & ~0x3);
 
 	// set busy bit
 	if (sw_type == TS_JMP || sw_type == TS_CALL) {
@@ -5699,8 +5739,7 @@ static bool pmcall(CPUI386 *cpu, bool opsz16, uword addr, int sel, bool isjmp)
 		}
 
 		if (gt != 4 && gt != 12) {
-			fprintf(stderr, "gate type = %d\n", gt);
-			cpu_abort(cpu, -203);
+			THROW(EX_GP, sel & ~0x3);
 		}
 
 		// call gates
@@ -6205,15 +6244,15 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 	}
 	case 3: /* from v8086 */ {
 //		dolog("int from v8086\n");
-		if (csdpl != 0) cpu_abort(cpu, -205);
-		if (gate16) cpu_abort(cpu, -206);
+		if (csdpl != 0) THROW(EX_GP, newcs & ~0x3);
+		if (gate16) THROW(EX_GP, off | 2 | ext);
 //		dolog("call_isr %d %x PVL %d => 0\n", no, no, cpu->cpl, csdpl);
 		OptAddr msp0, mss0;
 		int newpl = 0;
 		uword oldss = cpu->seg[SEG_SS].sel;
 		uword oldsp = REGi(4);
 		uword newss, newsp;
-		if (!(cpu->seg[SEG_TR].flags & 0x8)) cpu_abort(cpu, -207);
+		if (!(cpu->seg[SEG_TR].flags & 0x8)) THROW(EX_TS, cpu->seg[SEG_TR].sel & ~0x3);
 		TRY(translate(cpu, &msp0, 1, SEG_TR, 4 + 8 * newpl, 4, 0));
 		TRY(translate(cpu, &mss0, 1, SEG_TR, 8 + 8 * newpl, 4, 0));
 		newsp = load32(cpu, &msp0);
@@ -6405,11 +6444,11 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 	}
 
 	if (isiret && (newflags & VM)) {
-		if (cpu->cpl != 0) cpu_abort(cpu, -208);
+		if (cpu->cpl != 0) THROW(EX_GP, 0);
 		// return to v8086
 //		dolog("pmiret PVL %d => %d (vm) %04x:%08x\n", cpu->cpl, 3, newcs, newip);
 		OptAddr meml_vmes, meml_vmds, meml_vmfs, meml_vmgs;
-		if (opsz16) cpu_abort(cpu, -209);
+		if (opsz16) THROW(EX_GP, 0);
 		TRY(translate(cpu, &meml4, 1, SEG_SS, (sp + 12) & sp_mask, 4, 0));
 		TRY(translate(cpu, &meml5, 1, SEG_SS, (sp + 16) & sp_mask, 4, 0));
 		TRY(translate(cpu, &meml_vmes, 1, SEG_SS, (sp + 20) & sp_mask, 4, 0));
@@ -6484,9 +6523,11 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		int no = cpu->cb.pic_read_irq(cpu->cb.pic);
 		cpu->ip = cpu->next_ip;
 		if (unlikely(!call_isr(cpu, no, false, 1))) {
-			/* Hardware interrupt delivery failed — triple fault */
-			dolog("IRQ %d delivery failed\n", no);
-			goto triple_fault;
+			/* Hardware IRQ delivery failed — try #DF before triple fault */
+			dolog("IRQ %d delivery failed (2nd exc %d)\n", no, cpu->excno);
+			cpu->excerr = 0;
+			if (!call_isr(cpu, EX_DF, true, 1))
+				goto triple_fault;
 		}
 	}
 
@@ -6647,7 +6688,9 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		}
 
 		if (unlikely(!call_isr(cpu, cpu->excno, pusherr, 1))) {
-			/* Exception delivery failed — try double fault (#DF) */
+			/* Exception delivery failed — apply 386 double-fault
+			 * escalation matrix instead of blindly escalating. */
+			int second_exc = cpu->excno;
 			refresh_flags(cpu);
 
 			/* One-shot full dump on first delivery failure */
@@ -6657,38 +6700,16 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 				if (isrf_diag_gen != cpu->diag_gen) { isrf_diag_gen = cpu->diag_gen; isr_fail_dumped = false; }
 				if (!isr_fail_dumped) {
 					isr_fail_dumped = true;
-					dolog("=== FIRST call_isr failure (exc %d err=%d) ===\n",
-						orig_exc, cpu->excerr);
+					dolog("=== call_isr failure: exc %d during exc %d (class %d+%d) ===\n",
+						second_exc, orig_exc,
+						exc_class_386(orig_exc), exc_class_386(second_exc));
 					dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x CR0=%08x %s\n",
 						cpu->seg[SEG_CS].sel, cpu->ip,
 						cpu->seg[SEG_SS].sel, REGi(4),
 						cpu->flags, cpu->cr0,
 						(cpu->flags & VM) ? "V86" : "PM");
-					dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
-						REGi(0), REGi(3), REGi(1), REGi(2));
-					dolog("ESI=%08x EDI=%08x EBP=%08x\n",
-						REGi(6), REGi(7), REGi(5));
-					dolog("DS=%04x ES=%04x FS=%04x GS=%04x\n",
-						cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
-						cpu->seg[SEG_FS].sel, cpu->seg[SEG_GS].sel);
-					dolog("LDT sel=%04x base=%08x limit=%x\n",
-						cpu->seg[SEG_LDT].sel, cpu->seg[SEG_LDT].base,
-						cpu->seg[SEG_LDT].limit);
-					dolog("IDT base=%08x limit=%x\n",
-						cpu->idt.base, cpu->idt.limit);
 					dolog("CR2=%08x CR3=%08x CPL=%d\n",
 						cpu->cr2, cpu->cr3, cpu->cpl);
-					dolog("Stack:");
-					for (int i = 0; i < 8; i++) {
-						OptAddr stk;
-						uword sp = (REGi(4) + i * 4) & 0xffffffff;
-						if (translate_laddr(cpu, &stk, 1,
-						    cpu->seg[SEG_SS].base + sp, 4, 0))
-							dolog(" %08x", load32(cpu, &stk));
-						else
-							dolog(" ????????");
-					}
-					dolog("\n");
 				}
 			}
 
@@ -6696,9 +6717,28 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 				/* Double fault delivery failed — triple fault */
 				goto triple_fault;
 			}
-			if (!call_isr(cpu, EX_DF, true, 1)) {
-				/* Double fault delivery also failed — triple fault */
-				goto triple_fault;
+
+			/* 386 escalation matrix:
+			 *   contributory + contributory → #DF
+			 *   page fault   + page fault   → #DF
+			 *   everything else             → service second exception */
+			int c1 = exc_class_386(orig_exc);
+			int c2 = exc_class_386(second_exc);
+			if (c1 != 0 && c1 == c2) {
+				/* Escalate to #DF with error code 0 */
+				cpu->excerr = 0;
+				if (!call_isr(cpu, EX_DF, true, 1))
+					goto triple_fault;
+			} else {
+				/* Service second exception sequentially */
+				bool pusherr2 = exc_pushes_error_code(second_exc);
+				cpu->next_ip = cpu->ip;
+				if (!call_isr(cpu, second_exc, pusherr2, 1)) {
+					/* Second delivery also failed — escalate to #DF */
+					cpu->excerr = 0;
+					if (!call_isr(cpu, EX_DF, true, 1))
+						goto triple_fault;
+				}
 			}
 		}
 		/* (diagnostic dumps removed — using lightweight ring buffer only) */
@@ -6787,6 +6827,7 @@ void cpui386_reset(CPUI386 *cpu)
 	cpu->code16 = true;
 	cpu->sp_mask = 0xffff;
 	cpu->halt = false;
+	cpu->tf_trap_pending = false;
 
 	for (int i = 0; i < 8; i++) {
 		cpu->seg[i].sel = 0;
