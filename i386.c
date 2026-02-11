@@ -6655,8 +6655,53 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 				pte_present, pte_present * 4);
 			dolog("  PTEs not-present but non-zero: %d (demand-page/swapped)\n",
 				pte_not_present_nonzero);
-			dolog("  Phys pages available: %lu\n",
+			dolog("  Phys pages total: %lu\n",
 				(unsigned long)(cpu->phys_mem_size / 4096));
+
+			/* Count distinct physical pages referenced by present PTEs.
+			 * Uses a bitmap: 1 bit per physical page. */
+			{
+				uword total_phys_pages = cpu->phys_mem_size / 4096;
+				uword bitmap_bytes = (total_phys_pages + 7) / 8;
+				uint8_t *used_pages = calloc(bitmap_bytes, 1);
+				if (used_pages) {
+					int distinct_pages = 0;
+					for (int pdi = 0; pdi < 1024; pdi++) {
+						uword pde_addr = cr3_base + pdi * 4;
+						if ((uint64_t)pde_addr + 4 > (uint64_t)cpu->phys_mem_size) continue;
+						uword pde = pload32(cpu, pde_addr);
+						if (!(pde & 1)) continue;
+						/* Mark page table page itself as used */
+						uword pt_phys = (pde >> 12) & (total_phys_pages - 1);
+						if (pt_phys < total_phys_pages && !(used_pages[pt_phys / 8] & (1 << (pt_phys % 8)))) {
+							used_pages[pt_phys / 8] |= (1 << (pt_phys % 8));
+							distinct_pages++;
+						}
+						if ((cpu->cr4 & CR4_PSE) && (pde & (1 << 7))) continue;
+						uword pt_base = (pde & ~0xfff) & a20;
+						for (int pti = 0; pti < 1024; pti++) {
+							uword pte_addr = pt_base + pti * 4;
+							if ((uint64_t)pte_addr + 4 > (uint64_t)cpu->phys_mem_size) continue;
+							uword pte = pload32(cpu, pte_addr);
+							if (!(pte & 1)) continue;
+							uword ppn = (pte >> 12) & (total_phys_pages - 1);
+							if (ppn < total_phys_pages && !(used_pages[ppn / 8] & (1 << (ppn % 8)))) {
+								used_pages[ppn / 8] |= (1 << (ppn % 8));
+								distinct_pages++;
+							}
+						}
+					}
+					/* Also mark page directory itself */
+					uword pd_phys = (cr3_base >> 12);
+					if (pd_phys < total_phys_pages && !(used_pages[pd_phys / 8] & (1 << (pd_phys % 8)))) {
+						distinct_pages++;
+					}
+					dolog("  Distinct physical pages in use: %d / %lu (free: ~%lu)\n",
+						distinct_pages, (unsigned long)total_phys_pages,
+						(unsigned long)(total_phys_pages - distinct_pages));
+					free(used_pages);
+				}
+			}
 
 			/* Dump BFF range PTEs (KERNEL32.DLL area) */
 			uword bff_pdi = 0xBFF00000 >> 22; /* PDI for BFF range = 0x2FF */
