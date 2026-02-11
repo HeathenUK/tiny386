@@ -4408,12 +4408,12 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 
 // 486...
 #define CMPXCH_helper(BIT, a, b, la, sa, lb, sb) \
-	cpu->cc.src1 = sext ## BIT(la(a)); \
-	cpu->cc.src2 = sext ## BIT(lreg ## BIT(0)); \
+	cpu->cc.src2 = sext ## BIT(la(a)); \
+	cpu->cc.src1 = sext ## BIT(lreg ## BIT(0)); \
 	cpu->cc.dst = sext ## BIT(cpu->cc.src1 - cpu->cc.src2); \
 	cpu->cc.op = CC_SUB; \
 	cpu->cc.mask = CF | PF | AF | ZF | SF | OF; \
-	if (cpu->cc.dst == 0) sa(a, lb(b)); else sreg ## BIT(0, cpu->cc.src1); 
+	if (cpu->cc.dst == 0) sa(a, lb(b)); else sreg ## BIT(0, cpu->cc.src2);
 
 #define XADD_helper(BIT, a, b, la, sa, lb, sb) \
 	u ## BIT dst = la(a); \
