@@ -383,6 +383,27 @@ static inline void pstore32(CPUI386 *cpu, uword addr, u32 val)
 }
 #endif
 
+/* PF handler diagnostic: watches the physical PTE address during handler execution.
+ * Declared early so store functions can check the watchpoint.
+ * Silent during normal operation — only produces output when the handler FAILS. */
+static struct {
+	bool active;            /* true while inside PF handler for watched fault */
+	uword watch_phys;       /* physical address of the PTE being watched (4-byte aligned) */
+	uword initial_pte;      /* PTE value when watchpoint was set up */
+	uword cr2;              /* CR2 that triggered this watch */
+	int write_count;        /* number of writes to watched PTE during handler */
+	int nested_exc_count;   /* number of nested exceptions during handler */
+	uword last_write_val;   /* last value written to watched PTE */
+	uword last_write_eip;   /* EIP of last write instruction */
+	uint16_t last_write_cs; /* CS of last write instruction */
+	int cr3_write_count;    /* CR3 writes during handler */
+	int invlpg_count;       /* INVLPG executions during handler */
+	int nested_pf_count;    /* nested #PF during handler */
+	uword nested_pf_last_cr2;  /* CR2 of last nested #PF */
+	int oob_store_count;    /* stores to addr >= phys_mem_size during handler */
+	uword oob_store_last_addr;  /* last out-of-bounds store address */
+} pf_diag = {0};
+
 /* lazy flags */
 enum {
 	CC_ADC, CC_ADD,	CC_SBB, CC_SUB,
@@ -1145,6 +1166,13 @@ static u32 IRAM_ATTR load32(CPUI386 *cpu, OptAddr *res)
 static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 {
 	uword addr = res->addr1;
+	/* PTE watchpoint: detect byte writes overlapping watched PTE */
+	if (unlikely(pf_diag.active && addr >= pf_diag.watch_phys && addr < pf_diag.watch_phys + 4)) {
+		pf_diag.write_count++;
+		pf_diag.last_write_val = val;
+		pf_diag.last_write_cs = cpu->seg[SEG_CS].sel;
+		pf_diag.last_write_eip = cpu->ip;
+	}
 	if (likely(addr < 0xa0000)) {
 		if (likely(addr < cpu->phys_mem_size))
 			pstore8(cpu, addr, val);
@@ -1214,6 +1242,10 @@ static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 		return;
 	}
 	if (unlikely(addr >= cpu->phys_mem_size)) {
+		if (unlikely(pf_diag.active)) {
+			pf_diag.oob_store_count++;
+			pf_diag.oob_store_last_addr = addr;
+		}
 		return;
 	}
 	pstore8(cpu, addr, val);
@@ -1221,6 +1253,13 @@ static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 
 static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 {
+	/* PTE watchpoint: detect word writes overlapping watched PTE */
+	if (unlikely(pf_diag.active && res->addr1 < pf_diag.watch_phys + 4 && res->addr1 + 2 > pf_diag.watch_phys)) {
+		pf_diag.write_count++;
+		pf_diag.last_write_val = val;
+		pf_diag.last_write_cs = cpu->seg[SEG_CS].sel;
+		pf_diag.last_write_eip = cpu->ip;
+	}
 	if (likely(res->addr1 < 0xa0000)) {
 		if (likely(res->res == ADDR_OK1))
 			pstore16(cpu, res->addr1, val);
@@ -1242,6 +1281,10 @@ static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 		return;
 	}
 	if (unlikely(res->addr1 >= cpu->phys_mem_size)) {
+		if (unlikely(pf_diag.active)) {
+			pf_diag.oob_store_count++;
+			pf_diag.oob_store_last_addr = res->addr1;
+		}
 		return;
 	}
 	if (likely(res->res == ADDR_OK1)) {
@@ -1254,6 +1297,13 @@ static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 
 static void IRAM_ATTR store32(CPUI386 *cpu, OptAddr *res, u32 val)
 {
+	/* PTE watchpoint: detect dword writes overlapping watched PTE */
+	if (unlikely(pf_diag.active && res->addr1 < pf_diag.watch_phys + 4 && res->addr1 + 4 > pf_diag.watch_phys)) {
+		pf_diag.write_count++;
+		pf_diag.last_write_val = val;
+		pf_diag.last_write_cs = cpu->seg[SEG_CS].sel;
+		pf_diag.last_write_eip = cpu->ip;
+	}
 	if (likely(res->addr1 < 0xa0000)) {
 		if (likely(res->res == ADDR_OK1))
 			pstore32(cpu, res->addr1, val);
@@ -1289,6 +1339,10 @@ static void IRAM_ATTR store32(CPUI386 *cpu, OptAddr *res, u32 val)
 		return;
 	}
 	if (unlikely(res->addr1 >= cpu->phys_mem_size)) {
+		if (unlikely(pf_diag.active)) {
+			pf_diag.oob_store_count++;
+			pf_diag.oob_store_last_addr = res->addr1;
+		}
 		return;
 	}
 	if (likely(res->res == ADDR_OK1)) {
@@ -2846,6 +2900,7 @@ static inline void clear_segs(CPUI386 *cpu)
 		cpu->cr3 = lreg32(rm); \
 		tlb_clear(cpu); \
 		SEQ_INVALIDATE(cpu); \
+		if (unlikely(pf_diag.active)) pf_diag.cr3_write_count++; \
 	} else if (reg == 4) { \
 		u32 new_cr4 = lreg32(rm) & CR4_PSE; \
 		if ((new_cr4 ^ cpu->cr4) & CR4_PSE) { \
@@ -4432,7 +4487,8 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 #define XADDw(...) XADD_helper(16, __VA_ARGS__)
 #define XADDd(...) XADD_helper(32, __VA_ARGS__)
 
-#define INVLPG(addr) do { tlb_clear(cpu); SEQ_INVALIDATE(cpu); } while(0);
+#define INVLPG(addr) do { tlb_clear(cpu); SEQ_INVALIDATE(cpu); \
+	if (unlikely(pf_diag.active)) pf_diag.invlpg_count++; } while(0);
 
 #define BSWAPw(a, la, sa) THROW0(EX_UD);
 
@@ -5928,26 +5984,29 @@ static int __call_isr_check_cs(CPUI386 *cpu, int sel, int ext, int *csdpl)
 }
 
 /* Exception ring buffer — file-scope for post-mortem dump from cpui386_step */
-static struct { uint8_t no; uint8_t mode; uint16_t cs; uint32_t ip; uint32_t err; uint32_t cr2; } exc_ring[256];
+#define EXC_RING_SIZE 1024
+#define EXC_RING_MASK (EXC_RING_SIZE - 1)
+static struct { uint8_t no; uint8_t mode; uint16_t cs; uint32_t ip; uint32_t err; uint32_t cr2; } exc_ring[EXC_RING_SIZE];
 static int exc_ring_pos = 0;
 /* Delayed ring buffer dump: set to wall-clock time when a trigger fires;
  * cpui386_step checks and dumps 2 seconds later to capture post-trigger events. */
 static uint32_t exc_ring_delayed_dump_time = 0;
-static int exc_ring_frozen = 0;  /* freeze recording after trigger fires */
+static int exc_ring_trigger_pos = -1;  /* position where trigger fired (for marking in dump) */
 
 static void dump_exc_ring(const char *label) {
-	int n = exc_ring_pos > 256 ? 256 : exc_ring_pos;
+	int n = exc_ring_pos > EXC_RING_SIZE ? EXC_RING_SIZE : exc_ring_pos;
 	int start = exc_ring_pos - n;
-	dolog("=== %s: Last %d exceptions ===\n", label, n);
+	dolog("=== %s: Last %d exceptions (trigger@%d) ===\n", label, n, exc_ring_trigger_pos);
 	for (int i = start; i < exc_ring_pos; i++) {
-		int j = i & 255;
+		int j = i & EXC_RING_MASK;
+		const char *marker = (i == exc_ring_trigger_pos) ? ">>>" : "   ";
 		if (exc_ring[j].no == 14)
-			dolog("  %c exc %2d @ %04x:%08x err=%x CR2=%08x\n",
-				exc_ring[j].mode, exc_ring[j].no,
+			dolog("%s%c exc %2d @ %04x:%08x err=%x CR2=%08x\n",
+				marker, exc_ring[j].mode, exc_ring[j].no,
 				exc_ring[j].cs, exc_ring[j].ip, exc_ring[j].err, exc_ring[j].cr2);
 		else
-			dolog("  %c exc %2d @ %04x:%08x err=%x\n",
-				exc_ring[j].mode, exc_ring[j].no,
+			dolog("%s%c exc %2d @ %04x:%08x err=%x\n",
+				marker, exc_ring[j].mode, exc_ring[j].no,
 				exc_ring[j].cs, exc_ring[j].ip, exc_ring[j].err);
 	}
 }
@@ -5955,19 +6014,20 @@ static void dump_exc_ring(const char *label) {
 static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 {
 	/* Exception ring buffer — lightweight recording for post-mortem analysis.
-	 * NO serial output here — just struct writes. Dump triggered later. */
+	 * NO serial output here — just struct writes. Dump triggered later.
+	 * Ring buffer NEVER freezes — keeps recording through handler execution. */
 	{
 		static int diag_generation = -1;
 		if (diag_generation != cpu->diag_gen) {
 			diag_generation = cpu->diag_gen;
 			exc_ring_pos = 0;
 			exc_ring_delayed_dump_time = 0;
-			exc_ring_frozen = 0;
+			exc_ring_trigger_pos = -1;
+			pf_diag.active = false;
 		}
-		/* Record exception in ring buffer (only faults/traps, not software INTs).
-		 * Stop recording once trigger fires to preserve crash context. */
-		if (!exc_ring_frozen && (ext || no < 32)) {
-			int idx = exc_ring_pos & 255;
+		/* Record ALL exceptions in ring buffer (faults/traps and external IRQs). */
+		if (ext || no < 32) {
+			int idx = exc_ring_pos & EXC_RING_MASK;
 			exc_ring[idx].no = no;
 			exc_ring[idx].mode = (cpu->flags & VM) ? 'V' : ((cpu->cr0 & 1) ? 'P' : 'R');
 			exc_ring[idx].cs = cpu->seg[SEG_CS].sel;
@@ -5976,45 +6036,59 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 			exc_ring[idx].cr2 = (no == 14) ? cpu->cr2 : 0;
 			exc_ring_pos++;
 		}
-		/* Track repeated BFF-range page faults (same page faulting twice = handler failed).
-		 * This detects demand-paging failures where the PF handler can't resolve the fault. */
-		if (no == 14 && !exc_ring_frozen) {
-			uword fault_page = cpu->cr2 >> 12;
-			static uword last_bff_fault_page = 0;
-			static int bff_repeat_count = 0;
-			static bool bff_repeat_dumped = false;
-			static int bff_diag_gen = -1;
-			if (bff_diag_gen != cpu->diag_gen) {
-				bff_diag_gen = cpu->diag_gen;
-				last_bff_fault_page = 0;
-				bff_repeat_count = 0;
-				bff_repeat_dumped = false;
+
+		/* Track nested exceptions while PF handler is active */
+		if (unlikely(pf_diag.active) && (ext || no < 32)) {
+			pf_diag.nested_exc_count++;
+			if (no == 14) {
+				pf_diag.nested_pf_count++;
+				pf_diag.nested_pf_last_cr2 = cpu->cr2;
 			}
-			if (fault_page >= 0xBFF00 && fault_page < 0xC0000) {
-				if (fault_page == last_bff_fault_page) {
-					bff_repeat_count++;
-					if (bff_repeat_count == 1 && !bff_repeat_dumped) {
-						bff_repeat_dumped = true;
-						dolog("=== BFF REPEAT FAULT ===\n");
-						dolog("  page=%05x (LA=%08x) faulted %d times\n",
-							fault_page, cpu->cr2, bff_repeat_count + 1);
-						dolog("  CS:EIP=%04x:%08x err=%x CPL=%d\n",
-							cpu->seg[SEG_CS].sel, cpu->ip, pusherr ? cpu->excerr : 0, cpu->cpl);
-						/* Walk the PTE to see if it's still not-present */
-						dump_pf_walk(cpu, cpu->cr2, "BFF REPEAT");
+		}
+
+		/* PTE watchpoint: set up on BFF-range #PF with not-present PTE.
+		 * Silently arms the watchpoint — output only on failure. */
+		if (no == 14 && cpu->cr2 >= 0xBFF00000 && cpu->cr2 < 0xC0000000 && !pf_diag.active) {
+			uword a20 = cpu->a20_mask;
+			uword cr3_base = (cpu->cr3 & ~0xfff) & a20;
+			uword pdi = (cpu->cr2 >> 22) & 0x3ff;
+			uword pti = (cpu->cr2 >> 12) & 0x3ff;
+			uword pde_addr = cr3_base + pdi * 4;
+			if ((uint64_t)pde_addr + 4 <= (uint64_t)cpu->phys_mem_size) {
+				uword pde = pload32(cpu, pde_addr);
+				if (pde & 1) {
+					uword pt_base = (pde & ~0xfff) & a20;
+					uword pte_addr = pt_base + pti * 4;
+					if ((uint64_t)pte_addr + 4 <= (uint64_t)cpu->phys_mem_size) {
+						uword pte = pload32(cpu, pte_addr);
+						if (!(pte & 1) && pte != 0) {
+							/* Arm watchpoint — demand-load or swapped PTE */
+							pf_diag.active = true;
+							pf_diag.watch_phys = pte_addr;
+							pf_diag.initial_pte = pte;
+							pf_diag.cr2 = cpu->cr2;
+							pf_diag.write_count = 0;
+							pf_diag.nested_exc_count = 0;
+							pf_diag.nested_pf_count = 0;
+							pf_diag.nested_pf_last_cr2 = 0;
+							pf_diag.cr3_write_count = 0;
+							pf_diag.invlpg_count = 0;
+							pf_diag.oob_store_count = 0;
+							pf_diag.oob_store_last_addr = 0;
+							pf_diag.last_write_val = 0;
+							pf_diag.last_write_eip = 0;
+							pf_diag.last_write_cs = 0;
+						}
 					}
-				} else {
-					last_bff_fault_page = fault_page;
-					bff_repeat_count = 0;
 				}
 			}
 		}
 
 		/* Trigger delayed dump on CS=0137 #PF (Win95 flat user-mode LDT selector).
-		 * Freeze ring buffer immediately to preserve crash context. */
+		 * Mark trigger position but keep recording. */
 		if (no == 14 && cpu->seg[SEG_CS].sel == 0x0137) {
 			exc_ring_delayed_dump_time = get_uticks();
-			exc_ring_frozen = 1;
+			exc_ring_trigger_pos = exc_ring_pos - 1; /* mark the entry we just wrote */
 		}
 	}
 
@@ -6546,6 +6620,38 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 	}
 	if (isiret)
 		cpu->cc.mask = 0;
+
+	/* PF handler completion check: when IRET returns to ring 3 (or V86),
+	 * verify whether the watched PTE was resolved. Only produces output on FAILURE. */
+	if (unlikely(pf_diag.active) && isiret && cpu->cpl > 0) {
+		uword final_pte = 0;
+		if ((uint64_t)pf_diag.watch_phys + 4 <= (uint64_t)cpu->phys_mem_size)
+			final_pte = pload32(cpu, pf_diag.watch_phys);
+		bool resolved = (final_pte & 1) != 0; /* P bit set = resolved */
+		if (!resolved) {
+			/* FAILURE: PTE not resolved after handler ran */
+			dolog("=== PF_DIAG: HANDLER FAILED ===\n");
+			dolog("  CR2=%08x PTE@phys=%08x\n", pf_diag.cr2, pf_diag.watch_phys);
+			dolog("  PTE before=%08x after=%08x (P=%d)\n",
+				pf_diag.initial_pte, final_pte, !!(final_pte & 1));
+			dolog("  writes_to_PTE=%d nested_exc=%d nested_PF=%d\n",
+				pf_diag.write_count, pf_diag.nested_exc_count, pf_diag.nested_pf_count);
+			if (pf_diag.write_count > 0)
+				dolog("  last_write: val=%08x at %04x:%08x\n",
+					pf_diag.last_write_val, pf_diag.last_write_cs, pf_diag.last_write_eip);
+			if (pf_diag.nested_pf_count > 0)
+				dolog("  last_nested_PF CR2=%08x\n", pf_diag.nested_pf_last_cr2);
+			dolog("  CR3_writes=%d INVLPG=%d OOB_stores=%d\n",
+				pf_diag.cr3_write_count, pf_diag.invlpg_count, pf_diag.oob_store_count);
+			if (pf_diag.oob_store_count > 0)
+				dolog("  last_OOB_store addr=%08x (phys_mem_size=%08lx)\n",
+					pf_diag.oob_store_last_addr, (unsigned long)cpu->phys_mem_size);
+			dolog("  IRET to %04x:%08x CPL=%d\n",
+				cpu->seg[SEG_CS].sel, cpu->next_ip, cpu->cpl);
+		}
+		pf_diag.active = false;
+	}
+
 	return true;
 }
 
@@ -6605,7 +6711,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 	if (exc_ring_delayed_dump_time != 0 &&
 	    (get_uticks() - exc_ring_delayed_dump_time) > 2000000) {
 		exc_ring_delayed_dump_time = 0;
-		exc_ring_frozen = 0;  /* allow re-triggering */
+		exc_ring_trigger_pos = -1;  /* allow re-triggering */
 		refresh_flags(cpu);
 		dolog("=== Ring buffer dump (2s after last LDT #PF) ===\n");
 		dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x CPL=%d %s\n",
