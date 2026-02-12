@@ -570,6 +570,7 @@ void pc_step(PC *pc)
 	uint32_t t1 = 0, t2 = 0;
 	bool collecting = globals.stats_collecting;
 	if (collecting) t1 = get_uticks();  /* After peripherals */
+	cpui386_set_diag(pc->cpu, globals.cpu_debug_enabled);
 	cpui386_step(pc->cpu, batch_size);
 	if (collecting) t2 = get_uticks();  /* After CPU */
 

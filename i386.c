@@ -404,6 +404,11 @@ static struct {
 	uword oob_store_last_addr;  /* last out-of-bounds store address */
 } pf_diag = {0};
 
+/* Runtime diagnostic toggle — controlled via OSD "CPU Debug" setting.
+ * When false, all diagnostic dolog output is suppressed. */
+static bool cpu_diag_enabled = false;
+#define diaglog(...) do { if (cpu_diag_enabled) dolog(__VA_ARGS__); } while(0)
+
 /* lazy flags */
 enum {
 	CC_ADC, CC_ADD,	CC_SBB, CC_SUB,
@@ -800,19 +805,19 @@ static void dump_pf_walk(CPUI386 *cpu, uword laddr, const char *tag)
 	uword pti = (laddr >> 12) & 0x3ff;
 	uword pde_addr = cr3_base + pdi * 4;
 
-	dolog("=== %s: PF walk LA=%08x CR2=%08x CR3=%08x CR4=%08x ===\n",
+	diaglog("=== %s: PF walk LA=%08x CR2=%08x CR3=%08x CR4=%08x ===\n",
 		tag, laddr, cpu->cr2, cpu->cr3, cpu->cr4);
-	dolog("  CR3.base=%08x A20=%08x PDI=%03x PTI=%03x\n",
+	diaglog("  CR3.base=%08x A20=%08x PDI=%03x PTI=%03x\n",
 		cr3_base, a20, pdi, pti);
 
 	if ((uint64_t)pde_addr + 4 > (uint64_t)cpu->phys_mem_size) {
-		dolog("  PDE addr OOB: %08x (phys_mem_size=%u)\n",
+		diaglog("  PDE addr OOB: %08x (phys_mem_size=%u)\n",
 			pde_addr, cpu->phys_mem_size);
 		return;
 	}
 
 	uword pde = pload32(cpu, pde_addr);
-	dolog("  PDE[%03x] @ %08x = %08x P=%d RW=%d US=%d A=%d D=%d PS=%d\n",
+	diaglog("  PDE[%03x] @ %08x = %08x P=%d RW=%d US=%d A=%d D=%d PS=%d\n",
 		pdi, pde_addr, pde,
 		!!(pde & 1), !!(pde & 2), !!(pde & 4),
 		!!(pde & (1 << 5)), !!(pde & (1 << 6)), !!(pde & (1 << 7)));
@@ -822,21 +827,21 @@ static void dump_pf_walk(CPUI386 *cpu, uword laddr, const char *tag)
 
 	if ((cpu->cr4 & CR4_PSE) && (pde & (1 << 7))) {
 		uword phys = (pde & 0xffc00000) | (laddr & 0x003fffff);
-		dolog("  4MB map: phys=%08x (from PDE)\n", phys & a20);
+		diaglog("  4MB map: phys=%08x (from PDE)\n", phys & a20);
 		return;
 	}
 
 	uword pt_base = (pde & ~0xfff) & a20;
 	uword pte_addr = pt_base + pti * 4;
 	if ((uint64_t)pte_addr + 4 > (uint64_t)cpu->phys_mem_size) {
-		dolog("  PTE addr OOB: %08x (pt_base=%08x phys_mem_size=%u)\n",
+		diaglog("  PTE addr OOB: %08x (pt_base=%08x phys_mem_size=%u)\n",
 			pte_addr, pt_base, cpu->phys_mem_size);
 		return;
 	}
 
 	uword pte = pload32(cpu, pte_addr);
 	uword phys = ((pte & ~0xfff) & a20) | (laddr & 0xfff);
-	dolog("  PTE[%03x] @ %08x = %08x P=%d RW=%d US=%d A=%d D=%d -> phys=%08x\n",
+	diaglog("  PTE[%03x] @ %08x = %08x P=%d RW=%d US=%d A=%d D=%d -> phys=%08x\n",
 		pti, pte_addr, pte,
 		!!(pte & 1), !!(pte & 2), !!(pte & 4),
 		!!(pte & (1 << 5)), !!(pte & (1 << 6)), phys);
@@ -1167,7 +1172,7 @@ static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 {
 	uword addr = res->addr1;
 	/* PTE watchpoint: detect byte writes overlapping watched PTE */
-	if (unlikely(pf_diag.active && addr >= pf_diag.watch_phys && addr < pf_diag.watch_phys + 4)) {
+	if (unlikely(cpu_diag_enabled && pf_diag.active && addr >= pf_diag.watch_phys && addr < pf_diag.watch_phys + 4)) {
 		pf_diag.write_count++;
 		pf_diag.last_write_val = val;
 		pf_diag.last_write_cs = cpu->seg[SEG_CS].sel;
@@ -1242,7 +1247,7 @@ static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 		return;
 	}
 	if (unlikely(addr >= cpu->phys_mem_size)) {
-		if (unlikely(pf_diag.active)) {
+		if (unlikely(cpu_diag_enabled && pf_diag.active)) {
 			pf_diag.oob_store_count++;
 			pf_diag.oob_store_last_addr = addr;
 		}
@@ -1254,7 +1259,7 @@ static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 {
 	/* PTE watchpoint: detect word writes overlapping watched PTE */
-	if (unlikely(pf_diag.active && res->addr1 < pf_diag.watch_phys + 4 && res->addr1 + 2 > pf_diag.watch_phys)) {
+	if (unlikely(cpu_diag_enabled && pf_diag.active && res->addr1 < pf_diag.watch_phys + 4 && res->addr1 + 2 > pf_diag.watch_phys)) {
 		pf_diag.write_count++;
 		pf_diag.last_write_val = val;
 		pf_diag.last_write_cs = cpu->seg[SEG_CS].sel;
@@ -1281,7 +1286,7 @@ static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 		return;
 	}
 	if (unlikely(res->addr1 >= cpu->phys_mem_size)) {
-		if (unlikely(pf_diag.active)) {
+		if (unlikely(cpu_diag_enabled && pf_diag.active)) {
 			pf_diag.oob_store_count++;
 			pf_diag.oob_store_last_addr = res->addr1;
 		}
@@ -1298,7 +1303,7 @@ static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 static void IRAM_ATTR store32(CPUI386 *cpu, OptAddr *res, u32 val)
 {
 	/* PTE watchpoint: detect dword writes overlapping watched PTE */
-	if (unlikely(pf_diag.active && res->addr1 < pf_diag.watch_phys + 4 && res->addr1 + 4 > pf_diag.watch_phys)) {
+	if (unlikely(cpu_diag_enabled && pf_diag.active && res->addr1 < pf_diag.watch_phys + 4 && res->addr1 + 4 > pf_diag.watch_phys)) {
 		pf_diag.write_count++;
 		pf_diag.last_write_val = val;
 		pf_diag.last_write_cs = cpu->seg[SEG_CS].sel;
@@ -1339,7 +1344,7 @@ static void IRAM_ATTR store32(CPUI386 *cpu, OptAddr *res, u32 val)
 		return;
 	}
 	if (unlikely(res->addr1 >= cpu->phys_mem_size)) {
-		if (unlikely(pf_diag.active)) {
+		if (unlikely(cpu_diag_enabled && pf_diag.active)) {
 			pf_diag.oob_store_count++;
 			pf_diag.oob_store_last_addr = res->addr1;
 		}
@@ -2900,7 +2905,7 @@ static inline void clear_segs(CPUI386 *cpu)
 		cpu->cr3 = lreg32(rm); \
 		tlb_clear(cpu); \
 		SEQ_INVALIDATE(cpu); \
-		if (unlikely(pf_diag.active)) pf_diag.cr3_write_count++; \
+		if (unlikely(cpu_diag_enabled && pf_diag.active)) pf_diag.cr3_write_count++; \
 	} else if (reg == 4) { \
 		u32 new_cr4 = lreg32(rm) & CR4_PSE; \
 		if ((new_cr4 ^ cpu->cr4) & CR4_PSE) { \
@@ -4488,7 +4493,7 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 #define XADDd(...) XADD_helper(32, __VA_ARGS__)
 
 #define INVLPG(addr) do { tlb_clear(cpu); SEQ_INVALIDATE(cpu); \
-	if (unlikely(pf_diag.active)) pf_diag.invlpg_count++; } while(0);
+	if (unlikely(cpu_diag_enabled && pf_diag.active)) pf_diag.invlpg_count++; } while(0);
 
 #define BSWAPw(a, la, sa) THROW0(EX_UD);
 
@@ -6013,10 +6018,9 @@ static void dump_exc_ring(const char *label) {
 
 static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 {
-	/* Exception ring buffer — lightweight recording for post-mortem analysis.
-	 * NO serial output here — just struct writes. Dump triggered later.
-	 * Ring buffer NEVER freezes — keeps recording through handler execution. */
-	{
+	/* Exception ring buffer & PTE watchpoint — only active when diagnostics enabled.
+	 * Zero overhead when cpu_diag_enabled is false. */
+	if (unlikely(cpu_diag_enabled)) {
 		static int diag_generation = -1;
 		if (diag_generation != cpu->diag_gen) {
 			diag_generation = cpu->diag_gen;
@@ -6623,7 +6627,7 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 
 	/* PF handler completion check: when IRET returns to ring 3 (or V86),
 	 * verify whether the watched PTE was resolved. Only produces output on FAILURE. */
-	if (unlikely(pf_diag.active) && isiret && cpu->cpl > 0) {
+	if (unlikely(cpu_diag_enabled && pf_diag.active) && isiret && cpu->cpl > 0) {
 		uword final_pte = 0;
 		if ((uint64_t)pf_diag.watch_phys + 4 <= (uint64_t)cpu->phys_mem_size)
 			final_pte = pload32(cpu, pf_diag.watch_phys);
@@ -6689,7 +6693,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		if (halt_start_time == 0) halt_start_time = now;
 		halt_total_us += (now - halt_start_time);
 		halt_start_time = now;
-		if (!halt_dumped && halt_total_us > 5000000) { /* 5 seconds */
+		if (cpu_diag_enabled && !halt_dumped && halt_total_us > 5000000) { /* 5 seconds */
 			halt_dumped = true;
 			dolog("=== System halted %.1fs (IF=%d) — post-mortem ===\n",
 				halt_total_us / 1000000.0f, !!(cpu->flags & IF));
@@ -6708,7 +6712,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 
 	/* Delayed ring buffer dump: fires 2s after last non-009f LDT #PF.
 	 * This captures the crash aftermath without affecting timing. */
-	if (exc_ring_delayed_dump_time != 0 &&
+	if (cpu_diag_enabled && exc_ring_delayed_dump_time != 0 &&
 	    (get_uticks() - exc_ring_delayed_dump_time) > 2000000) {
 		exc_ring_delayed_dump_time = 0;
 		exc_ring_trigger_pos = -1;  /* allow re-triggering */
@@ -6848,7 +6852,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 	}
 
 	/* Track live changes to IDT[0x41] (VxD call path) to catch descriptor clobbering. */
-	if (cpu->cr0 & 1) {
+	if (cpu_diag_enabled && (cpu->cr0 & 1)) {
 		static bool idt41_have_last = false;
 		static uword idt41_last_w1 = 0, idt41_last_w2 = 0;
 		static int idt41_diag_gen = -1;
@@ -6882,7 +6886,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		cpu->next_ip = cpu->ip;
 
 		/* One-shot deep PF diagnostics for Win95 shared-user range faults. */
-		if (orig_exc == EX_PF) {
+		if (cpu_diag_enabled && orig_exc == EX_PF) {
 			static bool pf_bff_dumped = false;
 			static bool pf_target_dumped = false;
 			static int pf_diag_gen = -1;
@@ -6910,7 +6914,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		}
 
 		/* One-shot: diagnose IDT-referenced #GP (e.g., err=20a -> vector 0x41). */
-		if (orig_exc == EX_GP && (cpu->excerr & 0x2)) {
+		if (cpu_diag_enabled && orig_exc == EX_GP && (cpu->excerr & 0x2)) {
 			static bool gp_idt_dumped = false;
 			static int gp_diag_gen = -1;
 			if (gp_diag_gen != cpu->diag_gen) {
@@ -6930,7 +6934,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		}
 
 		/* One-shot: diagnose alignment-check exception context. */
-		if (orig_exc == 17) {
+		if (cpu_diag_enabled && orig_exc == 17) {
 			static bool ac_dumped = false;
 			static int ac_diag_gen = -1;
 			if (ac_diag_gen != cpu->diag_gen) {
@@ -6956,7 +6960,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 			refresh_flags(cpu);
 
 			/* One-shot full dump on first delivery failure */
-			{
+			if (cpu_diag_enabled) {
 				static bool isr_fail_dumped = false;
 				static int isrf_diag_gen = -1;
 				if (isrf_diag_gen != cpu->diag_gen) { isrf_diag_gen = cpu->diag_gen; isr_fail_dumped = false; }
@@ -7184,6 +7188,12 @@ void cpui386_set_a20(CPUI386 *cpu, int enabled)
 int cpui386_get_a20(CPUI386 *cpu)
 {
 	return (cpu->a20_mask >> 20) & 1;
+}
+
+void cpui386_set_diag(CPUI386 *cpu, bool enabled)
+{
+	(void)cpu;
+	cpu_diag_enabled = enabled;
 }
 
 long IRAM_ATTR cpui386_get_cycle(CPUI386 *cpu)

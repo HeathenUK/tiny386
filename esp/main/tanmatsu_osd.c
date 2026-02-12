@@ -107,6 +107,7 @@ typedef enum {
 	SYS_BATCH,
 	SYS_MOUSE_SPEED,
 	SYS_STATS_BAR,
+	SYS_CPU_DEBUG,
 	SYS_SEP1,
 	SYS_BACK,
 	SYS_COUNT
@@ -675,7 +676,7 @@ static const char *cpu_gen_names[] = { "i386", "i486", "i586" };
 // Render system settings submenu
 static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], mouse_val[16], statsbar_val[16];
+	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], mouse_val[16], statsbar_val[16], cpudbg_val[16];
 
 	// CPU generation (3=386, 4=486, 5=586)
 	int gen_idx = osd->cpu_gen - 3;
@@ -702,6 +703,9 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	// Stats bar
 	snprintf(statsbar_val, sizeof(statsbar_val), "%s", globals.stats_bar_visible ? "On" : "Off");
 
+	// CPU debug
+	snprintf(cpudbg_val, sizeof(cpudbg_val), "%s", globals.cpu_debug_enabled ? "On" : "Off");
+
 	MenuEntry entries[SYS_COUNT] = {
 		{ "CPU:", 0, 0, cpu_val },
 		{ "FPU:", 0, 0, fpu_val },
@@ -709,6 +713,7 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ "Batch:", 0, 0, batch_val },
 		{ "Mouse Speed:", 0, 0, mouse_val },
 		{ "Stats Bar:", 0, 0, statsbar_val },
+		{ "CPU Debug:", 0, 0, cpudbg_val },
 		{ NULL, 1, 0, NULL },  // SEP1
 		{ "< Back (restart to apply)", 0, 0, NULL },
 	};
@@ -1499,6 +1504,9 @@ static void handle_sys_adjust(OSD *osd, int delta)
 	case SYS_STATS_BAR:
 		globals.stats_bar_visible = !globals.stats_bar_visible;
 		break;
+	case SYS_CPU_DEBUG:
+		globals.cpu_debug_enabled = !globals.cpu_debug_enabled;
+		break;
 	}
 }
 
@@ -1753,6 +1761,8 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 				osd->view = VIEW_MAIN_MENU;
 			} else if (osd->sys_sel == SYS_STATS_BAR) {
 				globals.stats_bar_visible = !globals.stats_bar_visible;
+			} else if (osd->sys_sel == SYS_CPU_DEBUG) {
+				globals.cpu_debug_enabled = !globals.cpu_debug_enabled;
 			}
 			break;
 		case SC_ESC:

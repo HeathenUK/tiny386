@@ -84,5 +84,6 @@ void cpu_setexc(CPUI386 *cpu, int excno, uword excerr);
 void cpu_setflags(CPUI386 *cpu, uword set_mask, uword clear_mask);
 uword cpu_getflags(CPUI386 *cpu);
 void cpu_abort(CPUI386 *cpu, int code);
+void cpui386_set_diag(CPUI386 *cpu, bool enabled);
 
 #endif /* I386_H */
