@@ -261,6 +261,45 @@ static const char *basename_ptr(const char *path)
 	return p ? p + 1 : path;
 }
 
+/* Set browser start dir to the parent directory of the current mounted image.
+ * Falls back to default_path if no image is mounted or directory is unavailable. */
+static void set_browser_start_dir(OSD *osd, int target, const char *default_path)
+{
+	const char *mounted_path = NULL;
+	char candidate[MAX_PATH_LEN];
+	struct stat st;
+
+	if (target >= 0 && target < 6) {
+		if (osd->drive_paths[target][0] != '\0')
+			mounted_path = osd->drive_paths[target];
+	} else if (target == BROWSER_TARGET_HDA) {
+		if (osd->hda_path[0] != '\0')
+			mounted_path = osd->hda_path;
+	}
+
+	if (mounted_path && mounted_path[0]) {
+		strncpy(candidate, mounted_path, sizeof(candidate) - 1);
+		candidate[sizeof(candidate) - 1] = '\0';
+
+		char *slash = strrchr(candidate, '/');
+		if (slash) {
+			if (slash == candidate) {
+				candidate[1] = '\0';
+			} else {
+				*slash = '\0';
+			}
+			if (stat(candidate, &st) == 0 && S_ISDIR(st.st_mode)) {
+				strncpy(osd->browser_path, candidate, MAX_PATH_LEN - 1);
+				osd->browser_path[MAX_PATH_LEN - 1] = '\0';
+				return;
+			}
+		}
+	}
+
+	strncpy(osd->browser_path, default_path, MAX_PATH_LEN - 1);
+	osd->browser_path[MAX_PATH_LEN - 1] = '\0';
+}
+
 // Populate drive paths from current state
 static void populate_drive_paths(OSD *osd)
 {
@@ -1339,25 +1378,27 @@ static int handle_file_select(OSD *osd)
 // Handle mounting menu selection
 static int handle_mount_select(OSD *osd)
 {
+	populate_drive_paths(osd);
+
 	switch (osd->mount_sel) {
 	case MOUNT_FDA:
 	case MOUNT_FDB:
 		osd->browser_target = osd->mount_sel;  // 0 or 1
-		strcpy(osd->browser_path, "/sdcard");
+		set_browser_start_dir(osd, osd->browser_target, "/sdcard");
 		scan_directory(osd);
 		osd->view = VIEW_FILEBROWSER;
 		break;
 	case MOUNT_HDA:
 		// Hard drive - browse for .img files (requires restart)
 		osd->browser_target = BROWSER_TARGET_HDA;
-		strcpy(osd->browser_path, "/sdcard");
+		set_browser_start_dir(osd, osd->browser_target, "/sdcard");
 		scan_directory(osd);
 		osd->view = VIEW_FILEBROWSER;
 		break;
 	case MOUNT_CREATE_HDD:
 		// Open file browser to pick save location, then create dialog
 		osd->browser_target = BROWSER_TARGET_CREATE_HDD;
-		strcpy(osd->browser_path, "/sdcard");
+		set_browser_start_dir(osd, BROWSER_TARGET_HDA, "/sdcard");
 		scan_directory(osd);
 		osd->view = VIEW_FILEBROWSER;
 		break;
@@ -1365,7 +1406,7 @@ static int handle_mount_select(OSD *osd)
 		// CD-ROM is on slot 1 (primary slave), stored at drive_paths[3]
 		// browser_target 3 maps to: ide primary, drive (3-2)%2 = 1 (slave)
 		osd->browser_target = 3;
-		strcpy(osd->browser_path, "/sdcard");
+		set_browser_start_dir(osd, osd->browser_target, "/sdcard");
 		scan_directory(osd);
 		osd->view = VIEW_FILEBROWSER;
 		break;

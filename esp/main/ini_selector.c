@@ -16,12 +16,15 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <utime.h>
+#include <unistd.h>
+#include <errno.h>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "ini_sel";
+static const char *INI_DIR = "/sdcard/tiny386";
 
 /* ── Layout Constants (logical 800×480, rotated to 480×800 physical) ── */
 #define FONT_W 8
@@ -83,9 +86,320 @@ static int  s_scroll;
 static bool s_auto_boot;
 static int  s_countdown;            /* seconds remaining (5→0, -1 = cancelled) */
 static uint32_t s_countdown_tick;   /* timestamp of last countdown update */
+static char s_status[96];
+static uint32_t s_status_until;
+
+typedef enum {
+	EDIT_NONE = 0,
+	EDIT_RENAME,
+	EDIT_CLONE,
+} EditMode;
+
+#define MAX_EDIT_BASE (MAX_INI_NAME - 5)  /* room for ".ini" + NUL */
+static EditMode s_edit_mode;
+static char s_edit_name[MAX_EDIT_BASE + 1];
+static int  s_edit_len;
+static char s_edit_source_name[MAX_INI_NAME];
+
+static void scan_ini_files(void);
+static void parse_preview(IniFileEntry *e);
 
 /* How many list entries fit on screen */
 #define VISIBLE_LINES ((PANEL_BOT - LIST_Y) / (FONT_H + 2))
+
+static bool status_visible(void)
+{
+	if (s_status_until == 0)
+		return false;
+	uint32_t now = esp_log_timestamp();
+	return (int32_t)(s_status_until - now) > 0;
+}
+
+static void set_status(const char *msg)
+{
+	snprintf(s_status, sizeof(s_status), "%s", msg ? msg : "");
+	s_status_until = esp_log_timestamp() + 2500;
+}
+
+static int find_file_by_name(const char *name)
+{
+	if (!name || !name[0])
+		return -1;
+	for (int i = 0; i < s_count; i++) {
+		if (strcasecmp(s_files[i].name, name) == 0)
+			return i;
+	}
+	return -1;
+}
+
+static void filename_to_base(const char *filename, char *out, size_t out_sz)
+{
+	if (!out || out_sz == 0)
+		return;
+	out[0] = '\0';
+	if (!filename || !filename[0])
+		return;
+
+	strncpy(out, filename, out_sz - 1);
+	out[out_sz - 1] = '\0';
+	size_t len = strlen(out);
+	if (len > 4 && strcasecmp(out + len - 4, ".ini") == 0)
+		out[len - 4] = '\0';
+}
+
+static void trim_spaces(char *s)
+{
+	if (!s || !s[0])
+		return;
+	size_t len = strlen(s);
+	while (len > 0 && s[len - 1] == ' ') {
+		s[len - 1] = '\0';
+		len--;
+	}
+	size_t lead = 0;
+	while (s[lead] == ' ')
+		lead++;
+	if (lead > 0)
+		memmove(s, s + lead, strlen(s + lead) + 1);
+}
+
+static bool valid_base_name(const char *base)
+{
+	if (!base || !base[0])
+		return false;
+	if (strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
+		return false;
+	for (const char *p = base; *p; p++) {
+		if (*p == '/' || *p == '\\' || *p == ':' || *p == '*'
+		    || *p == '?' || *p == '"' || *p == '<' || *p == '>'
+		    || *p == '|')
+			return false;
+	}
+	return true;
+}
+
+static bool build_ini_path_from_name(const char *name, char *out, size_t out_sz)
+{
+	if (!name || !name[0] || !out || out_sz == 0)
+		return false;
+	int n = snprintf(out, out_sz, "%s/%s", INI_DIR, name);
+	return n > 0 && n < (int)out_sz;
+}
+
+static bool build_ini_path_from_base(const char *base, char *out, size_t out_sz)
+{
+	if (!base || !base[0] || !out || out_sz == 0)
+		return false;
+	int n = snprintf(out, out_sz, "%s/%s.ini", INI_DIR, base);
+	return n > 0 && n < (int)out_sz;
+}
+
+static char scancode_to_edit_char(int sc)
+{
+	if (sc >= 0x02 && sc <= 0x0b) return '0' + (sc == 0x0b ? 0 : sc - 1);
+	if (sc == 0x0c) return '-';
+	if (sc >= 0x10 && sc <= 0x19) return "QWERTYUIOP"[sc - 0x10];
+	if (sc >= 0x1e && sc <= 0x26) return "ASDFGHJKL"[sc - 0x1e];
+	if (sc >= 0x2c && sc <= 0x32) return "ZXCVBNM"[sc - 0x2c];
+	if (sc == 0x39) return ' ';
+	return 0;
+}
+
+static bool copy_file(const char *src, const char *dst)
+{
+	FILE *fin = fopen(src, "rb");
+	if (!fin) {
+		ESP_LOGE(TAG, "copy open src failed: %s (%d)", src, errno);
+		return false;
+	}
+	FILE *fout = fopen(dst, "wb");
+	if (!fout) {
+		ESP_LOGE(TAG, "copy open dst failed: %s (%d)", dst, errno);
+		fclose(fin);
+		return false;
+	}
+
+	uint8_t *buf = malloc(4096);
+	if (!buf) {
+		fclose(fin);
+		fclose(fout);
+		unlink(dst);
+		return false;
+	}
+
+	bool ok = true;
+	while (1) {
+		size_t nr = fread(buf, 1, 4096, fin);
+		if (nr > 0) {
+			if (fwrite(buf, 1, nr, fout) != nr) {
+				ok = false;
+				break;
+			}
+		}
+		if (nr < 4096) {
+			if (ferror(fin))
+				ok = false;
+			break;
+		}
+	}
+
+	free(buf);
+	if (fclose(fin) != 0)
+		ok = false;
+	if (fclose(fout) != 0)
+		ok = false;
+	if (!ok)
+		unlink(dst);
+	return ok;
+}
+
+static void suggest_clone_base(const char *src_name, char *out, size_t out_sz)
+{
+	char src_base[MAX_EDIT_BASE + 1];
+	filename_to_base(src_name, src_base, sizeof(src_base));
+	if (!src_base[0])
+		snprintf(src_base, sizeof(src_base), "CONFIG");
+
+	for (int n = 1; n < 1000; n++) {
+		char suffix[16];
+		if (n == 1)
+			snprintf(suffix, sizeof(suffix), "_COPY");
+		else
+			snprintf(suffix, sizeof(suffix), "_COPY%d", n);
+
+		int max_prefix = (int)out_sz - 1 - (int)strlen(suffix);
+		if (max_prefix < 1)
+			max_prefix = 1;
+		snprintf(out, out_sz, "%.*s%s", max_prefix, src_base, suffix);
+
+		char path[256];
+		if (!build_ini_path_from_base(out, path, sizeof(path)))
+			break;
+		struct stat st;
+		if (stat(path, &st) != 0)
+			return;
+	}
+	snprintf(out, out_sz, "CONFIG_COPY");
+}
+
+static void begin_edit(EditMode mode)
+{
+	if (s_count <= 0 || s_sel < 0 || s_sel >= s_count)
+		return;
+	s_edit_mode = mode;
+	snprintf(s_edit_source_name, sizeof(s_edit_source_name), "%s", s_files[s_sel].name);
+
+	if (mode == EDIT_CLONE)
+		suggest_clone_base(s_files[s_sel].name, s_edit_name, sizeof(s_edit_name));
+	else
+		filename_to_base(s_files[s_sel].name, s_edit_name, sizeof(s_edit_name));
+
+	trim_spaces(s_edit_name);
+	s_edit_len = strlen(s_edit_name);
+}
+
+static void cancel_edit(void)
+{
+	s_edit_mode = EDIT_NONE;
+	s_edit_name[0] = '\0';
+	s_edit_source_name[0] = '\0';
+	s_edit_len = 0;
+}
+
+static void finish_edit(void)
+{
+	EditMode mode = s_edit_mode;
+	char base[MAX_EDIT_BASE + 1];
+	char src_path[256];
+	char dst_path[256];
+	char dst_name[MAX_INI_NAME];
+	struct stat st;
+
+	snprintf(base, sizeof(base), "%s", s_edit_name);
+	trim_spaces(base);
+	if (!valid_base_name(base)) {
+		set_status("Invalid name");
+		return;
+	}
+
+	if (!build_ini_path_from_name(s_edit_source_name, src_path, sizeof(src_path))) {
+		set_status("Source path error");
+		cancel_edit();
+		return;
+	}
+	if (!build_ini_path_from_base(base, dst_path, sizeof(dst_path))) {
+		set_status("Name too long");
+		return;
+	}
+	snprintf(dst_name, sizeof(dst_name), "%s.ini", base);
+
+	if (s_edit_mode == EDIT_RENAME &&
+	    strcasecmp(dst_name, s_edit_source_name) == 0) {
+		cancel_edit();
+		set_status("Rename unchanged");
+		return;
+	}
+
+	if (stat(dst_path, &st) == 0) {
+		set_status("Target already exists");
+		return;
+	}
+
+	bool ok = false;
+	if (s_edit_mode == EDIT_RENAME) {
+		ok = (rename(src_path, dst_path) == 0);
+		if (!ok)
+			ESP_LOGE(TAG, "rename failed: %s -> %s (%d)", src_path, dst_path, errno);
+	} else {
+		ok = copy_file(src_path, dst_path);
+	}
+
+	if (!ok) {
+		set_status("File operation failed");
+		return;
+	}
+
+	utime(dst_path, NULL);  /* bump mtime so new/renamed file sorts first */
+	scan_ini_files();
+	int idx = find_file_by_name(dst_name);
+	if (idx >= 0) {
+		s_sel = idx;
+		parse_preview(&s_files[s_sel]);
+	}
+	cancel_edit();
+	set_status(mode == EDIT_RENAME ? "Renamed" : "Cloned");
+}
+
+static int handle_edit_key(int scancode)
+{
+	switch (scancode) {
+	case 0x1c: /* Enter */
+		finish_edit();
+		return 0;
+	case 0x01: /* Escape */
+		cancel_edit();
+		set_status("Edit cancelled");
+		return 0;
+	case 0x0e: /* Backspace */
+		if (s_edit_len > 0) {
+			s_edit_len--;
+			s_edit_name[s_edit_len] = '\0';
+		}
+		return 0;
+	default:
+	{
+		char c = scancode_to_edit_char(scancode);
+		if (c && s_edit_len < MAX_EDIT_BASE) {
+			if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			    c == '-' || c == ' ') {
+				s_edit_name[s_edit_len++] = c;
+				s_edit_name[s_edit_len] = '\0';
+			}
+		}
+		return 0;
+	}
+	}
+}
 
 /* ── Portrait coordinate transform (same as toast.c) ────────────── */
 static uint16_t *s_fb;
@@ -282,6 +596,9 @@ void ini_selector_start(bool auto_boot)
 {
 	scan_ini_files();
 	s_auto_boot = auto_boot;
+	s_status[0] = '\0';
+	s_status_until = 0;
+	cancel_edit();
 	if (auto_boot && s_count > 0) {
 		s_countdown = 5;
 		s_countdown_tick = esp_log_timestamp();
@@ -332,6 +649,10 @@ int ini_selector_handle_key(int scancode)
 		s_countdown = -1;
 	}
 
+	if (s_edit_mode != EDIT_NONE) {
+		return handle_edit_key(scancode);
+	}
+
 	if (s_count == 0) {
 		/* No files — Enter or Esc finishes with empty path (will create default) */
 		if (scancode == 0x1c || scancode == 0x01) {
@@ -354,6 +675,12 @@ int ini_selector_handle_key(int scancode)
 	case 0x1c: /* Enter */
 		finish_selection(s_sel);
 		return 1;
+	case 0x13: /* R */
+		begin_edit(EDIT_RENAME);
+		break;
+	case 0x2e: /* C */
+		begin_edit(EDIT_CLONE);
+		break;
 	case 0x01: /* Escape — in auto_boot mode, just cancel countdown.
 	            * In switch mode (no auto_boot), cancel and go back. */
 		if (!s_auto_boot) {
@@ -404,6 +731,9 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 	/* ── Title bar ─────────────────────────────────────────────── */
 	sel_fill_rect(0, 0, LOG_W, 28, C_PANEL);
 	sel_draw_text(LEFT_X, 6, "tiny386 - Select Configuration", C_TITLE, 0);
+	if (status_visible()) {
+		sel_draw_text(RIGHT_X + 8, 6, s_status, C_VALUE, RIGHT_W - 16);
+	}
 
 	/* Divider between title and content */
 	sel_fill_rect(0, 28, LOG_W, 1, C_BORDER);
@@ -522,9 +852,15 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 		snprintf(msg, sizeof(msg), "Auto-boot \"%.40s\" in %d...",
 		         s_files[0].name, s_countdown);
 		sel_draw_text(LEFT_X, FOOTER_Y + 2, msg, C_TITLE, LOG_W - 20);
+	} else if (s_edit_mode != EDIT_NONE) {
+		char msg[120];
+		const char *verb = (s_edit_mode == EDIT_RENAME) ? "Rename to: " : "Clone as: ";
+		snprintf(msg, sizeof(msg), "%s%s_  Enter:Save  Esc:Cancel",
+		         verb, s_edit_name);
+		sel_draw_text(LEFT_X, FOOTER_Y + 2, msg, C_TITLE, LOG_W - 20);
 	} else {
 		sel_draw_text(LEFT_X, FOOTER_Y + 2,
-		              "Up/Down:Navigate  Enter:Select  Esc:Cancel",
+		              "Up/Down:Navigate  Enter:Select  R:Rename  C:Clone  Esc:Cancel",
 		              C_SEP, 0);
 	}
 }
