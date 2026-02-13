@@ -2198,6 +2198,14 @@ extern void *rawsd;
 
 /* ── Write-behind cache + async I/O infrastructure ── */
 #define WCACHE_SLOTS 512  /* 256KB ring buffer */
+#define WCACHE_INDEX_SIZE 4096u
+#define WCACHE_INDEX_MASK (WCACHE_INDEX_SIZE - 1u)
+
+typedef struct {
+    BlockDeviceFile *bf;
+    uint64_t disk_sector;
+    uint32_t seq;   /* enqueue sequence number (maps to ring slot via % WCACHE_SLOTS) */
+} WCacheIndexEntry;
 
 static struct {
     uint8_t *data;                      /* PSRAM buffer: WCACHE_SLOTS * 512 bytes */
@@ -2206,16 +2214,144 @@ static struct {
         uint64_t disk_sector;           /* sector_num in disk image space */
         uint32_t sd_sector;
     } meta[WCACHE_SLOTS];
+    WCacheIndexEntry *index;            /* 2-choice hash: latest write per (bf,sector) */
     uint32_t head;                      /* producer index (atomic access) */
     uint32_t tail;                      /* consumer index (atomic access) */
     SemaphoreHandle_t not_empty;
     SemaphoreHandle_t sd_mutex;         /* protects all sdmmc_read/write calls */
     sdmmc_card_t *card;
     int active;
+
+    /* Lookup telemetry */
+    uint64_t lookup_calls;
+    uint64_t lookup_hits;
+    uint64_t lookup_index_hits;
+    uint64_t lookup_index_stale;
+    uint64_t lookup_index_out_of_range;
+    uint64_t lookup_fallback_hits;
+    uint64_t lookup_fallback_misses;
+    uint64_t lookup_scan_steps;
+    uint64_t lookup_reported_calls;
 } wcache;
 
 static uint32_t extent_lookup(BlockDeviceFile *bf, uint32_t file_sector, int *contig);
 static int wcache_lookup(BlockDeviceFile *bf, uint64_t sector_num, uint8_t *buf);
+static void wcache_report_stats(void);
+
+static inline uint32_t wcache_mix64(uint64_t x)
+{
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return (uint32_t)x;
+}
+
+static inline uint32_t wcache_hash1(const BlockDeviceFile *bf, uint64_t sector)
+{
+    uint64_t x = sector ^ ((uint64_t)(uintptr_t)bf * 0x9e3779b97f4a7c15ULL);
+    return wcache_mix64(x) & WCACHE_INDEX_MASK;
+}
+
+static inline uint32_t wcache_hash2(const BlockDeviceFile *bf, uint64_t sector)
+{
+    uint64_t x = (sector << 1) ^ ((uint64_t)(uintptr_t)bf * 0xd6e8feb86659fd93ULL) ^
+                 0xa0761d6478bd642fULL;
+    return wcache_mix64(x) & WCACHE_INDEX_MASK;
+}
+
+/* True if seq is currently in [tail, head) with wrap-safe unsigned arithmetic. */
+static inline bool wcache_seq_in_window(uint32_t seq, uint32_t tail, uint32_t head)
+{
+    return (uint32_t)(seq - tail) < (uint32_t)(head - tail);
+}
+
+static inline void wcache_index_store(WCacheIndexEntry *e, BlockDeviceFile *bf,
+                                      uint64_t sector, uint32_t seq)
+{
+    e->bf = bf;
+    e->disk_sector = sector;
+    e->seq = seq;
+}
+
+/* Update latest write location for (bf, sector) with 2-choice hashing. */
+static inline void wcache_index_update(BlockDeviceFile *bf, uint64_t sector, uint32_t seq)
+{
+    if (!wcache.index)
+        return;
+
+    uint32_t i1 = wcache_hash1(bf, sector);
+    uint32_t i2 = wcache_hash2(bf, sector);
+    WCacheIndexEntry *e1 = &wcache.index[i1];
+    WCacheIndexEntry *e2 = &wcache.index[i2];
+
+    if (i1 == i2) {
+        wcache_index_store(e1, bf, sector, seq);
+        return;
+    }
+    if (e1->bf == bf && e1->disk_sector == sector) {
+        e1->seq = seq;
+        return;
+    }
+    if (e2->bf == bf && e2->disk_sector == sector) {
+        e2->seq = seq;
+        return;
+    }
+    if (!e1->bf) {
+        wcache_index_store(e1, bf, sector, seq);
+        return;
+    }
+    if (!e2->bf) {
+        wcache_index_store(e2, bf, sector, seq);
+        return;
+    }
+
+    /* Replace the older candidate (age relative to current seq). */
+    uint32_t age1 = seq - e1->seq;
+    uint32_t age2 = seq - e2->seq;
+    if (age1 >= age2)
+        wcache_index_store(e1, bf, sector, seq);
+    else
+        wcache_index_store(e2, bf, sector, seq);
+}
+
+/* Try O(1) lookup via index; validates slot metadata before returning data. */
+static inline int wcache_lookup_index(BlockDeviceFile *bf, uint64_t sector_num,
+                                      uint8_t *buf, uint32_t tail, uint32_t head)
+{
+    if (!wcache.index)
+        return 0;
+
+    uint32_t idx[2];
+    idx[0] = wcache_hash1(bf, sector_num);
+    idx[1] = wcache_hash2(bf, sector_num);
+
+    int checks = (idx[0] == idx[1]) ? 1 : 2;
+    for (int k = 0; k < checks; k++) {
+        WCacheIndexEntry *e = &wcache.index[idx[k]];
+        if (e->bf != bf || e->disk_sector != sector_num)
+            continue;
+
+        uint32_t seq = e->seq;
+        if (!wcache_seq_in_window(seq, tail, head)) {
+            wcache.lookup_index_out_of_range++;
+            continue;
+        }
+
+        uint32_t slot = seq % WCACHE_SLOTS;
+        if (wcache.meta[slot].bf == bf &&
+            wcache.meta[slot].disk_sector == sector_num) {
+            memcpy(buf, wcache.data + slot * SECTOR_SIZE, SECTOR_SIZE);
+            wcache.lookup_index_hits++;
+            return 1;
+        }
+
+        wcache.lookup_index_stale++;
+    }
+
+    return 0;
+}
 
 static void io_task(void *arg)
 {
@@ -2312,12 +2448,21 @@ static void wcache_init(void)
 {
     if (wcache.active)
         return;
+    if ((WCACHE_INDEX_SIZE & (WCACHE_INDEX_SIZE - 1u)) != 0) {
+        fprintf(stderr, "wcache: WCACHE_INDEX_SIZE must be a power of two\n");
+        return;
+    }
     wcache.data = heap_caps_malloc(WCACHE_SLOTS * SECTOR_SIZE,
                                    MALLOC_CAP_SPIRAM);
     if (!wcache.data) {
         fprintf(stderr, "wcache: failed to allocate %dKB PSRAM\n",
                 WCACHE_SLOTS * SECTOR_SIZE / 1024);
         return;
+    }
+    wcache.index = heap_caps_calloc(WCACHE_INDEX_SIZE, sizeof(WCacheIndexEntry),
+                                    MALLOC_CAP_SPIRAM);
+    if (!wcache.index) {
+        fprintf(stderr, "wcache: index alloc failed, using reverse-scan fallback only\n");
     }
     wcache.sd_mutex = xSemaphoreCreateMutex();
     sdmmc_io_mutex = wcache.sd_mutex;
@@ -2339,33 +2484,47 @@ static void wcache_enqueue(BlockDeviceFile *bf, uint64_t disk_sector,
         while (wcache.head - __atomic_load_n(&wcache.tail, __ATOMIC_ACQUIRE) >= WCACHE_SLOTS)
             vTaskDelay(1);
 
-        uint32_t slot = wcache.head % WCACHE_SLOTS;
+        uint32_t seq = wcache.head;
+        uint32_t slot = seq % WCACHE_SLOTS;
         memcpy(wcache.data + slot * SECTOR_SIZE, buf + i * SECTOR_SIZE, SECTOR_SIZE);
         wcache.meta[slot].bf = bf;
         wcache.meta[slot].disk_sector = disk_sector + i;
         wcache.meta[slot].sd_sector = sd_sector + i;
-        __atomic_store_n(&wcache.head, wcache.head + 1, __ATOMIC_RELEASE);
+        wcache_index_update(bf, disk_sector + i, seq);
+        __atomic_store_n(&wcache.head, seq + 1, __ATOMIC_RELEASE);
     }
     xSemaphoreGive(wcache.not_empty);
 }
 
 /* Read-through: check if a sector is pending in the write cache.
- * Scans tail→head; later entries override. Returns 1 if found. */
+ * Fast path: index lookup + metadata validation.
+ * Fallback: reverse scan head→tail so the newest write wins immediately. */
 static int wcache_lookup(BlockDeviceFile *bf, uint64_t sector_num, uint8_t *buf)
 {
-    int found = 0;
+    wcache.lookup_calls++;
     uint32_t t = __atomic_load_n(&wcache.tail, __ATOMIC_ACQUIRE);
     uint32_t h = __atomic_load_n(&wcache.head, __ATOMIC_ACQUIRE);
-    for (uint32_t i = t; i < h; i++) {
+
+    if (wcache_lookup_index(bf, sector_num, buf, t, h)) {
+        wcache.lookup_hits++;
+        return 1;
+    }
+
+    for (uint32_t i = h; i > t; ) {
+        i--;
         uint32_t slot = i % WCACHE_SLOTS;
+        wcache.lookup_scan_steps++;
         if (wcache.meta[slot].bf == bf &&
             wcache.meta[slot].disk_sector == sector_num) {
             memcpy(buf, wcache.data + slot * SECTOR_SIZE, SECTOR_SIZE);
-            found = 1;
-            /* Keep scanning — later entries override */
+            wcache.lookup_hits++;
+            wcache.lookup_fallback_hits++;
+            return 1;
         }
     }
-    return found;
+
+    wcache.lookup_fallback_misses++;
+    return 0;
 }
 
 static void wcache_flush(void)
@@ -2378,6 +2537,35 @@ static void wcache_flush(void)
     while (__atomic_load_n(&wcache.tail, __ATOMIC_ACQUIRE) !=
            __atomic_load_n(&wcache.head, __ATOMIC_ACQUIRE))
         vTaskDelay(1);
+}
+
+static void wcache_report_stats(void)
+{
+    if (!wcache.active)
+        return;
+    uint64_t calls = wcache.lookup_calls;
+    if (calls == 0 || calls == wcache.lookup_reported_calls)
+        return;
+
+    double hit_pct = 100.0 * (double)wcache.lookup_hits / (double)calls;
+    double idx_pct = 100.0 * (double)wcache.lookup_index_hits / (double)calls;
+    uint64_t fallback_calls = calls - wcache.lookup_index_hits;
+    double avg_scan = fallback_calls ?
+        (double)wcache.lookup_scan_steps / (double)fallback_calls : 0.0;
+
+    fprintf(stderr,
+            "wcache_lookup: calls=%llu hits=%llu (%.1f%%) idx=%llu (%.1f%%) "
+            "fallback_hits=%llu misses=%llu avg_scan=%.2f stale=%llu oor=%llu\n",
+            (unsigned long long)calls,
+            (unsigned long long)wcache.lookup_hits, hit_pct,
+            (unsigned long long)wcache.lookup_index_hits, idx_pct,
+            (unsigned long long)wcache.lookup_fallback_hits,
+            (unsigned long long)wcache.lookup_fallback_misses,
+            avg_scan,
+            (unsigned long long)wcache.lookup_index_stale,
+            (unsigned long long)wcache.lookup_index_out_of_range);
+
+    wcache.lookup_reported_calls = calls;
 }
 
 /*
@@ -4119,6 +4307,7 @@ static void ide_sync_if(IDEIFState *s)
 void ide_sync(IDEIFState *ide, IDEIFState *ide2)
 {
     wcache_flush();
+    wcache_report_stats();
     ide_sync_if(ide);
     ide_sync_if(ide2);
 }
