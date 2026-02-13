@@ -195,7 +195,7 @@ static int pc_main(const char *file)
 	conf.height = LCD_HEIGHT;
 	conf.cpu_gen = 4;
 	conf.fpu = 0;
-	conf.brightness = 30;  // Default brightness
+	conf.brightness = BRIGHTNESS_BOOT_DEFAULT;  // Default brightness
 	conf.volume = 80;      // Default volume
 	conf.mouse_speed = 5;  // Default mouse speed (1-10)
 	conf.usb_passthru = 1; // Default USB passthrough enabled
@@ -249,7 +249,8 @@ static int pc_main(const char *file)
 	pc_batch_size_setting = conf.batch_size;
 
 	/* Store settings in globals for input_bsp and OSD to use */
-	globals.brightness = conf.brightness;
+	globals.brightness = clamp_brightness(conf.brightness);
+	bsp_display_set_backlight_brightness(brightness_to_bsp_percent(globals.brightness));
 	globals.volume = conf.volume;
 	globals.mouse_speed = conf.mouse_speed;
 	globals.usb_passthru = conf.usb_passthru;
@@ -523,6 +524,7 @@ void app_main(void)
 {
 	global_event_group = xEventGroupCreate();
 	globals.usb_passthru = -1;  // Sentinel: not yet loaded from INI
+	globals.brightness = BRIGHTNESS_BOOT_DEFAULT;  // INI selector default before config load
 
 #ifdef ESPDEBUG
 	uart_config_t uart_config = {

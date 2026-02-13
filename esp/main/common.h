@@ -5,9 +5,27 @@
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdatomic.h>
 
 #define KEYCODE_MAX 0x80
+
+#define BRIGHTNESS_MIN 0
+#define BRIGHTNESS_MAX 110
+#define BRIGHTNESS_BOOT_DEFAULT 50
+
+static inline int clamp_brightness(int value)
+{
+	if (value < BRIGHTNESS_MIN) return BRIGHTNESS_MIN;
+	if (value > BRIGHTNESS_MAX) return BRIGHTNESS_MAX;
+	return value;
+}
+
+static inline uint8_t brightness_to_bsp_percent(int value)
+{
+	int clamped = clamp_brightness(value);
+	return (uint8_t)((clamped * 100 + (BRIGHTNESS_MAX / 2)) / BRIGHTNESS_MAX);
+}
 
 struct Globals {
 	void *pc;
@@ -31,11 +49,11 @@ struct Globals {
 	int vga_mode_height;
 	int vga_pixel_double; // Pixel doubling factor (1=none, 2=double width for mode 13h)
 	uint32_t vga_frame_gen; // Frame generation counter - incremented on each VGA render
-	int brightness;   // Current brightness (0-100)
+	int brightness;   // Current brightness (0-110 normalized)
 	int volume;       // Current volume (0-100)
 	// Overlay bar for META+arrow feedback
 	int overlay_type;     // 0=none, 1=brightness, 2=volume
-	int overlay_value;    // Current value (0-100)
+	int overlay_value;    // Current value (brightness:0-110, volume:0-100)
 	uint32_t overlay_hide_time;  // Timestamp when overlay should hide
 	// Toast notification system
 	char toast_message[48];      // Current toast message

@@ -147,7 +147,7 @@ struct OSD {
 	char hda_path[MAX_PATH_LEN];        // Hard drive (from INI, changeable)
 
 	// Audio/Visual settings
-	int brightness;  // 0-100
+	int brightness;  // 0-110
 	int volume;      // 0-100
 	int frame_skip;  // 0-10 max frames to skip
 	// System settings (require restart to take effect)
@@ -752,10 +752,22 @@ static void render_delete_confirm(OSD *osd, uint8_t *pixels, int w, int h, int p
 	                    -1, "Y:Delete N/Esc:Cancel");
 }
 
-// Build MBR with a single partition spanning the disk
+/* Minimal MBR bootstrap: finds active partition and chain-loads its VBR
+ * at 0000:7C00 via BIOS INT 13h CHS read. */
+static const uint8_t tiny386_mbr_bootstrap[] = {
+	0xfa, 0x31, 0xc0, 0x8e, 0xd8, 0x8e, 0xc0, 0x8e, 0xd0, 0xbc, 0x00, 0x7c,
+	0xfb, 0xbe, 0xbe, 0x07, 0xb9, 0x04, 0x00, 0x80, 0x3c, 0x80, 0x74, 0x07,
+	0x83, 0xc6, 0x10, 0xe2, 0xf6, 0xeb, 0x26, 0xbf, 0x00, 0x06, 0x56, 0xb9,
+	0x08, 0x00, 0xf3, 0xa5, 0x5e, 0xbe, 0x00, 0x06, 0xbb, 0x00, 0x7c, 0x8a,
+	0x74, 0x01, 0x8a, 0x4c, 0x02, 0x8a, 0x6c, 0x03, 0xb4, 0x02, 0xb0, 0x01,
+	0xcd, 0x13, 0x72, 0x05, 0xea, 0x00, 0x7c, 0x00, 0x00, 0xf4, 0xeb, 0xfd,
+};
+
+// Build MBR with bootstrap and a single partition spanning the disk
 static void build_mbr(uint8_t *mbr, int64_t total_bytes, int fs_type, int heads, int spt)
 {
 	memset(mbr, 0, 512);
+	memcpy(mbr, tiny386_mbr_bootstrap, sizeof(tiny386_mbr_bootstrap));
 
 	uint32_t total_sectors = (uint32_t)(total_bytes / 512);
 	uint32_t lba_start = 63;
@@ -782,7 +794,7 @@ static void build_mbr(uint8_t *mbr, int64_t total_bytes, int fs_type, int heads,
 
 	// Partition entry at 0x1BE
 	uint8_t *pe = &mbr[0x1BE];
-	pe[0] = 0x00;          // Status: not bootable
+	pe[0] = 0x80;          // Status: active (bootable)
 	pe[1] = start_h;       // CHS start head
 	pe[2] = start_s_enc;   // CHS start sector + cyl high
 	pe[3] = start_c_enc;   // CHS start cylinder low
@@ -1181,8 +1193,9 @@ static void render_browser(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 // Apply brightness setting
 static void apply_brightness(OSD *osd)
 {
+	osd->brightness = clamp_brightness(osd->brightness);
 	globals.brightness = osd->brightness;  // Sync to globals
-	bsp_display_set_backlight_brightness(osd->brightness);
+	bsp_display_set_backlight_brightness(brightness_to_bsp_percent(osd->brightness));
 }
 
 // Apply volume setting
@@ -1450,8 +1463,8 @@ static void handle_av_adjust(OSD *osd, int delta)
 	switch (osd->av_sel) {
 	case AV_BRIGHTNESS:
 		osd->brightness += delta * 5;
-		if (osd->brightness < 5) osd->brightness = 5;
-		if (osd->brightness > 100) osd->brightness = 100;
+		if (osd->brightness < 0) osd->brightness = 0;
+		if (osd->brightness > BRIGHTNESS_MAX) osd->brightness = BRIGHTNESS_MAX;
 		apply_brightness(osd);
 		break;
 	case AV_VOLUME:
@@ -1530,7 +1543,7 @@ OSD *osd_init(void)
 	osd->av_sel = AV_BRIGHTNESS;
 	osd->sys_sel = SYS_CPU_GEN;
 	// Load brightness/volume from globals (set from INI in esp_main.c)
-	osd->brightness = globals.brightness;
+	osd->brightness = clamp_brightness(globals.brightness);
 	osd->volume = globals.volume;
 	osd->frame_skip = vga_frame_skip_max;  // Load from config
 	osd->batch_size = pc_batch_size_setting;  // Load from config (0=auto)
@@ -1608,7 +1621,7 @@ void osd_refresh(OSD *osd)
 {
 	populate_drive_paths(osd);
 	// Sync settings from globals (INI values set by i386_task after boot)
-	osd->brightness = globals.brightness;
+	osd->brightness = clamp_brightness(globals.brightness);
 	osd->volume = globals.volume;
 	osd->mouse_speed = globals.mouse_speed > 0 ? globals.mouse_speed : osd->mouse_speed;
 	if (globals.usb_passthru >= 0)

@@ -430,6 +430,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	if (!ini_path) return -1;
 	if (boot_order < 0 || boot_order >= BOOT_ORDER_COUNT)
 		boot_order = 0;
+	if (brightness < 0) brightness = 0;
+	if (brightness > 110) brightness = 110;
 
 	// Read existing file
 	FILE *f = fopen(ini_path, "r");

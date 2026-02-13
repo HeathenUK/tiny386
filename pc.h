@@ -110,7 +110,7 @@ typedef struct {
 	int boot_order;  // 0=HDD, 1=Floppy, 2=CD (see misc.h BOOT_ORDER_*)
 	int frame_skip;  // 0=disabled, 1-10=max frames to skip (adaptive)
 	int batch_size;  // 0=auto, or fixed value 512-4096 (ESP32 only)
-	int brightness;  // 0-100 display brightness (ESP32 only)
+	int brightness;  // 0-110 display brightness (ESP32 only)
 	int volume;      // 0-100 audio volume (ESP32 only)
 	int mouse_speed; // 1-10 mouse emulation speed (ESP32 only)
 	int usb_passthru; // 1=enabled, 0=disabled - pass USB storage to emulator (ESP32 only)

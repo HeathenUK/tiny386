@@ -353,7 +353,11 @@ static void render_overlay_bar(uint16_t *fb)
 	                  fill_area_w, bar_h - padding * 2, border_color);
 
 	// Draw fill bar (active portion)
-	int fill_w = fill_area_w * globals.overlay_value / 100;
+	int overlay_max = (globals.overlay_type == OVERLAY_BRIGHTNESS) ? BRIGHTNESS_MAX : 100;
+	int overlay_value = globals.overlay_value;
+	if (overlay_value < 0) overlay_value = 0;
+	if (overlay_value > overlay_max) overlay_value = overlay_max;
+	int fill_w = fill_area_w * overlay_value / overlay_max;
 	overlay_fill_rect(fb, fill_area_x, bar_y + padding,
 	                  fill_w, bar_h - padding * 2, fill_color);
 
@@ -475,7 +479,7 @@ void vga_task(void *arg)
 	// BSP already initialized in app_main - just get panel handle
 	esp_lcd_panel_handle_t panel = NULL;
 	ESP_ERROR_CHECK(bsp_display_get_panel(&panel));
-	ESP_ERROR_CHECK(bsp_display_set_backlight_brightness(30));
+	ESP_ERROR_CHECK(bsp_display_set_backlight_brightness(brightness_to_bsp_percent(globals.brightness)));
 	ESP_ERROR_CHECK(ppa_init());
 	globals.panel = panel;
 

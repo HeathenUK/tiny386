@@ -109,8 +109,8 @@ static void adjust_brightness(int delta)
 {
 	globals.brightness += delta;
 	if (globals.brightness < 0) globals.brightness = 0;
-	if (globals.brightness > 100) globals.brightness = 100;
-	bsp_display_set_backlight_brightness((uint8_t)globals.brightness);
+	if (globals.brightness > BRIGHTNESS_MAX) globals.brightness = BRIGHTNESS_MAX;
+	bsp_display_set_backlight_brightness(brightness_to_bsp_percent(globals.brightness));
 	// Show overlay bar
 	globals.overlay_type = OVERLAY_BRIGHTNESS;
 	globals.overlay_value = globals.brightness;
@@ -195,7 +195,7 @@ static void input_task(void *arg)
 			osd_attach_console(globals.osd, NULL);
 			osd_set_system_config(globals.osd, globals.cpu_gen, globals.fpu,
 			                      (long)globals.mem_size_mb * 1024 * 1024);
-			bsp_display_set_backlight_brightness((uint8_t)globals.brightness);
+			bsp_display_set_backlight_brightness(brightness_to_bsp_percent(globals.brightness));
 			bsp_audio_set_volume((float)globals.volume);
 			osd_pc_attached = true;
 			ESP_LOGI(TAG, "OSD attached to PC, brightness=%d%%, volume=%d%%",

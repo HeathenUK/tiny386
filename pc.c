@@ -1207,7 +1207,7 @@ int parse_conf_ini(void* user, const char* section,
 		} else if (NAME("brightness")) {
 			conf->brightness = atoi(value);
 			if (conf->brightness < 0) conf->brightness = 0;
-			if (conf->brightness > 100) conf->brightness = 100;
+			if (conf->brightness > 110) conf->brightness = 110;
 		} else if (NAME("volume")) {
 			conf->volume = atoi(value);
 			if (conf->volume < 0) conf->volume = 0;
