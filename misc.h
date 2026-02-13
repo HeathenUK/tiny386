@@ -36,7 +36,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
                          const char *cdc, const char *cdd,
                          int cpu_gen, int fpu, long mem_size,
                          int brightness, int volume, int frame_skip,
-                         int batch_size, int mouse_speed,
+                         int batch_size, int pit_burst, int mouse_speed,
                          int usb_passthru);
 
 typedef struct EMULINK EMULINK;

@@ -149,6 +149,7 @@ static const char *default_ini_content =
 	"[cpu]\n"
 	"gen = 5\n"
 	"fpu = 1\n"
+	"pit_burst = 1\n"
 	"\n"
 	"[display]\n"
 	"width = 800\n"
@@ -195,6 +196,7 @@ static int pc_main(const char *file)
 	conf.height = LCD_HEIGHT;
 	conf.cpu_gen = 4;
 	conf.fpu = 0;
+	conf.pit_burst = 1;
 	conf.brightness = BRIGHTNESS_BOOT_DEFAULT;  // Default brightness
 	conf.volume = 80;      // Default volume
 	conf.mouse_speed = 5;  // Default mouse speed (1-10)
@@ -247,6 +249,8 @@ static int pc_main(const char *file)
 	/* Apply settings from config */
 	vga_frame_skip_max = conf.frame_skip;
 	pc_batch_size_setting = conf.batch_size;
+	pc_pit_burst_setting = conf.pit_burst;
+	fprintf(stderr, "PIT burst catch-up: %s\n", pc_pit_burst_setting ? "enabled" : "disabled");
 
 	/* Store settings in globals for input_bsp and OSD to use */
 	globals.brightness = clamp_brightness(conf.brightness);

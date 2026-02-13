@@ -52,6 +52,11 @@ typedef struct PITChannelState {
 	uint32_t count_load_time;
 	uint32_t last_irq_count;
 	uint32_t last_read_d;  /* monotonic guard: prevents consecutive reads returning same value */
+	uint8_t last_out;
+	uint64_t load_count;
+	uint64_t irq_pulse_count;
+	uint64_t irq_suppressed_count;
+	uint32_t last_irq_time;
 	int irq;
 } PITChannelState;
 
@@ -132,6 +137,8 @@ static inline void pit_load_count(PITState *pit, PITChannelState *s, int val)
 	s->last_irq_count = 0;
 	s->last_read_d = 0;
 	s->count = val;
+	s->last_out = pit_get_out1(s, s->count_load_time);
+	s->load_count++;
 }
 
 /* if already latched, do not latch again */
@@ -170,22 +177,28 @@ void i8254_ioport_write(PITState *pit, uint32_t addr, uint32_t val)
 					}
 				}
 			}
-		} else {
-			s = &pit->channels[channel];
-			access = (val >> 4) & 3;
-			if (access == 0) {
-				pit_latch_count(s);
 			} else {
-				s->rw_mode = access;
-				s->read_state = access;
-				s->write_state = access;
+				s = &pit->channels[channel];
+				access = (val >> 4) & 3;
+				if (access == 0) {
+					pit_latch_count(s);
+				} else {
+					/* Modes 6 and 7 are aliases for modes 2 and 3. */
+					int mode = (val >> 1) & 7;
+					if (mode >= 6)
+						mode -= 4;
 
-				s->mode = (val >> 1) & 7;
-				s->bcd = val & 1;
-				/* XXX: update irq timer ? */
+					s->rw_mode = access;
+					s->read_state = access;
+					s->write_state = access;
+
+					s->mode = mode;
+					s->last_out = pit_get_out1(s, get_uticks());
+					s->bcd = val & 1;
+					/* XXX: update irq timer ? */
+				}
 			}
-		}
-	} else {
+		} else {
 		s = &pit->channels[addr];
 		switch(s->write_state) {
 		default:
@@ -278,24 +291,46 @@ void i8254_update_irq(PITState *pit)
 {
 	uint32_t uticks = get_uticks();
 	PITChannelState *s = pit->channels;
+	uint16_t irr = i8259_get_irr(pit->pic);
 	uint32_t d = ((uint64_t) (uticks - s->count_load_time)) * PIT_FREQ / 1000000;
 	switch(s->mode) {
 	case 2:
 	case 3:
 		/* Count how many IRQs we should have fired by now */
 		while (s->last_irq_count + s->count - d >= 0x80000000) {
-			if (s->irq != -1) {
-				/* Only fire if previous IRQ has been handled */
-				if (!i8259_irq_pending(pit->pic, s->irq)) {
-					pit->set_irq(pit->pic, s->irq, 1);
-					pit->set_irq(pit->pic, s->irq, 0);
+				if (s->irq != -1) {
+					/* Only suppress if a same-IRQ request is already latched in IRR.
+					 * An in-service IRQ (ISR) must not block latching a new edge. */
+					if ((irr & (1u << s->irq)) == 0) {
+						pit->set_irq(pit->pic, s->irq, 1);
+						pit->set_irq(pit->pic, s->irq, 0);
+						s->irq_pulse_count++;
+						s->last_irq_time = uticks;
+					} else {
+						s->irq_suppressed_count++;
+					}
 				}
+				s->last_irq_count += s->count;
 			}
-			s->last_irq_count += s->count;
+			break;
+	default:
+		/* Non-periodic modes (notably mode 0 one-shot): pulse IRQ0 on OUT
+		 * rising edge, matching 8259 edge-triggered behavior. */
+			if (s->irq != -1) {
+				int out = pit_get_out1(s, uticks);
+				if (out && !s->last_out) {
+					if ((irr & (1u << s->irq)) == 0) {
+						pit->set_irq(pit->pic, s->irq, 1);
+						pit->set_irq(pit->pic, s->irq, 0);
+						s->irq_pulse_count++;
+						s->last_irq_time = uticks;
+					} else {
+						s->irq_suppressed_count++;
+					}
+				}
+				s->last_out = out;
 		}
 		break;
-	default:
-		abort();
 	}
 }
 
@@ -417,6 +452,8 @@ bool pit_fire_single_irq(PITState *pit)
 	/* Fire the IRQ */
 	pit->set_irq(pit->pic, s->irq, 1);
 	pit->set_irq(pit->pic, s->irq, 0);
+	s->irq_pulse_count++;
+	s->last_irq_time = uticks;
 	s->last_irq_count += s->count;
 
 	return true;
@@ -454,6 +491,7 @@ int pit_burst_start(PITState *pit, uint32_t *out_d, int *out_irq)
 bool pit_burst_fire(PITState *pit, uint32_t d, int irq)
 {
 	PITChannelState *s = &pit->channels[0];
+	uint32_t uticks = get_uticks();
 
 	/* Check if we're still behind */
 	if (s->last_irq_count + s->count - d < 0x80000000)
@@ -462,6 +500,37 @@ bool pit_burst_fire(PITState *pit, uint32_t d, int irq)
 	/* Fire the IRQ */
 	pit->set_irq(pit->pic, irq, 1);
 	pit->set_irq(pit->pic, irq, 0);
+	s->irq_pulse_count++;
+	s->last_irq_time = uticks;
 	s->last_irq_count += s->count;
 	return true;
+}
+
+uint64_t pit_get_load_count(PITState *pit, int channel)
+{
+	return pit->channels[channel].load_count;
+}
+
+uint64_t pit_get_irq_pulse_count(PITState *pit, int channel)
+{
+	return pit->channels[channel].irq_pulse_count;
+}
+
+uint64_t pit_get_irq_suppressed_count(PITState *pit, int channel)
+{
+	return pit->channels[channel].irq_suppressed_count;
+}
+
+uint32_t pit_get_elapsed_us(PITState *pit, int channel)
+{
+	PITChannelState *s = &pit->channels[channel];
+	return get_uticks() - s->count_load_time;
+}
+
+uint32_t pit_get_last_irq_age_us(PITState *pit, int channel)
+{
+	PITChannelState *s = &pit->channels[channel];
+	if (s->last_irq_time == 0)
+		return 0xffffffffu;
+	return get_uticks() - s->last_irq_time;
 }

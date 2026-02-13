@@ -369,3 +369,31 @@ int i8259_irq_pending(PicState2 *s, int irq)
 	int mask = 1 << (irq & 7);
 	return (pic->irr | pic->isr) & mask;
 }
+
+uint16_t i8259_get_irr(PicState2 *s)
+{
+	return (uint16_t)s->pics[0].irr | ((uint16_t)s->pics[1].irr << 8);
+}
+
+uint16_t i8259_get_isr(PicState2 *s)
+{
+	return (uint16_t)s->pics[0].isr | ((uint16_t)s->pics[1].isr << 8);
+}
+
+uint16_t i8259_get_imr(PicState2 *s)
+{
+	return (uint16_t)s->pics[0].imr | ((uint16_t)s->pics[1].imr << 8);
+}
+
+int i8259_get_pending_irq(PicState2 *s)
+{
+	int irq = pic_get_irq(&s->pics[0]);
+	if (irq < 0)
+		return -1;
+	if (irq == 2) {
+		int irq2 = pic_get_irq(&s->pics[1]);
+		if (irq2 >= 0)
+			return irq2 + 8;
+	}
+	return irq;
+}

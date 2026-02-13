@@ -21,6 +21,13 @@ void pit_set_gate(PITState *pit, int channel, int val);
  * representing how many ticks WOULD have elapsed on real hardware. */
 uint64_t pit_get_virtual_ticks(PITState *pit, int channel);
 
+/* PIT diagnostic counters/ages */
+uint64_t pit_get_load_count(PITState *pit, int channel);
+uint64_t pit_get_irq_pulse_count(PITState *pit, int channel);
+uint64_t pit_get_irq_suppressed_count(PITState *pit, int channel);
+uint32_t pit_get_elapsed_us(PITState *pit, int channel);
+uint32_t pit_get_last_irq_age_us(PITState *pit, int channel);
+
 /* Get the number of pending channel 0 interrupts we're behind.
  * Used for burst catch-up when CPU can't keep up with high-frequency timers. */
 int pit_get_pending_irqs(PITState *pit);

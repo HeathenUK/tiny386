@@ -45,3 +45,4 @@ gen = 5
 ; Enable FPU for floating-point support
 ; Required for many Windows applications and games
 fpu = 1
+pit_burst = 1

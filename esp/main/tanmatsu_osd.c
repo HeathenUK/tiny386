@@ -105,6 +105,7 @@ typedef enum {
 	SYS_FPU,
 	SYS_MEMSIZE,
 	SYS_BATCH,
+	SYS_PIT_BURST,
 	SYS_MOUSE_SPEED,
 	SYS_STATS_BAR,
 	SYS_CPU_DEBUG,
@@ -155,6 +156,7 @@ struct OSD {
 	int fpu;         // 0=disabled, 1=enabled
 	int mem_size_mb; // Memory in MB (1 to 24)
 	int batch_size;  // 0=auto, or fixed value (512-4096 in 256 increments)
+	int pit_burst;   // 1=enabled, 0=disabled
 	int mouse_speed; // 1-10, mouse emulation speed
 	int usb_passthru; // 1=enabled (default), 0=disabled (requires restart)
 
@@ -715,7 +717,7 @@ static const char *cpu_gen_names[] = { "i386", "i486", "i586" };
 // Render system settings submenu
 static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], mouse_val[16], statsbar_val[16], cpudbg_val[16];
+	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], pitburst_val[16], mouse_val[16], statsbar_val[16], cpudbg_val[16];
 
 	// CPU generation (3=386, 4=486, 5=586)
 	int gen_idx = osd->cpu_gen - 3;
@@ -736,6 +738,9 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		snprintf(batch_val, sizeof(batch_val), "%d", osd->batch_size);
 	}
 
+	// PIT burst catch-up
+	snprintf(pitburst_val, sizeof(pitburst_val), "%s", osd->pit_burst ? "On" : "Off");
+
 	// Mouse speed (1-10)
 	snprintf(mouse_val, sizeof(mouse_val), "%d", osd->mouse_speed);
 
@@ -750,6 +755,7 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ "FPU:", 0, 0, fpu_val },
 		{ "Memory:", 0, 0, mem_val },
 		{ "Batch:", 0, 0, batch_val },
+		{ "PIT Burst:", 0, 0, pitburst_val },
 		{ "Mouse Speed:", 0, 0, mouse_val },
 		{ "Stats Bar:", 0, 0, statsbar_val },
 		{ "CPU Debug:", 0, 0, cpudbg_val },
@@ -1459,16 +1465,20 @@ static int handle_main_select(OSD *osd)
 		// Save all current settings to ini file
 		if (osd->pc && osd->pc->ini_path) {
 			int boot_order = osd->pc->cmos ? cmos_get_boot_order(osd->pc->cmos) : 0;
-			save_settings_to_ini(osd->pc->ini_path, boot_order,
-			                     osd->hda_path,
-			                     osd->drive_paths[0], osd->drive_paths[1],
-			                     osd->drive_paths[2], osd->drive_paths[3],
-			                     osd->drive_paths[4], osd->drive_paths[5],
-			                     osd->cpu_gen, osd->fpu, osd_get_mem_size_bytes(osd),
-			                     osd->brightness, osd->volume, osd->frame_skip,
-			                     osd->batch_size, osd->mouse_speed,
-			                     osd->usb_passthru);
-			toast_show("Settings saved");
+			int rc = save_settings_to_ini(osd->pc->ini_path, boot_order,
+			                              osd->hda_path,
+			                              osd->drive_paths[0], osd->drive_paths[1],
+			                              osd->drive_paths[2], osd->drive_paths[3],
+			                              osd->drive_paths[4], osd->drive_paths[5],
+			                              osd->cpu_gen, osd->fpu, osd_get_mem_size_bytes(osd),
+			                              osd->brightness, osd->volume, osd->frame_skip,
+			                              osd->batch_size, osd->pit_burst, osd->mouse_speed,
+			                              osd->usb_passthru);
+			if (rc == 0) {
+				toast_show("Settings saved");
+			} else {
+				toast_show("Save failed");
+			}
 		}
 		break;
 	case MAIN_SWITCH_INI:
@@ -1555,6 +1565,11 @@ static void handle_sys_adjust(OSD *osd, int delta)
 		// Apply immediately (takes effect next pc_step)
 		pc_batch_size_setting = osd->batch_size;
 		break;
+	case SYS_PIT_BURST:
+		osd->pit_burst = !osd->pit_burst;
+		// Apply immediately (takes effect next pc_step)
+		pc_pit_burst_setting = osd->pit_burst;
+		break;
 	case SYS_MOUSE_SPEED:
 		osd->mouse_speed += delta;
 		if (osd->mouse_speed < 1) osd->mouse_speed = 10;  // Wrap
@@ -1588,6 +1603,7 @@ OSD *osd_init(void)
 	osd->volume = globals.volume;
 	osd->frame_skip = vga_frame_skip_max;  // Load from config
 	osd->batch_size = pc_batch_size_setting;  // Load from config (0=auto)
+	osd->pit_burst = pc_pit_burst_setting ? 1 : 0;  // Load from config (1=enabled)
 	osd->mouse_speed = globals.mouse_speed > 0 ? globals.mouse_speed : 5;  // Load from config, default 5
 	osd->usb_passthru = globals.usb_passthru >= 0 ? globals.usb_passthru : 1;  // Default enabled
 
@@ -1661,9 +1677,15 @@ long osd_get_mem_size_bytes(OSD *osd)
 void osd_refresh(OSD *osd)
 {
 	populate_drive_paths(osd);
-	// Sync settings from globals (INI values set by i386_task after boot)
+	// Sync settings from globals/runtime (INI values set by i386_task after boot)
+	if (globals.cpu_gen > 0) osd->cpu_gen = globals.cpu_gen;
+	osd->fpu = globals.fpu;
+	if (globals.mem_size_mb > 0) osd->mem_size_mb = globals.mem_size_mb;
 	osd->brightness = clamp_brightness(globals.brightness);
 	osd->volume = globals.volume;
+	osd->frame_skip = vga_frame_skip_max;
+	osd->batch_size = pc_batch_size_setting;
+	osd->pit_burst = pc_pit_burst_setting ? 1 : 0;
 	osd->mouse_speed = globals.mouse_speed > 0 ? globals.mouse_speed : osd->mouse_speed;
 	if (globals.usb_passthru >= 0)
 		osd->usb_passthru = globals.usb_passthru;
@@ -1818,12 +1840,15 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 				handle_sys_adjust(osd, +1);
 			}
 			break;
-		case SC_ENTER:
-			if (osd->sys_sel == SYS_BACK) {
-				osd->view = VIEW_MAIN_MENU;
-			} else if (osd->sys_sel == SYS_STATS_BAR) {
-				globals.stats_bar_visible = !globals.stats_bar_visible;
-			} else if (osd->sys_sel == SYS_CPU_DEBUG) {
+			case SC_ENTER:
+				if (osd->sys_sel == SYS_BACK) {
+					osd->view = VIEW_MAIN_MENU;
+				} else if (osd->sys_sel == SYS_PIT_BURST) {
+					osd->pit_burst = !osd->pit_burst;
+					pc_pit_burst_setting = osd->pit_burst;
+				} else if (osd->sys_sel == SYS_STATS_BAR) {
+					globals.stats_bar_visible = !globals.stats_bar_visible;
+				} else if (osd->sys_sel == SYS_CPU_DEBUG) {
 				globals.cpu_debug_enabled = !globals.cpu_debug_enabled;
 			}
 			break;

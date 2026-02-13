@@ -87,6 +87,7 @@ static int  s_scroll;
 static bool s_auto_boot;
 static int  s_countdown;            /* seconds remaining (5→0, -1 = cancelled) */
 static uint32_t s_countdown_tick;   /* timestamp of last countdown update */
+static bool s_ctrl_held;            /* Ctrl modifier tracked by input layer */
 
 typedef enum {
 	EDIT_NONE = 0,
@@ -581,6 +582,7 @@ void ini_selector_start(bool auto_boot)
 {
 	scan_ini_files();
 	s_auto_boot = auto_boot;
+	s_ctrl_held = false;
 	cancel_edit();
 	if (auto_boot && s_count > 0) {
 		s_countdown = 5;
@@ -596,12 +598,21 @@ void ini_selector_start(bool auto_boot)
 	ESP_LOGI(TAG, "INI selector started (%d files, auto_boot=%d)", s_count, auto_boot);
 }
 
-static void finish_selection(int idx)
+void ini_selector_set_modifier_ctrl(bool held)
+{
+	s_ctrl_held = held;
+}
+
+static void finish_selection(int idx, bool force_debug)
 {
 	const char *path = "";
 	if (idx >= 0 && idx < s_count) {
 		path = s_files[idx].path;
 		utime(path, NULL);  /* bump mtime so it sorts first next boot */
+	}
+	if (force_debug) {
+		globals.cpu_debug_enabled = true;
+		ESP_LOGI(TAG, "Ctrl+Enter: forcing CPU Debug ON for boot");
 	}
 
 	if (s_auto_boot) {
@@ -639,7 +650,7 @@ int ini_selector_handle_key(int scancode)
 	if (s_count == 0) {
 		/* No files — Enter or Esc finishes with empty path (will create default) */
 		if (scancode == 0x1c || scancode == 0x01) {
-			finish_selection(-1);
+			finish_selection(-1, s_ctrl_held);
 			return 1;
 		}
 		return 0;
@@ -656,7 +667,7 @@ int ini_selector_handle_key(int scancode)
 		parse_preview(&s_files[s_sel]);
 		break;
 	case 0x1c: /* Enter */
-		finish_selection(s_sel);
+		finish_selection(s_sel, s_ctrl_held);
 		return 1;
 	case 0x13: /* R */
 		begin_edit(EDIT_RENAME);
@@ -702,7 +713,7 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 			s_countdown--;
 			if (s_countdown < 0) {
 				/* Auto-boot the first file */
-				finish_selection(0);
+				finish_selection(0, false);
 				return;
 			}
 		}
@@ -840,7 +851,7 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 		sel_draw_text(LEFT_X, FOOTER_Y + 2, msg, C_TITLE, LOG_W - 20);
 	} else {
 		sel_draw_text(LEFT_X, FOOTER_Y + 2,
-		              "Up/Down:Navigate  Enter:Select  R:Rename  C:Clone  Esc:Cancel",
+		              "Up/Down:Navigate  Enter:Select  Ctrl+Enter:Debug  R:Rename  C:Clone  Esc:Cancel",
 		              C_SEP, 0);
 	}
 }

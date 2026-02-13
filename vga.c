@@ -88,6 +88,23 @@ static planar_combine_t *planar_combine_23 = NULL;  /* planes 2,3 -> bits 2,3 (b
 static int ega_fast_logged = 0;
 static int vga256_fast_logged = 0;
 
+/* VGA I/O trace ring buffer for crash diagnostics.
+ * Records last N VGA port I/O and memory accesses.
+ * Dumped on VMM crash to diagnose VGA driver init failures. */
+#define VGA_TRACE_SIZE 2048
+typedef struct {
+	uint32_t addr;     /* port address or VGA memory offset */
+	uint32_t val;      /* value read or written */
+	uint8_t type;      /* 0=port_rd, 1=port_wr, 2=mem_rd, 3=mem_wr */
+	uint8_t sr2;       /* plane write mask at time of access */
+	uint8_t gr4;       /* read map select at time of access */
+	uint8_t gr5;       /* mode register (write mode + read mode) */
+} VGATraceEntry;
+static VGATraceEntry vga_trace_ring[VGA_TRACE_SIZE];
+static int vga_trace_idx = 0;
+static uint32_t vga_trace_total = 0;
+/* vga_trace_record and vga_dump_io_trace defined after VGAState struct */
+
 /*
  * Mode 13h Performance Optimizations for ESP32-P4
  *
@@ -372,6 +389,54 @@ struct VGAState {
     uint8_t tmpbuf[(LCD_WIDTH > 720 ? LCD_WIDTH : 720) * 3 * 2];
 #endif
 };
+
+static VGAState *vga_trace_state = NULL;
+
+static inline void vga_trace_record(uint32_t addr, uint32_t val, uint8_t type, VGAState *s) {
+	VGATraceEntry *e = &vga_trace_ring[vga_trace_idx];
+	e->addr = addr;
+	e->val = val;
+	e->type = type;
+	e->sr2 = s->sr[0x02];  /* plane write mask */
+	e->gr4 = s->gr[0x04];  /* read map select */
+	e->gr5 = s->gr[0x05];  /* mode register */
+	vga_trace_idx = (vga_trace_idx + 1) & (VGA_TRACE_SIZE - 1);
+	vga_trace_total++;
+}
+
+void vga_dump_io_trace(void) {
+	if (!vga_trace_state) return;
+	VGAState *s = vga_trace_state;
+	static const char *type_names[] = {"PR", "PW", "MR", "MW"};
+
+	/* Dump current VGA register state */
+	fprintf(stderr, "=== VGA state: msr=%02x sr1=%02x sr2=%02x sr4=%02x "
+		"gr0=%02x gr1=%02x gr3=%02x gr4=%02x gr5=%02x gr6=%02x gr8=%02x "
+		"ar10=%02x cr17=%02x ===\n",
+		s->msr, s->sr[1], s->sr[2], s->sr[4],
+		s->gr[0], s->gr[1], s->gr[3], s->gr[4], s->gr[5], s->gr[6], s->gr[8],
+		s->ar[0x10], s->cr[0x17]);
+	fprintf(stderr, "  CRTC: cr01=%02x cr06=%02x cr07=%02x cr12=%02x\n",
+		s->cr[0x01], s->cr[0x06], s->cr[0x07], s->cr[0x12]);
+
+	/* Dump ring buffer (oldest first) */
+	int count = (vga_trace_total < VGA_TRACE_SIZE) ? (int)vga_trace_total : VGA_TRACE_SIZE;
+	int start = (vga_trace_total < VGA_TRACE_SIZE) ? 0 :
+		(vga_trace_idx & (VGA_TRACE_SIZE - 1));
+	fprintf(stderr, "=== VGA I/O trace (last %d of %u) ===\n", count, vga_trace_total);
+	for (int i = 0; i < count; i++) {
+		VGATraceEntry *e = &vga_trace_ring[(start + i) & (VGA_TRACE_SIZE - 1)];
+		if (e->type <= 1) {
+			/* Port I/O */
+			fprintf(stderr, "  %s %03x=%02x\n", type_names[e->type], e->addr, e->val);
+		} else {
+			/* Memory I/O - show plane context */
+			fprintf(stderr, "  %s [%05x]=%02x sr2=%x gr4=%x gr5=%02x\n",
+				type_names[e->type], e->addr, e->val,
+				e->sr2, e->gr4, e->gr5);
+		}
+	}
+}
 
 uint32_t get_uticks();
 static int after_eq(uint32_t a, uint32_t b)
@@ -2345,6 +2410,8 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
                 val = 0;
             break;
         case 0x3c2:
+            /* ISR0: toggle switch sense bit on each read (real VGA behavior) */
+            s->st00 ^= 0x10;
             val = s->st00;
             break;
         case 0x3c4:
@@ -2481,6 +2548,9 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
 #if defined(DEBUG_VGA)
     printf("VGA: read addr=0x%04x data=0x%02x\n", addr, val);
 #endif
+    /* Skip retrace polling (3DA/3BA) and DAC (3C8/3C9) from trace - too noisy */
+    if (addr != 0x3da && addr != 0x3ba && addr != 0x3c9 && addr != 0x3c8)
+        vga_trace_record(addr, val, 0, s);
     return val;
 }
 
@@ -2526,6 +2596,9 @@ static inline void vga_update_cached_state(VGAState *s)
 void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
 {
     int index;
+    /* Skip DAC index/data (3C8/3C9) from trace - too noisy during palette loads */
+    if (addr != 0x3c9 && addr != 0x3c8)
+        vga_trace_record(addr, val, 1, s);
 
     /* check port range access depending on color/monochrome mode */
     if ((addr >= 0x3b0 && addr <= 0x3bf && (s->msr & MSR_COLOR_EMULATION)) ||
@@ -2659,24 +2732,14 @@ void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
 #endif
         /* handle CR0-7 protection */
         if ((s->cr[0x11] & 0x80) && s->cr_index <= 7) {
+            printf("VGA: CRTC write CR%02x=%02x BLOCKED by CR11 protection (CR11=%02x)\n",
+                   s->cr_index, val, s->cr[0x11]);
             /* can always write bit 4 of CR7 */
             if (s->cr_index == 7)
                 s->cr[7] = (s->cr[7] & ~0x10) | (val & 0x10);
             return;
         }
-        switch(s->cr_index) {
-        case 0x01: /* horizontal display end */
-        case 0x07:
-        case 0x09:
-        case 0x0c:
-        case 0x0d:
-        case 0x12: /* vertical display end */
-            s->cr[s->cr_index] = val;
-            break;
-        default:
-            s->cr[s->cr_index] = val;
-            break;
-        }
+        s->cr[s->cr_index] = val;
         break;
     case 0x3ba:
     case 0x3da:
@@ -3677,6 +3740,7 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
 
     /* Initialize cached state for Mode X fast path */
     vga_update_cached_state(s);
+    vga_trace_state = s;
 
     return s;
 }

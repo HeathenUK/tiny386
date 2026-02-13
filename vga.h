@@ -48,6 +48,7 @@ void vga_direct_mark_dirty(VGAState *s, uint32_t addr, int len);
 
 /* Debug functions */
 void vga_debug_direct_conditions(VGAState *s);
+void vga_dump_io_trace(void);
 
 typedef struct PCIDevice PCIDevice;
 typedef struct PCIBus PCIBus;

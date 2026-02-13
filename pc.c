@@ -11,6 +11,10 @@
 
 // Batch size setting: 0=auto (dynamic), or fixed value 512-4096
 int pc_batch_size_setting = 0;
+// Last effective batch size used by pc_step()
+int pc_last_batch_size = 0;
+// PIT burst catch-up: 1=enabled (default), 0=disabled
+int pc_pit_burst_setting = 1;
 
 #define cpu_raise_irq cpui386_raise_irq
 #define cpu_get_cycle cpui386_get_cycle
@@ -542,22 +546,30 @@ void pc_step(PC *pc)
 	 *
 	 * Optimized: use pit_burst_start/fire to avoid repeated get_uticks()
 	 * calls and mode validation on each iteration. */
-	uint32_t pit_d;
-	int pit_irq;
-	int pending = pit_burst_start(pc->pit, &pit_d, &pit_irq);
-	if (pending > 1) {
-		/* Limit burst size to avoid stalling other emulation too long. */
-		int burst = pending > 48 ? 48 : pending;
-		for (int i = 0; i < burst; i++) {
-			if (!pit_burst_fire(pc->pit, pit_d, pit_irq))
-				break;
-			/* Run enough instructions for a typical music ISR (~60-100) */
-			cpui386_step(pc->cpu, 100);
+		if (pc_pit_burst_setting) {
+			uint32_t pit_d;
+			int pit_irq;
+			int pending = pit_burst_start(pc->pit, &pit_d, &pit_irq);
+			if (pending > 1) {
+				/* Limit burst size to avoid stalling other emulation too long. */
+				int burst = pending > 48 ? 48 : pending;
+				for (int i = 0; i < burst; i++) {
+					if (!pit_burst_fire(pc->pit, pit_d, pit_irq))
+						break;
+					/* Run enough instructions for a typical music ISR (~60-100) */
+					cpui386_step(pc->cpu, 100);
+				}
+			} else {
+				/* pending==1: single periodic IRQ pending.
+				 * pending==0: either up-to-date periodic PIT or non-periodic mode.
+				 * In both cases we still need i8254_update_irq() so non-periodic
+				 * modes (e.g., mode 0 one-shot) can generate OUT rising-edge IRQs. */
+				i8254_update_irq(pc->pit);
+			}
+		} else {
+			/* Debug/compat mode: no PIT burst catch-up, one normal update per step. */
+			i8254_update_irq(pc->pit);
 		}
-	} else if (pending == 1) {
-		/* Single IRQ pending - use normal path */
-		i8254_update_irq(pc->pit);
-	}
 
 	cmos_update_irq(pc->cmos);
 	if (pc->enable_serial)
@@ -626,6 +638,57 @@ void pc_step(PC *pc)
 			stat_last_report = t2;
 		}
 	}
+
+	/* CPU-debug halt forensics: dump PIC/PIT once after prolonged halting.
+	 * Accumulate halt time across short wakeups so we still capture states
+	 * where the CPU alternates between brief wakes and HLT loops. */
+	if (globals.cpu_debug_enabled) {
+		static uint32_t last_sample = 0;
+		static uint32_t halt_accum_us = 0;
+		static uint32_t run_accum_us = 0;
+		static bool halt_dumped = false;
+		uint32_t now = get_uticks();
+		if (last_sample == 0)
+			last_sample = now;
+		uint32_t dt = now - last_sample;
+		last_sample = now;
+		if (cpui386_is_halted(pc->cpu)) {
+			halt_accum_us += dt;
+			run_accum_us = 0;
+			if (!halt_dumped && halt_accum_us > 5000000) {
+				uint16_t irr = i8259_get_irr(pc->pic);
+				uint16_t isr = i8259_get_isr(pc->pic);
+				uint16_t imr = i8259_get_imr(pc->pic);
+				int pending_irq = i8259_get_pending_irq(pc->pic);
+				int pit_pending = pit_get_pending_irqs(pc->pit);
+				uint64_t pit_ticks = pit_get_virtual_ticks(pc->pit, 0);
+				int pit_mode = pit_get_mode(pc->pit, 0);
+				int pit_count = pit_get_initial_count(pc->pit, 0);
+				int pit_gate = pit_get_gate(pc->pit, 0);
+				int pit_out = pit_get_out(pc->pit, 0);
+					fprintf(stderr, "=== PC halt-forensics ===\n");
+					fprintf(stderr, "  PIC irr=%04x isr=%04x imr=%04x pending_irq=%d\n",
+						irr, isr, imr, pending_irq);
+						fprintf(stderr, "  PIT ch0: pending=%d ticks=%llu mode=%d count=%d gate=%d out=%d\n",
+							pit_pending, (unsigned long long)pit_ticks,
+							pit_mode, pit_count, pit_gate, pit_out);
+						fprintf(stderr, "  Config: batch_setting=%d batch_effective=%d pit_burst=%d\n",
+							pc_batch_size_setting, pc_last_batch_size, pc_pit_burst_setting);
+						fflush(stderr);
+						halt_dumped = true;
+					}
+		} else if (halt_accum_us != 0 || halt_dumped) {
+			run_accum_us += dt;
+			/* If the guest has been running for a while, treat it as a new
+			 * episode and re-arm diagnostics for future halts. */
+			if (run_accum_us > 2000000) {
+				halt_accum_us = 0;
+				run_accum_us = 0;
+				halt_dumped = false;
+			}
+		}
+		}
+	pc_last_batch_size = batch_size;
 	/* Batch size is always available (tracked for dynamic batching) */
 	globals.emu_batch_size = batch_size;
 }
@@ -872,6 +935,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	cb->pic_read_irq = read_irq;
 
 	pc->pit = i8254_init(0, pc->pic, set_irq);
+	cb->pit = pc->pit;
 	pc->serial = u8250_init(4, pc->pic, set_irq);
 	pc->cmos = cmos_init(conf->mem_size, 8, pc->pic, set_irq);
 	pc->ide = ide_allocate(14, pc->pic, set_irq);
@@ -1236,8 +1300,8 @@ int parse_conf_ini(void* user, const char* section,
 		} else if (NAME("double_buffer")) {
 			// Ignored - TE vsync replaces software double buffering
 		}
-	} else if (SEC("cpu")) {
-		if (NAME("gen")) {
+		} else if (SEC("cpu")) {
+			if (NAME("gen")) {
 			int gen = atoi(value);
 			if (gen < 3 || gen > 6) {
 				fprintf(stderr, "Warning: Invalid cpu gen '%s' (valid: 3-6), using 4\n", value);
@@ -1246,16 +1310,18 @@ int parse_conf_ini(void* user, const char* section,
 			conf->cpu_gen = gen;
 		} else if (NAME("fpu")) {
 			conf->fpu = atoi(value);
-		} else if (NAME("batch_size")) {
-			int bs = atoi(value);
-			// Validate: 0 (auto) or 512-4096
-			if (bs != 0 && (bs < 512 || bs > 4096)) {
-				fprintf(stderr, "Warning: Invalid batch_size '%s' (valid: 0 or 512-4096), using auto\n", value);
-				bs = 0;
+			} else if (NAME("batch_size")) {
+				int bs = atoi(value);
+				// Validate: 0 (auto) or 512-4096
+				if (bs != 0 && (bs < 512 || bs > 4096)) {
+					fprintf(stderr, "Warning: Invalid batch_size '%s' (valid: 0 or 512-4096), using auto\n", value);
+					bs = 0;
+				}
+				conf->batch_size = bs;
+			} else if (NAME("pit_burst")) {
+				conf->pit_burst = atoi(value) ? 1 : 0;
 			}
-			conf->batch_size = bs;
 		}
-	}
 #undef SEC
 #undef NAME
 	return 1;

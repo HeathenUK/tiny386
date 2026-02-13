@@ -10,5 +10,9 @@ void i8259_ioport_write(PicState2 *s, uint32_t addr, uint32_t val);
 int i8259_read_irq(PicState2 *s);
 void i8259_set_irq(PicState2 *s, int irq, int level);
 int i8259_irq_pending(PicState2 *s, int irq);
+uint16_t i8259_get_irr(PicState2 *s);
+uint16_t i8259_get_isr(PicState2 *s);
+uint16_t i8259_get_imr(PicState2 *s);
+int i8259_get_pending_irq(PicState2 *s);
 
 #endif /* I8259_H */

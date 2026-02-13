@@ -20,6 +20,7 @@ typedef struct CPUI386 CPUI386;
 typedef struct {
 	void *pic;
 	int (*pic_read_irq)(void *);
+	void *pit;
 
 	void *io;
 	u8 (*io_read8)(void *, int);
@@ -85,5 +86,6 @@ void cpu_setflags(CPUI386 *cpu, uword set_mask, uword clear_mask);
 uword cpu_getflags(CPUI386 *cpu);
 void cpu_abort(CPUI386 *cpu, int code);
 void cpui386_set_diag(CPUI386 *cpu, bool enabled);
+bool cpui386_is_halted(CPUI386 *cpu);
 
 #endif /* I386_H */

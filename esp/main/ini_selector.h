@@ -29,4 +29,10 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch);
  */
 int ini_selector_handle_key(int scancode);
 
+/*
+ * Update Ctrl modifier state while selector is active.
+ * Used for Ctrl+Enter "debug boot" shortcut.
+ */
+void ini_selector_set_modifier_ctrl(bool held);
+
 #endif /* INI_SELECTOR_H */

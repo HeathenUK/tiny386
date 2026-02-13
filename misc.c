@@ -412,8 +412,11 @@ int cmos_get_boot_order(CMOS *cmos)
 // Helper to check if a line starts with a key
 static int line_starts_with(const char *line, const char *key)
 {
+	while (*line == ' ' || *line == '\t')
+		line++;
 	size_t len = strlen(key);
-	return strncmp(line, key, len) == 0 && (line[len] == ' ' || line[len] == '=');
+	return strncmp(line, key, len) == 0 &&
+	       (line[len] == ' ' || line[len] == '=' || line[len] == '\t');
 }
 
 // Save all settings to ini file
@@ -424,7 +427,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
                          const char *cdc, const char *cdd,
                          int cpu_gen, int fpu, long mem_size,
                          int brightness, int volume, int frame_skip,
-                         int batch_size, int mouse_speed,
+                         int batch_size, int pit_burst, int mouse_speed,
                          int usb_passthru)
 {
 	if (!ini_path) return -1;
@@ -437,13 +440,11 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	FILE *f = fopen(ini_path, "r");
 	if (!f) return -1;
 
-	// Read all lines into memory (heap allocated to avoid stack overflow)
-	char (*lines)[256] = malloc(64 * 256);
-	if (!lines) {
-		fclose(f);
-		return -1;
-	}
+	// Read all lines into memory (dynamic; do not truncate large INI files)
+	char **lines = NULL;
+	int line_cap = 0;
 	int line_count = 0;
+	char readbuf[1024];
 	int in_pc_section = 0;
 	int in_cpu_section = 0;
 	int in_display_section = 0;
@@ -455,31 +456,55 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	int found_boot_order = -1, found_hda = -1, found_fda = -1, found_fdb = -1;
 	int found_cda = -1, found_cdb = -1, found_cdc = -1, found_cdd = -1;
 	int found_mem_size = -1;
-	int found_gen = -1, found_fpu = -1, found_batch_size = -1;
+	int found_gen = -1, found_fpu = -1, found_batch_size = -1, found_pit_burst = -1;
 	int found_brightness = -1, found_volume = -1, found_frame_skip = -1;
 	int found_mouse_speed = -1, found_usb_passthru = -1;
 
-	while (line_count < 64 && fgets(lines[line_count], 256, f)) {
+	while (fgets(readbuf, sizeof(readbuf), f)) {
+		if (line_count >= line_cap) {
+			int new_cap = line_cap ? line_cap * 2 : 128;
+			char **new_lines = realloc(lines, (size_t)new_cap * sizeof(*new_lines));
+			if (!new_lines) {
+				for (int i = 0; i < line_count; i++) free(lines[i]);
+				free(lines);
+				fclose(f);
+				return -1;
+			}
+			lines = new_lines;
+			line_cap = new_cap;
+		}
+
+		lines[line_count] = strdup(readbuf);
+		if (!lines[line_count]) {
+			for (int i = 0; i < line_count; i++) free(lines[i]);
+			free(lines);
+			fclose(f);
+			return -1;
+		}
+
+		const char *line = lines[line_count];
+		while (*line == ' ' || *line == '\t') line++;
+
 		// Check for section headers
-		if (strncmp(lines[line_count], "[pc]", 4) == 0) {
+		if (strncmp(line, "[pc]", 4) == 0) {
 			if (in_cpu_section && cpu_section_end < 0) cpu_section_end = line_count;
 			if (in_display_section && display_section_end < 0) display_section_end = line_count;
 			in_pc_section = 1;
 			in_cpu_section = 0;
 			in_display_section = 0;
-		} else if (strncmp(lines[line_count], "[cpu]", 5) == 0) {
+		} else if (strncmp(line, "[cpu]", 5) == 0) {
 			if (in_pc_section && pc_section_end < 0) pc_section_end = line_count;
 			if (in_display_section && display_section_end < 0) display_section_end = line_count;
 			in_pc_section = 0;
 			in_cpu_section = 1;
 			in_display_section = 0;
-		} else if (strncmp(lines[line_count], "[display]", 9) == 0) {
+		} else if (strncmp(line, "[display]", 9) == 0) {
 			if (in_pc_section && pc_section_end < 0) pc_section_end = line_count;
 			if (in_cpu_section && cpu_section_end < 0) cpu_section_end = line_count;
 			in_pc_section = 0;
 			in_cpu_section = 0;
 			in_display_section = 1;
-		} else if (lines[line_count][0] == '[') {
+		} else if (line[0] == '[') {
 			if (in_pc_section && pc_section_end < 0) pc_section_end = line_count;
 			if (in_cpu_section && cpu_section_end < 0) cpu_section_end = line_count;
 			if (in_display_section && display_section_end < 0) display_section_end = line_count;
@@ -490,27 +515,28 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 
 		// Check for existing settings in [pc] section
 		if (in_pc_section) {
-			if (line_starts_with(lines[line_count], "boot_order")) found_boot_order = line_count;
-			else if (line_starts_with(lines[line_count], "hda")) found_hda = line_count;
-			else if (line_starts_with(lines[line_count], "fda")) found_fda = line_count;
-			else if (line_starts_with(lines[line_count], "fdb")) found_fdb = line_count;
-			else if (line_starts_with(lines[line_count], "cda")) found_cda = line_count;
-			else if (line_starts_with(lines[line_count], "cdb")) found_cdb = line_count;
-			else if (line_starts_with(lines[line_count], "cdc")) found_cdc = line_count;
-			else if (line_starts_with(lines[line_count], "cdd")) found_cdd = line_count;
-			else if (line_starts_with(lines[line_count], "mem_size")) found_mem_size = line_count;
-			else if (line_starts_with(lines[line_count], "brightness")) found_brightness = line_count;
-			else if (line_starts_with(lines[line_count], "volume")) found_volume = line_count;
-			else if (line_starts_with(lines[line_count], "frame_skip")) found_frame_skip = line_count;
-			else if (line_starts_with(lines[line_count], "mouse_speed")) found_mouse_speed = line_count;
-			else if (line_starts_with(lines[line_count], "usb_passthru")) found_usb_passthru = line_count;
+			if (line_starts_with(line, "boot_order")) found_boot_order = line_count;
+			else if (line_starts_with(line, "hda")) found_hda = line_count;
+			else if (line_starts_with(line, "fda")) found_fda = line_count;
+			else if (line_starts_with(line, "fdb")) found_fdb = line_count;
+			else if (line_starts_with(line, "cda")) found_cda = line_count;
+			else if (line_starts_with(line, "cdb")) found_cdb = line_count;
+			else if (line_starts_with(line, "cdc")) found_cdc = line_count;
+			else if (line_starts_with(line, "cdd")) found_cdd = line_count;
+			else if (line_starts_with(line, "mem_size")) found_mem_size = line_count;
+			else if (line_starts_with(line, "brightness")) found_brightness = line_count;
+			else if (line_starts_with(line, "volume")) found_volume = line_count;
+			else if (line_starts_with(line, "frame_skip")) found_frame_skip = line_count;
+			else if (line_starts_with(line, "mouse_speed")) found_mouse_speed = line_count;
+			else if (line_starts_with(line, "usb_passthru")) found_usb_passthru = line_count;
 		}
 
 		// Check for existing settings in [cpu] section
 		if (in_cpu_section) {
-			if (line_starts_with(lines[line_count], "gen")) found_gen = line_count;
-			else if (line_starts_with(lines[line_count], "fpu")) found_fpu = line_count;
-			else if (line_starts_with(lines[line_count], "batch_size")) found_batch_size = line_count;
+			if (line_starts_with(line, "gen")) found_gen = line_count;
+			else if (line_starts_with(line, "fpu")) found_fpu = line_count;
+			else if (line_starts_with(line, "batch_size")) found_batch_size = line_count;
+			else if (line_starts_with(line, "pit_burst")) found_pit_burst = line_count;
 		}
 
 		line_count++;
@@ -531,6 +557,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	// Write back with updated settings
 	f = fopen(ini_path, "w");
 	if (!f) {
+		for (int i = 0; i < line_count; i++) free(lines[i]);
 		free(lines);
 		return -1;
 	}
@@ -573,9 +600,11 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			fprintf(f, "fpu = %d\n", fpu);
 		} else if (i == found_batch_size) {
 			fprintf(f, "batch_size = %d\n", batch_size);
-		} else {
-			fputs(lines[i], f);
-		}
+			} else if (i == found_pit_burst) {
+				fprintf(f, "pit_burst = %d\n", pit_burst ? 1 : 0);
+			} else {
+				fputs(lines[i] ? lines[i] : "", f);
+			}
 
 		// Add new settings at end of [pc] section
 		if (i == pc_section_end - 1) {
@@ -608,18 +637,47 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 				fprintf(f, "mouse_speed = %d\n", mouse_speed);
 			if (found_usb_passthru < 0)
 				fprintf(f, "usb_passthru = %d\n", usb_passthru);
-		}
+			}
 
-		// Add new settings at end of [cpu] section
-		if (i == cpu_section_end - 1) {
-			if (found_gen < 0)
-				fprintf(f, "gen = %d\n", cpu_gen);
-			if (found_fpu < 0)
-				fprintf(f, "fpu = %d\n", fpu);
-			if (found_batch_size < 0)
-				fprintf(f, "batch_size = %d\n", batch_size);
-		}
+			// Add new settings at end of [cpu] section
+			if (i == cpu_section_end - 1) {
+				if (found_gen < 0)
+					fprintf(f, "gen = %d\n", cpu_gen);
+				if (found_fpu < 0)
+					fprintf(f, "fpu = %d\n", fpu);
+				if (found_batch_size < 0)
+					fprintf(f, "batch_size = %d\n", batch_size);
+				if (found_pit_burst < 0)
+					fprintf(f, "pit_burst = %d\n", pit_burst ? 1 : 0);
+			}
 
+	}
+
+	// If section missing, append it so settings persist.
+	if (pc_section_end < 0) {
+		fprintf(f, "\n[pc]\n");
+		fprintf(f, "boot_order = %s\n", boot_order_names[boot_order]);
+		if (hda && hda[0]) fprintf(f, "hda = %s\n", hda);
+		if (fda && fda[0]) fprintf(f, "fda = %s\n", fda);
+		if (fdb && fdb[0]) fprintf(f, "fdb = %s\n", fdb);
+		if (cda && cda[0]) fprintf(f, "cda = %s\n", cda);
+		if (cdb && cdb[0]) fprintf(f, "cdb = %s\n", cdb);
+		if (cdc && cdc[0]) fprintf(f, "cdc = %s\n", cdc);
+		if (cdd && cdd[0]) fprintf(f, "cdd = %s\n", cdd);
+		fprintf(f, "mem_size = %ldM\n", mem_size / (1024 * 1024));
+		fprintf(f, "brightness = %d\n", brightness);
+		fprintf(f, "volume = %d\n", volume);
+		fprintf(f, "frame_skip = %d\n", frame_skip);
+		fprintf(f, "mouse_speed = %d\n", mouse_speed);
+		fprintf(f, "usb_passthru = %d\n", usb_passthru);
+	}
+
+	if (cpu_section_end < 0) {
+		fprintf(f, "\n[cpu]\n");
+		fprintf(f, "gen = %d\n", cpu_gen);
+		fprintf(f, "fpu = %d\n", fpu);
+		fprintf(f, "batch_size = %d\n", batch_size);
+		fprintf(f, "pit_burst = %d\n", pit_burst ? 1 : 0);
 	}
 
 	/* Ensure INI is written to physical media before closing */
@@ -627,6 +685,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	fsync(fileno(f));
 
 	fclose(f);
+	for (int i = 0; i < line_count; i++) free(lines[i]);
 	free(lines);
 	return 0;
 }

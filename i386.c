@@ -7,6 +7,12 @@
 
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
+#include "i8259.h"
+#include "i8254.h"
+extern int pc_batch_size_setting;
+extern int pc_last_batch_size;
+extern int pc_pit_burst_setting;
+extern void vga_dump_io_trace(void);
 
 /* PIE SIMD helpers for ESP32-P4 string operations */
 extern void pie_memcpy_128(void *dst, const void *src, size_t n);
@@ -409,6 +415,265 @@ static struct {
 static bool cpu_diag_enabled = false;
 #define diaglog(...) do { if (cpu_diag_enabled) dolog(__VA_ARGS__); } while(0)
 
+/* Per-generation, rate-limited diagnostic events for heavy CPU-debug traces. */
+#define CPU_DIAG_EVENT_LIMIT 8
+static struct {
+	int gen;
+	uint8_t vm86_int_iopl;
+	uint8_t vm86_gp_decode;
+	uint8_t vm86_ud_decode;
+	uint8_t swint_dpl;
+	uint8_t task_gate;
+	uint8_t vm86_isr_entry;
+	uint8_t iret_to_vm86;
+	uint8_t setseg_gap;
+	uint8_t hlt_exec;
+	uint8_t halt_irq_wake;
+} cpu_diag_events = { .gen = -1 };
+
+/* Last VM86 trap seen before returning to DOS; helps correlate Win386 aborts. */
+static struct {
+	int gen;
+	bool valid;
+	uint8_t excno;
+	uint16_t cs;
+	uword ip;
+	uword fl;
+	uword err;
+	char decoded[80];
+} vm86_last_fault = { .gen = -1 };
+
+/* Keep a tail of VM86 #GP/#UD traps for post-mortem on Win386 abort. */
+#define VM86_FAULT_RING_SIZE 96
+static struct {
+	int gen;
+	uint16_t count;
+	uint16_t pos;
+	struct {
+		uint8_t excno;
+		uint16_t cs;
+		uint16_t ss;
+		uword ip;
+		uword sp;
+		uword fl;
+		uword err;
+		char decoded[40];
+	} ring[VM86_FAULT_RING_SIZE];
+} vm86_fault_ring = { .gen = -1 };
+
+/* Keep a tail of actual VM86 IRET executions (IOPL=3 path). */
+#define VM86_IRET_RING_SIZE 96
+static struct {
+	int gen;
+	uint16_t count;
+	uint16_t pos;
+	struct {
+		uint16_t from_cs;
+		uint16_t from_ss;
+		uint16_t to_cs;
+		uword from_ip;
+		uword from_sp;
+		uword to_ip;
+		uword to_fl;
+		uint8_t opsz16;
+	} ring[VM86_IRET_RING_SIZE];
+} vm86_iret_ring = { .gen = -1 };
+
+/* Focused Win386 diagnostics: enable narrow traces only while win386.exe runs. */
+static struct {
+	int gen;
+	bool active;
+	uint16_t code_cs;
+	uint16_t int21_count;
+	uint16_t int2f_count;
+	uint16_t pm_exc_count;
+} win386_diag = { .gen = -1 };
+
+static inline void cpu_diag_events_sync(CPUI386 *cpu)
+{
+	if (cpu_diag_events.gen != cpu->diag_gen) {
+		memset(&cpu_diag_events, 0, sizeof(cpu_diag_events));
+		cpu_diag_events.gen = cpu->diag_gen;
+	}
+}
+
+static inline bool cpu_diag_event_allow(CPUI386 *cpu, uint8_t *slot)
+{
+	cpu_diag_events_sync(cpu);
+	if (*slot >= CPU_DIAG_EVENT_LIMIT)
+		return false;
+	(*slot)++;
+	return true;
+}
+
+static inline void cpu_diag_win386_sync(CPUI386 *cpu)
+{
+	if (win386_diag.gen != cpu->diag_gen) {
+		memset(&win386_diag, 0, sizeof(win386_diag));
+		win386_diag.gen = cpu->diag_gen;
+	}
+}
+
+static inline void cpu_diag_vm86_fault_ring_sync(CPUI386 *cpu)
+{
+	if (vm86_fault_ring.gen != cpu->diag_gen) {
+		memset(&vm86_fault_ring, 0, sizeof(vm86_fault_ring));
+		vm86_fault_ring.gen = cpu->diag_gen;
+	}
+}
+
+static inline void cpu_diag_vm86_iret_ring_sync(CPUI386 *cpu)
+{
+	if (vm86_iret_ring.gen != cpu->diag_gen) {
+		memset(&vm86_iret_ring, 0, sizeof(vm86_iret_ring));
+		vm86_iret_ring.gen = cpu->diag_gen;
+	}
+}
+
+static void cpu_diag_vm86_fault_ring_push(CPUI386 *cpu, int excno, bool pusherr, const char *decoded)
+{
+	uint16_t idx;
+	cpu_diag_vm86_fault_ring_sync(cpu);
+	idx = vm86_fault_ring.pos % VM86_FAULT_RING_SIZE;
+	vm86_fault_ring.ring[idx].excno = (uint8_t)excno;
+	vm86_fault_ring.ring[idx].cs = cpu->seg[SEG_CS].sel;
+	vm86_fault_ring.ring[idx].ss = cpu->seg[SEG_SS].sel;
+	vm86_fault_ring.ring[idx].ip = cpu->ip;
+	vm86_fault_ring.ring[idx].sp = REGi(4);
+	vm86_fault_ring.ring[idx].fl = cpu->flags;
+	vm86_fault_ring.ring[idx].err = pusherr ? cpu->excerr : 0;
+	snprintf(vm86_fault_ring.ring[idx].decoded, sizeof(vm86_fault_ring.ring[idx].decoded),
+		 "%s", decoded ? decoded : "?");
+	vm86_fault_ring.pos++;
+	if (vm86_fault_ring.count < VM86_FAULT_RING_SIZE)
+		vm86_fault_ring.count++;
+}
+
+static void cpu_diag_vm86_iret_ring_push(CPUI386 *cpu,
+					 uint16_t from_cs, uword from_ip,
+					 uint16_t from_ss, uword from_sp,
+					 uint16_t to_cs, uword to_ip,
+					 uword to_fl, bool opsz16)
+{
+	uint16_t idx;
+	cpu_diag_vm86_iret_ring_sync(cpu);
+	idx = vm86_iret_ring.pos % VM86_IRET_RING_SIZE;
+	vm86_iret_ring.ring[idx].from_cs = from_cs;
+	vm86_iret_ring.ring[idx].from_ip = from_ip;
+	vm86_iret_ring.ring[idx].from_ss = from_ss;
+	vm86_iret_ring.ring[idx].from_sp = from_sp;
+	vm86_iret_ring.ring[idx].to_cs = to_cs;
+	vm86_iret_ring.ring[idx].to_ip = to_ip;
+	vm86_iret_ring.ring[idx].to_fl = to_fl;
+	vm86_iret_ring.ring[idx].opsz16 = opsz16 ? 1 : 0;
+	vm86_iret_ring.pos++;
+	if (vm86_iret_ring.count < VM86_IRET_RING_SIZE)
+		vm86_iret_ring.count++;
+}
+
+static void cpu_diag_vm86_fault_ring_dump_tail(int n)
+{
+	int count = vm86_fault_ring.count;
+	if (count <= 0)
+		return;
+	if (n > count)
+		n = count;
+	dolog("=== VM86 fault tail (%d of %d) ===\n", n, count);
+	for (int i = count - n; i < count; i++) {
+		int idx = (vm86_fault_ring.pos - count + i) % VM86_FAULT_RING_SIZE;
+		if (idx < 0)
+			idx += VM86_FAULT_RING_SIZE;
+		dolog("  #%d exc=%02x %04x:%08x SS:ESP=%04x:%08x FL=%08x err=%08x %s\n",
+			i + 1,
+			vm86_fault_ring.ring[idx].excno,
+			vm86_fault_ring.ring[idx].cs,
+			vm86_fault_ring.ring[idx].ip,
+			vm86_fault_ring.ring[idx].ss,
+			vm86_fault_ring.ring[idx].sp,
+			vm86_fault_ring.ring[idx].fl,
+			vm86_fault_ring.ring[idx].err,
+			vm86_fault_ring.ring[idx].decoded);
+	}
+}
+
+static void cpu_diag_vm86_iret_ring_dump_tail(int n)
+{
+	int count = vm86_iret_ring.count;
+	if (count <= 0)
+		return;
+	if (n > count)
+		n = count;
+	dolog("=== VM86 IRET tail (%d of %d) ===\n", n, count);
+	for (int i = count - n; i < count; i++) {
+		int idx = (vm86_iret_ring.pos - count + i) % VM86_IRET_RING_SIZE;
+		if (idx < 0)
+			idx += VM86_IRET_RING_SIZE;
+		dolog("  #%d %s from %04x:%08x SS:ESP=%04x:%08x -> %04x:%08x FL=%08x\n",
+			i + 1,
+			vm86_iret_ring.ring[idx].opsz16 ? "IRET16" : "IRET32",
+			vm86_iret_ring.ring[idx].from_cs,
+			vm86_iret_ring.ring[idx].from_ip,
+			vm86_iret_ring.ring[idx].from_ss,
+			vm86_iret_ring.ring[idx].from_sp,
+			vm86_iret_ring.ring[idx].to_cs,
+			vm86_iret_ring.ring[idx].to_ip,
+			vm86_iret_ring.ring[idx].to_fl);
+	}
+}
+
+static inline uint8_t cpu_diag_ascii_tolower(uint8_t c)
+{
+	if (c >= 'A' && c <= 'Z')
+		return (uint8_t)(c + ('a' - 'A'));
+	return c;
+}
+
+static bool cpu_diag_str_has_win386(const char *s)
+{
+	static const char needle[] = "win386.exe";
+	size_t nlen = sizeof(needle) - 1;
+	if (!s)
+		return false;
+	for (size_t i = 0; s[i]; i++) {
+		size_t j = 0;
+		while (j < nlen && s[i + j] &&
+		       cpu_diag_ascii_tolower((uint8_t)s[i + j]) == (uint8_t)needle[j])
+			j++;
+		if (j == nlen)
+			return true;
+	}
+	return false;
+}
+
+/* Captures where the most recent architectural HLT executed. */
+static struct {
+	int gen;
+	uint32_t count;
+	uint16_t cs;
+	uword ip;
+	uint16_t ss;
+	uword sp;
+	uword fl;
+	int cpl;
+	bool vm;
+	uint32_t wake_count;
+	int last_wake_vec;
+	uword last_wake_eip;
+	uint16_t last_wake_cs;
+	uint16_t last_wake_ss;
+	uword last_wake_sp;
+	uword last_wake_fl;
+	uint32_t last_wake_time_us;
+} hlt_diag = { .gen = -1 };
+
+static inline void hlt_diag_sync(CPUI386 *cpu)
+{
+	if (hlt_diag.gen != cpu->diag_gen) {
+		memset(&hlt_diag, 0, sizeof(hlt_diag));
+		hlt_diag.gen = cpu->diag_gen;
+	}
+}
+
 /* lazy flags */
 enum {
 	CC_ADC, CC_ADD,	CC_SBB, CC_SUB,
@@ -750,6 +1015,7 @@ static bool translate_laddr(CPUI386 *cpu, OptAddr *res, int rwm, uword laddr, in
 static u32 load32(CPUI386 *cpu, OptAddr *res);
 static bool translate(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uword addr, int size, int cpl);
 static u8 load8(CPUI386 *cpu, OptAddr *res);
+static u16 load16(CPUI386 *cpu, OptAddr *res);
 
 static bool IRAM_ATTR tlb_refill(CPUI386 *cpu, struct tlb_entry *ent, uword lpgno)
 {
@@ -918,6 +1184,306 @@ static void dump_cs_bytes(CPUI386 *cpu, const char *tag, int nbytes)
 		}
 	}
 	dolog("\n");
+}
+
+static bool read_seg_u8_noexcept(CPUI386 *cpu, int seg, uword off, int cpl, uint8_t *out)
+{
+	uword saved_cr2 = cpu->cr2;
+	uword saved_excno = cpu->excno;
+	uword saved_excerr = cpu->excerr;
+	OptAddr b;
+	bool ok = translate(cpu, &b, 1, seg, off, 1, cpl);
+	if (ok)
+		*out = load8(cpu, &b);
+	cpu->cr2 = saved_cr2;
+	cpu->excno = saved_excno;
+	cpu->excerr = saved_excerr;
+	return ok;
+}
+
+static bool read_seg_u16_noexcept(CPUI386 *cpu, int seg, uword off, int cpl, uint16_t *out)
+{
+	uword saved_cr2 = cpu->cr2;
+	uword saved_excno = cpu->excno;
+	uword saved_excerr = cpu->excerr;
+	OptAddr b;
+	bool ok = translate(cpu, &b, 1, seg, off, 2, cpl);
+	if (ok)
+		*out = load16(cpu, &b);
+	cpu->cr2 = saved_cr2;
+	cpu->excno = saved_excno;
+	cpu->excerr = saved_excerr;
+	return ok;
+}
+
+static void vm86_dump_stack_words(CPUI386 *cpu, int words)
+{
+	uword sp = REGi(4);
+	uword sp_mask = (cpu->seg[SEG_SS].flags & SEG_B_BIT) ? 0xffffffff : 0xffff;
+	dolog("  vm86 stack SS:SP=%04x:%08x", cpu->seg[SEG_SS].sel, sp);
+	for (int i = 0; i < words; i++) {
+		uint16_t w = 0;
+		uword off = (sp + (uword)(i * 2)) & sp_mask;
+		if (read_seg_u16_noexcept(cpu, SEG_SS, off, cpu->cpl, &w))
+			dolog(" [%d]=%04x", i, w);
+		else {
+			dolog(" [%d]=????", i);
+			break;
+		}
+	}
+	dolog("\n");
+}
+
+static void vm86_log_ioperm_probe(CPUI386 *cpu, int port, int bits)
+{
+	bool need_iobitmap = false;
+	if (cpu->cr0 & 1) {
+		int iopl = get_IOPL(cpu);
+		if (cpu->flags & VM)
+			need_iobitmap = (iopl < 3);
+		else
+			need_iobitmap = (cpu->cpl > iopl);
+	}
+
+	if (!need_iobitmap) {
+		dolog("  io-perm: bypass (no bitmap check needed)\n");
+		return;
+	}
+
+	if (cpu->seg[SEG_TR].limit < 103) {
+		dolog("  io-perm: deny (TR limit %x < 0x67)\n", cpu->seg[SEG_TR].limit);
+		return;
+	}
+
+	uint16_t iobase16 = 0;
+	if (!read_seg_u16_noexcept(cpu, SEG_TR, 102, 0, &iobase16)) {
+		dolog("  io-perm: failed reading TSS iobase\n");
+		return;
+	}
+
+	uword iobase = iobase16;
+	dolog("  io-perm: port=%04x bits=%d TR.limit=%x iobase=%x\n",
+		port & 0xffff, bits, cpu->seg[SEG_TR].limit, iobase);
+
+	if (iobase > cpu->seg[SEG_TR].limit) {
+		dolog("  io-perm: deny (iobase beyond TR limit)\n");
+		return;
+	}
+
+	int denied_bit = -1;
+	uword denied_byte_off = 0;
+	uint8_t denied_byte = 0;
+	for (int b = 0; b < bits; b++) {
+		uword p = (uword)port + (uword)b;
+		uword byte_off = iobase + (p >> 3);
+		if (byte_off > cpu->seg[SEG_TR].limit) {
+			denied_bit = b;
+			denied_byte_off = byte_off;
+			break;
+		}
+		uint8_t perm = 0;
+		if (!read_seg_u8_noexcept(cpu, SEG_TR, byte_off, 0, &perm)) {
+			dolog("  io-perm: failed reading bitmap byte @%x\n", byte_off);
+			return;
+		}
+		if (perm & (1u << (p & 7))) {
+			denied_bit = b;
+			denied_byte_off = byte_off;
+			denied_byte = perm;
+			break;
+		}
+	}
+
+	if (denied_bit >= 0) {
+		if (denied_byte_off > cpu->seg[SEG_TR].limit)
+			dolog("  io-perm: deny bit=%d (bitmap out-of-range)\n", denied_bit);
+		else
+			dolog("  io-perm: deny bit=%d byte[%x]=%02x\n",
+				denied_bit, denied_byte_off, denied_byte);
+	} else {
+		dolog("  io-perm: allow\n");
+	}
+}
+
+static void vm86_decode_fault_instruction(CPUI386 *cpu, char *buf, size_t buflen,
+					  bool *is_io, int *io_port, int *io_bits,
+					  bool *needs_stack_dump)
+{
+	int idx = 0;
+	bool op32 = false;
+	uint8_t op = 0;
+	uint8_t imm = 0;
+
+	*is_io = false;
+	*io_port = -1;
+	*io_bits = 0;
+	*needs_stack_dump = false;
+
+	while (idx < 6) {
+		if (!read_seg_u8_noexcept(cpu, SEG_CS, cpu->ip + idx, cpu->cpl, &op)) {
+			snprintf(buf, buflen, "<unreadable>");
+			return;
+		}
+		switch (op) {
+		case 0x66:
+			op32 = !op32;
+			idx++;
+			continue;
+		case 0x67: case 0xF2: case 0xF3:
+		case 0x26: case 0x2E: case 0x36: case 0x3E: case 0x64: case 0x65:
+			idx++;
+			continue;
+		default:
+			break;
+		}
+		break;
+	}
+
+	switch (op) {
+	case 0xFA:
+		snprintf(buf, buflen, "CLI");
+		break;
+	case 0xFB:
+		snprintf(buf, buflen, "STI");
+		break;
+	case 0xCF:
+		snprintf(buf, buflen, "IRET");
+		*needs_stack_dump = true;
+		break;
+	case 0x9C:
+		snprintf(buf, buflen, op32 ? "PUSHFD" : "PUSHF");
+		break;
+	case 0x9D:
+		snprintf(buf, buflen, op32 ? "POPFD" : "POPF");
+		*needs_stack_dump = true;
+		break;
+	case 0xCD:
+		if (read_seg_u8_noexcept(cpu, SEG_CS, cpu->ip + idx + 1, cpu->cpl, &imm))
+			snprintf(buf, buflen, "INT %02Xh", imm);
+		else
+			snprintf(buf, buflen, "INT imm8");
+		*needs_stack_dump = true;
+		break;
+	case 0xCE:
+		snprintf(buf, buflen, "INTO");
+		*needs_stack_dump = true;
+		break;
+	case 0xF4:
+		snprintf(buf, buflen, "HLT");
+		break;
+	case 0xE4:
+		*is_io = true; *io_bits = 8;
+		if (read_seg_u8_noexcept(cpu, SEG_CS, cpu->ip + idx + 1, cpu->cpl, &imm)) {
+			*io_port = imm;
+			snprintf(buf, buflen, "IN AL,%02Xh", imm);
+		} else {
+			snprintf(buf, buflen, "IN AL,imm8");
+		}
+		break;
+	case 0xE5:
+		*is_io = true; *io_bits = op32 ? 32 : 16;
+		if (read_seg_u8_noexcept(cpu, SEG_CS, cpu->ip + idx + 1, cpu->cpl, &imm)) {
+			*io_port = imm;
+			snprintf(buf, buflen, "IN %s,%02Xh", op32 ? "EAX" : "AX", imm);
+		} else {
+			snprintf(buf, buflen, "IN %s,imm8", op32 ? "EAX" : "AX");
+		}
+		break;
+	case 0xE6:
+		*is_io = true; *io_bits = 8;
+		if (read_seg_u8_noexcept(cpu, SEG_CS, cpu->ip + idx + 1, cpu->cpl, &imm)) {
+			*io_port = imm;
+			snprintf(buf, buflen, "OUT %02Xh,AL", imm);
+		} else {
+			snprintf(buf, buflen, "OUT imm8,AL");
+		}
+		break;
+	case 0xE7:
+		*is_io = true; *io_bits = op32 ? 32 : 16;
+		if (read_seg_u8_noexcept(cpu, SEG_CS, cpu->ip + idx + 1, cpu->cpl, &imm)) {
+			*io_port = imm;
+			snprintf(buf, buflen, "OUT %02Xh,%s", imm, op32 ? "EAX" : "AX");
+		} else {
+			snprintf(buf, buflen, "OUT imm8,%s", op32 ? "EAX" : "AX");
+		}
+		break;
+	case 0xEC:
+		*is_io = true; *io_bits = 8;
+		*io_port = (u16)REGi(2);
+		snprintf(buf, buflen, "IN AL,DX");
+		break;
+	case 0xED:
+		*is_io = true; *io_bits = op32 ? 32 : 16;
+		*io_port = (u16)REGi(2);
+		snprintf(buf, buflen, "IN %s,DX", op32 ? "EAX" : "AX");
+		break;
+	case 0xEE:
+		*is_io = true; *io_bits = 8;
+		*io_port = (u16)REGi(2);
+		snprintf(buf, buflen, "OUT DX,AL");
+		break;
+	case 0xEF:
+		*is_io = true; *io_bits = op32 ? 32 : 16;
+		*io_port = (u16)REGi(2);
+		snprintf(buf, buflen, "OUT DX,%s", op32 ? "EAX" : "AX");
+		break;
+	case 0x6C:
+		*is_io = true; *io_bits = 8;
+		*io_port = (u16)REGi(2);
+		snprintf(buf, buflen, "INSB");
+		break;
+	case 0x6D:
+		*is_io = true; *io_bits = op32 ? 32 : 16;
+		*io_port = (u16)REGi(2);
+		snprintf(buf, buflen, op32 ? "INSD" : "INSW");
+		break;
+	case 0x6E:
+		*is_io = true; *io_bits = 8;
+		*io_port = (u16)REGi(2);
+		snprintf(buf, buflen, "OUTSB");
+		break;
+	case 0x6F:
+		*is_io = true; *io_bits = op32 ? 32 : 16;
+		*io_port = (u16)REGi(2);
+		snprintf(buf, buflen, op32 ? "OUTSD" : "OUTSW");
+		break;
+	case 0x0F: {
+		uint8_t op2 = 0, modrm = 0;
+		if (!read_seg_u8_noexcept(cpu, SEG_CS, cpu->ip + idx + 1, cpu->cpl, &op2)) {
+			snprintf(buf, buflen, "0F ??");
+			break;
+		}
+		if (op2 == 0x01 &&
+		    read_seg_u8_noexcept(cpu, SEG_CS, cpu->ip + idx + 2, cpu->cpl, &modrm)) {
+			int grp = (modrm >> 3) & 7;
+			static const char *grp7_names[8] = {
+				"SGDT", "SIDT", "LGDT", "LIDT", "SMSW", "grp7/5", "LMSW", "INVLPG"
+			};
+			snprintf(buf, buflen, "0F 01 /%d (%s)", grp, grp7_names[grp]);
+		} else {
+			snprintf(buf, buflen, "0F %02Xh", op2);
+		}
+		break;
+	}
+	default:
+		snprintf(buf, buflen, "opcode %02Xh", op);
+		break;
+	}
+}
+
+static const char *seg_name(int seg)
+{
+	switch (seg) {
+	case SEG_ES: return "ES";
+	case SEG_CS: return "CS";
+	case SEG_SS: return "SS";
+	case SEG_DS: return "DS";
+	case SEG_FS: return "FS";
+	case SEG_GS: return "GS";
+	case SEG_LDT: return "LDT";
+	case SEG_TR: return "TR";
+	default: return "?";
+	}
 }
 
 static bool IRAM_ATTR translate_lpgno(CPUI386 *cpu, int rwm, uword lpgno, uword laddr, int cpl, uword *paddr)
@@ -1684,7 +2250,34 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 	// TODO: various permission checks
 	bool s = (w2 >> 12) & 1;
 	bool p = (w2 >> 15) & 1;
+	bool code = (w2 >> 11) & 1;
+	bool rw = (w2 >> 9) & 1;
+	int dpl = (w2 >> 13) & 0x3;
+	int rpl = sel & 0x3;
+	int maxpl = cpu->cpl > rpl ? cpu->cpl : rpl;
 	if (sel & ~0x3) {
+		if (unlikely(cpu_diag_enabled)) {
+			const char *reason = NULL;
+			if (seg == SEG_SS) {
+				if (!s) reason = "SS load with system descriptor";
+				else if (code) reason = "SS load with code descriptor";
+				else if (!rw) reason = "SS load with non-writable descriptor";
+				else if (dpl != cpu->cpl || rpl != cpu->cpl) reason = "SS load with CPL/RPL/DPL mismatch";
+			} else if (seg == SEG_DS || seg == SEG_ES || seg == SEG_FS || seg == SEG_GS) {
+				if (s && code && !rw) reason = "data seg load with unreadable code descriptor";
+				else if (s && !code && dpl < maxpl) reason = "data seg load with DPL < max(CPL,RPL)";
+			}
+			if (reason && p && cpu_diag_event_allow(cpu, &cpu_diag_events.setseg_gap)) {
+				refresh_flags(cpu);
+				dolog("=== set_seg weak-check path #%u ===\n", cpu_diag_events.setseg_gap);
+				dolog("  %s via %s sel=%04x rpl=%d dpl=%d cpl=%d FL=%08x\n",
+					reason, seg_name(seg), sel, rpl, dpl, cpu->cpl, cpu->flags);
+				dolog("  desc raw=%08x %08x s=%d code=%d rw=%d p=%d\n",
+					w1, w2, s, code, rw, p);
+				dolog("  at CS:EIP=%04x:%08x\n", cpu->seg[SEG_CS].sel, cpu->ip);
+			}
+		}
+
 		switch(seg) {
 		case SEG_DS: case SEG_ES: case SEG_FS: case SEG_GS:
 			if (!s) {
@@ -2261,6 +2854,192 @@ static inline void clear_segs(CPUI386 *cpu)
 #define saddr32(addr, v) store32(cpu, addr, v)
 #define lseg(i) ((u16) SEGi((i)))
 #define set_sp(v, mask) (sreg32(4, ((v) & mask) | (lreg32(4) & ~mask)))
+
+static void cpu_diag_copy_seg_string(CPUI386 *cpu, int seg, uword off, int cpl,
+	char term, char *out, size_t outsz)
+{
+	size_t i = 0;
+	if (!out || outsz == 0)
+		return;
+	while (i + 1 < outsz) {
+		uint8_t b = 0;
+		if (!read_seg_u8_noexcept(cpu, seg, off + (uword)i, cpl, &b))
+			break;
+		if ((term == 0 && b == 0) || (term != 0 && b == (uint8_t)term))
+			break;
+		out[i++] = (b >= 0x20 && b <= 0x7e) ? (char)b : '.';
+	}
+	out[i] = '\0';
+}
+
+static const char *cpu_mode_name(uword flags, uword cr0)
+{
+	if (flags & VM)
+		return "VM86";
+	return (cr0 & 1) ? "PM" : "RM";
+}
+
+static void cpu_diag_log_cr0_transition(CPUI386 *cpu, uword old_cr0, uword new_cr0)
+{
+	static int diag_gen = -1;
+	static uint16_t count = 0;
+	if (!cpu_diag_enabled || old_cr0 == new_cr0)
+		return;
+	if (diag_gen != cpu->diag_gen) {
+		diag_gen = cpu->diag_gen;
+		count = 0;
+	}
+	if (count >= 64)
+		return;
+	count++;
+	refresh_flags(cpu);
+	dolog("=== CR0 change #%u ===\n", count);
+	dolog("  %08x -> %08x at CS:EIP=%04x:%08x (%s)\n",
+		old_cr0, new_cr0, cpu->seg[SEG_CS].sel, cpu->ip,
+		cpu_mode_name(cpu->flags, old_cr0));
+	dolog("  PE:%d->%d PG:%d->%d WP:%d->%d FL=%08x CPL=%d VM=%d\n",
+		!!(old_cr0 & 1), !!(new_cr0 & 1),
+		!!(old_cr0 & CR0_PG), !!(new_cr0 & CR0_PG),
+		!!(old_cr0 & CR0_WP), !!(new_cr0 & CR0_WP),
+		cpu->flags, cpu->cpl, !!(cpu->flags & VM));
+}
+
+static void cpu_diag_log_int21(CPUI386 *cpu)
+{
+	static int diag_gen = -1;
+	static uint16_t print_count = 0;
+	static uint16_t write_count = 0;
+	char text[128];
+	uint8_t ah, al;
+	u16 ax, bx, cx, dx;
+
+	if (!cpu_diag_enabled)
+		return;
+	cpu_diag_win386_sync(cpu);
+	if (diag_gen != cpu->diag_gen) {
+		diag_gen = cpu->diag_gen;
+		print_count = 0;
+		write_count = 0;
+	}
+
+	ah = lreg8(4);
+	al = lreg8(0);
+	ax = lreg16(0);
+	bx = lreg16(3);
+	cx = lreg16(1);
+	dx = lreg16(2);
+
+	if (ah == 0x4b) {
+		cpu_diag_copy_seg_string(cpu, SEG_DS, dx, cpu->cpl, 0, text, sizeof(text));
+		dolog("=== INT 21h EXEC ===\n");
+		dolog("  AX=%04x BX=%04x CX=%04x DX=%04x DS:DX=%04x:%04x path=\"%s\"\n",
+			ax, bx, cx, dx, cpu->seg[SEG_DS].sel, dx, text);
+		dolog("  at CS:EIP=%04x:%08x %s FL=%08x\n",
+			cpu->seg[SEG_CS].sel, cpu->ip,
+			cpu_mode_name(cpu->flags, cpu->cr0), cpu->flags);
+		if (cpu_diag_str_has_win386(text)) {
+			win386_diag.active = true;
+			win386_diag.code_cs = 0;
+			win386_diag.int21_count = 0;
+			win386_diag.int2f_count = 0;
+			win386_diag.pm_exc_count = 0;
+			dolog("=== WIN386 trace start ===\n");
+		}
+		return;
+	}
+
+	if (win386_diag.active && ah != 0x40 && ah != 0x09 && win386_diag.int21_count < 160) {
+		win386_diag.int21_count++;
+		dolog("=== WIN386 INT21 #%u === AH=%02x AL=%02x AX=%04x BX=%04x CX=%04x DX=%04x DS=%04x ES=%04x at %04x:%08x\n",
+			win386_diag.int21_count, ah, al, ax, bx, cx, dx,
+			cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
+			cpu->seg[SEG_CS].sel, cpu->ip);
+	}
+
+	if (ah == 0x4c || ah == 0x31 || ah == 0x00 || ah == 0x27) {
+		dolog("=== INT 21h TERMINATE ===\n");
+		dolog("  AH=%02x AL=%02x AX=%04x BX=%04x CX=%04x DX=%04x DS=%04x\n",
+			ah, al, ax, bx, cx, dx, cpu->seg[SEG_DS].sel);
+		dolog("  at CS:EIP=%04x:%08x %s FL=%08x\n",
+			cpu->seg[SEG_CS].sel, cpu->ip,
+			cpu_mode_name(cpu->flags, cpu->cr0), cpu->flags);
+		if (al == 0xff && vm86_last_fault.valid && vm86_last_fault.gen == cpu->diag_gen) {
+			dolog("  last VM86 fault: exc=%02x CS:EIP=%04x:%08x FL=%08x err=%08x %s\n",
+				vm86_last_fault.excno, vm86_last_fault.cs, vm86_last_fault.ip,
+				vm86_last_fault.fl, vm86_last_fault.err, vm86_last_fault.decoded);
+			cpu_diag_vm86_fault_ring_dump_tail(24);
+			cpu_diag_vm86_iret_ring_dump_tail(24);
+		}
+		if (win386_diag.active) {
+			if (win386_diag.code_cs == 0)
+				win386_diag.code_cs = cpu->seg[SEG_CS].sel;
+			if (cpu->seg[SEG_CS].sel == win386_diag.code_cs) {
+				dolog("=== WIN386 trace stop ===\n");
+				dolog("  exit code AL=%02x CS=%04x int21=%u int2f=%u pm_exc=%u\n",
+					al, cpu->seg[SEG_CS].sel, win386_diag.int21_count,
+					win386_diag.int2f_count, win386_diag.pm_exc_count);
+				win386_diag.active = false;
+			}
+		}
+		return;
+	}
+
+	if (ah == 0x09 && print_count < 24) {
+		print_count++;
+		cpu_diag_copy_seg_string(cpu, SEG_DS, dx, cpu->cpl, '$', text, sizeof(text));
+		dolog("=== INT 21h PRINT #%u === \"%s\"\n", print_count, text);
+		return;
+	}
+
+	if (ah == 0x40 && (bx == 1 || bx == 2) && cx > 0 && write_count < 40) {
+		size_t n = (size_t)cx;
+		if (n >= sizeof(text))
+			n = sizeof(text) - 1;
+		size_t i = 0;
+		for (; i < n; i++) {
+			uint8_t b = 0;
+			if (!read_seg_u8_noexcept(cpu, SEG_DS, dx + (uword)i, cpu->cpl, &b))
+				break;
+			text[i] = (b >= 0x20 && b <= 0x7e) ? (char)b : '.';
+		}
+		text[i] = '\0';
+		write_count++;
+		dolog("=== INT 21h WRITE #%u h=%u len=%u === \"%s\"\n",
+			write_count, bx, cx, text);
+		return;
+	}
+
+	if (ah == 0x59) {
+		dolog("=== INT 21h GET EXTENDED ERROR ===\n");
+		dolog("  AX=%04x BX=%04x CX=%04x DX=%04x DS=%04x at %04x:%08x\n",
+			ax, bx, cx, dx, cpu->seg[SEG_DS].sel, cpu->seg[SEG_CS].sel, cpu->ip);
+		return;
+	}
+
+	if (ah == 0x4d) {
+		dolog("=== INT 21h GET RETURN CODE === AX=%04x BX=%04x CX=%04x DX=%04x at %04x:%08x\n",
+			ax, bx, cx, dx, cpu->seg[SEG_CS].sel, cpu->ip);
+	}
+}
+
+static void cpu_diag_log_int2f(CPUI386 *cpu)
+{
+	u16 ax, bx, cx, dx;
+	if (!cpu_diag_enabled)
+		return;
+	cpu_diag_win386_sync(cpu);
+	if (!win386_diag.active || win386_diag.int2f_count >= 160)
+		return;
+	ax = lreg16(0);
+	bx = lreg16(3);
+	cx = lreg16(1);
+	dx = lreg16(2);
+	win386_diag.int2f_count++;
+	dolog("=== WIN386 INT2F #%u === AX=%04x BX=%04x CX=%04x DX=%04x DS=%04x ES=%04x at %04x:%08x\n",
+		win386_diag.int2f_count, ax, bx, cx, dx,
+		cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
+		cpu->seg[SEG_CS].sel, cpu->ip);
+}
 
 /*
  * instructions
@@ -2888,6 +3667,7 @@ static inline void clear_segs(CPUI386 *cpu)
 	int reg = (modrm >> 3) & 7; \
 	int rm = modrm & 7; \
 	if (reg == 0) { \
+		u32 old_cr0 = cpu->cr0; \
 		u32 new_cr0 = lreg32(rm); \
 		if ((new_cr0 ^ cpu->cr0) & (CR0_PG | CR0_WP | 1)) { \
 			tlb_clear(cpu); \
@@ -2898,6 +3678,8 @@ static inline void clear_segs(CPUI386 *cpu)
 			} \
 		} \
 		if (cpu->fpu) new_cr0 |= 0x10; \
+		if (unlikely(cpu_diag_enabled) && new_cr0 != old_cr0) \
+			cpu_diag_log_cr0_transition(cpu, old_cr0, new_cr0); \
 		cpu->cr0 = new_cr0; \
 	} else if (reg == 2) { \
 		cpu->cr2 = lreg32(rm); \
@@ -2926,17 +3708,107 @@ static inline void clear_segs(CPUI386 *cpu)
 	}
 
 static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
+static bool call_isr_vm86_softint(CPUI386 *cpu, int no);
+
+/* BIOS High-Level Emulation: intercept INT 15h calls that use problematic
+ * GCC -m16 encodings.  SeaBIOS compiles handle_1587() with -m16, producing
+ * 67h-prefixed LGDT that Win386/Win95 VMM can't decode in V86 mode.
+ * Also faster than letting the BIOS do PM transitions for block copies. */
+static bool bios_hle_int(CPUI386 *cpu, int intno)
+{
+	if (intno != 0x15) return false;
+
+	u8 ah = (lreg32(0) >> 8) & 0xFF;
+
+	if (ah == 0x87) {
+		/* INT 15h/AH=87h — Block Move (copy extended memory)
+		 * ES:SI -> 6-entry GDT: [2]=source, [3]=dest descriptors
+		 * CX = number of 16-bit words to copy
+		 * Returns: AH=0/CF=0 on success */
+		u32 cx = lreg16(1);
+		u32 si = lreg16(6);
+		u32 gdt_lin = (cpu->seg[SEG_ES].base + si) & cpu->a20_mask;
+		u32 byte_count = (u32)cx * 2;
+
+		/* Bounds check GDT access (need 48 bytes: 6 descriptors x 8) */
+		if (gdt_lin + 48 > (u32)cpu->phys_mem_size)
+			return false; /* fall through to BIOS */
+
+		if (byte_count == 0) goto hle87_ok;
+
+		/* Extract 32-bit base addresses from segment descriptors */
+		u8 *sd = &cpu->phys_mem[gdt_lin + 0x10]; /* source = descriptor 2 */
+		u8 *dd = &cpu->phys_mem[gdt_lin + 0x18]; /* dest   = descriptor 3 */
+		u32 src = sd[2] | (sd[3] << 8) | (sd[4] << 16) | (sd[7] << 24);
+		u32 dst = dd[2] | (dd[3] << 8) | (dd[4] << 16) | (dd[7] << 24);
+
+		/* Bounds check source and destination */
+		if ((uint64_t)src + byte_count > (uint64_t)cpu->phys_mem_size ||
+		    (uint64_t)dst + byte_count > (uint64_t)cpu->phys_mem_size)
+			return false; /* fall through to BIOS */
+
+		memmove(&cpu->phys_mem[dst], &cpu->phys_mem[src], byte_count);
+
+	hle87_ok:
+		sreg16(0, lreg16(0) & 0x00FF); /* AH = 0 */
+		refresh_flags(cpu);
+		cpu->cc.mask = 0;
+		cpu->flags &= ~CF;
+		return true;
+	}
+
+	if (ah == 0x89) {
+		/* INT 15h/AH=89h — Switch to Protected Mode.
+		 * Same -m16 encoding issue.  Rarely used; return error. */
+		sreg16(0, (lreg16(0) & 0x00FF) | 0xFF00); /* AH = 0xFF */
+		refresh_flags(cpu);
+		cpu->cc.mask = 0;
+		cpu->flags |= CF;
+		return true;
+	}
+
+	return false;
+}
 
 #define INT(i, li, _) \
 	/*dolog("int %02x %08x %04x:%08x\n", li(i), REGi[0], SEGi(SEG_CS), cpu->ip);*/ \
-	if ((cpu->flags & VM)) { \
-		if(get_IOPL(cpu) < 3) THROW(EX_GP, 0); \
+	if (unlikely(cpu_diag_enabled) && li(i) == 0x21) { \
+		cpu_diag_log_int21(cpu); \
+	} else if (unlikely(cpu_diag_enabled) && li(i) == 0x2f) { \
+		cpu_diag_log_int2f(cpu); \
 	} \
-	uword oldip = cpu->ip; \
-	cpu->ip = cpu->next_ip; \
-	if (!call_isr(cpu, li(i), false, 0)) { \
-		cpu->ip = oldip; \
-		return false; \
+	if (li(i) == 0x10 && ((cpu->flags & VM) || !(cpu->cr0 & 1))) { \
+		dolog("INT10h AH=%02x AL=%02x BX=%04x at %04x:%04x\n", \
+			(lreg16(0) >> 8) & 0xff, lreg16(0) & 0xff, \
+			lreg16(3), SEGi(SEG_CS) & 0xffff, cpu->ip & 0xffff); \
+	} \
+	if (((cpu->flags & VM) || !(cpu->cr0 & 1)) && bios_hle_int(cpu, li(i))) { \
+		cpu->ip = cpu->next_ip; \
+	} else if ((cpu->flags & VM)) { \
+		if(get_IOPL(cpu) < 3) { \
+			if (unlikely(cpu_diag_enabled) && cpu_diag_event_allow(cpu, &cpu_diag_events.vm86_int_iopl)) { \
+				refresh_flags(cpu); \
+				dolog("=== VM86 INT blocked by IOPL #%u ===\n", cpu_diag_events.vm86_int_iopl); \
+				dolog("  INT %02x at CS:EIP=%04x:%08x CPL=%d FL=%08x IOPL=%d\n", \
+					li(i), cpu->seg[SEG_CS].sel, cpu->ip, cpu->cpl, cpu->flags, get_IOPL(cpu)); \
+				dump_cs_bytes(cpu, "  opcodes @CS:EIP:", 8); \
+				dump_idt_vector(cpu, li(i), "VM86 INT gate"); \
+			} \
+			THROW(EX_GP, 0); \
+		} \
+		uword oldip = cpu->ip; \
+		cpu->ip = cpu->next_ip; \
+		if (!call_isr_vm86_softint(cpu, li(i))) { \
+			cpu->ip = oldip; \
+			return false; \
+		} \
+	} else { \
+		uword oldip = cpu->ip; \
+		cpu->ip = cpu->next_ip; \
+		if (!call_isr(cpu, li(i), false, 0)) { \
+			cpu->ip = oldip; \
+			return false; \
+		} \
 	}
 
 #define IRET() \
@@ -2948,6 +3820,10 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		uword newip, oldflags; \
 		int newcs; \
 		uint16_t newflags_val; \
+		bool vm_iret_exec = !!(cpu->flags & VM); \
+		uint16_t vm_from_cs = cpu->seg[SEG_CS].sel; \
+		uint16_t vm_from_ss = cpu->seg[SEG_SS].sel; \
+		uword vm_from_ip = cpu->ip; \
 		/* Fast path: direct memory read if 6 bytes won't cross page. \
 		 * MUST NOT use in V86 mode — paging maps linear != physical. */ \
 		if (likely(((sp & 0xfff) <= 0xffa) && !(cpu->flags & VM))) { \
@@ -2973,12 +3849,20 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		cpu->cc.mask = 0; \
 		set_sp(sp + 6, sp_mask); \
 		cpu->next_ip = newip; \
+		if (unlikely(cpu_diag_enabled && vm_iret_exec)) { \
+			cpu_diag_vm86_iret_ring_push(cpu, vm_from_cs, vm_from_ip, vm_from_ss, sp, \
+						     newcs, newip, cpu->flags, true); \
+		} \
 	} else { \
 		/* 32-bit IRETD in real/V86 mode */ \
 		uword sp = lreg32(4); \
 		uword newip, oldflags; \
 		int newcs; \
 		uint32_t newflags_val; \
+		bool vm_iret_exec = !!(cpu->flags & VM); \
+		uint16_t vm_from_cs = cpu->seg[SEG_CS].sel; \
+		uint16_t vm_from_ss = cpu->seg[SEG_SS].sel; \
+		uword vm_from_ip = cpu->ip; \
 		/* Fast path: direct memory read if 12 bytes won't cross page. \
 		 * MUST NOT use in V86 mode — paging maps linear != physical. */ \
 		if (likely(((sp & 0xfff) <= 0xff4) && !(cpu->flags & VM))) { \
@@ -2996,7 +3880,7 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 			newflags_val = laddr32(&meml3); \
 		} \
 		oldflags = cpu->flags; \
-		if (cpu->flags & VM) cpu->flags = (cpu->flags & IOPL) | (newflags_val & ~IOPL); \
+		if (cpu->flags & VM) cpu->flags = (cpu->flags & (IOPL | VM)) | (newflags_val & ~(IOPL | VM)); \
 		else cpu->flags = newflags_val; \
 		cpu->flags &= EFLAGS_MASK; \
 		cpu->flags |= 0x2; \
@@ -3004,6 +3888,10 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 		cpu->cc.mask = 0; \
 		set_sp(sp + 12, sp_mask); \
 		cpu->next_ip = newip; \
+		if (unlikely(cpu_diag_enabled && vm_iret_exec)) { \
+			cpu_diag_vm86_iret_ring_push(cpu, vm_from_cs, vm_from_ip, vm_from_ss, sp, \
+						     newcs, newip, cpu->flags, false); \
+		} \
 	} \
 	if (cpu->intr && (cpu->flags & IF)) return true;
 
@@ -3038,6 +3926,21 @@ static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 
 #define HLT() \
 	if (cpu->cpl != 0) THROW(EX_GP, 0); \
+	hlt_diag_sync(cpu); \
+	refresh_flags(cpu); \
+	hlt_diag.count++; \
+	hlt_diag.cs = cpu->seg[SEG_CS].sel; \
+	hlt_diag.ip = cpu->ip; \
+	hlt_diag.ss = cpu->seg[SEG_SS].sel; \
+	hlt_diag.sp = REGi(4); \
+	hlt_diag.fl = cpu->flags; \
+	hlt_diag.cpl = cpu->cpl; \
+	hlt_diag.vm = !!(cpu->flags & VM); \
+	if (unlikely(cpu_diag_enabled) && cpu_diag_event_allow(cpu, &cpu_diag_events.hlt_exec)) { \
+		dolog("=== HLT executed #%u ===\n", cpu_diag_events.hlt_exec); \
+		dolog("  at CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x\n", \
+			cpu->seg[SEG_CS].sel, cpu->ip, cpu->seg[SEG_SS].sel, REGi(4), cpu->flags); \
+	} \
 	cpu->halt = true; return true;
 #define NOP()
 
@@ -4076,9 +4979,12 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 
 #define LMSW(addr, laddr, saddr) \
 	if (cpu->cpl != 0) THROW(EX_GP, 0); \
-	{ u32 __lmsw_val = (cpu->cr0 & ((~0xf) | 1)) | (laddr(addr) & 0xf); \
+	{ u32 __lmsw_old = cpu->cr0; \
+	u32 __lmsw_val = (cpu->cr0 & ((~0xf) | 1)) | (laddr(addr) & 0xf); \
 	if ((__lmsw_val ^ cpu->cr0) & 1) { cpu->int8_cache_valid = false; cpu->int8_warmup_counter = 0; \
 	tlb_clear(cpu); SEQ_INVALIDATE(cpu); } \
+	if (unlikely(cpu_diag_enabled) && __lmsw_val != __lmsw_old) \
+		cpu_diag_log_cr0_transition(cpu, __lmsw_old, __lmsw_val); \
 	cpu->cr0 = __lmsw_val; }
 
 #define LSEGd(NAME, reg, addr, lreg32, sreg32, laddr32, saddr32) \
@@ -4114,26 +5020,41 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 
 static bool check_ioperm(CPUI386 *cpu, int port, int bit)
 {
-	bool allow = true;
-	if ((cpu->cr0 & 1) && (cpu->cpl > get_IOPL(cpu) || (cpu->flags & VM))) {
-		allow = false;
-		if (cpu->seg[SEG_TR].limit >= 103) {
-			OptAddr meml;
-			TRY(translate(cpu, &meml, 1, SEG_TR, 102, 2, 0));
-			u32 iobase = load16(cpu, &meml);
-			if (iobase + port / 8 < cpu->seg[SEG_TR].limit) {
-				TRY(translate(cpu, &meml, 1, SEG_TR, iobase + port / 8, 2, 0));
-				u16 perm = load16(cpu, &meml);
-				int len = bit / 8;
-				unsigned bit_index = port & 0x7;
-				unsigned mask = (1 << len) - 1;
-				if (!((perm >> bit_index) & mask))
-					allow = true;
-			}
-		}
+	/* I/O bitmap checks are only required when current privilege is not
+	 * sufficient for direct I/O (or in VM86 when IOPL < 3). */
+	bool need_iobitmap = false;
+	if (cpu->cr0 & 1) {
+		int iopl = get_IOPL(cpu);
+		if (cpu->flags & VM)
+			need_iobitmap = (iopl < 3);
+		else
+			need_iobitmap = (cpu->cpl > iopl);
 	}
+	if (!need_iobitmap)
+		return true;
 
-	if (!allow) THROW(EX_GP, 0);
+	/* No usable 32-bit TSS I/O bitmap metadata -> deny. */
+	if (cpu->seg[SEG_TR].limit < 103)
+		THROW(EX_GP, 0);
+
+	OptAddr meml;
+	TRY(translate(cpu, &meml, 1, SEG_TR, 102, 2, 0));
+	u32 iobase = load16(cpu, &meml);
+	if (iobase > cpu->seg[SEG_TR].limit)
+		THROW(EX_GP, 0);
+
+	/* Check each requested port bit against the I/O permission bitmap.
+	 * Any 1 bit means access is denied. */
+	for (int b = 0; b < bit; b++) {
+		u32 p = (u32)port + (u32)b;
+		u32 byte_off = iobase + (p >> 3);
+		if (byte_off > cpu->seg[SEG_TR].limit)
+			THROW(EX_GP, 0);
+		TRY(translate(cpu, &meml, 1, SEG_TR, byte_off, 1, 0));
+		u8 perm = load8(cpu, &meml);
+		if (perm & (1u << (p & 7)))
+			THROW(EX_GP, 0);
+	}
 	return true;
 }
 
@@ -6016,6 +6937,40 @@ static void dump_exc_ring(const char *label) {
 	}
 }
 
+/* VM86 software INT n with IOPL=3 follows real-mode IVT semantics:
+ * vector from linear 0:0 table, push FLAGS/CS/IP to VM stack, clear IF/TF. */
+static bool IRAM_ATTR call_isr_vm86_softint(CPUI386 *cpu, int no)
+{
+	OptAddr memv, meml1, meml2, meml3;
+	uword w1;
+	int newcs;
+	uword newip;
+	uword sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
+	uword sp = lreg32(4);
+
+	TRY(translate_laddr(cpu, &memv, 1, (uword)no * 4, 4, 3));
+	w1 = load32(cpu, &memv);
+	newcs = w1 >> 16;
+	newip = w1 & 0xffff;
+
+	TRY(translate(cpu, &meml1, 2, SEG_SS, (sp - 2 * 1) & sp_mask, 2, 3));
+	TRY(translate(cpu, &meml2, 2, SEG_SS, (sp - 2 * 2) & sp_mask, 2, 3));
+	TRY(translate(cpu, &meml3, 2, SEG_SS, (sp - 2 * 3) & sp_mask, 2, 3));
+
+	refresh_flags(cpu);
+	cpu->cc.mask = 0;
+	saddr16(&meml1, cpu->flags);
+	saddr16(&meml2, cpu->seg[SEG_CS].sel);
+	saddr16(&meml3, cpu->ip);
+	set_sp(sp - 2 * 3, sp_mask);
+
+	TRY1(set_seg(cpu, SEG_CS, newcs));
+	cpu->next_ip = newip;
+	cpu->ip = newip;
+	cpu->flags &= ~(IF | TF);
+	return true;
+}
+
 static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 {
 	/* Exception ring buffer & PTE watchpoint — only active when diagnostics enabled.
@@ -6189,8 +7144,21 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 	}
 
 	int dpl = (w2 >> 13) & 0x3;
-	if (!ext && dpl < cpu->cpl)
+	if (!ext && dpl < cpu->cpl) {
+		if (unlikely(cpu_diag_enabled) && cpu_diag_event_allow(cpu, &cpu_diag_events.swint_dpl)) {
+			uword gate_target = (w1 & 0xffff) | (w2 & 0xffff0000);
+			refresh_flags(cpu);
+			dolog("=== SW INT DPL reject #%u ===\n", cpu_diag_events.swint_dpl);
+			dolog("  vec=%02x ext=%d gate_dpl=%d cpl=%d err=%x\n",
+				no, ext, dpl, cpu->cpl, off | 2);
+			dolog("  gate raw=%08x %08x type=%x p=%d target=%04x:%08x\n",
+				w1, w2, gt, (w2 >> 15) & 1, w1 >> 16, gate_target);
+			dolog("  at CS:EIP=%04x:%08x FL=%08x IOPL=%d VM=%d\n",
+				cpu->seg[SEG_CS].sel, cpu->ip, cpu->flags, get_IOPL(cpu), !!(cpu->flags & VM));
+			dump_cs_bytes(cpu, "  opcodes @CS:EIP:", 8);
+		}
 		THROW(EX_GP, off | 2);
+	}
 
 	int p = (w2 >> 15) & 1;
 	if (!p) {
@@ -6199,8 +7167,17 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 	}
 
 	/* task gate */
-	if (gt == 5)
+	if (gt == 5) {
+		if (unlikely(cpu_diag_enabled) && cpu_diag_event_allow(cpu, &cpu_diag_events.task_gate)) {
+			refresh_flags(cpu);
+			dolog("=== Task gate dispatch #%u ===\n", cpu_diag_events.task_gate);
+			dolog("  vec=%02x ext=%d gate raw=%08x %08x selector=%04x\n",
+				no, ext, w1, w2, w1 >> 16);
+			dolog("  from CS:EIP=%04x:%08x SS:ESP=%04x:%08x CPL=%d FL=%08x\n",
+				cpu->seg[SEG_CS].sel, cpu->ip, cpu->seg[SEG_SS].sel, REGi(4), cpu->cpl, cpu->flags);
+		}
 		return task_switch(cpu, w1 >> 16, TS_CALL);
+	}
 
 	/* TRAP-OR-INTERRUPT-GATE */
 	int newcs = w1 >> 16;
@@ -6261,15 +7238,16 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		newcs = (newcs & (~3)) | cpu->cpl;
 		break;
 	}
-	case 2: /* inter PVL */ {
-//		dolog("call_isr %d %x PVL %d => %d\n", no, no, cpu->cpl, csdpl);
-		OptAddr msp0, mss0;
-		int newpl = csdpl;
-		uword oldss = cpu->seg[SEG_SS].sel;
-		uword oldsp = REGi(4);
-		uword saved_ss_sel = cpu->seg[SEG_SS].sel;
-		uword saved_ss_base = cpu->seg[SEG_SS].base;
-		uword saved_ss_limit = cpu->seg[SEG_SS].limit;
+		case 2: /* inter PVL */ {
+	//		dolog("call_isr %d %x PVL %d => %d\n", no, no, cpu->cpl, csdpl);
+			OptAddr msp0, mss0;
+			int newpl = csdpl;
+			int oldcpl = cpu->cpl;
+			uword oldss = cpu->seg[SEG_SS].sel;
+			uword oldsp = REGi(4);
+			uword saved_ss_sel = cpu->seg[SEG_SS].sel;
+			uword saved_ss_base = cpu->seg[SEG_SS].base;
+			uword saved_ss_limit = cpu->seg[SEG_SS].limit;
 		uword saved_ss_flags = cpu->seg[SEG_SS].flags;
 		uword saved_sp_mask = cpu->sp_mask;
 		uword newss, newsp;
@@ -6281,15 +7259,20 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		} else {
 			TRY(translate(cpu, &msp0, 1, SEG_TR, 2 + 4 * newpl, 2, 0));
 			TRY(translate(cpu, &mss0, 1, SEG_TR, 4 + 4 * newpl, 2, 0));
-			newsp = load16(cpu, &msp0);
-			newss = load16(cpu, &mss0);
-		}
+				newsp = load16(cpu, &msp0);
+				newss = load16(cpu, &mss0);
+			}
 
-		REGi(4) = newsp;
-		if (!set_seg(cpu, SEG_SS, newss)) {
-			REGi(4) = oldsp;
-			return false;
-		}
+			/* Hardware privilege transition updates CPL before loading SS:ESP
+			 * from TSS. Match that ordering so SS permission/page checks run
+			 * with the target privilege level. */
+			cpu->cpl = newpl;
+			REGi(4) = newsp;
+			if (!set_seg(cpu, SEG_SS, newss)) {
+				cpu->cpl = oldcpl;
+				REGi(4) = oldsp;
+				return false;
+			}
 		uword sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
 		OptAddr meml1, meml2, meml3, meml4, meml5, meml6;
 		uword sp = lreg32(4);
@@ -6344,17 +7327,18 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		}
 		newcs = (newcs & (~3)) | newpl;
 		break;
-	inter_pvl_fail:
-		cpu->seg[SEG_SS].sel = saved_ss_sel;
-		cpu->seg[SEG_SS].base = saved_ss_base;
-		cpu->seg[SEG_SS].limit = saved_ss_limit;
-		cpu->seg[SEG_SS].flags = saved_ss_flags;
-		cpu->sp_mask = saved_sp_mask;
-		update_seg_flat(cpu, SEG_SS);
-		REGi(4) = oldsp;
-		return false;
-	}
-	case 3: /* from v8086 */ {
+		inter_pvl_fail:
+			cpu->seg[SEG_SS].sel = saved_ss_sel;
+			cpu->seg[SEG_SS].base = saved_ss_base;
+			cpu->seg[SEG_SS].limit = saved_ss_limit;
+			cpu->seg[SEG_SS].flags = saved_ss_flags;
+			cpu->sp_mask = saved_sp_mask;
+			cpu->cpl = oldcpl;
+			update_seg_flat(cpu, SEG_SS);
+			REGi(4) = oldsp;
+			return false;
+		}
+		case 3: /* from v8086 */ {
 //		dolog("int from v8086\n");
 		if (csdpl != 0) THROW(EX_GP, newcs & ~0x3);
 		if (gate16) THROW(EX_GP, off | 2 | ext);
@@ -6369,14 +7353,44 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		TRY(translate(cpu, &mss0, 1, SEG_TR, 8 + 8 * newpl, 4, 0));
 		newsp = load32(cpu, &msp0);
 		newss = load32(cpu, &mss0) & 0xffff;
-		uword oldflags = cpu->flags;
-		cpu->flags &= ~VM;
-		REGi(4) = newsp;
-		if (!set_seg(cpu, SEG_SS, newss)) {
-			cpu->flags = oldflags;
-			REGi(4) = oldsp;
-			return false;
-		}
+				if (unlikely(cpu_diag_enabled) && cpu_diag_event_allow(cpu, &cpu_diag_events.vm86_isr_entry)) {
+					char decoded[80];
+					bool is_io, needs_stack_dump;
+					int io_port, io_bits;
+					refresh_flags(cpu);
+					dolog("=== VM86 -> ring0 ISR entry #%u ===\n", cpu_diag_events.vm86_isr_entry);
+					dolog("  vec=%02x ext=%d pusherr=%d gate=%x target=%04x:%08x\n",
+						no, ext, pusherr, gt, newcs, newip);
+					dolog("  old CS:EIP=%04x:%08x SS:ESP=%04x:%08x\n",
+					cpu->seg[SEG_CS].sel, cpu->ip, oldss, oldsp);
+				dolog("  TSS->ring0 SS:ESP=%04x:%08x TR=%04x base=%08x limit=%x\n",
+					newss, newsp, cpu->seg[SEG_TR].sel, cpu->seg[SEG_TR].base, cpu->seg[SEG_TR].limit);
+					if (pusherr)
+						dolog("  FL=%08x IOPL=%d VM=%d err=%08x\n",
+							cpu->flags, get_IOPL(cpu), !!(cpu->flags & VM), cpu->excerr);
+					else
+						dolog("  FL=%08x IOPL=%d VM=%d err=<none>\n",
+							cpu->flags, get_IOPL(cpu), !!(cpu->flags & VM));
+					dump_cs_bytes(cpu, "  vm86 fault bytes:", 8);
+					vm86_decode_fault_instruction(cpu, decoded, sizeof(decoded),
+								     &is_io, &io_port, &io_bits, &needs_stack_dump);
+					dolog("  vm86 trap decode: %s\n", decoded);
+					if (needs_stack_dump)
+						vm86_dump_stack_words(cpu, 5);
+					if (is_io && io_port >= 0)
+						vm86_log_ioperm_probe(cpu, io_port, io_bits);
+				}
+			uword oldflags = cpu->flags;
+			int oldcpl = cpu->cpl;
+			cpu->flags &= ~VM;
+			cpu->cpl = newpl;
+			REGi(4) = newsp;
+			if (!set_seg(cpu, SEG_SS, newss)) {
+				cpu->cpl = oldcpl;
+				cpu->flags = oldflags;
+				REGi(4) = oldsp;
+				return false;
+			}
 
 		uword sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
 		OptAddr memlg, memlf, memld, memle;
@@ -6567,16 +7581,70 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 		TRY(translate(cpu, &meml_vmds, 1, SEG_SS, (sp + 24) & sp_mask, 4, 0));
 		TRY(translate(cpu, &meml_vmfs, 1, SEG_SS, (sp + 28) & sp_mask, 4, 0));
 		TRY(translate(cpu, &meml_vmgs, 1, SEG_SS, (sp + 32) & sp_mask, 4, 0));
+		uword vm_esp = laddr32(&meml4);
+		uword vm_ss = laddr32(&meml5);
+		uword vm_es = laddr32(&meml_vmes);
+		uword vm_ds = laddr32(&meml_vmds);
+		uword vm_fs = laddr32(&meml_vmfs);
+		uword vm_gs = laddr32(&meml_vmgs);
+		if (unlikely(cpu_diag_enabled) && cpu_diag_event_allow(cpu, &cpu_diag_events.iret_to_vm86)) {
+			refresh_flags(cpu);
+			dolog("=== IRET to VM86 #%u ===\n", cpu_diag_events.iret_to_vm86);
+			dolog("  return CS:EIP=%04x:%08x FL=%08x from CPL=%d (old FL=%08x)\n",
+				newcs, newip, newflags, cpu->cpl, oldflags);
+			dolog("  vm frame SS:ESP=%04x:%08x ES=%04x DS=%04x FS=%04x GS=%04x\n",
+				vm_ss & 0xffff, vm_esp, vm_es & 0xffff, vm_ds & 0xffff, vm_fs & 0xffff, vm_gs & 0xffff);
+			dolog("  at CS:EIP=%04x:%08x stack SS:ESP=%04x:%08x\n",
+				cpu->seg[SEG_CS].sel, cpu->ip, cpu->seg[SEG_SS].sel, sp);
+		}
+		/* Detect VMM dispatching to VGA/system BIOS via V86 exec */
+		if (unlikely(cpu_diag_enabled) && ((newcs & 0xFFFF) == 0xC000 || (newcs & 0xFFFF) == 0xF000)) {
+			dolog("VMM BIOS dispatch: AH=%02x AL=%02x BX=%04x to %04x:%04x\n",
+				(lreg16(0) >> 8) & 0xff, lreg16(0) & 0xff,
+				lreg16(3), newcs & 0xffff, newip & 0xffff);
+		}
+		/* Detect VMM crashing a VM: IRET to VM86 with CS=0000 */
+		if (unlikely(cpu_diag_enabled) && (newcs & 0xFFFF) == 0) {
+			refresh_flags(cpu);
+			dolog("=== IRET-to-VM86 CRASH: target CS=0000 EIP=%08x ===\n", newip);
+			dolog("  from PM CS:EIP=%04x:%08x SS:ESP=%04x:%08x CPL=%d\n",
+				cpu->seg[SEG_CS].sel, cpu->ip, cpu->seg[SEG_SS].sel, sp,
+				cpu->seg[SEG_CS].sel & 3);
+			dolog("  newflags=%08x oldflags=%08x\n", newflags, oldflags);
+			dolog("  vm frame SS:ESP=%04x:%08x ES=%04x DS=%04x FS=%04x GS=%04x\n",
+				vm_ss & 0xffff, vm_esp, vm_es & 0xffff, vm_ds & 0xffff, vm_fs & 0xffff, vm_gs & 0xffff);
+			/* Dump BDA video fields */
+			dolog("  BDA video mode (0449h)=%02x\n",
+				(uint8_t)cpu->phys_mem[0x449]);
+			dolog("  BDA dcc_index (048Ah)=%02x video_ctl (0487h)=%02x video_switches (0488h)=%02x\n",
+				(uint8_t)cpu->phys_mem[0x48A],
+				(uint8_t)cpu->phys_mem[0x487],
+				(uint8_t)cpu->phys_mem[0x488]);
+			dolog("  BDA video_rows (0484h)=%02x char_height (0485h)=%04x crtc_addr (0463h)=%04x\n",
+				(uint8_t)cpu->phys_mem[0x484],
+				*(uint16_t*)(cpu->phys_mem + 0x485),
+				*(uint16_t*)(cpu->phys_mem + 0x463));
+			/* Dump PM stack to see VMM call chain (return addresses) */
+			for (int si = 0; si < 16; si++) {
+				OptAddr saddr;
+				if (translate(cpu, &saddr, 1, SEG_SS, (sp + si * 4) & sp_mask, 4, 0))
+					break;
+				dolog("  [ESP+%02x] = %08x\n", si * 4, laddr32(&saddr));
+			}
+			dump_cs_bytes(cpu, "  PM IRET site:", 16);
+			/* Dump VGA I/O trace ring for diagnosis */
+			vga_dump_io_trace();
+		}
 		cpu->flags = newflags;
 		TRY1(set_seg(cpu, SEG_CS, newcs));
 		set_sp(sp + 12, sp_mask);
 		cpu->next_ip = newip;
-		TRY1(set_seg(cpu, SEG_SS, laddr32(&meml5)));
-		TRY1(set_seg(cpu, SEG_ES, laddr32(&meml_vmes)));
-		TRY1(set_seg(cpu, SEG_DS, laddr32(&meml_vmds)));
-		TRY1(set_seg(cpu, SEG_FS, laddr32(&meml_vmfs)));
-		TRY(set_seg(cpu, SEG_GS, laddr32(&meml_vmgs)));
-		set_sp(laddr32(&meml4), 0xffffffff);
+		TRY1(set_seg(cpu, SEG_SS, vm_ss));
+		TRY1(set_seg(cpu, SEG_ES, vm_es));
+		TRY1(set_seg(cpu, SEG_DS, vm_ds));
+		TRY1(set_seg(cpu, SEG_FS, vm_fs));
+		TRY(set_seg(cpu, SEG_GS, vm_gs));
+		set_sp(vm_esp, 0xffffffff);
 	} else {
 		int rpl = newcs & 3;
 		if (rpl < cpu->cpl) THROW(EX_GP, newcs & ~0x3);
@@ -6661,10 +7729,47 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 
 void cpui386_step(CPUI386 *cpu, int stepcount)
 {
+	/* Halt/post-mortem detector state (per diagnostic generation). */
+	static int halt_diag_gen = -1;
+	static bool halt_window_active = false;
+	static bool halt_dumped = false;
+	static uint32_t halt_window_start_us = 0;
+	static uint32_t last_irq_service_time_us = 0;
+	static uint32_t alive_last_log_time_us = 0;
+	if (halt_diag_gen != cpu->diag_gen) {
+		halt_diag_gen = cpu->diag_gen;
+		halt_window_active = false;
+		halt_dumped = false;
+		halt_window_start_us = 0;
+		last_irq_service_time_us = get_uticks();
+		alive_last_log_time_us = last_irq_service_time_us;
+	}
+
 	if ((cpu->flags & IF) && cpu->intr) {
+		bool was_halted = cpu->halt;
 		cpu->intr = false;
 		cpu->halt = false;
 		int no = cpu->cb.pic_read_irq(cpu->cb.pic);
+		if (was_halted) {
+			hlt_diag_sync(cpu);
+			refresh_flags(cpu);
+			hlt_diag.wake_count++;
+			hlt_diag.last_wake_vec = no;
+			hlt_diag.last_wake_eip = cpu->next_ip;
+			hlt_diag.last_wake_cs = cpu->seg[SEG_CS].sel;
+			hlt_diag.last_wake_ss = cpu->seg[SEG_SS].sel;
+			hlt_diag.last_wake_sp = REGi(4);
+			hlt_diag.last_wake_fl = cpu->flags;
+			hlt_diag.last_wake_time_us = get_uticks();
+		}
+		if (unlikely(cpu_diag_enabled) && was_halted &&
+		    cpu_diag_event_allow(cpu, &cpu_diag_events.halt_irq_wake)) {
+			refresh_flags(cpu);
+			dolog("=== HLT wake by IRQ #%u ===\n", cpu_diag_events.halt_irq_wake);
+			dolog("  vec=%02x resume CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x\n",
+				no, cpu->seg[SEG_CS].sel, cpu->next_ip,
+				cpu->seg[SEG_SS].sel, REGi(4), cpu->flags);
+		}
 		cpu->ip = cpu->next_ip;
 		if (unlikely(!call_isr(cpu, no, false, 1))) {
 			/* Hardware IRQ delivery failed — try #DF before triple fault */
@@ -6673,30 +7778,45 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 			if (!call_isr(cpu, EX_DF, true, 1))
 				goto triple_fault;
 		}
+		last_irq_service_time_us = get_uticks();
 	}
 
 	if (cpu->halt) {
-		/* Detect permanently-halted or error-looping system.
-		 * Uses wall time (5 seconds cumulative halt) instead of iteration
-		 * count since usleep granularity varies across platforms. */
-		static uint32_t halt_start_time = 0;
-		static uint32_t halt_total_us = 0;
-		static int halt_diag_gen = -1;
-		static bool halt_dumped = false;
-		if (halt_diag_gen != cpu->diag_gen) {
-			halt_diag_gen = cpu->diag_gen;
-			halt_total_us = 0;
-			halt_dumped = false;
-			halt_start_time = get_uticks();
+		/* Lost-latch safeguard: if PIC already has a deliverable IRQ while
+		 * CPU is halted with IF=1, reassert the CPU interrupt latch so the
+		 * next step will take it. */
+		if ((cpu->flags & IF) && !cpu->intr && cpu->cb.pic) {
+			int pending_irq = i8259_get_pending_irq((PicState2 *)cpu->cb.pic);
+			if (pending_irq >= 0) {
+				cpu->intr = true;
+				return;
+			}
 		}
+
+		/* Detect permanently-halted or error-looping system.
+		 * We require both:
+		 * 1) a continuous halt window longer than threshold
+		 * 2) no successful hardware IRQ service in that window */
 		uint32_t now = get_uticks();
-		if (halt_start_time == 0) halt_start_time = now;
-		halt_total_us += (now - halt_start_time);
-		halt_start_time = now;
-		if (cpu_diag_enabled && !halt_dumped && halt_total_us > 5000000) { /* 5 seconds */
+		if (!halt_window_active) {
+			halt_window_active = true;
+			halt_window_start_us = now;
+			halt_dumped = false;
+		}
+		uint32_t halt_cont_us = now - halt_window_start_us;
+		uint32_t irq_quiet_us = (last_irq_service_time_us != 0)
+			? (now - last_irq_service_time_us)
+			: halt_cont_us;
+		hlt_diag_sync(cpu);
+		uint32_t wake_age_us = (hlt_diag.last_wake_time_us != 0)
+			? (now - hlt_diag.last_wake_time_us)
+			: halt_cont_us;
+			if (cpu_diag_enabled && !halt_dumped &&
+			    halt_cont_us > 5000000 && irq_quiet_us > 5000000) { /* 5s continuous halt + no IRQ service */
 			halt_dumped = true;
-			dolog("=== System halted %.1fs (IF=%d) — post-mortem ===\n",
-				halt_total_us / 1000000.0f, !!(cpu->flags & IF));
+			dolog("=== System halted %.1fs (IF=%d intr=%d, no-irq %.1fs) — post-mortem ===\n",
+				halt_cont_us / 1000000.0f, !!(cpu->flags & IF), !!cpu->intr,
+				irq_quiet_us / 1000000.0f);
 			dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x CR0=%08x %s\n",
 				cpu->seg[SEG_CS].sel, cpu->ip,
 				cpu->seg[SEG_SS].sel, REGi(4),
@@ -6704,10 +7824,86 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 				(cpu->flags & VM) ? "V86" : ((cpu->cr0 & 1) ? "PM" : "RM"));
 			dolog("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n",
 				REGi(0), REGi(3), REGi(1), REGi(2));
-			dump_exc_ring("halted post-mortem");
+			if (hlt_diag.count > 0) {
+				dolog("HLT origin: count=%u last=%04x:%08x SS:ESP=%04x:%08x FL=%08x CPL=%d VM=%d\n",
+					hlt_diag.count, hlt_diag.cs, hlt_diag.ip,
+					hlt_diag.ss, hlt_diag.sp, hlt_diag.fl,
+					hlt_diag.cpl, hlt_diag.vm);
+			} else {
+				dolog("HLT origin: <none recorded>\n");
+			}
+			if (hlt_diag.wake_count > 0) {
+				dolog("HLT wake: count=%u last_vec=%02x resume=%04x:%08x SS:ESP=%04x:%08x FL=%08x age_us=%u\n",
+					hlt_diag.wake_count, hlt_diag.last_wake_vec,
+					hlt_diag.last_wake_cs, hlt_diag.last_wake_eip,
+					hlt_diag.last_wake_ss, hlt_diag.last_wake_sp,
+					hlt_diag.last_wake_fl, wake_age_us);
+			} else {
+				dolog("HLT wake: count=0 age_us=%u\n", wake_age_us);
+			}
+			dolog("IRQ service quiet: age_us=%u\n", irq_quiet_us);
+			dolog("Config: batch_setting=%d batch_effective=%d pit_burst=%d\n",
+				pc_batch_size_setting, pc_last_batch_size, pc_pit_burst_setting);
+			if (cpu->cb.pic) {
+				PicState2 *pic = (PicState2 *)cpu->cb.pic;
+				dolog("PIC irr=%04x isr=%04x imr=%04x pending_irq=%d\n",
+					i8259_get_irr(pic), i8259_get_isr(pic),
+					i8259_get_imr(pic), i8259_get_pending_irq(pic));
+			}
+			if (cpu->cb.pit) {
+				PITState *pit = (PITState *)cpu->cb.pit;
+				uint32_t pit_elapsed_us = pit_get_elapsed_us(pit, 0);
+				uint32_t pit_last_irq_age = pit_get_last_irq_age_us(pit, 0);
+				dolog("PIT ch0: pending=%d ticks=%llu mode=%d count=%d gate=%d out=%d\n",
+					pit_get_pending_irqs(pit),
+					(unsigned long long)pit_get_virtual_ticks(pit, 0),
+					pit_get_mode(pit, 0),
+					pit_get_initial_count(pit, 0),
+					pit_get_gate(pit, 0),
+					pit_get_out(pit, 0));
+				dolog("PIT ch0 stats: loads=%llu pulses=%llu suppressed=%llu age_us=%u last_irq_age_us=%d\n",
+					(unsigned long long)pit_get_load_count(pit, 0),
+					(unsigned long long)pit_get_irq_pulse_count(pit, 0),
+					(unsigned long long)pit_get_irq_suppressed_count(pit, 0),
+					pit_elapsed_us,
+					(pit_last_irq_age == 0xffffffffu) ? -1 : (int)pit_last_irq_age);
+			}
+				dump_exc_ring("halted post-mortem");
+			}
+			if (cpu_diag_enabled && (now - alive_last_log_time_us) > 3000000) {
+				int pending_irq = -1;
+				int pit_last_irq_age = -1;
+				if (cpu->cb.pic) {
+					pending_irq = i8259_get_pending_irq((PicState2 *)cpu->cb.pic);
+				}
+				if (cpu->cb.pit) {
+					PITState *pit = (PITState *)cpu->cb.pit;
+					uint32_t a = pit_get_last_irq_age_us(pit, 0);
+					pit_last_irq_age = (a == 0xffffffffu) ? -1 : (int)a;
+				}
+				dolog("=== CPU alive (halt) %.1fs IF=%d intr=%d CS:EIP=%04x:%08x pending_irq=%d HLT(count=%u wake=%u) irq_quiet_us=%u wake_age_us=%u pit_last_irq_age_us=%d ===\n",
+					halt_cont_us / 1000000.0f,
+					!!(cpu->flags & IF), !!cpu->intr,
+					cpu->seg[SEG_CS].sel, cpu->ip,
+					pending_irq, hlt_diag.count, hlt_diag.wake_count,
+					irq_quiet_us, wake_age_us, pit_last_irq_age);
+				alive_last_log_time_us = now;
+			}
+			usleep(1);
+			return;
 		}
-		usleep(1);
-		return;
+	halt_window_active = false;
+	halt_window_start_us = 0;
+	if (cpu_diag_enabled) {
+		uint32_t now = get_uticks();
+		if ((now - alive_last_log_time_us) > 3000000) {
+			refresh_flags(cpu);
+			dolog("=== CPU alive (run) IF=%d intr=%d CS:EIP=%04x:%08x next=%08x CPL=%d VM=%d ===\n",
+				!!(cpu->flags & IF), !!cpu->intr,
+				cpu->seg[SEG_CS].sel, cpu->ip, cpu->next_ip,
+				cpu->cpl, !!(cpu->flags & VM));
+			alive_last_log_time_us = now;
+		}
 	}
 
 	/* Delayed ring buffer dump: fires 2s after last non-009f LDT #PF.
@@ -6884,6 +8080,8 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		}
 		int orig_exc = cpu->excno;
 		cpu->next_ip = cpu->ip;
+		if (cpu_diag_enabled)
+			cpu_diag_win386_sync(cpu);
 
 		/* One-shot deep PF diagnostics for Win95 shared-user range faults. */
 		if (cpu_diag_enabled && orig_exc == EX_PF) {
@@ -6951,6 +8149,100 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 				dolog("  FL=%08x CR0=%08x CR2=%08x CR3=%08x\n",
 					cpu->flags, cpu->cr0, cpu->cr2, cpu->cr3);
 			}
+		}
+
+		/* Capture ALL VM86 exceptions in fault ring (not just #GP/#UD)
+		 * so we can see #PF, #SS, etc. that may cause VMM to crash the VM. */
+		if (cpu_diag_enabled && (cpu->flags & VM)) {
+			char last_decoded[80];
+			if (orig_exc == EX_GP || orig_exc == EX_UD) {
+				bool last_is_io, last_needs_stack_dump;
+				int last_io_port, last_io_bits;
+				vm86_decode_fault_instruction(cpu, last_decoded, sizeof(last_decoded),
+							      &last_is_io, &last_io_port, &last_io_bits, &last_needs_stack_dump);
+			} else if (orig_exc == EX_PF) {
+				snprintf(last_decoded, sizeof(last_decoded), "#PF CR2=%08x err=%x", cpu->cr2, cpu->excerr);
+			} else {
+				static const char *exc_names[] = {
+					"#DE","#DB","NMI","#BP","#OF","#BR","#UD","#NM",
+					"#DF","","#TS","#NP","#SS","#GP","#PF","","","#AC"
+				};
+				const char *name = (orig_exc < 18) ? exc_names[orig_exc] : "?";
+				snprintf(last_decoded, sizeof(last_decoded), "%s(%d) err=%x", name, orig_exc,
+					 pusherr ? cpu->excerr : 0);
+			}
+			if (vm86_last_fault.gen != cpu->diag_gen) {
+				memset(&vm86_last_fault, 0, sizeof(vm86_last_fault));
+				vm86_last_fault.gen = cpu->diag_gen;
+			}
+			cpu_diag_vm86_fault_ring_push(cpu, orig_exc, pusherr, last_decoded);
+
+			/* Detect VM86 crash: execution at IVT area (seg 0, low offset)
+			 * means the VMM failed to handle an instruction and crashed the
+			 * task.  Dump the fault ring to identify the failing instruction. */
+			if (cpu->seg[SEG_CS].sel == 0 && cpu->ip < 0x100) {
+				dolog("=== VM86 CRASH detected at %04x:%08x — fault ring tail: ===\n",
+					cpu->seg[SEG_CS].sel, cpu->ip);
+				cpu_diag_vm86_fault_ring_dump_tail(32);
+				cpu_diag_vm86_iret_ring_dump_tail(16);
+			}
+
+			vm86_last_fault.valid = true;
+			vm86_last_fault.excno = (uint8_t)orig_exc;
+			vm86_last_fault.cs = cpu->seg[SEG_CS].sel;
+			vm86_last_fault.ip = cpu->ip;
+			vm86_last_fault.fl = cpu->flags;
+			vm86_last_fault.err = pusherr ? cpu->excerr : 0;
+			snprintf(vm86_last_fault.decoded, sizeof(vm86_last_fault.decoded), "%s", last_decoded);
+
+			if (orig_exc == EX_GP || orig_exc == EX_UD) {
+				uint8_t *slot = (orig_exc == EX_GP) ? &cpu_diag_events.vm86_gp_decode :
+								      &cpu_diag_events.vm86_ud_decode;
+				if (cpu_diag_event_allow(cpu, slot)) {
+					char decoded[80];
+					bool is_io, needs_stack_dump;
+					int io_port, io_bits;
+					refresh_flags(cpu);
+					dolog("=== VM86 #%s pre-delivery #%u ===\n",
+						(orig_exc == EX_GP) ? "GP" : "UD", *slot);
+					if (pusherr)
+						dolog("  CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x IOPL=%d err=%08x\n",
+							cpu->seg[SEG_CS].sel, cpu->ip,
+							cpu->seg[SEG_SS].sel, REGi(4),
+							cpu->flags, get_IOPL(cpu), cpu->excerr);
+					else
+						dolog("  CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x IOPL=%d err=<none>\n",
+							cpu->seg[SEG_CS].sel, cpu->ip,
+							cpu->seg[SEG_SS].sel, REGi(4),
+							cpu->flags, get_IOPL(cpu));
+					dump_cs_bytes(cpu, "  vm86 fault bytes:", 8);
+					vm86_decode_fault_instruction(cpu, decoded, sizeof(decoded),
+								     &is_io, &io_port, &io_bits, &needs_stack_dump);
+					dolog("  vm86 trap decode: %s\n", decoded);
+					if (needs_stack_dump)
+						vm86_dump_stack_words(cpu, 5);
+					if (is_io && io_port >= 0)
+						vm86_log_ioperm_probe(cpu, io_port, io_bits);
+				}
+			}
+		}
+
+		if (cpu_diag_enabled && !(cpu->flags & VM) && win386_diag.active &&
+		    win386_diag.pm_exc_count < 80 && orig_exc < 32) {
+			win386_diag.pm_exc_count++;
+			refresh_flags(cpu);
+			dolog("=== WIN386 PM EXC #%u ===\n", win386_diag.pm_exc_count);
+			if (pusherr)
+				dolog("  exc=%02x CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x err=%08x\n",
+					orig_exc, cpu->seg[SEG_CS].sel, cpu->ip,
+					cpu->seg[SEG_SS].sel, REGi(4), cpu->flags, cpu->excerr);
+			else
+				dolog("  exc=%02x CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x err=<none>\n",
+					orig_exc, cpu->seg[SEG_CS].sel, cpu->ip,
+					cpu->seg[SEG_SS].sel, REGi(4), cpu->flags);
+			if (orig_exc == EX_PF)
+				dolog("  CR2=%08x CR3=%08x\n", cpu->cr2, cpu->cr3);
+			dump_cs_bytes(cpu, "  pm fault bytes:", 8);
 		}
 
 		if (unlikely(!call_isr(cpu, cpu->excno, pusherr, 1))) {
@@ -7194,6 +8486,11 @@ void cpui386_set_diag(CPUI386 *cpu, bool enabled)
 {
 	(void)cpu;
 	cpu_diag_enabled = enabled;
+}
+
+bool cpui386_is_halted(CPUI386 *cpu)
+{
+	return cpu->halt;
 }
 
 long IRAM_ATTR cpui386_get_cycle(CPUI386 *cpu)

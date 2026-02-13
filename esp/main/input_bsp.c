@@ -147,12 +147,22 @@ static void toggle_osd(void)
 /* Route a key-down scancode to the INI selector (queue-based) */
 static void route_to_ini_selector(uint8_t code, int is_down)
 {
-	if (!is_down) return;  /* selector only cares about key-down */
+	/* Keep selector modifier state in sync (left/right Ctrl normalize to 0x1D). */
+	if (code == SC_LEFT_CTRL) {
+		ini_selector_set_modifier_ctrl(is_down);
+	}
+
+	if (!is_down) {
+		if (code == repeat_keycode)
+			repeat_keycode = 0;
+		return;  /* selector actions are key-down only */
+	}
+
 	/* Also support key repeat for navigation */
 	if (is_osd_repeatable(code)) {
 		repeat_keycode = code;
 		repeat_next_ms = esp_log_timestamp() + KEY_REPEAT_DELAY_MS;
-	} else if (!is_down && code == repeat_keycode) {
+	} else if (code == repeat_keycode) {
 		repeat_keycode = 0;
 	}
 	ini_selector_handle_key(code);
