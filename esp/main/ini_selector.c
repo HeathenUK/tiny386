@@ -9,6 +9,7 @@
 #include "common.h"
 #include "../../ini.h"
 #include "vga_font_8x16.h"
+#include "toast.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,8 +87,6 @@ static int  s_scroll;
 static bool s_auto_boot;
 static int  s_countdown;            /* seconds remaining (5→0, -1 = cancelled) */
 static uint32_t s_countdown_tick;   /* timestamp of last countdown update */
-static char s_status[96];
-static uint32_t s_status_until;
 
 typedef enum {
 	EDIT_NONE = 0,
@@ -106,20 +105,6 @@ static void parse_preview(IniFileEntry *e);
 
 /* How many list entries fit on screen */
 #define VISIBLE_LINES ((PANEL_BOT - LIST_Y) / (FONT_H + 2))
-
-static bool status_visible(void)
-{
-	if (s_status_until == 0)
-		return false;
-	uint32_t now = esp_log_timestamp();
-	return (int32_t)(s_status_until - now) > 0;
-}
-
-static void set_status(const char *msg)
-{
-	snprintf(s_status, sizeof(s_status), "%s", msg ? msg : "");
-	s_status_until = esp_log_timestamp() + 2500;
-}
 
 static int find_file_by_name(const char *name)
 {
@@ -318,17 +303,17 @@ static void finish_edit(void)
 	snprintf(base, sizeof(base), "%s", s_edit_name);
 	trim_spaces(base);
 	if (!valid_base_name(base)) {
-		set_status("Invalid name");
+		toast_show("Invalid name");
 		return;
 	}
 
 	if (!build_ini_path_from_name(s_edit_source_name, src_path, sizeof(src_path))) {
-		set_status("Source path error");
+		toast_show("Source path error");
 		cancel_edit();
 		return;
 	}
 	if (!build_ini_path_from_base(base, dst_path, sizeof(dst_path))) {
-		set_status("Name too long");
+		toast_show("Name too long");
 		return;
 	}
 	snprintf(dst_name, sizeof(dst_name), "%s.ini", base);
@@ -336,12 +321,12 @@ static void finish_edit(void)
 	if (s_edit_mode == EDIT_RENAME &&
 	    strcasecmp(dst_name, s_edit_source_name) == 0) {
 		cancel_edit();
-		set_status("Rename unchanged");
+		toast_show("Rename unchanged");
 		return;
 	}
 
 	if (stat(dst_path, &st) == 0) {
-		set_status("Target already exists");
+		toast_show("Target already exists");
 		return;
 	}
 
@@ -355,7 +340,7 @@ static void finish_edit(void)
 	}
 
 	if (!ok) {
-		set_status("File operation failed");
+		toast_show("File operation failed");
 		return;
 	}
 
@@ -367,7 +352,7 @@ static void finish_edit(void)
 		parse_preview(&s_files[s_sel]);
 	}
 	cancel_edit();
-	set_status(mode == EDIT_RENAME ? "Renamed" : "Cloned");
+	toast_show(mode == EDIT_RENAME ? "Renamed" : "Cloned");
 }
 
 static int handle_edit_key(int scancode)
@@ -378,7 +363,7 @@ static int handle_edit_key(int scancode)
 		return 0;
 	case 0x01: /* Escape */
 		cancel_edit();
-		set_status("Edit cancelled");
+		toast_show("Edit cancelled");
 		return 0;
 	case 0x0e: /* Backspace */
 		if (s_edit_len > 0) {
@@ -596,8 +581,6 @@ void ini_selector_start(bool auto_boot)
 {
 	scan_ini_files();
 	s_auto_boot = auto_boot;
-	s_status[0] = '\0';
-	s_status_until = 0;
 	cancel_edit();
 	if (auto_boot && s_count > 0) {
 		s_countdown = 5;
@@ -731,9 +714,6 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 	/* ── Title bar ─────────────────────────────────────────────── */
 	sel_fill_rect(0, 0, LOG_W, 28, C_PANEL);
 	sel_draw_text(LEFT_X, 6, "tiny386 - Select Configuration", C_TITLE, 0);
-	if (status_visible()) {
-		sel_draw_text(RIGHT_X + 8, 6, s_status, C_VALUE, RIGHT_W - 16);
-	}
 
 	/* Divider between title and content */
 	sel_fill_rect(0, 28, LOG_W, 1, C_BORDER);
