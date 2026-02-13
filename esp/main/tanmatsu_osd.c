@@ -1204,7 +1204,8 @@ static int handle_file_select(OSD *osd)
 		const char *drive_names[] = {"A:", "B:", "CD0:", "CD1:", "CD2:", "CD3:"};
 		if (osd->browser_target < 2) {
 			// Floppy
-			if (osd->emulink) emulink_attach_floppy(osd->emulink, osd->browser_target, NULL);
+			if (osd->emulink)
+				emulink_attach_floppy(osd->emulink, osd->browser_target, NULL);
 		} else {
 			// CD-ROM
 			IDEIFState *ide = (osd->browser_target < 4) ? osd->ide : osd->ide2;
@@ -1293,7 +1294,14 @@ static int handle_file_select(OSD *osd)
 		return 0;
 	} else if (osd->browser_target < 2) {
 		// Floppy
-		if (osd->emulink) emulink_attach_floppy(osd->emulink, osd->browser_target, fullpath);
+		if (osd->emulink) {
+			if (emulink_attach_floppy(osd->emulink, osd->browser_target, fullpath) != 0) {
+				toast_show("Mount failed");
+				populate_drive_paths(osd);
+				osd->view = VIEW_MOUNTING;
+				return 0;
+			}
+		}
 	} else {
 		// CD-ROM
 		IDEIFState *ide = (osd->browser_target < 4) ? osd->ide : osd->ide2;

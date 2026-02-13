@@ -82,8 +82,23 @@ sdk:
 
 .PHONY: patch_idf
 patch_idf:
-	@echo "Patching ESP-IDF..."
-	cd "$(IDF_PATH)" && patch -p1 < ../esp-idf.patch
+	@if [ ! -d "$(IDF_PATH)" ]; then \
+		echo "ESP-IDF not present at $(IDF_PATH)"; \
+		exit 1; \
+	fi
+	@FFCONF="$(IDF_PATH)/components/fatfs/src/ffconf.h"; \
+	if [ ! -f "$$FFCONF" ]; then \
+		echo "Cannot find $$FFCONF"; \
+		exit 1; \
+	fi; \
+	if grep -q "^#define[[:space:]]\\+FF_FS_EXFAT[[:space:]]\\+1" "$$FFCONF" && \
+	   grep -q "^#define[[:space:]]\\+FF_LBA64[[:space:]]\\+1" "$$FFCONF"; then \
+		echo "ESP-IDF exFAT/GPT support already enabled"; \
+	else \
+		echo "Enabling exFAT + GPT LBA64 in $$FFCONF"; \
+		sed -i -E 's/^#define[[:space:]]+FF_FS_EXFAT[[:space:]]+0/#define FF_FS_EXFAT\t\t1/' "$$FFCONF"; \
+		sed -i -E 's/^#define[[:space:]]+FF_LBA64[[:space:]]+0/#define FF_LBA64\t\t1/' "$$FFCONF"; \
+	fi
 
 .PHONY: patch_bsp
 patch_bsp:
@@ -130,7 +145,7 @@ checkbuildenv:
 # Building
 
 .PHONY: build
-build: checkbuildenv submodules patch_bsp
+build: checkbuildenv submodules patch_idf patch_bsp
 	export IDF_TOOLS_PATH="$(IDF_TOOLS_PATH)" && \
 	source "$(IDF_PATH)/export.sh" >/dev/null && \
 	idf.py -B $(BUILD) build -DDEVICE=$(DEVICE)

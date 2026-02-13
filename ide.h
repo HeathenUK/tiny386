@@ -64,4 +64,12 @@ void ide_set_geometry(IDEIFState *s, int drive, int heads, int spt);
 void ide_sync(IDEIFState *ide, IDEIFState *ide2);
 void ide_close_files(IDEIFState *ide, IDEIFState *ide2);
 void ide_poll_async(void);
+
+/* Reusable block-image backend helpers (same path used by IDE/CD). */
+BlockDevice *ide_block_open_rw(const char *filename);
+int ide_block_reopen_rw(BlockDevice *bs, const char *filename);
+int ide_block_read(BlockDevice *bs, uint64_t sector_num, uint8_t *buf, int nsectors);
+int ide_block_write(BlockDevice *bs, uint64_t sector_num, const uint8_t *buf, int nsectors);
+int64_t ide_block_sector_count(BlockDevice *bs);
+void ide_block_close(BlockDevice *bs);
 #endif /* IDE_H */

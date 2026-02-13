@@ -32,14 +32,15 @@ static void do_window(mu_Context *ctx, struct OSD *osd)
 			if (mu_textbox(ctx, buf[i], sizeof(buf[0])) & MU_RES_SUBMIT) {
 //				mu_set_focus(ctx, ctx->last_id);
 			}
-			if (mu_button(ctx, "Submit")) {
-				if (osd->emulink) {
-					if (buf[i][0] == 0)
-						emulink_attach_floppy(osd->emulink, i, NULL);
-					else
-						emulink_attach_floppy(osd->emulink, i, buf[i]);
+				if (mu_button(ctx, "Submit")) {
+					if (osd->emulink) {
+						if (buf[i][0] == 0) {
+							emulink_attach_floppy(osd->emulink, i, NULL);
+						} else if (emulink_attach_floppy(osd->emulink, i, buf[i]) != 0) {
+							buf[i][0] = '\0';
+						}
+					}
 				}
-			}
 			mu_pop_id(ctx);
 		}
 

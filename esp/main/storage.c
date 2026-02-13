@@ -76,29 +76,29 @@ void storage_init(void)
 	};
 
 	sdmmc_card_t *card = NULL;
+	/* Default log level is ERROR on tanmatsu; expose FatFS reason codes. */
+	esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_WARN);
+	static DRAM_DMA_ALIGNED_ATTR uint8_t dma_buf[512 * 4];
 
 	ESP_LOGI(TAG, "Initializing SD card");
 
-	/* SDMMC native slot 0 — mirrors launcher's sd_mount() */
+	/* SDMMC native slot 0 — keep strict 40MHz/4-bit mode */
 	sdmmc_host_t host = SDMMC_HOST_DEFAULT();
 	host.slot = SDMMC_HOST_SLOT_0;
 	host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
 	host.pwr_ctrl_handle = sd_pwr_handle;
-
-	/* DMA buffer in internal RAM — same as launcher */
-	static DRAM_DMA_ALIGNED_ATTR uint8_t dma_buf[512 * 4];
 	host.dma_aligned_buffer = dma_buf;
 
 	sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-	slot_config.clk   = SD_CLK;  /* GPIO 43 */
-	slot_config.cmd   = SD_CMD;  /* GPIO 44 */
-	slot_config.d0    = SD_D0;   /* GPIO 39 */
-	slot_config.d1    = SD_D1;   /* GPIO 40 */
-	slot_config.d2    = SD_D2;   /* GPIO 41 */
-	slot_config.d3    = SD_D3;   /* GPIO 42 */
+	slot_config.clk = SD_CLK;   /* GPIO 43 */
+	slot_config.cmd = SD_CMD;   /* GPIO 44 */
+	slot_config.d0 = SD_D0;     /* GPIO 39 */
+	slot_config.d1 = SD_D1;     /* GPIO 40 */
+	slot_config.d2 = SD_D2;     /* GPIO 41 */
+	slot_config.d3 = SD_D3;     /* GPIO 42 */
 	slot_config.width = 4;
 
-	ESP_LOGI(TAG, "Mounting filesystem");
+	ESP_LOGI(TAG, "Mounting filesystem (40MHz/4-bit)");
 	esp_err_t ret = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config,
 						&mount_config, &card);
 	if (ret != ESP_OK) {

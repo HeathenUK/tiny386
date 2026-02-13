@@ -43,6 +43,50 @@
 #include "freertos/task.h"
 #define IDE_ACTIVITY() led_activity_hdd()
 
+#define SDMMC_RETRY_COUNT 8
+#define SDMMC_RETRY_DELAY_MS 2
+static SemaphoreHandle_t sdmmc_io_mutex = NULL;
+
+static esp_err_t sdmmc_read_sectors_retry(sdmmc_card_t *card, void *dst,
+                                          size_t start_sector, size_t sector_count)
+{
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= SDMMC_RETRY_COUNT; attempt++) {
+        if (sdmmc_io_mutex)
+            xSemaphoreTake(sdmmc_io_mutex, portMAX_DELAY);
+        err = sdmmc_read_sectors(card, dst, start_sector, sector_count);
+        if (sdmmc_io_mutex)
+            xSemaphoreGive(sdmmc_io_mutex);
+        if (err == ESP_OK)
+            return err;
+        if (attempt < SDMMC_RETRY_COUNT)
+            vTaskDelay(pdMS_TO_TICKS(SDMMC_RETRY_DELAY_MS));
+    }
+    fprintf(stderr, "sdmmc_read retry exhausted: sector=%u count=%u err=0x%x\n",
+            (unsigned)start_sector, (unsigned)sector_count, (unsigned)err);
+    return err;
+}
+
+static esp_err_t sdmmc_write_sectors_retry(sdmmc_card_t *card, const void *src,
+                                           size_t start_sector, size_t sector_count)
+{
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= SDMMC_RETRY_COUNT; attempt++) {
+        if (sdmmc_io_mutex)
+            xSemaphoreTake(sdmmc_io_mutex, portMAX_DELAY);
+        err = sdmmc_write_sectors(card, src, start_sector, sector_count);
+        if (sdmmc_io_mutex)
+            xSemaphoreGive(sdmmc_io_mutex);
+        if (err == ESP_OK)
+            return err;
+        if (attempt < SDMMC_RETRY_COUNT)
+            vTaskDelay(pdMS_TO_TICKS(SDMMC_RETRY_DELAY_MS));
+    }
+    fprintf(stderr, "sdmmc_write retry exhausted: sector=%u count=%u err=0x%x\n",
+            (unsigned)start_sector, (unsigned)sector_count, (unsigned)err);
+    return err;
+}
+
 //#define DEBUG_IDE_ATAPI
 
 /* Bits of HD_STATUS */
@@ -2205,13 +2249,11 @@ static void io_task(void *arg)
                     break;
                 }
                 int chunk = (n < contig) ? n : contig;
-                xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
-                if (sdmmc_read_sectors(bf->card, buf, sd_sector, chunk) != ESP_OK) {
-                    xSemaphoreGive(wcache.sd_mutex);
+                esp_err_t err = sdmmc_read_sectors_retry(bf->card, buf, sd_sector, chunk);
+                if (err != ESP_OK) {
                     result = -1;
                     break;
                 }
-                xSemaphoreGive(wcache.sd_mutex);
                 /* Overlay any write-cached sectors over stale SD data */
                 for (int c = 0; c < chunk; c++)
                     wcache_lookup(bf, sector_num + c, buf + c * SECTOR_SIZE);
@@ -2249,10 +2291,15 @@ static void io_task(void *arg)
                     batch++;
                 }
 
-                xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
-                sdmmc_write_sectors(wcache.card, wcache.data + t * SECTOR_SIZE,
-                                    sd_start, batch);
-                xSemaphoreGive(wcache.sd_mutex);
+                esp_err_t werr = sdmmc_write_sectors_retry(wcache.card,
+                                                           wcache.data + t * SECTOR_SIZE,
+                                                           sd_start, batch);
+                if (werr != ESP_OK) {
+                    fprintf(stderr, "wcache drain write failed, preserving queue tail=%u\n",
+                            local_tail);
+                    xSemaphoreGive(wcache.not_empty);
+                    break;
+                }
 
                 local_tail += batch;
                 __atomic_store_n(&wcache.tail, local_tail, __ATOMIC_RELEASE);
@@ -2273,6 +2320,7 @@ static void wcache_init(void)
         return;
     }
     wcache.sd_mutex = xSemaphoreCreateMutex();
+    sdmmc_io_mutex = wcache.sd_mutex;
     wcache.not_empty = xSemaphoreCreateBinary();
     wcache.card = (sdmmc_card_t *)rawsd;
     wcache.head = 0;
@@ -2346,7 +2394,7 @@ static DWORD fat_next_cluster(sdmmc_card_t *card, DWORD cluster,
     uint32_t fat_sector = fat_base + (cluster * entry_size) / SECTOR_SIZE;
 
     if (fat_sector != *cached_fat_sector) {
-        if (sdmmc_read_sectors(card, fat_buf, fat_sector, 1) != ESP_OK)
+        if (sdmmc_read_sectors_retry(card, fat_buf, fat_sector, 1) != ESP_OK)
             return 0;  /* read error */
         *cached_fat_sector = fat_sector;
     }
@@ -2607,12 +2655,8 @@ static int bf_read_async(BlockDevice *bs,
                     }
                     int read_count = DISK_CACHE_SECTORS;
                     if (read_count > contig) read_count = contig;
-                    if (wcache.active)
-                        xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
-                    esp_err_t err = sdmmc_read_sectors(bf->card, bf->cache_buf,
-                                                       sd_sector, read_count);
-                    if (wcache.active)
-                        xSemaphoreGive(wcache.sd_mutex);
+                    esp_err_t err = sdmmc_read_sectors_retry(bf->card, bf->cache_buf,
+                                                             sd_sector, read_count);
                     if (err != ESP_OK)
                         return -1;
                     bf->cache_start = file_sector;
@@ -2676,11 +2720,7 @@ static int bf_read_async(BlockDevice *bs,
                     break;
                 }
                 int chunk = (n < contig) ? n : contig;
-                if (wcache.active)
-                    xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
-                esp_err_t err = sdmmc_read_sectors(bf->card, buf, sd_sector, chunk);
-                if (wcache.active)
-                    xSemaphoreGive(wcache.sd_mutex);
+                esp_err_t err = sdmmc_read_sectors_retry(bf->card, buf, sd_sector, chunk);
                 if (err != ESP_OK)
                     return -1;
                 buf += chunk * SECTOR_SIZE;
@@ -2782,7 +2822,7 @@ static int bf_write_async(BlockDevice *bs,
                 if (sd_sector == (uint32_t)-1)
                     return -1;
                 int chunk = (n < contig) ? n : contig;
-                if (sdmmc_write_sectors(bf->card, buf, sd_sector, chunk) != ESP_OK)
+                if (sdmmc_write_sectors_retry(bf->card, buf, sd_sector, chunk) != ESP_OK)
                     return -1;
                 buf += chunk * SECTOR_SIZE;
                 file_sector += chunk;
@@ -3229,13 +3269,9 @@ static int espsd_read_async(BlockDevice *bs,
             }
 
             // Read from SD card (under sd_mutex if wcache active)
-            if (wcache.active)
-                xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
-            ret = sdmmc_read_sectors(bf->card, read_buf,
-                                      bf->start_sector + sector_num + read_start,
-                                      total_read);
-            if (wcache.active)
-                xSemaphoreGive(wcache.sd_mutex);
+            ret = sdmmc_read_sectors_retry(bf->card, read_buf,
+                                           bf->start_sector + sector_num + read_start,
+                                           total_read);
             if (ret != 0) {
                 if (temp_buf) free(temp_buf);
                 return -1;
@@ -3291,11 +3327,7 @@ static int espsd_write_async(BlockDevice *bs,
     }
 
     esp_err_t ret;
-    if (wcache.active)
-        xSemaphoreTake(wcache.sd_mutex, portMAX_DELAY);
-    ret = sdmmc_write_sectors(bf->card, buf, bf->start_sector + sector_num, n);
-    if (wcache.active)
-        xSemaphoreGive(wcache.sd_mutex);
+    ret = sdmmc_write_sectors_retry(bf->card, buf, bf->start_sector + sector_num, n);
     if (ret != 0)
         return -1;
     return 0;
@@ -3505,6 +3537,73 @@ IDEIFState *ide_allocate(int irq, void *pic, void (*set_irq)(void *pic, int irq,
 
     s->cur_drive = s->drives[0];
     return s;
+}
+
+BlockDevice *ide_block_open_rw(const char *filename)
+{
+    if (!filename || !filename[0])
+        return NULL;
+    return block_device_init(filename, BF_MODE_RW);
+}
+
+int ide_block_reopen_rw(BlockDevice *bs, const char *filename)
+{
+    (void)bs;
+    (void)filename;
+    /* Not currently supported for generic RW block devices. */
+    return -1;
+}
+
+int ide_block_read(BlockDevice *bs, uint64_t sector_num, uint8_t *buf, int nsectors)
+{
+    int ret;
+    if (!bs || !buf || nsectors <= 0)
+        return -1;
+    ret = bs->read_async(bs, sector_num, buf, nsectors, NULL, NULL);
+    return (ret <= 0) ? ret : -1;
+}
+
+int ide_block_write(BlockDevice *bs, uint64_t sector_num, const uint8_t *buf, int nsectors)
+{
+    int ret;
+    if (!bs || !buf || nsectors <= 0)
+        return -1;
+    ret = bs->write_async(bs, sector_num, buf, nsectors, NULL, NULL);
+    return (ret <= 0) ? ret : -1;
+}
+
+int64_t ide_block_sector_count(BlockDevice *bs)
+{
+    if (!bs || !bs->get_sector_count)
+        return -1;
+    return bs->get_sector_count(bs);
+}
+
+void ide_block_close(BlockDevice *bs)
+{
+    if (!bs)
+        return;
+    /* Only supports standard file-backed block devices for now. */
+    if (bs->get_sector_count != bf_get_sector_count)
+        return;
+    BlockDeviceFile *bf = bs->opaque;
+    if (!bf)
+        return;
+    if (bf->f) {
+        fclose(bf->f);
+        bf->f = NULL;
+    }
+    if (bf->cache_buf) {
+        free(bf->cache_buf);
+        bf->cache_buf = NULL;
+        bf->cache_start = -1;
+        bf->cache_count = 0;
+    }
+    if (bf->extents) {
+        free(bf->extents);
+        bf->extents = NULL;
+        bf->num_extents = 0;
+    }
 }
 
 int ide_attach(IDEIFState *s, int drive, const char *filename)

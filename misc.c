@@ -1,4 +1,5 @@
 #include "misc.h"
+#include "ide.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -686,9 +687,180 @@ struct EMULINK {
 
 	// fake floppy drive
 	FILE *fdd[2];
+	BlockDevice *fdd_bs[2];
 	int fdfmti[2];
+	uint8_t *fdd_buf[2];     // Optional in-memory floppy image cache
+	int fdd_size[2];
+	int fdd_dirty[2];
 	char fdd_path[2][256];  // Store filenames for OSD display
+	int dataoff;
 };
+
+static int emulink_reopen_floppy(EMULINK *e, int i)
+{
+	if (!e || i < 0 || i >= 2)
+		return -1;
+	if (e->fdd_path[i][0] == '\0')
+		return -1;
+	if (e->fdd[i]) {
+		fclose(e->fdd[i]);
+		e->fdd[i] = NULL;
+	}
+	e->fdd[i] = fopen(e->fdd_path[i], "r+b");
+	return e->fdd[i] ? 0 : -1;
+}
+
+static int emulink_reopen_floppy_block(EMULINK *e, int i)
+{
+	if (!e || i < 0 || i >= 2)
+		return -1;
+	if (e->fdd_path[i][0] == '\0')
+		return -1;
+	if (e->fdd_bs[i]) {
+		ide_block_close(e->fdd_bs[i]);
+		e->fdd_bs[i] = NULL;
+	}
+	e->fdd_bs[i] = ide_block_open_rw(e->fdd_path[i]);
+	return e->fdd_bs[i] ? 0 : -1;
+}
+
+static int emulink_block_read_bytes(EMULINK *e, int drive, int offset, uint8_t *buf, int len)
+{
+	if (!e || drive < 0 || drive >= 2 || !buf || len < 0 || !e->fdd_bs[drive])
+		return -1;
+
+	while (len > 0) {
+		uint64_t sector = (uint64_t)offset >> 9;
+		int sector_off = offset & 511;
+
+		if (sector_off == 0 && len >= 512) {
+			int nsec = len >> 9;
+			if (nsec > 64)
+				nsec = 64;
+			if (ide_block_read(e->fdd_bs[drive], sector, buf, nsec) < 0)
+				return -1;
+			int adv = nsec << 9;
+			offset += adv;
+			buf += adv;
+			len -= adv;
+			continue;
+		}
+
+		uint8_t tmp[512];
+		if (ide_block_read(e->fdd_bs[drive], sector, tmp, 1) < 0)
+			return -1;
+		int chunk = 512 - sector_off;
+		if (chunk > len)
+			chunk = len;
+		memcpy(buf, tmp + sector_off, chunk);
+		offset += chunk;
+		buf += chunk;
+		len -= chunk;
+	}
+
+	return 0;
+}
+
+static int emulink_block_write_bytes(EMULINK *e, int drive, int offset, const uint8_t *buf, int len)
+{
+	if (!e || drive < 0 || drive >= 2 || !buf || len < 0 || !e->fdd_bs[drive])
+		return -1;
+
+	while (len > 0) {
+		uint64_t sector = (uint64_t)offset >> 9;
+		int sector_off = offset & 511;
+
+		if (sector_off == 0 && len >= 512) {
+			int nsec = len >> 9;
+			if (nsec > 64)
+				nsec = 64;
+			if (ide_block_write(e->fdd_bs[drive], sector, buf, nsec) < 0)
+				return -1;
+			int adv = nsec << 9;
+			offset += adv;
+			buf += adv;
+			len -= adv;
+			continue;
+		}
+
+		uint8_t tmp[512];
+		if (ide_block_read(e->fdd_bs[drive], sector, tmp, 1) < 0)
+			return -1;
+		int chunk = 512 - sector_off;
+		if (chunk > len)
+			chunk = len;
+		memcpy(tmp + sector_off, buf, chunk);
+		if (ide_block_write(e->fdd_bs[drive], sector, tmp, 1) < 0)
+			return -1;
+		offset += chunk;
+		buf += chunk;
+		len -= chunk;
+	}
+
+	return 0;
+}
+
+static void emulink_free_floppy_buffer(EMULINK *e, int i)
+{
+	if (!e || i < 0 || i >= 2)
+		return;
+	if (e->fdd_buf[i]) {
+		free(e->fdd_buf[i]);
+		e->fdd_buf[i] = NULL;
+	}
+	e->fdd_size[i] = 0;
+	e->fdd_dirty[i] = 0;
+}
+
+static int emulink_cache_load_from_block(EMULINK *e, int i, int size)
+{
+	if (!e || i < 0 || i >= 2 || !e->fdd_buf[i] || !e->fdd_bs[i] || size <= 0)
+		return -1;
+	int total = size / 512;
+	int done = 0;
+	while (done < total) {
+		int chunk = total - done;
+		if (chunk > 64)
+			chunk = 64;
+		if (ide_block_read(e->fdd_bs[i], done, e->fdd_buf[i] + done * 512, chunk) < 0)
+			return -1;
+		done += chunk;
+	}
+	return 0;
+}
+
+static void emulink_flush_floppy_buffer(EMULINK *e, int i)
+{
+	if (!e || i < 0 || i >= 2)
+		return;
+	if (!e->fdd_buf[i] || !e->fdd_dirty[i] || e->fdd_size[i] <= 0)
+		return;
+	if (e->fdd_bs[i]) {
+		int total = e->fdd_size[i] / 512;
+		int done = 0;
+		while (done < total) {
+			int chunk = total - done;
+			if (chunk > 64)
+				chunk = 64;
+			if (ide_block_write(e->fdd_bs[i], done,
+					    e->fdd_buf[i] + done * 512, chunk) < 0)
+				return;
+			done += chunk;
+		}
+		e->fdd_dirty[i] = 0;
+		return;
+	}
+	if (!e->fdd[i])
+		return;
+	clearerr(e->fdd[i]);
+	if (fseek(e->fdd[i], 0, SEEK_SET) != 0)
+		return;
+	if ((int)fwrite(e->fdd_buf[i], 1, e->fdd_size[i], e->fdd[i]) != e->fdd_size[i])
+		return;
+	fflush(e->fdd[i]);
+	fsync(fileno(e->fdd[i]));
+	e->fdd_dirty[i] = 0;
+}
 
 EMULINK *emulink_init()
 {
@@ -702,10 +874,16 @@ void emulink_close(EMULINK *e)
 {
 	if (!e) return;
 	for (int i = 0; i < 2; i++) {
+		emulink_flush_floppy_buffer(e, i);
 		if (e->fdd[i]) {
 			fclose(e->fdd[i]);
 			e->fdd[i] = NULL;
 		}
+		if (e->fdd_bs[i]) {
+			ide_block_close(e->fdd_bs[i]);
+			e->fdd_bs[i] = NULL;
+		}
+		emulink_free_floppy_buffer(e, i);
 		e->fdd_path[i][0] = '\0';
 	}
 }
@@ -713,9 +891,28 @@ void emulink_close(EMULINK *e)
 int emulink_attach_floppy(EMULINK *e, int i, const char *filename)
 {
 	if (i >= 0 && i < 2) {
+		/* Drop any in-flight floppy command state on media change. */
+		e->cmd = -1;
+		e->argi = 0;
+		e->dataleft = 0;
+		e->status = 0;
+		e->dataoff = 0;
+
+		emulink_flush_floppy_buffer(e, i);
 		if (e->fdd[i]) {
 			fclose(e->fdd[i]);
 			e->fdd[i] = NULL;
+		}
+		if (e->fdd_bs[i]) {
+			ide_block_close(e->fdd_bs[i]);
+			e->fdd_bs[i] = NULL;
+		}
+		emulink_free_floppy_buffer(e, i);
+		if (filename && filename[0]) {
+			/* Uses the same raw-SD accelerated backend as IDE/CD when available. */
+			e->fdd_bs[i] = ide_block_open_rw(filename);
+		} else {
+			e->fdd_bs[i] = NULL;
 		}
 		e->fdd_path[i][0] = '\0';
 		if (filename) {
@@ -725,18 +922,61 @@ int emulink_attach_floppy(EMULINK *e, int i, const char *filename)
 				e->fdd_path[i][sizeof(e->fdd_path[i]) - 1] = '\0';
 			}
 		}
-		if (!e->fdd[i])
-			return -1;
-		fseek(e->fdd[i], 0, SEEK_END);
-		int size = ftell(e->fdd[i]);
-		for (int j = 0; fmt[j].sectors; j++) {
-			if (size ==
-			    fmt[j].sectors * fmt[j].tracks * fmt[j].heads * 512) {
-				e->fdfmti[i] = j;
+		/* Eject is valid and intentional. */
+			if (!filename)
 				return 0;
+			if (!e->fdd[i] && !e->fdd_bs[i])
+				return -1;
+			int size = -1;
+			if (e->fdd_bs[i]) {
+				int64_t sc = ide_block_sector_count(e->fdd_bs[i]);
+				if (sc > 0)
+					size = (int)(sc * 512);
 			}
-		}
-		return -1;
+			if (size <= 0 && e->fdd[i]) {
+				fseek(e->fdd[i], 0, SEEK_END);
+				size = ftell(e->fdd[i]);
+			}
+			for (int j = 0; fmt[j].sectors; j++) {
+				if (size ==
+				    fmt[j].sectors * fmt[j].tracks * fmt[j].heads * 512) {
+				e->fdfmti[i] = j;
+					e->fdd_buf[i] = malloc(size);
+					if (e->fdd_buf[i]) {
+						int load_ok = -1;
+						if (e->fdd_bs[i]) {
+							load_ok = emulink_cache_load_from_block(e, i, size);
+						}
+						if (load_ok < 0 && e->fdd[i]) {
+							clearerr(e->fdd[i]);
+							if (fseek(e->fdd[i], 0, SEEK_SET) == 0 &&
+							    (int)fread(e->fdd_buf[i], 1, size, e->fdd[i]) == size)
+								load_ok = 0;
+						}
+						if (load_ok == 0) {
+							e->fdd_size[i] = size;
+							e->fdd_dirty[i] = 0;
+							fprintf(stderr, "floppy%d: cache ready (%d KB, source=%s)\n",
+							        i, size / 1024, e->fdd_bs[i] ? "block" : "stdio");
+						} else {
+							fprintf(stderr, "floppy%d: cache load failed (block=%d stdio=%d)\n",
+							        i, e->fdd_bs[i] ? 1 : 0, e->fdd[i] ? 1 : 0);
+							emulink_free_floppy_buffer(e, i);
+						}
+					}
+					return 0;
+				}
+			}
+			if (e->fdd[i]) {
+				fclose(e->fdd[i]);
+				e->fdd[i] = NULL;
+			}
+			e->fdd_path[i][0] = '\0';
+			if (e->fdd_bs[i]) {
+				ide_block_close(e->fdd_bs[i]);
+				e->fdd_bs[i] = NULL;
+			}
+			return -1;
 	}
 	return 0;
 }
@@ -768,29 +1008,52 @@ static void exec_cmd(EMULINK *e)
 		e->status = 0x40 | 0x04;
 		e->cmd = -1;
 		break;
-	case 0x101:
-	case 0x102:
-		if (e->argi == 3) {
-			int ret;
-			if (!e->fdd[e->args[0]]) {
+		case 0x101:
+		case 0x102:
+			if (e->argi == 3) {
+				int drive = e->args[0];
+				int ret;
+				if (drive < 0 || drive >= 2 || (!e->fdd[drive] && !e->fdd_bs[drive])) {
+					e->status = -EIO;
+					e->cmd = -1;
+					break;
+				}
+			int c = e->args[1] >> 16;
+			int h = (e->args[1] >> 8) & 0xff;
+			int s = e->args[1] & 0xff;
+			const struct fdfmt *f = &(fmt[e->fdfmti[drive]]);
+			if (s < 1 || s > f->sectors || h >= f->heads || c >= f->tracks) {
 				e->status = -EIO;
 				e->cmd = -1;
 				break;
 			}
-			if (e->args[0] < 2) {
-				int c = e->args[1] >> 16;
-				int h = (e->args[1] >> 8) & 0xff;
-				int s = e->args[1] & 0xff;
-				const struct fdfmt *f = &(fmt[e->fdfmti[e->args[0]]]);
 				int lba = (c * f->heads + h) * f->sectors + (s - 1);
-				ret = fseek(e->fdd[e->args[0]], 512 * lba, SEEK_SET);
-				if (ret < 0) {
-					e->status = -errno;
+				e->dataoff = 512 * lba;
+					if (e->fdd_buf[drive] || e->fdd_bs[drive]) {
+						e->status = 0;
+						e->dataleft = 512 * e->args[2];
+						break;
+					}
+				if (!e->fdd[drive]) {
+					e->status = -EIO;
 					e->cmd = -1;
-				} else {
-					e->status = 0;
-					e->dataleft = 512 * e->args[2];
+					break;
 				}
+				clearerr(e->fdd[drive]);
+				ret = fseek(e->fdd[drive], e->dataoff, SEEK_SET);
+			if (ret != 0) {
+				/* Some hosts recover after reopening the image (same path). */
+				if (emulink_reopen_floppy(e, drive) == 0) {
+					clearerr(e->fdd[drive]);
+					ret = fseek(e->fdd[drive], e->dataoff, SEEK_SET);
+				}
+			}
+			if (ret != 0) {
+				e->status = -errno;
+				e->cmd = -1;
+			} else {
+				e->status = 0;
+				e->dataleft = 512 * e->args[2];
 			}
 		}
 		break;
@@ -821,14 +1084,54 @@ int emulink_data_write_string(void *s, uint8_t *buf, int size, int count)
 	EMULINK *e = s;
 	switch (e->cmd) {
 	case 0x102: // floppy write
-		if (!e->fdd[e->args[0]])
+		if (e->args[0] >= 2 || (!e->fdd[e->args[0]] && !e->fdd_bs[e->args[0]]))
 			break;
 		if (e->argi == 3) {
+			int drive = e->args[0];
 			int len = size * count;
 			if (len > e->dataleft)
 				break;
 			FLOPPY_ACTIVITY();
-			int ret = fwrite(buf, 1, len, e->fdd[e->args[0]]);
+			if (e->fdd_buf[drive] &&
+			    e->dataoff >= 0 &&
+			    e->dataoff + len <= e->fdd_size[drive]) {
+				memcpy(e->fdd_buf[drive] + e->dataoff, buf, len);
+				e->dataoff += len;
+				e->fdd_dirty[drive] = 1;
+				e->dataleft -= len;
+				if (e->dataleft == 0) {
+					emulink_flush_floppy_buffer(e, drive);
+					e->cmd = -1;
+					e->status = 0;
+					return count;
+				}
+				return count;
+			}
+			if (e->fdd_bs[drive]) {
+				int ret = emulink_block_write_bytes(e, drive, e->dataoff, buf, len);
+				if (ret < 0 && emulink_reopen_floppy_block(e, drive) == 0)
+					ret = emulink_block_write_bytes(e, drive, e->dataoff, buf, len);
+				if (ret < 0)
+					break;
+				e->dataoff += len;
+				e->dataleft -= len;
+				if (e->dataleft == 0) {
+					e->cmd = -1;
+					e->status = 0;
+					return count;
+				}
+				return count;
+			}
+			if (!e->fdd[drive])
+				break;
+			long pos = ftell(e->fdd[drive]);
+			clearerr(e->fdd[drive]);
+			int ret = fwrite(buf, 1, len, e->fdd[drive]);
+			if (ret != len && emulink_reopen_floppy(e, drive) == 0) {
+				clearerr(e->fdd[drive]);
+				if (pos >= 0 && fseek(e->fdd[drive], pos, SEEK_SET) == 0)
+					ret = fwrite(buf, 1, len, e->fdd[drive]);
+			}
 			if (ret != len)
 				break;
 			e->dataleft -= len;
@@ -851,14 +1154,52 @@ int emulink_data_read_string(void *s, uint8_t *buf, int size, int count)
 	EMULINK *e = s;
 	switch (e->cmd) {
 	case 0x101: // floppy read
-		if (!e->fdd[e->args[0]])
+		if (e->args[0] >= 2 || (!e->fdd[e->args[0]] && !e->fdd_bs[e->args[0]]))
 			break;
 		if (e->argi == 3) {
+			int drive = e->args[0];
 			int len = size * count;
 			if (len > e->dataleft)
 				break;
 			FLOPPY_ACTIVITY();
-			int ret = fread(buf, 1, len, e->fdd[e->args[0]]);
+			if (e->fdd_buf[drive] &&
+			    e->dataoff >= 0 &&
+			    e->dataoff + len <= e->fdd_size[drive]) {
+				memcpy(buf, e->fdd_buf[drive] + e->dataoff, len);
+				e->dataoff += len;
+				e->dataleft -= len;
+				if (e->dataleft == 0) {
+					e->cmd = -1;
+					e->status = 0;
+					return count;
+				}
+				return count;
+			}
+			if (e->fdd_bs[drive]) {
+				int ret = emulink_block_read_bytes(e, drive, e->dataoff, buf, len);
+				if (ret < 0 && emulink_reopen_floppy_block(e, drive) == 0)
+					ret = emulink_block_read_bytes(e, drive, e->dataoff, buf, len);
+				if (ret < 0)
+					break;
+				e->dataoff += len;
+				e->dataleft -= len;
+				if (e->dataleft == 0) {
+					e->cmd = -1;
+					e->status = 0;
+					return count;
+				}
+				return count;
+			}
+			if (!e->fdd[drive])
+				break;
+			long pos = ftell(e->fdd[drive]);
+			clearerr(e->fdd[drive]);
+			int ret = fread(buf, 1, len, e->fdd[drive]);
+			if (ret != len && emulink_reopen_floppy(e, drive) == 0) {
+				clearerr(e->fdd[drive]);
+				if (pos >= 0 && fseek(e->fdd[drive], pos, SEEK_SET) == 0)
+					ret = fread(buf, 1, len, e->fdd[drive]);
+			}
 			if (ret != len)
 				break;
 			e->dataleft -= len;
