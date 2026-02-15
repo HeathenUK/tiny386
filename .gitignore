@@ -5,6 +5,7 @@
 # Build artifacts
 build/
 out/
+build/seabios/
 
 # Generated files
 fmopl.inc
@@ -14,7 +15,20 @@ fmopl.inc
 
 # AI assistant content
 CLAUDE.md
+PLAN.md
 .claude/
+.codex-local/
+docs/
+
+# Test/debug artifacts
+TEST386.COM
+test386.asm
+old_*.c
+shot.png
+
+# BIOS binaries (built from seabios/)
+bios.bin
+vgabios.bin
 
 # ESP-IDF tooling and caches
 esp/.cache/
