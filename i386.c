@@ -13,6 +13,9 @@ extern int pc_batch_size_setting;
 extern int pc_last_batch_size;
 extern int pc_pit_burst_setting;
 extern void vga_dump_io_trace(void);
+extern void vga_validate_current(int mode);
+extern void vga_dump_regs_summary(void);
+extern void vga_dump_screen_text(int max_lines);
 
 /* PIE SIMD helpers for ESP32-P4 string operations */
 extern void pie_memcpy_128(void *dst, const void *src, size_t n);
@@ -50,6 +53,9 @@ static inline void fast_memset32(void *dst, uint32_t val, size_t count) {
 #ifdef I386_OPT2
 #define I386_SEQ_FASTPATH
 #endif
+/* Fine-grained REP string fast-path toggles for Win3.x validation. */
+#define I386_MOVS_FASTPATH 1
+#define I386_STOS_FASTPATH 1
 
 #ifdef I386_SEQ_FASTPATH
 #define SEQ_INVALIDATE(cpu) do { (cpu)->seq_active = false; } while(0)
@@ -413,6 +419,18 @@ static struct {
 /* Runtime diagnostic toggle — controlled via OSD "CPU Debug" setting.
  * When false, all diagnostic dolog output is suppressed. */
 static bool cpu_diag_enabled = false;
+/* Win3.x compatibility:
+ * route VM86 INT n at IOPL=3 through IDT (historical emulator behavior)
+ * instead of direct IVT dispatch. */
+static bool vm86_iopl3_softint_via_idt = true;
+/* Route VM86+IOPL=3 software INTs through IDT so VMM can consistently
+ * mediate/virtualize services (Bochs/QEMU-compatible behavior). */
+static inline bool vm86_iopl3_int_uses_idt(int intno, uint16_t ax)
+{
+	(void)ax;
+	(void)intno;
+	return true;
+}
 #define diaglog(...) do { if (cpu_diag_enabled) dolog(__VA_ARGS__); } while(0)
 
 /* Per-generation, rate-limited diagnostic events for heavy CPU-debug traces. */
@@ -452,6 +470,8 @@ static struct {
 	struct {
 		uint8_t excno;
 		uint16_t cs;
+		uint16_t ds;
+		uint16_t es;
 		uint16_t ss;
 		uword ip;
 		uword sp;
@@ -479,6 +499,44 @@ static struct {
 	} ring[VM86_IRET_RING_SIZE];
 } vm86_iret_ring = { .gen = -1 };
 
+/* Dense VM86 tripwire ring: one compact block dumped on first fatal VM86 fault. */
+#define VM86_TRIP_RING_SIZE 64
+enum {
+	VM86_TRIP_E = 'E', /* VM86 exception entry */
+	VM86_TRIP_R = 'R', /* ring0 IRET -> VM86 */
+	VM86_TRIP_V = 'V', /* VM86 -> ring0 gate entry */
+	VM86_TRIP_I = 'I', /* I/O bitmap deny */
+};
+enum {
+	VM86_TRIP_IO_BAD_TR = 1,
+	VM86_TRIP_IO_BAD_TR_LIMIT = 2,
+	VM86_TRIP_IO_BAD_IOBASE = 3,
+	VM86_TRIP_IO_BAD_BYTE_OOR = 4,
+	VM86_TRIP_IO_BAD_BIT = 5,
+};
+static struct {
+	int gen;
+	uint16_t count;
+	uint16_t pos;
+	bool frozen;
+	bool has_first_bad;
+	uint8_t first_bad_exc;
+	uint16_t first_bad_cs;
+	uint32_t first_bad_ip;
+	char first_bad_decoded[24];
+	struct {
+		uint8_t type;   /* VM86_TRIP_* */
+		uint8_t v0;     /* exc/vec/width/reason */
+		uint8_t blen;
+		uint16_t cs, ss;
+		uint16_t cs2, ss2;
+		uint32_t ip, sp;
+		uint32_t fl;
+		uint32_t a, b;
+		uint8_t bytes[8];
+	} ring[VM86_TRIP_RING_SIZE];
+} vm86_trip = { .gen = -1 };
+
 /* Focused Win386 diagnostics: enable narrow traces only while win386.exe runs. */
 static struct {
 	int gen;
@@ -488,6 +546,548 @@ static struct {
 	uint16_t int2f_count;
 	uint16_t pm_exc_count;
 } win386_diag = { .gen = -1 };
+
+/* WfW 3.11 boot monitor: condensed diagnostics collected while win386 is active.
+ * All counters gated behind cpu_diag_enabled && win386_diag.active — zero overhead
+ * when not running Windows with debug enabled. Dumps ~20 line summary on exit. */
+#define WFW_FLOW_RING_SIZE 96
+static struct {
+	/* Counters */
+	uint32_t vm86_ints;        /* Total VM86 interrupts delivered */
+	uint32_t pm_ints;          /* Total PM interrupts delivered */
+	uint32_t mode_switches;    /* CR0 PE/PG transitions */
+	struct {
+		uint16_t cs;
+		uint32_t ip;
+		uint32_t old_cr0;
+		uint32_t new_cr0;
+	} cr0_tail[8];
+	uint8_t cr0_tail_pos;
+	uint8_t cr0_tail_count;
+	uint32_t v86_to_ring0;     /* VM86->ring0 ISR entries */
+	uint32_t isr_failures;     /* call_isr() returned false */
+	uint32_t exc_counts[32];   /* Per-exception counters (0-31) */
+
+	/* INT 10h VGA mode tracking */
+	uint8_t last_int10h_ah;
+	uint8_t last_int10h_al;
+	uint16_t int10h_count;
+	/* Capture teletype output (AH=0Eh) — the error message */
+	char tty_buf[80];
+	uint8_t tty_pos;
+
+	/* INT 15h tracking */
+	uint16_t int15h_count;
+	uint8_t last_int15h_ah;
+
+	/* A20 state */
+	uint8_t a20_state;
+	uint16_t a20_toggles;
+
+	/* Last fatal context */
+	uint16_t fatal_cs, fatal_ds, fatal_es, fatal_ss;
+	uint32_t fatal_eip, fatal_esp, fatal_efl;
+	uint8_t fatal_cpl;
+	uint8_t fatal_vm;
+	uint8_t fatal_excno;
+	uint8_t fatal_ext;
+	uint8_t fatal_pusherr;
+	bool has_fatal;
+	char fatal_decoded[24];
+	uint8_t fatal_bytes[8];
+	uint8_t fatal_blen;
+	/* Software INT vectors < 20h (tracked separately from exceptions). */
+	uint32_t lowvec_softint_total;
+	uint16_t lowvec_softint_hist[32];
+	/* Unified dense event flow (single-block causal timeline). */
+	struct {
+		uint8_t tag;    /* 'I' int, 'E' exc, 'D' dpl reject, 'H' compat hle, 'L' lowvec, 'R' return, 'A' abort-site */
+		uint8_t mode;   /* 'R' real, 'P' protected, 'V' vm86 */
+		uint8_t vec;    /* vector/exception */
+		uint8_t cpl;
+		uint16_t cs, ds;
+		uint32_t ip;
+		uint16_t ax, bx, cx, dx;
+		uint32_t extra; /* tag-specific payload (see flow dump) */
+	} flow_ring[WFW_FLOW_RING_SIZE];
+	uint16_t flow_pos;
+	uint16_t flow_count;
+
+	/* V86 INT #GP histogram: which INT vectors cause #GP in V86 (IOPL<3) */
+	uint16_t v86_int_gp_counts[256];
+
+	/* Ring-3 PM tracking: nonzero means DPMI client entered PM */
+	uint32_t pm_ring3_ints;
+	uint32_t pm_ring3_irqs;         /* Hardware IRQs (exc >= 32) in ring-3 */
+	uint32_t pm_ring3_faults;       /* CPU exceptions (exc < 32) in ring-3 */
+	uint16_t pm_ring3_exc_hist[32]; /* Per-exception counter for ring-3 */
+	uint16_t pm_r3_last_cs;         /* Last ring-3 fault context */
+	uint32_t pm_r3_last_eip;
+	uint8_t pm_r3_last_exc;
+	/* Ring-3 #GP capture: first few ring-3 #GPs with CS:EIP */
+	struct { uint16_t cs; uint32_t eip; uint32_t err; char dec[24]; } r3_gp_log[8];
+	uint8_t r3_gp_count;
+	struct { uint16_t cs; uint32_t eip; uint32_t err; uint32_t cr2; char dec[24]; } r3_pf_log[8];
+	uint8_t r3_pf_count;
+	/* Ring-3 high-address #PF page table snapshot (CR2 >= 0x80000000).
+	 * Ring buffer — last 16 entries, so the failing PF is always captured. */
+	struct {
+		uint32_t cr2;
+		uint32_t err;
+		uint16_t cs;
+		uint32_t eip;
+		uint32_t cr3;
+		uint32_t pde;    /* Raw page directory entry */
+		uint32_t pte;    /* Raw page table entry (0 if PDE not present) */
+	} r3_hipf[16];
+	uint8_t r3_hipf_pos;
+	uint8_t r3_hipf_count;
+	/* PM ring-3 INT 21h/31h tracking (ring buffers for last-N) */
+	uint16_t pm_r3_int21_count;
+	uint8_t pm_r3_int21_ah_ring[16];  /* ring buffer of AH values */
+	uint16_t pm_r3_int31_count;
+	uint16_t pm_r3_int31_ax_ring[16]; /* ring buffer of AX values */
+	/* File open tracking: capture filenames for AH=3Dh */
+	struct { char name[32]; uint8_t result_ah; bool failed; } r3_fopen_log[8];
+	uint8_t r3_fopen_count;
+
+	/* BIOS privileged instruction detection */
+	uint16_t bios_lgdt_count;	/* LGDT in V86 at f000/c000 */
+	uint16_t bios_priv_count;	/* Other privileged insns in V86 BIOS */
+
+	/* V86 INT 21h subfunction tracking */
+	uint8_t v86_int21_ah_log[16];   /* First 16 INT 21h AH values */
+	uint8_t v86_int21_ah_count;
+
+	/* V86 IOPL=3 INT tracking (softints through IVT) */
+	uint32_t v86_softint_total;	/* Total V86 INTs via IOPL=3 IVT path */
+	uint16_t v86_int2f_count;	/* INT 2Fh calls in V86 */
+	uint16_t v86_int2f_ax_hist[8];	/* Last 8 unique AX values for INT 2Fh */
+	uint8_t v86_int2f_hist_pos;
+	uint16_t v86_int21_count;	/* INT 21h calls in V86 */
+	/* VM86 INT 13h request/return correlation (disk service health). */
+	uint16_t v86_int13_count;
+	uint16_t v86_int13_ret_count;
+	uint16_t v86_int13_fail_count;
+	uint8_t v86_int13_last_path; /* 1=IVT softint, 2=IDT-compat */
+	bool pending_v86_int13;
+	uint16_t pending_v86_int13_ret_cs;
+	uint32_t pending_v86_int13_ret_ip;
+	uint16_t v86_int13_req_ax, v86_int13_req_bx, v86_int13_req_cx, v86_int13_req_dx, v86_int13_req_es;
+	uint16_t v86_int13_ret_ax, v86_int13_ret_bx, v86_int13_ret_cx, v86_int13_ret_dx, v86_int13_ret_es;
+	uint8_t v86_int13_ret_cf;
+	/* First VM86 INT events: compact path tuples for quick boot diffing */
+	struct {
+		uint8_t vec;   /* interrupt vector */
+		uint8_t path;  /* 0=IOPL<3(#GP), 1=IOPL=3 softINT */
+		uint8_t iopl;  /* IOPL at INT execution */
+		uint16_t ax;   /* AX at INT execution */
+		uint16_t cs;   /* CS at INT execution */
+		uint16_t ip;   /* IP at INT execution */
+	} vm86_int_evt[8];
+	uint8_t vm86_int_evt_count;
+	/* IVT[2Fh] snapshot at trace start (to detect if VMM patches it) */
+	uint32_t ivt_2f_at_start;
+
+	/* IOPL transition tracking: captures first PM→V86 IRET with IOPL=3 */
+	bool iopl3_captured;        /* Already captured */
+	uint32_t iopl3_iret_count;  /* PM→V86 IRETs before first IOPL=3 */
+	uint16_t iopl3_from_cs;     /* Ring-0 CS performing the IRET */
+	uint32_t iopl3_from_eip;    /* Ring-0 EIP performing the IRET */
+	uint16_t iopl3_to_cs;       /* V86 target CS */
+	uint32_t iopl3_to_ip;       /* V86 target IP */
+	uint32_t iopl3_eflags;      /* Full EFLAGS being loaded */
+	uint32_t iopl3_ivt_2f;      /* IVT[2Fh] at the moment of transition */
+	/* First fault seen after first IOPL=3 VM86 entry */
+	bool post_iopl3_fault_captured;
+	uint8_t post_iopl3_excno;
+	uint16_t post_iopl3_cs;
+	uint32_t post_iopl3_eip;
+	uint32_t post_iopl3_fl;
+	uint32_t post_iopl3_err;
+	int8_t post_iopl3_last_evt; /* vm86_int_evt index, -1 if none */
+	char post_iopl3_decoded[24];
+	uint8_t post_iopl3_bytes[8];
+	uint8_t post_iopl3_blen;
+	/* Hot VM86 BIOS fault PCs (recurring #GP/#UD) */
+	struct {
+		uint16_t cs;
+		uint16_t ip;
+		uint8_t exc; /* EX_GP/EX_UD */
+		uint16_t count;
+		uint16_t resume_same;  /* IRET returned to same CS:IP (reflected) */
+		uint16_t resume_other; /* IRET returned elsewhere (emulated/advanced) */
+		char decoded[24];
+		uint8_t bytes[8];
+		uint8_t blen;
+	} bios_hot[6];
+	uint8_t bios_hot_count;
+	int8_t pending_bios_fault_idx; /* set on VM86 BIOS fault, consumed on VM86 IRET */
+	/* Focused VM86 #UD opcode 63h tracker (ARPL callback loop signal). */
+	struct {
+		uint16_t cs;
+		uint16_t ip;
+		uint16_t count;
+		uint16_t resume_same;  /* reflected: resumed at same CS:IP */
+		uint16_t resume_next4; /* advanced to CS:IP+4 (after ARPL trap opcode) */
+		uint16_t resume_next8; /* advanced to CS:IP+8 (past TEST/Jcc pair) */
+		uint16_t resume_other; /* advanced/emulated elsewhere */
+		uint16_t out_ax;       /* AX at resume (last observed) */
+		uint32_t out_fl;       /* FLAGS at resume (last observed) */
+		uint16_t cf_set;       /* Resume returns with CF=1 */
+		uint16_t ax, bx, cx, dx, si, di;
+		uint16_t ss;
+		uint32_t sp;
+		uint32_t fl;
+		uint8_t bytes[8];
+		uint8_t blen;
+	} ud63_hot[6];
+	uint8_t ud63_hot_count;
+	int8_t pending_ud63_idx;
+	uint16_t pending_ud63_cs;
+	uint32_t pending_ud63_ip;
+	/* Focused ARPL resize probe: #UD opcode 63h at FE95:1638 around sel 0127. */
+	bool pending_ud63_fe95_0127;
+	struct {
+		uint16_t seen;       /* FE95:1638 #UD entries observed */
+		uint16_t resumed;    /* IRET resumes observed */
+		uint16_t desc_changed;
+		uint16_t pre_cs, pre_ip;
+		uint16_t post_cs, post_ip;
+		uint16_t pre_ds;     /* DS at #UD entry */
+		uint16_t post_ds;    /* DS at resume-note time */
+		uint16_t resume_ds;  /* target DS on IRET path when available */
+		uint16_t pre_ax, post_ax;
+		uint32_t pre_fl, post_fl;
+		uint32_t pre_w1, pre_w2;
+		uint32_t post_w1, post_w2;
+		uint32_t pre_near_w1[4], pre_near_w2[4];   /* 011c/0124/0127/012c */
+		uint32_t post_near_w1[4], post_near_w2[4];
+		uint8_t pre_near_ok, post_near_ok;         /* bitmask */
+		uint16_t near_changed[4];                  /* per-slot pre->post changes */
+		/* First-callback ring-0 micro-trace (FE95:1638 -> ring0 -> IRET). */
+		bool trace_active;
+		bool trace_done;
+		uint16_t trace_entry_ax;
+		uint16_t trace_prev_ax;
+		bool trace_ax5_valid;
+		uint16_t trace_ax5_prev;
+		uint16_t trace_ax5_ax;
+		uint16_t trace_ax5_cs, trace_ax5_ip;
+		/* Path probes across FE95 callback sessions (not first-trace only). */
+		uint16_t ret_ax5;
+		uint16_t ret_ax_other;
+		uint16_t ret_ax_last;
+		/* 0028:6ca7 -> test byte [bp+2e],2 */
+		uint16_t t6ca7_count;
+		uint16_t t6ca7_bit_set;
+		uint16_t t6ca7_bit_clear;
+		uint8_t t6ca7_last_byte;
+		uint16_t t6ca7_last_ss, t6ca7_last_bp;
+		/* 0028:6cab -> je rel8 (branch outcome observed at next step). */
+		bool j6cab_pending;
+		uint16_t j6cab_count;
+		uint16_t j6cab_taken;
+		uint16_t j6cab_not_taken;
+		uint16_t j6cab_other;
+		uint16_t j6cab_last_from_cs, j6cab_last_from_ip;
+		uint16_t j6cab_last_to_cs, j6cab_last_to_ip;
+		uint16_t j6cab_last_tgt, j6cab_last_fall;
+		uint8_t j6cab_last_zf;
+		/* AX transition tracker: first point where callback path reaches AX=0005. */
+		bool step_prev_valid;
+		uint16_t step_prev_cs, step_prev_ip, step_prev_ax;
+		uint8_t step_prev_bytes[8];
+		uint8_t step_prev_blen;
+		uint16_t ax5_transitions;
+		uint16_t ax5_from_cs, ax5_from_ip, ax5_from_ax;
+		uint16_t ax5_to_cs, ax5_to_ip, ax5_to_ax;
+		uint8_t ax5_from_bytes[8];
+		uint8_t ax5_from_blen;
+		struct {
+			uint16_t cs, ip;
+			uint16_t ax, bx, cx, dx, si, di, bp, sp;
+			uint32_t fl;
+			uint8_t bytes[8];
+			uint8_t blen;
+		} trace[128];
+		uint8_t trace_count;
+	} ud63_fe95_0127;
+	/* Software-INT DPL reject tracking (PM #GP from INT n with DPL<CPL). */
+	struct {
+		uint8_t vec;
+		uint16_t count;
+		uint16_t first_cs;
+		uint32_t first_ip;
+		uint16_t first_err;
+		uint16_t resume_same; /* returned to faulting CS:IP */
+		uint16_t resume_next; /* returned to CS:next_ip (emulated INT) */
+		uint16_t resume_other;
+		uint16_t in_ax, in_bx;
+		uint16_t out_ax, out_bx;
+		uint32_t out_fl;
+		uint16_t cf_set;
+	} swint_dpl[6];
+	uint8_t swint_dpl_count;
+	struct {
+		uint8_t vec;
+		uint8_t mode;
+		uint8_t cpl;
+		uint8_t rcls;      /* 1=same 2=next 3=other */
+		uint8_t cf;
+		uint16_t in_ax, in_bx;
+		uint16_t out_ax, out_bx;
+		uint16_t in_cs, out_cs;
+		uint32_t in_ip, out_ip;
+	} dpl_tail[16];
+	uint8_t dpl_tail_pos;
+	uint8_t dpl_tail_count;
+	int8_t pending_swint_dpl_idx;
+	uint16_t pending_swint_cs;
+	uint32_t pending_swint_ip;
+	uint32_t pending_swint_next_ip;
+
+	/* INT 31h first-16 capture (init sequence) */
+	uint16_t pm_r3_int31_ax_first[16];
+	uint8_t pm_r3_int31_first_count;
+	/* INT 31h histogram (compact: {ax, count} pairs) */
+	struct { uint16_t ax; uint16_t count; } int31_hist[24];
+	uint8_t int31_hist_len;
+	/* DPMI/INT21h failure detection via IRET CF check */
+	bool pending_dpmi;
+	uint16_t pending_dpmi_ax;
+	bool pending_int21;
+	uint8_t pending_int21_ah;
+	/* DPMI failure log (INT 31h returned CF=1) */
+	struct { uint16_t ax; uint32_t ret_eip; } int31_fail_log[8];
+	uint8_t int31_fail_count;
+	/* INT 21h failure log (returned CF=1) */
+	struct { uint8_t ah; uint32_t ret_eip; } int21_fail_log[8];
+	uint8_t int21_fail_count;
+	/* INT 21h first-16 capture */
+	uint8_t pm_r3_int21_ah_first[16];
+	uint8_t pm_r3_int21_first_count;
+	/* INT 31h/0006 selector capture: BX values for first 16 Get Segment Base calls */
+	uint16_t int31_0006_bx[16];
+	uint8_t int31_0006_count;
+	/* Initial PM ring-3 register state (first ring-3 event) */
+	bool r3_first_captured;
+	uint16_t r3_first_cs, r3_first_ds, r3_first_es, r3_first_ss;
+	uint32_t r3_first_eip, r3_first_esp, r3_first_eax;
+	/* PSP command tail from DS:0080h and environment from PSP:002Ch */
+	uint32_t psp_ds_base;    /* Linear address of DS (PSP) */
+	uint8_t psp_header[16];  /* First 16 bytes at DS_base (PSP signature check) */
+	char psp_cmdtail[128];   /* Command tail (up to 127 chars) */
+	uint8_t psp_cmdtail_len;
+	char psp_env[256];       /* First 256 bytes of environment block */
+	uint16_t psp_env_seg;    /* PSP:2Ch value (selector or segment) */
+	uint32_t psp_env_lin;    /* Resolved linear address of environment */
+	bool psp_env_is_sel;     /* true if resolved via LDT lookup */
+	/* DPMI return value capture: first 8 returns from INT 31h */
+	struct { uint16_t call_ax; uint16_t ret_ax; uint16_t ret_cx; uint16_t ret_dx; bool cf; } int31_ret_log[8];
+	uint8_t int31_ret_count;
+	/* DPMI 0501/0503 memory block allocation log */
+	struct {
+		uint16_t func;       /* 0501=alloc, 0503=resize */
+		uint32_t req_size;   /* BX:CX on call (requested size in bytes) */
+		uint32_t ret_addr;   /* BX:CX on return (linear address) */
+		uint32_t ret_handle; /* SI:DI on return (memory block handle) */
+		bool cf;             /* CF on return */
+	} dpmi_alloc_log[8];
+	uint8_t dpmi_alloc_count;
+	uint32_t pending_alloc_size; /* BX:CX at call time for pending 0501/0503 */
+	/* DPMI descriptor-mutating function log (first 32 calls):
+	 * 0001=AllocLDT, 0007=SetBase, 0008=SetLimit, 0009=SetRights,
+	 * 000A=CreateAlias, 000B=GetDesc, 000C=SetDesc */
+	struct {
+		uint16_t func;   /* DPMI function code */
+		uint16_t sel;    /* BX = selector (or AX return for 0001) */
+		uint32_t val;    /* type-specific value (see dump formatter) */
+		uint32_t extra;  /* type-specific extra (e.g. SetDesc w2) */
+		uint8_t ret_cf;  /* CF at IRET return (0/1) */
+		uint8_t ret_valid; /* IRET return captured for this call */
+	} dpmi_seg_log[32];
+	uint8_t dpmi_seg_log_count;
+	/* INT 21h return value capture: first 8 returns */
+	struct { uint8_t call_ah; uint16_t ret_ax; bool cf; } int21_ret_log[8];
+	uint8_t int21_ret_count;
+	/* INT 31h/0006 return values: last-16 ring buffer {selector, base} */
+	struct { uint16_t bx; uint32_t base; } int31_0006_ret_ring[16];
+	uint16_t int31_0006_ret_count;
+	/* INT 31h/0006 last-16 selector ring buffer */
+	uint16_t int31_0006_bx_ring[16];
+	/* Track pending 0006 BX for IRET return capture */
+	uint16_t pending_dpmi_bx;
+	/* PM ring-3 INT 2Fh tracking */
+	uint16_t pm_r3_int2f_count;
+	uint16_t pm_r3_int2f_ax[16]; /* First 16 AX values */
+	/* INT 2Fh/168Ah specific: DS:SI string capture */
+	uint16_t pm_r3_168a_count; /* Count of AX=16xx calls */
+	char pm_r3_168a_str[16]; /* DS:SI string from first 168Ah call */
+	/* INT 2Fh return capture via IRET */
+	bool pending_int2f;
+	uint16_t pending_int2f_ax;
+	/* INT 2Fh return values: first 4 returns with full register state */
+	struct {
+		uint16_t call_ax;   /* AX on entry */
+		uint16_t ret_ax;    /* AX on return */
+		uint16_t ret_ds;    /* DS on return (168Ah changes DS:SI) */
+		uint16_t ret_si;    /* SI on return */
+		uint16_t ret_es;    /* ES on return */
+		uint16_t ret_di;    /* DI on return (1687h uses ES:DI) */
+		bool cf;            /* CF on return */
+	} int2f_ret_log[4];
+	uint8_t int2f_ret_count;
+	/* Tail of PM ring-3 software-INT returns (in->out), newest last. */
+	struct {
+		uint8_t vec;         /* 21h / 31h / 2Fh */
+		uint16_t in_ax;      /* AX at call site */
+		uint16_t out_ax;     /* AX at return */
+		uint16_t out_bx;
+		uint16_t out_cx;
+		uint16_t out_dx;
+		uint16_t out_ds;
+		uint16_t out_cs;     /* return target CS (newcs) */
+		uint32_t out_ip;     /* return target EIP (newip) */
+		uint8_t cf;          /* CF at return */
+	} r3_ret_tail[16];
+	uint8_t r3_ret_tail_pos;
+	uint8_t r3_ret_tail_count;
+	/* Compact abort trail: last INT21/INT2F call sites before WIN386 exit. */
+	struct {
+		uint8_t vec;   /* 21h or 2Fh */
+		uint8_t mode;  /* 'R' real, 'P' protected, 'V' vm86 */
+		uint8_t cpl;
+		uint8_t ah;
+		uint16_t cs;
+		uint32_t ip;
+		uint16_t ds;
+		uint16_t ax, bx, cx, dx;
+	} abort_tail[16];
+	uint8_t abort_tail_pos;
+	uint8_t abort_tail_count;
+	/* Sliding window base addresses from SetSegBase(0x100F) */
+	uint32_t seg100f_bases[8];    /* Unique base values seen */
+	uint8_t seg100f_base_count;
+	/* Full register snapshot for the last ring-3 PF with PTE=0 (unmapped) */
+	struct {
+		uint32_t cr2;
+		uint16_t cs;
+		uint32_t eip;
+		uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp;
+		uint16_t ds, es, ss, fs, gs;
+		uint32_t ds_base, es_base, ss_base;
+		uint32_t ds_limit, es_limit, cs_limit;
+	} fatal_pf;
+	bool fatal_pf_captured;
+	/* Last PM ring-3 segcheck reject (architectural #GP/#SS source). */
+	struct {
+		bool valid;
+		uint16_t cs;
+		uint32_t eip;
+		uint8_t seg;      /* SEG_* */
+		uint8_t why;      /* 1=write-protect, 2=limit */
+		uint8_t rwm;      /* translate access mode */
+		uint8_t size;     /* bytes */
+		uint16_t sel;
+		uint16_t flags;
+		uint32_t limit;
+		uint32_t addr;    /* offset within segment */
+		/* Context snapshot for DS-limit investigations at fault site. */
+		uint16_t bx, di, bp;
+		uint8_t bl;
+		bool ds_word_ok;
+		uint16_t ds_word; /* word at SEG:addr via linear read (if mapped) */
+		bool ss_bp_m6_ok;
+		uint16_t ss_bp_m6; /* word at SS:[BP-6] via linear read (if mapped) */
+	} segchk_last;
+	/* INT 41h module identification (LOADMODULE/LOADDLL notifications) */
+	struct {
+		uint16_t hmod;       /* Module handle (selector) */
+		uint16_t ax;         /* INT 41h function (005Ah or 005Ch) */
+		uint16_t call_cs;    /* CS of the INT 41h call */
+		char name[16];       /* NE module name */
+	} int41_modules[8];
+	uint8_t int41_module_count;
+	/* Selector 0x0127 provenance: snapshots when DS is loaded with 0x0127 */
+	struct {
+		uint8_t count;       /* Number of DS←0127 loads seen */
+		/* Raw descriptor words at first load + at segcheck trigger */
+		uint32_t first_w1, first_w2;   /* 0x0127 descriptor at first DS load */
+		uint32_t first_adj_w1, first_adj_w2; /* 0x0117 descriptor at same time */
+		uint16_t first_cs;
+		uint32_t first_eip;
+		uint32_t last_w1, last_w2;     /* 0x0127 descriptor at last DS load */
+		uint32_t last_adj_w1, last_adj_w2; /* 0x0117 descriptor at same time */
+		uint16_t last_cs;
+		uint32_t last_eip;
+	} sel0127_prov;
+	/* Instruction bytes at segcheck fault site */
+	uint8_t segchk_insn_bytes[16];
+	uint8_t segchk_insn_len;    /* Number of bytes captured (up to 16) */
+	bool segchk_insn_captured;
+	/* LDT write watch around selector 0x0127:
+	 * watch window = LDT offsets 0x118..0x12f (selectors 0x0117..0x0127). */
+	struct {
+		uint16_t cs;
+		uint32_t eip;
+		uint8_t cpl;
+		uint8_t size;
+		uint32_t phys;      /* physical write address (first overlapping byte) */
+		uint32_t ldt_off;   /* linear offset from LDT base */
+		uint16_t sel;       /* selector corresponding to (ldt_off & ~7), TI=1 */
+		uint32_t val;       /* raw write value (low size bytes significant) */
+	} ldt_watch_log[24];
+	uint16_t ldt_watch_pos;
+	uint8_t ldt_watch_count;
+	/* DS=0127 load source trace (how selector value reached DS). */
+	struct {
+		uint16_t cs;
+		uint32_t eip;
+		uint8_t src_kind;   /* 1=mov_ds_reg 2=mov_ds_mem 3=pop_ds 4=lds 5=other */
+		uint8_t src_reg;    /* GPR index if src_kind==1, else 0xff */
+		uint16_t src_val;   /* source value if known */
+		uint16_t bx, di, bp;
+		uint16_t ss;
+		uint32_t sp;
+		bool bp_m6_ok;
+		uint16_t bp_m6_val; /* SS:[BP-6] if source was mov ds,[bp-6] */
+		uint8_t op;
+		uint8_t modrm;
+		uint8_t blen;
+		uint8_t bytes[8];
+	} ds0127_load_log[8];
+	uint8_t ds0127_load_count;
+} wfw_monitor;
+
+/* One-shot DPMI trace: captures INT 2Fh/AX=1687h return value and entry point */
+static struct {
+	bool ret_active;	/* Waiting for return from 1687h handler */
+	uint16_t ret_cs;	/* Return CS:IP (instruction after INT 2Fh) */
+	uint32_t ret_ip;
+	bool entry_active;	/* Watching for DPMI entry point call */
+	uint16_t entry_cs;	/* Entry point ES:DI from 1687h return */
+	uint16_t entry_ip;
+	bool entry_called;	/* Entry point was reached */
+	uint16_t entry_ax;	/* AX when entry point called */
+	uint16_t entry_es;	/* ES when entry point called */
+	/* IVT data */
+	uint16_t ivt_phys_cs;	/* IVT[2Fh] from physical memory */
+	uint16_t ivt_phys_ip;
+	uint16_t ivt_paged_cs;	/* IVT[2Fh] as read through paging */
+	uint16_t ivt_paged_ip;
+	uint8_t target_first_byte;	/* First byte at handler (through paging) */
+	uint8_t target_phys_byte;	/* First byte at handler (physical memory) */
+	bool ivt_mismatch;	/* Paged != physical */
+	/* Return values */
+	bool returned;
+	uint16_t ret_ax;
+	uint16_t ret_bx;
+	uint16_t ret_dx;
+	uint16_t ret_si;
+	uint16_t ret_es;
+	uint16_t ret_di;
+} dpmi_trace;
 
 static inline void cpu_diag_events_sync(CPUI386 *cpu)
 {
@@ -514,6 +1114,153 @@ static inline void cpu_diag_win386_sync(CPUI386 *cpu)
 	}
 }
 
+static inline void vm86_trip_sync(CPUI386 *cpu)
+{
+	if (vm86_trip.gen != cpu->diag_gen) {
+		memset(&vm86_trip, 0, sizeof(vm86_trip));
+		vm86_trip.gen = cpu->diag_gen;
+	}
+}
+
+static inline bool vm86_trip_enabled(CPUI386 *cpu)
+{
+	if (!cpu_diag_enabled)
+		return false;
+	cpu_diag_win386_sync(cpu);
+	if (!win386_diag.active)
+		return false;
+	vm86_trip_sync(cpu);
+	return true;
+}
+
+static inline bool vm86_trip_silence_live_logs(CPUI386 *cpu)
+{
+	return vm86_trip_enabled(cpu) && !vm86_trip.frozen;
+}
+
+static inline void vm86_trip_push(CPUI386 *cpu, uint8_t type, uint8_t v0,
+				  uint16_t cs, uint32_t ip, uint16_t ss, uint32_t sp,
+				  uint32_t fl, uint16_t cs2, uint32_t a, uint16_t ss2,
+				  uint32_t b, const uint8_t *bytes, uint8_t blen)
+{
+	int idx;
+	if (!vm86_trip_enabled(cpu) || vm86_trip.frozen)
+		return;
+	idx = vm86_trip.pos % VM86_TRIP_RING_SIZE;
+	vm86_trip.ring[idx].type = type;
+	vm86_trip.ring[idx].v0 = v0;
+	vm86_trip.ring[idx].cs = cs;
+	vm86_trip.ring[idx].ip = ip;
+	vm86_trip.ring[idx].ss = ss;
+	vm86_trip.ring[idx].sp = sp;
+	vm86_trip.ring[idx].fl = fl;
+	vm86_trip.ring[idx].cs2 = cs2;
+	vm86_trip.ring[idx].ss2 = ss2;
+	vm86_trip.ring[idx].a = a;
+	vm86_trip.ring[idx].b = b;
+	if (bytes && blen > 0) {
+		if (blen > 8) blen = 8;
+		memcpy(vm86_trip.ring[idx].bytes, bytes, blen);
+		vm86_trip.ring[idx].blen = blen;
+	} else {
+		vm86_trip.ring[idx].blen = 0;
+	}
+	vm86_trip.pos++;
+	if (vm86_trip.count < VM86_TRIP_RING_SIZE)
+		vm86_trip.count++;
+}
+
+static void vm86_trip_dump(CPUI386 *cpu, const char *reason)
+{
+	int count, start;
+	if (!vm86_trip_enabled(cpu))
+		return;
+	count = vm86_trip.count;
+	start = vm86_trip.pos - count;
+	dolog("=== VM86 Tripwire (%s) ===\n", reason);
+	if (vm86_trip.has_first_bad) {
+		dolog("tripwire: first_bad=#%02x@%04x:%08x dec=%s n=%d frozen=%u\n",
+			vm86_trip.first_bad_exc, vm86_trip.first_bad_cs,
+			vm86_trip.first_bad_ip, vm86_trip.first_bad_decoded,
+			count, vm86_trip.frozen ? 1u : 0u);
+	} else {
+		dolog("tripwire: first_bad=<none> n=%d frozen=%u\n",
+			count, vm86_trip.frozen ? 1u : 0u);
+	}
+	dolog("trip_evt:");
+	for (int i = start; i < vm86_trip.pos; i++) {
+		int j = i % VM86_TRIP_RING_SIZE;
+		if (i != start && ((i - start) % 4) == 0)
+			dolog("\n  ");
+		switch (vm86_trip.ring[j].type) {
+		case VM86_TRIP_E:
+			dolog(" [E%02x %04x:%04x ss:%04x:%04x f=%08x e=%08x",
+				vm86_trip.ring[j].v0,
+				vm86_trip.ring[j].cs, vm86_trip.ring[j].ip & 0xffff,
+				vm86_trip.ring[j].ss, vm86_trip.ring[j].sp & 0xffff,
+				vm86_trip.ring[j].fl, vm86_trip.ring[j].a);
+			if (vm86_trip.ring[j].blen > 0) {
+				dolog(" b=");
+				for (int k = 0; k < vm86_trip.ring[j].blen; k++)
+					dolog("%02x", vm86_trip.ring[j].bytes[k]);
+			}
+			dolog("]");
+			break;
+		case VM86_TRIP_R:
+			dolog(" [R %04x:%08x->%04x:%08x fl=%08x vmss:%04x vmsp:%08x es:%04x ds:%04x fs:%04x gs:%04x]",
+				vm86_trip.ring[j].cs, vm86_trip.ring[j].ip,
+				vm86_trip.ring[j].cs2, vm86_trip.ring[j].a,
+				vm86_trip.ring[j].fl,
+				vm86_trip.ring[j].ss, vm86_trip.ring[j].sp,
+				vm86_trip.ring[j].bytes[0] | ((uint16_t)vm86_trip.ring[j].bytes[1] << 8),
+				vm86_trip.ring[j].bytes[2] | ((uint16_t)vm86_trip.ring[j].bytes[3] << 8),
+				vm86_trip.ring[j].bytes[4] | ((uint16_t)vm86_trip.ring[j].bytes[5] << 8),
+				vm86_trip.ring[j].bytes[6] | ((uint16_t)vm86_trip.ring[j].bytes[7] << 8));
+			break;
+		case VM86_TRIP_V:
+			dolog(" [V%02x %04x:%04x ss:%04x:%04x -> %04x:%08x r0:%04x:%08x]",
+				vm86_trip.ring[j].v0,
+				vm86_trip.ring[j].cs, vm86_trip.ring[j].ip & 0xffff,
+				vm86_trip.ring[j].ss, vm86_trip.ring[j].sp & 0xffff,
+				vm86_trip.ring[j].cs2, vm86_trip.ring[j].a,
+				vm86_trip.ring[j].ss2, vm86_trip.ring[j].b);
+			break;
+		case VM86_TRIP_I:
+			dolog(" [I p=%04x w=%u tr=%04x iob=%04x bo=%05x bv=%02x bit=%u r=%u at=%04x:%04x]",
+				(uint16_t)vm86_trip.ring[j].sp,
+				vm86_trip.ring[j].v0,
+				vm86_trip.ring[j].cs,
+				vm86_trip.ring[j].ss,
+				vm86_trip.ring[j].a,
+				(uint8_t)(vm86_trip.ring[j].b >> 8),
+				(uint8_t)(vm86_trip.ring[j].b & 0xff),
+				(uint8_t)(vm86_trip.ring[j].b >> 16),
+				vm86_trip.ring[j].cs2,
+				vm86_trip.ring[j].ip & 0xffff);
+			break;
+		default:
+			dolog(" [?]");
+			break;
+		}
+	}
+	dolog("\n=== End VM86 Tripwire ===\n");
+}
+
+static inline void vm86_trip_mark_first_bad(CPUI386 *cpu, uint8_t exc, uint16_t cs,
+					    uint32_t ip, const char *decoded)
+{
+	if (!vm86_trip_enabled(cpu) || vm86_trip.frozen)
+		return;
+	vm86_trip.frozen = true;
+	vm86_trip.has_first_bad = true;
+	vm86_trip.first_bad_exc = exc;
+	vm86_trip.first_bad_cs = cs;
+	vm86_trip.first_bad_ip = ip;
+	snprintf(vm86_trip.first_bad_decoded, sizeof(vm86_trip.first_bad_decoded),
+		"%s", decoded ? decoded : "");
+	vm86_trip_dump(cpu, "first fatal");
+}
+
 static inline void cpu_diag_vm86_fault_ring_sync(CPUI386 *cpu)
 {
 	if (vm86_fault_ring.gen != cpu->diag_gen) {
@@ -537,6 +1284,8 @@ static void cpu_diag_vm86_fault_ring_push(CPUI386 *cpu, int excno, bool pusherr,
 	idx = vm86_fault_ring.pos % VM86_FAULT_RING_SIZE;
 	vm86_fault_ring.ring[idx].excno = (uint8_t)excno;
 	vm86_fault_ring.ring[idx].cs = cpu->seg[SEG_CS].sel;
+	vm86_fault_ring.ring[idx].ds = cpu->seg[SEG_DS].sel;
+	vm86_fault_ring.ring[idx].es = cpu->seg[SEG_ES].sel;
 	vm86_fault_ring.ring[idx].ss = cpu->seg[SEG_SS].sel;
 	vm86_fault_ring.ring[idx].ip = cpu->ip;
 	vm86_fault_ring.ring[idx].sp = REGi(4);
@@ -583,11 +1332,13 @@ static void cpu_diag_vm86_fault_ring_dump_tail(int n)
 		int idx = (vm86_fault_ring.pos - count + i) % VM86_FAULT_RING_SIZE;
 		if (idx < 0)
 			idx += VM86_FAULT_RING_SIZE;
-		dolog("  #%d exc=%02x %04x:%08x SS:ESP=%04x:%08x FL=%08x err=%08x %s\n",
+		dolog("  #%d exc=%02x %04x:%08x DS=%04x ES=%04x SS:ESP=%04x:%08x FL=%08x err=%08x %s\n",
 			i + 1,
 			vm86_fault_ring.ring[idx].excno,
 			vm86_fault_ring.ring[idx].cs,
 			vm86_fault_ring.ring[idx].ip,
+			vm86_fault_ring.ring[idx].ds,
+			vm86_fault_ring.ring[idx].es,
 			vm86_fault_ring.ring[idx].ss,
 			vm86_fault_ring.ring[idx].sp,
 			vm86_fault_ring.ring[idx].fl,
@@ -974,6 +1725,118 @@ static inline int get_IOPL(CPUI386 *cpu)
 	return (cpu->flags & IOPL) >> 12;
 }
 
+static inline void wfw_monitor_log_vm86_int_event(CPUI386 *cpu, uint8_t vec, uint8_t path)
+{
+	if (unlikely(cpu_diag_enabled) && win386_diag.active &&
+	    wfw_monitor.vm86_int_evt_count < 8) {
+		uint8_t i = wfw_monitor.vm86_int_evt_count++;
+		wfw_monitor.vm86_int_evt[i].vec = vec;
+		wfw_monitor.vm86_int_evt[i].path = path;
+		wfw_monitor.vm86_int_evt[i].iopl = (uint8_t)get_IOPL(cpu);
+		wfw_monitor.vm86_int_evt[i].ax = cpu->gprx[0].r16;
+		wfw_monitor.vm86_int_evt[i].cs = cpu->seg[SEG_CS].sel;
+		wfw_monitor.vm86_int_evt[i].ip = cpu->ip & 0xffff;
+	}
+}
+
+static inline uint8_t wfw_mode_char(CPUI386 *cpu)
+{
+	if (cpu->flags & VM)
+		return 'V';
+	if (cpu->cr0 & 1)
+		return 'P';
+	return 'R';
+}
+
+static inline uint8_t wfw_mode_from_state(uword flags, uword cr0)
+{
+	if (flags & VM)
+		return 'V';
+	if (cr0 & 1)
+		return 'P';
+	return 'R';
+}
+
+static inline void wfw_flow_push_raw(CPUI386 *cpu, uint8_t tag, uint8_t vec,
+				     uint8_t mode, uint8_t cpl,
+				     uint16_t cs, uint32_t ip, uint32_t extra)
+{
+	if (unlikely(!(cpu_diag_enabled && win386_diag.active)))
+		return;
+	uint16_t idx = wfw_monitor.flow_pos % WFW_FLOW_RING_SIZE;
+	wfw_monitor.flow_ring[idx].tag = tag;
+	wfw_monitor.flow_ring[idx].mode = mode;
+	wfw_monitor.flow_ring[idx].vec = vec;
+	wfw_monitor.flow_ring[idx].cpl = cpl & 3;
+	wfw_monitor.flow_ring[idx].cs = cs;
+	wfw_monitor.flow_ring[idx].ip = ip;
+	wfw_monitor.flow_ring[idx].ds = cpu->seg[SEG_DS].sel;
+	wfw_monitor.flow_ring[idx].ax = cpu->gprx[0].r16;
+	wfw_monitor.flow_ring[idx].bx = cpu->gprx[3].r16;
+	wfw_monitor.flow_ring[idx].cx = cpu->gprx[1].r16;
+	wfw_monitor.flow_ring[idx].dx = cpu->gprx[2].r16;
+	wfw_monitor.flow_ring[idx].extra = extra;
+	wfw_monitor.flow_pos++;
+	if (wfw_monitor.flow_count < WFW_FLOW_RING_SIZE)
+		wfw_monitor.flow_count++;
+}
+
+static inline void wfw_flow_push_here(CPUI386 *cpu, uint8_t tag, uint8_t vec, uint32_t extra)
+{
+	wfw_flow_push_raw(cpu, tag, vec, wfw_mode_char(cpu), cpu->cpl,
+			  cpu->seg[SEG_CS].sel, cpu->ip, extra);
+}
+
+static inline void wfw_abort_tail_push(CPUI386 *cpu, uint8_t vec,
+				       uint16_t ax, uint16_t bx, uint16_t cx, uint16_t dx)
+{
+	if (unlikely(!(cpu_diag_enabled && win386_diag.active)))
+		return;
+
+	uint8_t idx = wfw_monitor.abort_tail_pos % 16;
+	wfw_monitor.abort_tail[idx].vec = vec;
+	wfw_monitor.abort_tail[idx].mode = wfw_mode_char(cpu);
+	wfw_monitor.abort_tail[idx].cpl = cpu->cpl & 3;
+	wfw_monitor.abort_tail[idx].ah = (uint8_t)(ax >> 8);
+	wfw_monitor.abort_tail[idx].cs = cpu->seg[SEG_CS].sel;
+	wfw_monitor.abort_tail[idx].ip = cpu->ip;
+	wfw_monitor.abort_tail[idx].ds = cpu->seg[SEG_DS].sel;
+	wfw_monitor.abort_tail[idx].ax = ax;
+	wfw_monitor.abort_tail[idx].bx = bx;
+	wfw_monitor.abort_tail[idx].cx = cx;
+	wfw_monitor.abort_tail[idx].dx = dx;
+	wfw_monitor.abort_tail_pos++;
+	if (wfw_monitor.abort_tail_count < 16)
+		wfw_monitor.abort_tail_count++;
+	wfw_flow_push_here(cpu, 'A', vec, (uint32_t)((ax >> 8) & 0xff));
+}
+
+static inline void wfw_monitor_note_int13_return(CPUI386 *cpu, uint16_t ret_cs, uint16_t ret_ip, uword ret_flags)
+{
+	if (unlikely(!(cpu_diag_enabled && win386_diag.active)))
+		return;
+	if (!wfw_monitor.pending_v86_int13)
+		return;
+	if (ret_cs != wfw_monitor.pending_v86_int13_ret_cs ||
+	    ret_ip != (uint16_t)wfw_monitor.pending_v86_int13_ret_ip)
+		return;
+
+	wfw_monitor.pending_v86_int13 = false;
+	wfw_monitor.v86_int13_ret_count++;
+	wfw_monitor.v86_int13_ret_ax = cpu->gprx[0].r16;
+	wfw_monitor.v86_int13_ret_bx = cpu->gprx[3].r16;
+	wfw_monitor.v86_int13_ret_cx = cpu->gprx[1].r16;
+	wfw_monitor.v86_int13_ret_dx = cpu->gprx[2].r16;
+	wfw_monitor.v86_int13_ret_es = cpu->seg[SEG_ES].sel;
+	wfw_monitor.v86_int13_ret_cf = (ret_flags & CF) ? 1 : 0;
+	if (ret_flags & CF)
+		wfw_monitor.v86_int13_fail_count++;
+	wfw_flow_push_raw(cpu, 'K', 0x13, wfw_mode_from_state(ret_flags, cpu->cr0),
+			  ret_cs & 3, ret_cs, ret_ip,
+			  ((uint32_t)wfw_monitor.v86_int13_req_ax << 16) |
+			  ((ret_flags & CF) ? 1u : 0u));
+}
+
 /* MMU */
 #define CR0_PG (1<<31)
 #define CR0_WP (0x10000)
@@ -1216,6 +2079,239 @@ static bool read_seg_u16_noexcept(CPUI386 *cpu, int seg, uword off, int cpl, uin
 	return ok;
 }
 
+/* Read a byte from a linear address without throwing exceptions. */
+static bool read_laddr_u8_noexcept(CPUI386 *cpu, uword laddr, int cpl, uint8_t *out)
+{
+	uword saved_cr2 = cpu->cr2;
+	uword saved_excno = cpu->excno;
+	uword saved_excerr = cpu->excerr;
+	OptAddr b;
+	bool ok = translate_laddr(cpu, &b, 1, laddr, 1, cpl);
+	if (ok)
+		*out = load8(cpu, &b);
+	cpu->cr2 = saved_cr2;
+	cpu->excno = saved_excno;
+	cpu->excerr = saved_excerr;
+	return ok;
+}
+
+static bool read_laddr_u16_noexcept(CPUI386 *cpu, uword laddr, int cpl, uint16_t *out)
+{
+	uword saved_cr2 = cpu->cr2;
+	uword saved_excno = cpu->excno;
+	uword saved_excerr = cpu->excerr;
+	OptAddr b;
+	bool ok = translate_laddr(cpu, &b, 1, laddr, 2, cpl);
+	if (ok)
+		*out = load16(cpu, &b);
+	cpu->cr2 = saved_cr2;
+	cpu->excno = saved_excno;
+	cpu->excerr = saved_excerr;
+	return ok;
+}
+
+/* Translate linear address to physical without throwing; returns false if unmapped. */
+static bool laddr_to_paddr_noexcept(CPUI386 *cpu, uint32_t laddr, uint32_t *out_pa)
+{
+	if (!(cpu->cr0 & CR0_PG)) {
+		uint32_t pa = laddr & cpu->a20_mask;
+		if (pa >= (uint32_t)cpu->phys_mem_size)
+			return false;
+		*out_pa = pa;
+		return true;
+	}
+
+	uint32_t pde_a = (cpu->cr3 & 0xfffff000u) | ((laddr >> 20) & 0xffcu);
+	if (pde_a + 4 > (uint32_t)cpu->phys_mem_size)
+		return false;
+	uint32_t pde = *(uint32_t *)&cpu->phys_mem[pde_a];
+	if (!(pde & 1))
+		return false;
+
+	uint32_t pte_a = (pde & 0xfffff000u) | ((laddr >> 10) & 0xffcu);
+	if (pte_a + 4 > (uint32_t)cpu->phys_mem_size)
+		return false;
+	uint32_t pte = *(uint32_t *)&cpu->phys_mem[pte_a];
+	if (!(pte & 1))
+		return false;
+
+	uint32_t pa = (pte & 0xfffff000u) | (laddr & 0xfffu);
+	if (pa >= (uint32_t)cpu->phys_mem_size)
+		return false;
+	*out_pa = pa;
+	return true;
+}
+
+static inline uint32_t wfw_desc_base_u32(uint32_t w1, uint32_t w2)
+{
+	return (w1 >> 16) | ((w2 & 0xffu) << 16) | (w2 & 0xff000000u);
+}
+
+static inline uint32_t wfw_desc_limit_u32(uint32_t w1, uint32_t w2)
+{
+	uint32_t lim = (w1 & 0xffffu) | (w2 & 0x000f0000u);
+	if (w2 & 0x00800000u)
+		lim = (lim << 12) | 0xfffu;
+	return lim;
+}
+
+static inline uint16_t wfw_desc_flags_u16(uint32_t w2)
+{
+	return (uint16_t)((w2 >> 8) & 0xffffu);
+}
+
+/* Read a raw LDT descriptor without throwing exceptions. */
+static bool wfw_read_ldt_desc_noexcept(CPUI386 *cpu, uint16_t sel, uint32_t *w1, uint32_t *w2)
+{
+	if (!(sel & 4))
+		return false; /* GDT selector */
+	uint32_t off = (uint32_t)(sel & ~7u);
+	if (off + 7 > cpu->seg[SEG_LDT].limit)
+		return false;
+	uint32_t la = cpu->seg[SEG_LDT].base + off;
+	uint8_t d[8];
+	for (int i = 0; i < 8; i++) {
+		if (!read_laddr_u8_noexcept(cpu, la + (uint32_t)i, 0, &d[i]))
+			return false;
+	}
+	*w1 = (uint32_t)d[0] | ((uint32_t)d[1] << 8) |
+	      ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
+	*w2 = (uint32_t)d[4] | ((uint32_t)d[5] << 8) |
+	      ((uint32_t)d[6] << 16) | ((uint32_t)d[7] << 24);
+	return true;
+}
+
+static const uint16_t wfw_ud63_near_sels[4] = { 0x011c, 0x0124, 0x0127, 0x012c };
+
+static inline void wfw_ud63_snapshot_near_desc(CPUI386 *cpu, uint32_t *w1, uint32_t *w2, uint8_t *ok_mask)
+{
+	uint8_t m = 0;
+	for (int i = 0; i < 4; i++) {
+		uint32_t a = 0xffffffffu, b = 0xffffffffu;
+		if (wfw_read_ldt_desc_noexcept(cpu, wfw_ud63_near_sels[i], &a, &b))
+			m |= (uint8_t)(1u << i);
+		w1[i] = a;
+		w2[i] = b;
+	}
+	*ok_mask = m;
+}
+
+/* Watch physical writes that overlap the LDT window around selector 0x0127. */
+static inline void wfw_note_ldt_window_store(CPUI386 *cpu, uint32_t paddr, uint8_t size, uint32_t val)
+{
+	if (unlikely(!(cpu_diag_enabled && win386_diag.active)))
+		return;
+	if (unlikely(size == 0))
+		return;
+
+	uint32_t ldt_base = cpu->seg[SEG_LDT].base;
+	uint32_t ldt_lim = cpu->seg[SEG_LDT].limit;
+	const uint32_t win_lo = 0x118;
+	const uint32_t win_hi = 0x12f;
+	if (win_lo > ldt_lim)
+		return;
+	uint32_t off_hi = (win_hi <= ldt_lim) ? win_hi : ldt_lim;
+	uint32_t la_lo = ldt_base + win_lo;
+	uint32_t la_hi = ldt_base + off_hi;
+	uint32_t wr_lo = paddr;
+	uint32_t wr_hi = paddr + (uint32_t)size - 1;
+
+	/* Walk window by linear page; per-page mapping is contiguous in physical page. */
+	for (uint32_t page = la_lo & ~0xfffu; page <= (la_hi & ~0xfffu); page += 0x1000u) {
+		uint32_t chunk_la_lo = (la_lo > page) ? la_lo : page;
+		uint32_t chunk_la_hi = (la_hi < (page + 0xfffu)) ? la_hi : (page + 0xfffu);
+		uint32_t chunk_pa_lo;
+		if (!laddr_to_paddr_noexcept(cpu, chunk_la_lo, &chunk_pa_lo))
+			continue;
+		uint32_t chunk_len = chunk_la_hi - chunk_la_lo + 1;
+		uint32_t chunk_pa_hi = chunk_pa_lo + chunk_len - 1;
+		if (wr_hi < chunk_pa_lo || wr_lo > chunk_pa_hi)
+			continue;
+
+		uint32_t ov_pa = (wr_lo > chunk_pa_lo) ? wr_lo : chunk_pa_lo;
+		uint32_t ov_la = chunk_la_lo + (ov_pa - chunk_pa_lo);
+		uint32_t ldt_off = ov_la - ldt_base;
+		uint16_t sel = (uint16_t)((ldt_off & ~7u) | 0x4u); /* TI=LDT */
+
+		{
+			int i = wfw_monitor.ldt_watch_pos % 24;
+			wfw_monitor.ldt_watch_log[i].cs = cpu->seg[SEG_CS].sel;
+			wfw_monitor.ldt_watch_log[i].eip = cpu->ip;
+			wfw_monitor.ldt_watch_log[i].cpl = cpu->cpl & 3;
+			wfw_monitor.ldt_watch_log[i].size = size;
+			wfw_monitor.ldt_watch_log[i].phys = ov_pa;
+			wfw_monitor.ldt_watch_log[i].ldt_off = ldt_off;
+			wfw_monitor.ldt_watch_log[i].sel = sel;
+			wfw_monitor.ldt_watch_log[i].val = val;
+			wfw_monitor.ldt_watch_pos++;
+			if (wfw_monitor.ldt_watch_count < 24)
+				wfw_monitor.ldt_watch_count++;
+		}
+		/* One log entry per store is sufficient. */
+		break;
+	}
+}
+
+/* Read the base address of a selector from GDT/LDT without throwing. */
+static uint32_t desc_base_noexcept(CPUI386 *cpu, uint16_t sel)
+{
+	uint32_t off = sel & ~7;
+	uint32_t tbl_base, tbl_limit;
+	if (sel & 4) {
+		tbl_base = cpu->seg[SEG_LDT].base;
+		tbl_limit = cpu->seg[SEG_LDT].limit;
+	} else {
+		tbl_base = cpu->gdt.base;
+		tbl_limit = cpu->gdt.limit;
+	}
+	if (off + 7 > tbl_limit)
+		return 0xFFFFFFFF;
+	uint8_t d[8];
+	for (int i = 0; i < 8; i++)
+		if (!read_laddr_u8_noexcept(cpu, tbl_base + off + i, 0, &d[i]))
+			return 0xFFFFFFFF;
+	return (uint32_t)d[2] | ((uint32_t)d[3] << 8) |
+	       ((uint32_t)d[4] << 16) | ((uint32_t)d[7] << 24);
+}
+
+/* Read the NE module name from a module handle selector.
+ * The module handle in Windows 3.x is a selector pointing to the NE header.
+ * The module name is the first entry in the Resident Name Table. */
+static void read_ne_module_name(CPUI386 *cpu, uint16_t hmod, char *buf, int bufsize)
+{
+	buf[0] = '\0';
+	if (bufsize < 2 || (hmod & ~7) == 0)
+		return;
+	uint32_t base = desc_base_noexcept(cpu, hmod);
+	if (base == 0xFFFFFFFF)
+		return;
+	/* Verify NE signature */
+	uint16_t sig;
+	if (!read_laddr_u16_noexcept(cpu, base, 0, &sig))
+		return;
+	if (sig != 0x454E) /* 'NE' little-endian */
+		return;
+	/* Resident Name Table offset at NE+0x26 */
+	uint16_t rnt_off;
+	if (!read_laddr_u16_noexcept(cpu, base + 0x26, 0, &rnt_off))
+		return;
+	/* First entry: length byte followed by module name */
+	uint8_t len;
+	if (!read_laddr_u8_noexcept(cpu, base + rnt_off, 0, &len))
+		return;
+	if (len == 0 || len >= (uint8_t)bufsize)
+		return;
+	for (int i = 0; i < len; i++) {
+		uint8_t c;
+		if (!read_laddr_u8_noexcept(cpu, base + rnt_off + 1 + i, 0, &c)) {
+			buf[0] = '\0';
+			return;
+		}
+		buf[i] = (c >= 0x20 && c <= 0x7e) ? (char)c : '.';
+	}
+	buf[len] = '\0';
+}
+
 static void vm86_dump_stack_words(CPUI386 *cpu, int words)
 {
 	uword sp = REGi(4);
@@ -1238,9 +2334,11 @@ static void vm86_log_ioperm_probe(CPUI386 *cpu, int port, int bits)
 {
 	bool need_iobitmap = false;
 	if (cpu->cr0 & 1) {
+		/* 80386 rule: VM86 IN/OUT always consults the TSS I/O bitmap.
+		 * In PM, bitmap checks are needed only when CPL > IOPL. */
 		int iopl = get_IOPL(cpu);
 		if (cpu->flags & VM)
-			need_iobitmap = (iopl < 3);
+			need_iobitmap = true;
 		else
 			need_iobitmap = (cpu->cpl > iopl);
 	}
@@ -1250,6 +2348,13 @@ static void vm86_log_ioperm_probe(CPUI386 *cpu, int port, int bits)
 		return;
 	}
 
+	{
+		int tr_type = cpu->seg[SEG_TR].flags & 0xf;
+		if (tr_type != 9 && tr_type != 11) {
+			dolog("  io-perm: deny (TR type %x not 32-bit TSS)\n", tr_type);
+			return;
+		}
+	}
 	if (cpu->seg[SEG_TR].limit < 103) {
 		dolog("  io-perm: deny (TR limit %x < 0x67)\n", cpu->seg[SEG_TR].limit);
 		return;
@@ -1471,6 +2576,354 @@ static void vm86_decode_fault_instruction(CPUI386 *cpu, char *buf, size_t buflen
 	}
 }
 
+static uint8_t wfw_capture_cs_bytes(CPUI386 *cpu, uint8_t out[8])
+{
+	uint8_t n = 0, b = 0;
+	for (int i = 0; i < 8; i++) {
+		if (!read_seg_u8_noexcept(cpu, SEG_CS, cpu->ip + i, cpu->cpl, &b))
+			break;
+		out[n++] = b;
+	}
+	return n;
+}
+
+static void wfw_capture_decode_and_bytes(CPUI386 *cpu, char *decoded, size_t dlen,
+					 uint8_t out[8], uint8_t *out_len)
+{
+	bool is_io = false, needs_stack_dump = false;
+	int io_port = -1, io_bits = 0;
+	vm86_decode_fault_instruction(cpu, decoded, dlen, &is_io, &io_port, &io_bits, &needs_stack_dump);
+	*out_len = wfw_capture_cs_bytes(cpu, out);
+}
+
+static int wfw_bios_hot_find_or_add(uint16_t cs, uint16_t ip, uint8_t exc)
+{
+	for (int i = 0; i < wfw_monitor.bios_hot_count; i++) {
+		if (wfw_monitor.bios_hot[i].cs == cs &&
+		    wfw_monitor.bios_hot[i].ip == ip &&
+		    wfw_monitor.bios_hot[i].exc == exc)
+			return i;
+	}
+	if (wfw_monitor.bios_hot_count < 6) {
+		int i = wfw_monitor.bios_hot_count++;
+		wfw_monitor.bios_hot[i].cs = cs;
+		wfw_monitor.bios_hot[i].ip = ip;
+		wfw_monitor.bios_hot[i].exc = exc;
+		return i;
+	}
+	/* If full, fold into slot 0 to keep output bounded. */
+	return 0;
+}
+
+static int wfw_swint_dpl_find_or_add(uint8_t vec)
+{
+	for (int i = 0; i < wfw_monitor.swint_dpl_count; i++) {
+		if (wfw_monitor.swint_dpl[i].vec == vec)
+			return i;
+	}
+	if (wfw_monitor.swint_dpl_count < 6) {
+		int i = wfw_monitor.swint_dpl_count++;
+		wfw_monitor.swint_dpl[i].vec = vec;
+		return i;
+	}
+	/* Keep output bounded. Fold overflow into slot 0. */
+	return 0;
+}
+
+static inline void wfw_swint_dpl_note_resume(CPUI386 *cpu, uint16_t newcs, uword newip, uword newflags)
+{
+	if (!win386_diag.active)
+		return;
+	if (wfw_monitor.pending_swint_dpl_idx < 0 ||
+	    wfw_monitor.pending_swint_dpl_idx >= (int8_t)wfw_monitor.swint_dpl_count)
+		return;
+
+	int i = wfw_monitor.pending_swint_dpl_idx;
+	uint8_t rcls = 0;
+	if (newcs == wfw_monitor.pending_swint_cs &&
+	    newip == wfw_monitor.pending_swint_ip) {
+		wfw_monitor.swint_dpl[i].resume_same++;
+		rcls = 1;
+	} else if (newcs == wfw_monitor.pending_swint_cs &&
+		   newip == wfw_monitor.pending_swint_next_ip) {
+		wfw_monitor.swint_dpl[i].resume_next++;
+		rcls = 2;
+	} else {
+		wfw_monitor.swint_dpl[i].resume_other++;
+		rcls = 3;
+	}
+	wfw_monitor.swint_dpl[i].out_ax = REGi(0) & 0xffff;
+	wfw_monitor.swint_dpl[i].out_bx = REGi(3) & 0xffff;
+	wfw_monitor.swint_dpl[i].out_fl = newflags;
+	if (newflags & CF)
+		wfw_monitor.swint_dpl[i].cf_set++;
+	{
+		int ti = wfw_monitor.dpl_tail_pos % 16;
+		wfw_monitor.dpl_tail[ti].vec = wfw_monitor.swint_dpl[i].vec;
+		wfw_monitor.dpl_tail[ti].mode = wfw_mode_from_state(newflags, cpu->cr0);
+		wfw_monitor.dpl_tail[ti].cpl = newcs & 3;
+		wfw_monitor.dpl_tail[ti].rcls = rcls;
+		wfw_monitor.dpl_tail[ti].cf = (newflags & CF) ? 1 : 0;
+		wfw_monitor.dpl_tail[ti].in_ax = wfw_monitor.swint_dpl[i].in_ax;
+		wfw_monitor.dpl_tail[ti].in_bx = wfw_monitor.swint_dpl[i].in_bx;
+		wfw_monitor.dpl_tail[ti].out_ax = wfw_monitor.swint_dpl[i].out_ax;
+		wfw_monitor.dpl_tail[ti].out_bx = wfw_monitor.swint_dpl[i].out_bx;
+		wfw_monitor.dpl_tail[ti].in_cs = wfw_monitor.pending_swint_cs;
+		wfw_monitor.dpl_tail[ti].in_ip = wfw_monitor.pending_swint_ip;
+		wfw_monitor.dpl_tail[ti].out_cs = newcs;
+		wfw_monitor.dpl_tail[ti].out_ip = newip;
+		wfw_monitor.dpl_tail_pos++;
+		if (wfw_monitor.dpl_tail_count < 16)
+			wfw_monitor.dpl_tail_count++;
+	}
+	wfw_flow_push_raw(cpu, 'Q', wfw_monitor.swint_dpl[i].vec,
+			  wfw_mode_from_state(newflags, cpu->cr0),
+			  newcs & 3, newcs, newip,
+			  ((uint32_t)wfw_monitor.swint_dpl[i].in_ax << 16) |
+			  ((uint32_t)rcls << 8) |
+			  ((newflags & CF) ? 1u : 0u));
+	wfw_monitor.pending_swint_dpl_idx = -1;
+}
+
+static int wfw_ud63_find_or_add(uint16_t cs, uint16_t ip)
+{
+	for (int i = 0; i < wfw_monitor.ud63_hot_count; i++) {
+		if (wfw_monitor.ud63_hot[i].cs == cs &&
+		    wfw_monitor.ud63_hot[i].ip == ip)
+			return i;
+	}
+	if (wfw_monitor.ud63_hot_count < 6) {
+		int i = wfw_monitor.ud63_hot_count++;
+		wfw_monitor.ud63_hot[i].cs = cs;
+		wfw_monitor.ud63_hot[i].ip = ip;
+		return i;
+	}
+	/* Keep output bounded. Fold overflow into slot 0. */
+	return 0;
+}
+
+/* Capture FE95 callback path details:
+ * - bounded ring-0 instruction trace for the first callback
+ * - branch predicate/outcome probes at 0028:6ca7/6cab for every callback
+ * - AX transition-to-0005 writer site across callbacks */
+static inline void wfw_ud63_trace_step(CPUI386 *cpu)
+{
+	if (unlikely(!(cpu_diag_enabled && win386_diag.active)))
+		return;
+	if (!(wfw_monitor.ud63_fe95_0127.trace_active ||
+	      wfw_monitor.pending_ud63_fe95_0127))
+		return;
+	if (cpu->cpl != 0)
+		return;
+	bool in_cb = wfw_monitor.pending_ud63_fe95_0127;
+
+	/* Resolve pending branch outcome from previous 0028:6cab JE step. */
+	if (in_cb && wfw_monitor.ud63_fe95_0127.j6cab_pending) {
+		uint16_t csn = cpu->seg[SEG_CS].sel;
+		uint16_t ipn = cpu->ip & 0xffff;
+		wfw_monitor.ud63_fe95_0127.j6cab_count++;
+		wfw_monitor.ud63_fe95_0127.j6cab_last_to_cs = csn;
+		wfw_monitor.ud63_fe95_0127.j6cab_last_to_ip = ipn;
+		if (csn == wfw_monitor.ud63_fe95_0127.j6cab_last_from_cs &&
+		    ipn == wfw_monitor.ud63_fe95_0127.j6cab_last_tgt) {
+			wfw_monitor.ud63_fe95_0127.j6cab_taken++;
+		} else if (csn == wfw_monitor.ud63_fe95_0127.j6cab_last_from_cs &&
+			   ipn == wfw_monitor.ud63_fe95_0127.j6cab_last_fall) {
+			wfw_monitor.ud63_fe95_0127.j6cab_not_taken++;
+		} else {
+			wfw_monitor.ud63_fe95_0127.j6cab_other++;
+		}
+		wfw_monitor.ud63_fe95_0127.j6cab_pending = false;
+	}
+
+	if (wfw_monitor.ud63_fe95_0127.trace_count < 128) {
+		int ti = wfw_monitor.ud63_fe95_0127.trace_count++;
+		wfw_monitor.ud63_fe95_0127.trace[ti].cs = cpu->seg[SEG_CS].sel;
+		wfw_monitor.ud63_fe95_0127.trace[ti].ip = cpu->ip & 0xffff;
+		wfw_monitor.ud63_fe95_0127.trace[ti].ax = REGi(0) & 0xffff;
+		wfw_monitor.ud63_fe95_0127.trace[ti].bx = REGi(3) & 0xffff;
+		wfw_monitor.ud63_fe95_0127.trace[ti].cx = REGi(1) & 0xffff;
+		wfw_monitor.ud63_fe95_0127.trace[ti].dx = REGi(2) & 0xffff;
+		wfw_monitor.ud63_fe95_0127.trace[ti].si = REGi(6) & 0xffff;
+		wfw_monitor.ud63_fe95_0127.trace[ti].di = REGi(7) & 0xffff;
+		wfw_monitor.ud63_fe95_0127.trace[ti].bp = REGi(5) & 0xffff;
+		wfw_monitor.ud63_fe95_0127.trace[ti].sp = REGi(4) & 0xffff;
+		wfw_monitor.ud63_fe95_0127.trace[ti].fl = cpu->flags;
+		wfw_monitor.ud63_fe95_0127.trace[ti].blen =
+			wfw_capture_cs_bytes(cpu, wfw_monitor.ud63_fe95_0127.trace[ti].bytes);
+	}
+
+	if (in_cb) {
+		uint16_t cs = cpu->seg[SEG_CS].sel;
+		uint16_t ip = cpu->ip & 0xffff;
+		uint16_t ax = REGi(0) & 0xffff;
+
+		/* Track where AX first transitions to 0005 on callback path. */
+		if (wfw_monitor.ud63_fe95_0127.step_prev_valid &&
+		    wfw_monitor.ud63_fe95_0127.step_prev_ax != ax &&
+		    ax == 0x0005) {
+			wfw_monitor.ud63_fe95_0127.ax5_transitions++;
+			wfw_monitor.ud63_fe95_0127.ax5_from_cs =
+				wfw_monitor.ud63_fe95_0127.step_prev_cs;
+			wfw_monitor.ud63_fe95_0127.ax5_from_ip =
+				wfw_monitor.ud63_fe95_0127.step_prev_ip;
+			wfw_monitor.ud63_fe95_0127.ax5_from_ax =
+				wfw_monitor.ud63_fe95_0127.step_prev_ax;
+			wfw_monitor.ud63_fe95_0127.ax5_to_cs = cs;
+			wfw_monitor.ud63_fe95_0127.ax5_to_ip = ip;
+			wfw_monitor.ud63_fe95_0127.ax5_to_ax = ax;
+			wfw_monitor.ud63_fe95_0127.ax5_from_blen =
+				wfw_monitor.ud63_fe95_0127.step_prev_blen;
+			for (int b = 0; b < wfw_monitor.ud63_fe95_0127.step_prev_blen; b++)
+				wfw_monitor.ud63_fe95_0127.ax5_from_bytes[b] =
+					wfw_monitor.ud63_fe95_0127.step_prev_bytes[b];
+		}
+
+		/* 0028:6ca7: test byte [bp+2e],2 branch predicate source. */
+		if (cs == 0x0028 && ip == 0x6ca7) {
+			uint8_t v = 0;
+			uint16_t ss = cpu->seg[SEG_SS].sel;
+			uint32_t bp = REGi(5);
+			uint32_t off = bp + 0x2e;
+			if (read_seg_u8_noexcept(cpu, SEG_SS, off, cpu->cpl, &v)) {
+				wfw_monitor.ud63_fe95_0127.t6ca7_count++;
+				wfw_monitor.ud63_fe95_0127.t6ca7_last_byte = v;
+				wfw_monitor.ud63_fe95_0127.t6ca7_last_ss = ss;
+				wfw_monitor.ud63_fe95_0127.t6ca7_last_bp = (uint16_t)(bp & 0xffff);
+				if (v & 0x02)
+					wfw_monitor.ud63_fe95_0127.t6ca7_bit_set++;
+				else
+					wfw_monitor.ud63_fe95_0127.t6ca7_bit_clear++;
+			}
+		}
+
+		/* 0028:6cab: JE rel8 — evaluate outcome on next traced step. */
+		if (cs == 0x0028 && ip == 0x6cab) {
+			uint8_t rel = 0;
+			int8_t srel = 0;
+			if (read_seg_u8_noexcept(cpu, SEG_CS, cpu->ip + 1, cpu->cpl, &rel))
+				srel = (int8_t)rel;
+			wfw_monitor.ud63_fe95_0127.j6cab_pending = true;
+			wfw_monitor.ud63_fe95_0127.j6cab_last_from_cs = cs;
+			wfw_monitor.ud63_fe95_0127.j6cab_last_from_ip = ip;
+			wfw_monitor.ud63_fe95_0127.j6cab_last_zf = (cpu->flags & ZF) ? 1 : 0;
+			wfw_monitor.ud63_fe95_0127.j6cab_last_fall = (uint16_t)(ip + 2);
+			wfw_monitor.ud63_fe95_0127.j6cab_last_tgt =
+				(uint16_t)(ip + 2 + srel);
+		}
+
+		/* Save pre-exec state for next-step transition analysis. */
+		wfw_monitor.ud63_fe95_0127.step_prev_valid = true;
+		wfw_monitor.ud63_fe95_0127.step_prev_cs = cs;
+		wfw_monitor.ud63_fe95_0127.step_prev_ip = ip;
+		wfw_monitor.ud63_fe95_0127.step_prev_ax = ax;
+		wfw_monitor.ud63_fe95_0127.step_prev_blen = 0;
+		for (int b = 0; b < 8; b++) {
+			uint8_t v = 0;
+			if (!read_seg_u8_noexcept(cpu, SEG_CS, cpu->ip + (uword)b, cpu->cpl, &v))
+				break;
+			wfw_monitor.ud63_fe95_0127.step_prev_bytes[
+				wfw_monitor.ud63_fe95_0127.step_prev_blen++] = v;
+		}
+	}
+
+	{
+		uint16_t ax = REGi(0) & 0xffff;
+		if (!wfw_monitor.ud63_fe95_0127.trace_ax5_valid &&
+		    ax == 0x0005 &&
+		    wfw_monitor.ud63_fe95_0127.trace_prev_ax != 0x0005) {
+			wfw_monitor.ud63_fe95_0127.trace_ax5_valid = true;
+			wfw_monitor.ud63_fe95_0127.trace_ax5_prev =
+				wfw_monitor.ud63_fe95_0127.trace_prev_ax;
+			wfw_monitor.ud63_fe95_0127.trace_ax5_ax = ax;
+			wfw_monitor.ud63_fe95_0127.trace_ax5_cs = cpu->seg[SEG_CS].sel;
+			wfw_monitor.ud63_fe95_0127.trace_ax5_ip = cpu->ip & 0xffff;
+		}
+		wfw_monitor.ud63_fe95_0127.trace_prev_ax = ax;
+	}
+}
+
+static inline void wfw_ud63_note_resume(CPUI386 *cpu, uint16_t newcs, uword newip,
+					uword newflags, uint16_t resume_ds)
+{
+	if (!win386_diag.active)
+		return;
+	if (wfw_monitor.pending_ud63_idx < 0 ||
+	    wfw_monitor.pending_ud63_idx >= (int8_t)wfw_monitor.ud63_hot_count)
+		return;
+
+	int i = wfw_monitor.pending_ud63_idx;
+	uint16_t old_ip16 = (uint16_t)(wfw_monitor.pending_ud63_ip & 0xffff);
+	uint16_t new_ip16 = (uint16_t)(newip & 0xffff);
+	uint16_t old_ip4 = (uint16_t)(old_ip16 + 4);
+	uint16_t old_ip8 = (uint16_t)(old_ip16 + 8);
+	if (newcs == wfw_monitor.pending_ud63_cs &&
+	    new_ip16 == old_ip16)
+		wfw_monitor.ud63_hot[i].resume_same++;
+	else if (newcs == wfw_monitor.pending_ud63_cs &&
+		 new_ip16 == old_ip4)
+		wfw_monitor.ud63_hot[i].resume_next4++;
+	else if (newcs == wfw_monitor.pending_ud63_cs &&
+		 new_ip16 == old_ip8)
+		wfw_monitor.ud63_hot[i].resume_next8++;
+	else
+		wfw_monitor.ud63_hot[i].resume_other++;
+	wfw_monitor.ud63_hot[i].out_ax = REGi(0) & 0xffff;
+	wfw_monitor.ud63_hot[i].out_fl = newflags;
+	if (newflags & CF)
+		wfw_monitor.ud63_hot[i].cf_set++;
+
+	if (wfw_monitor.pending_ud63_fe95_0127) {
+		uint32_t w1 = 0xffffffffu, w2 = 0xffffffffu;
+		if (wfw_read_ldt_desc_noexcept(cpu, 0x0127, &w1, &w2)) {
+			wfw_monitor.ud63_fe95_0127.post_w1 = w1;
+			wfw_monitor.ud63_fe95_0127.post_w2 = w2;
+		} else {
+			wfw_monitor.ud63_fe95_0127.post_w1 = 0xffffffffu;
+			wfw_monitor.ud63_fe95_0127.post_w2 = 0xffffffffu;
+		}
+		wfw_monitor.ud63_fe95_0127.resumed++;
+		if (wfw_monitor.ud63_fe95_0127.pre_w1 != wfw_monitor.ud63_fe95_0127.post_w1 ||
+		    wfw_monitor.ud63_fe95_0127.pre_w2 != wfw_monitor.ud63_fe95_0127.post_w2)
+			wfw_monitor.ud63_fe95_0127.desc_changed++;
+		wfw_monitor.ud63_fe95_0127.post_cs = newcs;
+		wfw_monitor.ud63_fe95_0127.post_ip = (uint16_t)(newip & 0xffff);
+		wfw_monitor.ud63_fe95_0127.post_ds = cpu->seg[SEG_DS].sel;
+		wfw_monitor.ud63_fe95_0127.resume_ds = resume_ds;
+		wfw_monitor.ud63_fe95_0127.post_ax = REGi(0) & 0xffff;
+		wfw_monitor.ud63_fe95_0127.ret_ax_last = wfw_monitor.ud63_fe95_0127.post_ax;
+		if (wfw_monitor.ud63_fe95_0127.post_ax == 0x0005)
+			wfw_monitor.ud63_fe95_0127.ret_ax5++;
+		else
+			wfw_monitor.ud63_fe95_0127.ret_ax_other++;
+		wfw_monitor.ud63_fe95_0127.post_fl = newflags;
+		wfw_ud63_snapshot_near_desc(cpu,
+					    wfw_monitor.ud63_fe95_0127.post_near_w1,
+					    wfw_monitor.ud63_fe95_0127.post_near_w2,
+					    &wfw_monitor.ud63_fe95_0127.post_near_ok);
+		for (int k = 0; k < 4; k++) {
+			uint8_t mk = (uint8_t)(1u << k);
+			if ((wfw_monitor.ud63_fe95_0127.pre_near_ok & mk) &&
+			    (wfw_monitor.ud63_fe95_0127.post_near_ok & mk)) {
+				if (wfw_monitor.ud63_fe95_0127.pre_near_w1[k] !=
+				    wfw_monitor.ud63_fe95_0127.post_near_w1[k] ||
+				    wfw_monitor.ud63_fe95_0127.pre_near_w2[k] !=
+				    wfw_monitor.ud63_fe95_0127.post_near_w2[k]) {
+					wfw_monitor.ud63_fe95_0127.near_changed[k]++;
+				}
+			}
+		}
+		wfw_monitor.pending_ud63_fe95_0127 = false;
+		wfw_monitor.ud63_fe95_0127.j6cab_pending = false;
+		wfw_monitor.ud63_fe95_0127.step_prev_valid = false;
+		if (wfw_monitor.ud63_fe95_0127.trace_active) {
+			wfw_monitor.ud63_fe95_0127.trace_active = false;
+			wfw_monitor.ud63_fe95_0127.trace_done = true;
+		}
+	}
+	wfw_monitor.pending_ud63_idx = -1;
+}
+
 static const char *seg_name(int seg)
 {
 	switch (seg) {
@@ -1542,17 +2995,175 @@ static bool IRAM_ATTR translate_laddr(CPUI386 *cpu, OptAddr *res, int rwm, uword
 	return true;
 }
 
+/* Non-throwing full-span segment check for REP string fast paths.
+ * Returns false if taking a bulk memcpy/memset would bypass a #GP/#SS that
+ * scalar accesses would have raised. */
+static inline bool seg_span_fast_ok(CPUI386 *cpu, int seg, int rwm, uword addr, uword bytes)
+{
+	if (likely(bytes == 0))
+		return true;
+	/* Match segcheck(): only enforce in protected mode outside VM86. */
+	if (!(cpu->cr0 & 1) || (cpu->flags & VM))
+		return true;
+
+	/* Null selector check. */
+	if (cpu->seg[seg].limit == 0 && (cpu->seg[seg].sel & ~0x3) == 0)
+		return false;
+
+	uword flags = cpu->seg[seg].flags;
+	uword limit = cpu->seg[seg].limit;
+	bool is_code = !!(flags & 0x8);
+	bool rw = !!(flags & 0x2);
+	bool expand_down = !is_code && ((flags & 0xc) == 0x4);
+	uword max_off = (flags & SEG_B_BIT) ? 0xffffffffu : 0xffffu;
+	uword last = addr + bytes - 1;
+
+	/* Writes require writable data segments. */
+	if ((rwm & 2) && (is_code || !rw))
+		return false;
+	/* Overflow in end computation is invalid span. */
+	if (last < addr)
+		return false;
+
+	if (!expand_down)
+		return last <= limit;
+
+	/* Expand-down: (limit..max_off] */
+	if (addr <= limit || last > max_off)
+		return false;
+	return true;
+}
+
 static bool IRAM_ATTR segcheck(CPUI386 *cpu, int rwm, int seg, uword addr, int size)
 {
-	if (cpu->cr0 & 1) {
+	if ((cpu->cr0 & 1) && !(cpu->flags & VM)) {
 		/* null selector check */
 		if (cpu->seg[seg].limit == 0 && (cpu->seg[seg].sel & ~0x3) == 0) {
 //			dolog("segcheck: seg %d is null %x\n", seg, cpu->seg[seg].sel);
 			THROW(seg == SEG_SS ? EX_SS : EX_GP, 0);
 		}
-		/* Limit checks remain disabled for compatibility with existing DPMI/Win9x
-		 * workloads in this emulator. Keep null-selector faults only. */
-		/* todo: readonly check */
+		/* Segment limit and writability checks (protected mode / VM86).
+		 * This must run before paging translation so out-of-bounds selector
+		 * accesses raise #GP/#SS rather than being misreported as #PF. */
+		{
+			uword flags = cpu->seg[seg].flags;
+			uword limit = cpu->seg[seg].limit;
+			bool is_code = !!(flags & 0x8);
+			bool rw = !!(flags & 0x2);
+			bool expand_down = !is_code && ((flags & 0xc) == 0x4);
+			uword max_off = (flags & SEG_B_BIT) ? 0xffffffffu : 0xffffu;
+			uword last = addr + (uword)size - 1;
+			bool over;
+
+			if (unlikely(size <= 0))
+				return true;
+
+			/* Writes require writable data segments; code/read-only data trap. */
+			if ((rwm & 2) && (is_code || !rw)) {
+				if (unlikely(cpu_diag_enabled && win386_diag.active && cpu->cpl == 3)) {
+					wfw_monitor.segchk_last.valid = true;
+					wfw_monitor.segchk_last.cs = cpu->seg[SEG_CS].sel;
+					wfw_monitor.segchk_last.eip = cpu->ip;
+					wfw_monitor.segchk_last.seg = (uint8_t)seg;
+					wfw_monitor.segchk_last.why = 1;
+					wfw_monitor.segchk_last.rwm = (uint8_t)rwm;
+					wfw_monitor.segchk_last.size = (uint8_t)size;
+					wfw_monitor.segchk_last.sel = cpu->seg[seg].sel;
+					wfw_monitor.segchk_last.flags = (uint16_t)flags;
+					wfw_monitor.segchk_last.limit = limit;
+					wfw_monitor.segchk_last.addr = addr;
+					wfw_monitor.segchk_last.bx = REGi(3) & 0xffff;
+					wfw_monitor.segchk_last.di = REGi(7) & 0xffff;
+					wfw_monitor.segchk_last.bp = REGi(5) & 0xffff;
+					wfw_monitor.segchk_last.bl = REGi(3) & 0xff;
+					wfw_monitor.segchk_last.ds_word_ok = false;
+					wfw_monitor.segchk_last.ds_word = 0;
+					wfw_monitor.segchk_last.ss_bp_m6_ok = false;
+					wfw_monitor.segchk_last.ss_bp_m6 = 0;
+				}
+				THROW(seg == SEG_SS ? EX_SS : EX_GP, 0);
+			}
+
+			if (!expand_down) {
+				/* Expand-up: [0..limit] valid. */
+				over = (last < addr) || (last > limit);
+			} else {
+				/* Expand-down: (limit..max_off] valid. */
+				over = (last < addr) || (addr <= limit) || (last > max_off);
+			}
+
+			if (over) {
+				if (unlikely(cpu_diag_enabled && win386_diag.active && cpu->cpl == 3)) {
+					wfw_monitor.segchk_last.valid = true;
+					wfw_monitor.segchk_last.cs = cpu->seg[SEG_CS].sel;
+					wfw_monitor.segchk_last.eip = cpu->ip;
+					wfw_monitor.segchk_last.seg = (uint8_t)seg;
+					wfw_monitor.segchk_last.why = 2;
+					wfw_monitor.segchk_last.rwm = (uint8_t)rwm;
+					wfw_monitor.segchk_last.size = (uint8_t)size;
+					wfw_monitor.segchk_last.sel = cpu->seg[seg].sel;
+					wfw_monitor.segchk_last.flags = (uint16_t)flags;
+					wfw_monitor.segchk_last.limit = limit;
+					wfw_monitor.segchk_last.addr = addr;
+					wfw_monitor.segchk_last.bx = REGi(3) & 0xffff;
+					wfw_monitor.segchk_last.di = REGi(7) & 0xffff;
+					wfw_monitor.segchk_last.bp = REGi(5) & 0xffff;
+					wfw_monitor.segchk_last.bl = REGi(3) & 0xff;
+					wfw_monitor.segchk_last.ds_word_ok = false;
+					wfw_monitor.segchk_last.ds_word = 0;
+					wfw_monitor.segchk_last.ss_bp_m6_ok = false;
+					wfw_monitor.segchk_last.ss_bp_m6 = 0;
+					{
+						uint16_t w = 0;
+						uint32_t la = cpu->seg[seg].base + addr;
+						if (read_laddr_u16_noexcept(cpu, la, cpu->cpl, &w)) {
+							wfw_monitor.segchk_last.ds_word_ok = true;
+							wfw_monitor.segchk_last.ds_word = w;
+						}
+						{
+							uint32_t spm = cpu->sp_mask;
+							uint32_t bp = REGi(5) & spm;
+							uint32_t off = (bp - 6) & spm;
+							uint32_t ss_la = cpu->seg[SEG_SS].base + off;
+							if (read_laddr_u16_noexcept(cpu, ss_la, cpu->cpl, &w)) {
+								wfw_monitor.segchk_last.ss_bp_m6_ok = true;
+								wfw_monitor.segchk_last.ss_bp_m6 = w;
+							}
+						}
+					}
+					/* Capture instruction bytes at fault site
+					 * Need linear→physical translation if paging on */
+					{
+						uint32_t insn_la = cpu->seg[SEG_CS].base + cpu->ip;
+						wfw_monitor.segchk_insn_len = 0;
+						wfw_monitor.segchk_insn_captured = true;
+						for (int ib = 0; ib < 16; ib++) {
+							uint32_t la = insn_la + ib;
+							uint32_t pa;
+							if (cpu->cr0 & (1u << 31)) {
+								/* Paging enabled: walk CR3→PDE→PTE */
+								uint32_t pde_a = (cpu->cr3 & 0xfffff000) | ((la >> 20) & 0xffc);
+								if (pde_a + 4 > (uint32_t)cpu->phys_mem_size) break;
+								uint32_t pde = *(uint32_t *)&cpu->phys_mem[pde_a];
+								if (!(pde & 1)) break;
+								uint32_t pte_a = (pde & 0xfffff000) | ((la >> 10) & 0xffc);
+								if (pte_a + 4 > (uint32_t)cpu->phys_mem_size) break;
+								uint32_t pte = *(uint32_t *)&cpu->phys_mem[pte_a];
+								if (!(pte & 1)) break;
+								pa = (pte & 0xfffff000) | (la & 0xfff);
+							} else {
+								pa = la;
+							}
+							if (pa < (uint32_t)cpu->phys_mem_size) {
+								wfw_monitor.segchk_insn_bytes[ib] = (uint8_t)cpu->phys_mem[pa];
+								wfw_monitor.segchk_insn_len = ib + 1;
+							} else break;
+						}
+					}
+				}
+				THROW(seg == SEG_SS ? EX_SS : EX_GP, 0);
+			}
+		}
 	}
 	return true;
 }
@@ -1744,6 +3355,8 @@ static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 		pf_diag.last_write_cs = cpu->seg[SEG_CS].sel;
 		pf_diag.last_write_eip = cpu->ip;
 	}
+	if (unlikely(cpu_diag_enabled && win386_diag.active))
+		wfw_note_ldt_window_store(cpu, addr, 1, val);
 	if (likely(addr < 0xa0000)) {
 		if (likely(addr < cpu->phys_mem_size))
 			pstore8(cpu, addr, val);
@@ -1831,6 +3444,8 @@ static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 		pf_diag.last_write_cs = cpu->seg[SEG_CS].sel;
 		pf_diag.last_write_eip = cpu->ip;
 	}
+	if (unlikely(cpu_diag_enabled && win386_diag.active))
+		wfw_note_ldt_window_store(cpu, res->addr1, 2, val);
 	if (likely(res->addr1 < 0xa0000)) {
 		if (likely(res->res == ADDR_OK1))
 			pstore16(cpu, res->addr1, val);
@@ -1875,6 +3490,8 @@ static void IRAM_ATTR store32(CPUI386 *cpu, OptAddr *res, u32 val)
 		pf_diag.last_write_cs = cpu->seg[SEG_CS].sel;
 		pf_diag.last_write_eip = cpu->ip;
 	}
+	if (unlikely(cpu_diag_enabled && win386_diag.active))
+		wfw_note_ldt_window_store(cpu, res->addr1, 4, val);
 	if (likely(res->addr1 < 0xa0000)) {
 		if (likely(res->res == ADDR_OK1))
 			pstore32(cpu, res->addr1, val);
@@ -2222,6 +3839,90 @@ static inline void update_seg_flat(CPUI386 *cpu, int seg)
 	cpu->all_segs_flat = (cpu->seg_flat == 0x3F);
 }
 
+/* Capture source/class for DS<-0127 loads (e.g. MOV DS,r/m16 vs POP DS vs LDS). */
+static inline void wfw_note_ds0127_load(CPUI386 *cpu, uint16_t sel_val)
+{
+	if (unlikely(!(cpu_diag_enabled && win386_diag.active)))
+		return;
+	if (sel_val != 0x0127)
+		return;
+	if (wfw_monitor.ds0127_load_count >= 8)
+		return;
+
+	int i = wfw_monitor.ds0127_load_count++;
+	wfw_monitor.ds0127_load_log[i].cs = cpu->seg[SEG_CS].sel;
+	wfw_monitor.ds0127_load_log[i].eip = cpu->ip;
+	wfw_monitor.ds0127_load_log[i].src_kind = 5;
+	wfw_monitor.ds0127_load_log[i].src_reg = 0xff;
+	wfw_monitor.ds0127_load_log[i].src_val = sel_val;
+	wfw_monitor.ds0127_load_log[i].bx = REGi(3) & 0xffff;
+	wfw_monitor.ds0127_load_log[i].di = REGi(7) & 0xffff;
+	wfw_monitor.ds0127_load_log[i].bp = REGi(5) & 0xffff;
+	wfw_monitor.ds0127_load_log[i].ss = cpu->seg[SEG_SS].sel;
+	wfw_monitor.ds0127_load_log[i].sp = REGi(4);
+	wfw_monitor.ds0127_load_log[i].bp_m6_ok = false;
+	wfw_monitor.ds0127_load_log[i].bp_m6_val = 0;
+	wfw_monitor.ds0127_load_log[i].op = 0;
+	wfw_monitor.ds0127_load_log[i].modrm = 0;
+	wfw_monitor.ds0127_load_log[i].blen = 0;
+
+	for (int b = 0; b < 8; b++) {
+		uint8_t v;
+		if (!read_seg_u8_noexcept(cpu, SEG_CS, cpu->ip + (uword)b, cpu->cpl, &v))
+			break;
+		wfw_monitor.ds0127_load_log[i].bytes[wfw_monitor.ds0127_load_log[i].blen++] = v;
+	}
+	if (wfw_monitor.ds0127_load_log[i].blen == 0)
+		return;
+
+	uint8_t op = wfw_monitor.ds0127_load_log[i].bytes[0];
+	wfw_monitor.ds0127_load_log[i].op = op;
+	switch (op) {
+	case 0x1f: { /* POP DS */
+		wfw_monitor.ds0127_load_log[i].src_kind = 3;
+		uint16_t spm = REGi(4) & cpu->sp_mask;
+		uint16_t top;
+		if (read_seg_u16_noexcept(cpu, SEG_SS, spm, cpu->cpl, &top))
+			wfw_monitor.ds0127_load_log[i].src_val = top;
+		break;
+	}
+	case 0x8e: { /* MOV Sreg, r/m16 */
+		if (wfw_monitor.ds0127_load_log[i].blen < 2)
+			break;
+		uint8_t modrm = wfw_monitor.ds0127_load_log[i].bytes[1];
+		wfw_monitor.ds0127_load_log[i].modrm = modrm;
+		uint8_t reg = (modrm >> 3) & 7;
+		uint8_t mod = modrm >> 6;
+		uint8_t rm = modrm & 7;
+		if (reg != 3) /* not DS destination */
+			break;
+		if (mod == 3) {
+			wfw_monitor.ds0127_load_log[i].src_kind = 1;
+			wfw_monitor.ds0127_load_log[i].src_reg = rm;
+			wfw_monitor.ds0127_load_log[i].src_val = REGi(rm) & 0xffff;
+		} else {
+			wfw_monitor.ds0127_load_log[i].src_kind = 2;
+			/* Focused decode for MOV DS,[BP-6] pattern at 0117:7488. */
+			if (modrm == 0x5e) {
+				uint16_t bp = REGi(5) & cpu->sp_mask;
+				uint16_t off = (bp - 6) & cpu->sp_mask;
+				uint16_t w = 0;
+				if (read_seg_u16_noexcept(cpu, SEG_SS, off, cpu->cpl, &w)) {
+					wfw_monitor.ds0127_load_log[i].bp_m6_ok = true;
+					wfw_monitor.ds0127_load_log[i].bp_m6_val = w;
+				}
+			}
+		}
+		break;
+	}
+	case 0xc5: /* LDS Gv,Mp */
+		wfw_monitor.ds0127_load_log[i].src_kind = 4;
+		break;
+	default:
+		break;
+	}
+}
+
 static bool set_seg(CPUI386 *cpu, int seg, int sel)
 {
 	sel = sel & 0xffff;
@@ -2244,49 +3945,59 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 		return true;
 	}
 
+	/* Protected-mode data-segment null selector semantics:
+	 * DS/ES/FS/GS accept null selectors and become unusable until reloaded.
+	 * SS null is always invalid (#GP(0)). */
+	if (!(sel & ~0x3)) {
+		if (seg == SEG_DS || seg == SEG_ES || seg == SEG_FS || seg == SEG_GS) {
+			cpu->seg[seg].sel = sel;
+			cpu->seg[seg].base = 0;
+			cpu->seg[seg].limit = 0;
+			cpu->seg[seg].flags = 0;
+			update_seg_flat(cpu, seg);
+			return true;
+		}
+		if (seg == SEG_SS)
+			THROW(EX_GP, 0);
+	}
+
 	uword w1, w2;
 	TRY(read_desc(cpu, sel, &w1, &w2));
 
-	// TODO: various permission checks
 	bool s = (w2 >> 12) & 1;
 	bool p = (w2 >> 15) & 1;
 	bool code = (w2 >> 11) & 1;
 	bool rw = (w2 >> 9) & 1;
+	bool conforming = code && ((w2 >> 10) & 1);
 	int dpl = (w2 >> 13) & 0x3;
 	int rpl = sel & 0x3;
 	int maxpl = cpu->cpl > rpl ? cpu->cpl : rpl;
 	if (sel & ~0x3) {
-		if (unlikely(cpu_diag_enabled)) {
-			const char *reason = NULL;
-			if (seg == SEG_SS) {
-				if (!s) reason = "SS load with system descriptor";
-				else if (code) reason = "SS load with code descriptor";
-				else if (!rw) reason = "SS load with non-writable descriptor";
-				else if (dpl != cpu->cpl || rpl != cpu->cpl) reason = "SS load with CPL/RPL/DPL mismatch";
-			} else if (seg == SEG_DS || seg == SEG_ES || seg == SEG_FS || seg == SEG_GS) {
-				if (s && code && !rw) reason = "data seg load with unreadable code descriptor";
-				else if (s && !code && dpl < maxpl) reason = "data seg load with DPL < max(CPL,RPL)";
-			}
-			if (reason && p && cpu_diag_event_allow(cpu, &cpu_diag_events.setseg_gap)) {
-				refresh_flags(cpu);
-				dolog("=== set_seg weak-check path #%u ===\n", cpu_diag_events.setseg_gap);
-				dolog("  %s via %s sel=%04x rpl=%d dpl=%d cpl=%d FL=%08x\n",
-					reason, seg_name(seg), sel, rpl, dpl, cpu->cpl, cpu->flags);
-				dolog("  desc raw=%08x %08x s=%d code=%d rw=%d p=%d\n",
-					w1, w2, s, code, rw, p);
-				dolog("  at CS:EIP=%04x:%08x\n", cpu->seg[SEG_CS].sel, cpu->ip);
-			}
-		}
-
 		switch(seg) {
-		case SEG_DS: case SEG_ES: case SEG_FS: case SEG_GS:
-			if (!s) {
-				// to avoid win95 BSOD...
+		case SEG_SS:
+			/* SS must reference present writable data at exact CPL/RPL. */
+			if (!s || code || !rw || dpl != cpu->cpl || rpl != cpu->cpl)
 				THROW(EX_GP, sel & ~0x3);
-			}
+			if (!p)
+				THROW(EX_SS, sel & ~0x3);
+			break;
+		case SEG_DS: case SEG_ES: case SEG_FS: case SEG_GS:
+			/* Data regs may load data or readable code descriptors. */
+			if (!s)
+				THROW(EX_GP, sel & ~0x3);
+			if (code && !rw)
+				THROW(EX_GP, sel & ~0x3);
+			if ((!code || !conforming) && dpl < maxpl)
+				THROW(EX_GP, sel & ~0x3);
+			if (!p)
+				THROW(EX_NP, sel & ~0x3);
+			break;
+		default:
+			/* Preserve historical behavior for non-data seg registers. */
+			if (!p)
+				THROW((seg == SEG_SS ? EX_SS : EX_NP), sel & ~0x3);
+			break;
 		}
-
-		if (!p) THROW((seg == SEG_SS ? EX_SS : EX_NP), sel & ~0x3);
 	}
 
 	cpu->seg[seg].sel = sel;
@@ -2304,6 +4015,60 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 	}
 	if (seg == SEG_SS) {
 		cpu->sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
+	}
+	/* Decode source/class for DS<-0127 before provenance snapshot. */
+	if (unlikely(seg == SEG_DS && (sel & 0xffff) == 0x0127))
+		wfw_note_ds0127_load(cpu, (uint16_t)(sel & 0xffff));
+	/* Selector 0x0127 provenance watch: log when DS is loaded with 0x0127.
+	 * w1/w2 are from read_desc() above — already correctly paging-translated. */
+	if (unlikely(cpu_diag_enabled && win386_diag.active &&
+	             seg == SEG_DS && (sel & 0xffff) == 0x0127)) {
+		uint32_t rw1 = w1, rw2 = w2; /* 0x0127's descriptor from read_desc */
+		/* Read adjacent 0x0117 descriptor via read_desc path */
+		uword aw1 = 0, aw2 = 0;
+		/* Temporarily save/restore exception state — read_desc may throw */
+		{
+			uint32_t ldt_base = cpu->seg[SEG_LDT].base;
+			uint32_t ldt_lim  = cpu->seg[SEG_LDT].limit;
+			uint32_t off117 = 0x0117 & ~7;
+			if (off117 + 7 <= ldt_lim) {
+				/* Manual page-walk for LDT linear address */
+				for (int dw = 0; dw < 2; dw++) {
+					uint32_t la = ldt_base + off117 + dw * 4;
+					uint32_t pa = la;
+					if (cpu->cr0 & (1u << 31)) {
+						uint32_t pde_a = (cpu->cr3 & 0xfffff000) | ((la >> 20) & 0xffc);
+						if (pde_a + 4 > (uint32_t)cpu->phys_mem_size) break;
+						uint32_t pde = *(uint32_t *)&cpu->phys_mem[pde_a];
+						if (!(pde & 1)) break;
+						uint32_t pte_a = (pde & 0xfffff000) | ((la >> 10) & 0xffc);
+						if (pte_a + 4 > (uint32_t)cpu->phys_mem_size) break;
+						uint32_t pte = *(uint32_t *)&cpu->phys_mem[pte_a];
+						if (!(pte & 1)) break;
+						pa = (pte & 0xfffff000) | (la & 0xfff);
+					}
+					if (pa + 4 <= (uint32_t)cpu->phys_mem_size) {
+						if (dw == 0) aw1 = *(uint32_t *)&cpu->phys_mem[pa];
+						else         aw2 = *(uint32_t *)&cpu->phys_mem[pa];
+					}
+				}
+			}
+		}
+		wfw_monitor.sel0127_prov.last_w1 = rw1;
+		wfw_monitor.sel0127_prov.last_w2 = rw2;
+		wfw_monitor.sel0127_prov.last_adj_w1 = aw1;
+		wfw_monitor.sel0127_prov.last_adj_w2 = aw2;
+		wfw_monitor.sel0127_prov.last_cs = cpu->seg[SEG_CS].sel;
+		wfw_monitor.sel0127_prov.last_eip = cpu->ip;
+		if (wfw_monitor.sel0127_prov.count == 0) {
+			wfw_monitor.sel0127_prov.first_w1 = rw1;
+			wfw_monitor.sel0127_prov.first_w2 = rw2;
+			wfw_monitor.sel0127_prov.first_adj_w1 = aw1;
+			wfw_monitor.sel0127_prov.first_adj_w2 = aw2;
+			wfw_monitor.sel0127_prov.first_cs = cpu->seg[SEG_CS].sel;
+			wfw_monitor.sel0127_prov.first_eip = cpu->ip;
+		}
+		wfw_monitor.sel0127_prov.count++;
 	}
 	return true;
 }
@@ -2725,7 +4490,9 @@ static inline void clear_segs(CPUI386 *cpu)
 	}
 
 #define Jv(rwm, INST) \
-	if (adsz16) { \
+	/* Near branch displacement size follows operand size (66h), \
+	 * not address size (67h). */ \
+	if (opsz16) { \
 		u16 imm16; \
 		TRY(fetch16(cpu, &imm16)); \
 		INST ## w(imm16, limm, 0); \
@@ -2885,23 +4652,1121 @@ static void cpu_diag_log_cr0_transition(CPUI386 *cpu, uword old_cr0, uword new_c
 	static uint16_t count = 0;
 	if (!cpu_diag_enabled || old_cr0 == new_cr0)
 		return;
+	if (win386_diag.active) {
+		wfw_monitor.mode_switches++;
+		{
+			int ti = wfw_monitor.cr0_tail_pos % 8;
+			wfw_monitor.cr0_tail[ti].cs = cpu->seg[SEG_CS].sel;
+			wfw_monitor.cr0_tail[ti].ip = cpu->ip;
+			wfw_monitor.cr0_tail[ti].old_cr0 = old_cr0;
+			wfw_monitor.cr0_tail[ti].new_cr0 = new_cr0;
+			wfw_monitor.cr0_tail_pos++;
+			if (wfw_monitor.cr0_tail_count < 8)
+				wfw_monitor.cr0_tail_count++;
+		}
+	}
 	if (diag_gen != cpu->diag_gen) {
 		diag_gen = cpu->diag_gen;
 		count = 0;
 	}
-	if (count >= 64)
+	if (count >= 8)
 		return;
 	count++;
-	refresh_flags(cpu);
-	dolog("=== CR0 change #%u ===\n", count);
-	dolog("  %08x -> %08x at CS:EIP=%04x:%08x (%s)\n",
-		old_cr0, new_cr0, cpu->seg[SEG_CS].sel, cpu->ip,
-		cpu_mode_name(cpu->flags, old_cr0));
-	dolog("  PE:%d->%d PG:%d->%d WP:%d->%d FL=%08x CPL=%d VM=%d\n",
+	dolog("CR0 #%u %08x->%08x PE:%d->%d PG:%d->%d at %04x:%08x\n",
+		count, old_cr0, new_cr0,
 		!!(old_cr0 & 1), !!(new_cr0 & 1),
 		!!(old_cr0 & CR0_PG), !!(new_cr0 & CR0_PG),
-		!!(old_cr0 & CR0_WP), !!(new_cr0 & CR0_WP),
-		cpu->flags, cpu->cpl, !!(cpu->flags & VM));
+		cpu->seg[SEG_CS].sel, cpu->ip);
+}
+
+/* Exception ring buffer — file-scope for post-mortem dump from cpui386_step */
+#define EXC_RING_SIZE 1024
+#define EXC_RING_MASK (EXC_RING_SIZE - 1)
+static struct { uint8_t no; uint8_t mode; uint16_t cs; uint32_t ip; uint32_t err; uint32_t cr2; } exc_ring[EXC_RING_SIZE];
+static int exc_ring_pos = 0;
+
+static void wfw_monitor_dump(CPUI386 *cpu, const char *reason)
+{
+	uint32_t gp_total = 0;
+	uint32_t dpmi_0006 = 0, dpmi_0703 = 0, dpmi_0007 = 0, dpmi_0008 = 0;
+	uint32_t dpmi_0501 = 0, dpmi_0004 = 0;
+	static const char *exc_names[] = {
+		"#DE","#DB","NMI","#BP","#OF","#BR","#UD","#NM",
+		"#DF","---","#TS","#NP","#SS","#GP","#PF","---",
+		"#MF","#AC","#MC","#XF","---","---","---","---",
+		"---","---","---","---","---","---","#SX","---"
+	};
+
+	for (int i = 0; i < 256; i++)
+		gp_total += wfw_monitor.v86_int_gp_counts[i];
+	for (int i = 0; i < wfw_monitor.int31_hist_len; i++) {
+		switch (wfw_monitor.int31_hist[i].ax) {
+		case 0x0006: dpmi_0006 = wfw_monitor.int31_hist[i].count; break;
+		case 0x0703: dpmi_0703 = wfw_monitor.int31_hist[i].count; break;
+		case 0x0007: dpmi_0007 = wfw_monitor.int31_hist[i].count; break;
+		case 0x0008: dpmi_0008 = wfw_monitor.int31_hist[i].count; break;
+		case 0x0501: dpmi_0501 = wfw_monitor.int31_hist[i].count; break;
+		case 0x0004: dpmi_0004 = wfw_monitor.int31_hist[i].count; break;
+		default: break;
+		}
+	}
+	if (wfw_monitor.tty_pos > 0)
+		wfw_monitor.tty_buf[wfw_monitor.tty_pos] = '\0';
+
+	dolog("=== WfW Boot Monitor (%s) ===\n", reason);
+	dolog("core: pm_int=%u vm86_int=%u v86_to_r0=%u isr_fail=%u mode_sw=%u a20_toggles=%u(state=%u)\n",
+		wfw_monitor.pm_ints, wfw_monitor.vm86_ints, wfw_monitor.v86_to_ring0,
+		wfw_monitor.isr_failures, wfw_monitor.mode_switches, wfw_monitor.a20_toggles,
+		wfw_monitor.a20_state);
+	if (wfw_monitor.cr0_tail_count > 0) {
+		int cnt = wfw_monitor.cr0_tail_count;
+		dolog("cr0_tail:");
+		for (int i = 0; i < cnt; i++) {
+			int idx = (int)wfw_monitor.cr0_tail_pos - cnt + i;
+			while (idx < 0)
+				idx += 8;
+			idx %= 8;
+			dolog(" [%04x:%08x %08x>%08x]",
+				wfw_monitor.cr0_tail[idx].cs,
+				wfw_monitor.cr0_tail[idx].ip,
+				wfw_monitor.cr0_tail[idx].old_cr0,
+				wfw_monitor.cr0_tail[idx].new_cr0);
+		}
+		dolog("\n");
+	}
+	dolog("exc: #UD=%u #GP=%u #PF=%u #AC=%u #DF=%u #TS=%u #NP=%u #SS=%u\n",
+		wfw_monitor.exc_counts[EX_UD], wfw_monitor.exc_counts[EX_GP],
+		wfw_monitor.exc_counts[EX_PF], wfw_monitor.exc_counts[17],
+		wfw_monitor.exc_counts[EX_DF], wfw_monitor.exc_counts[EX_TS],
+		wfw_monitor.exc_counts[EX_NP], wfw_monitor.exc_counts[EX_SS]);
+	dolog("int: 10h=%u(last=%02x/%02x tty_len=%u) 15h=%u(last=%02x)\n",
+		wfw_monitor.int10h_count, wfw_monitor.last_int10h_ah, wfw_monitor.last_int10h_al,
+		wfw_monitor.tty_pos, wfw_monitor.int15h_count, wfw_monitor.last_int15h_ah);
+	{
+		uint16_t bda_equip = 0;
+		uint16_t bda_convk = 0;
+		uint8_t bda_mode = 0;
+		if (cpu->phys_mem_size > 0x411)
+			bda_equip = cpu->phys_mem[0x410] | ((uint16_t)cpu->phys_mem[0x411] << 8);
+		if (cpu->phys_mem_size > 0x414)
+			bda_convk = cpu->phys_mem[0x413] | ((uint16_t)cpu->phys_mem[0x414] << 8);
+		if (cpu->phys_mem_size > 0x449)
+			bda_mode = cpu->phys_mem[0x449];
+		dolog("bda: equip=%04x convkb=%04x mode=%02x\n", bda_equip, bda_convk, bda_mode);
+	}
+	dolog("r3: pm=%u irq=%u faults=%u gp=%u pf=%u ac=%u last=%s@%04x:%08x bios_lgdt=%u bios_priv=%u\n",
+		wfw_monitor.pm_ring3_ints, wfw_monitor.pm_ring3_irqs, wfw_monitor.pm_ring3_faults,
+		wfw_monitor.pm_ring3_exc_hist[EX_GP], wfw_monitor.pm_ring3_exc_hist[EX_PF],
+		wfw_monitor.pm_ring3_exc_hist[17],
+		(wfw_monitor.pm_r3_last_exc < 32) ? exc_names[wfw_monitor.pm_r3_last_exc] : "irq",
+		wfw_monitor.pm_r3_last_cs, wfw_monitor.pm_r3_last_eip,
+		wfw_monitor.bios_lgdt_count, wfw_monitor.bios_priv_count);
+	dolog("r3_dos: int21=%u int31=%u int2f=%u open=%u fail21=%u fail31=%u\n",
+		wfw_monitor.pm_r3_int21_count, wfw_monitor.pm_r3_int31_count,
+		wfw_monitor.pm_r3_int2f_count, wfw_monitor.r3_fopen_count,
+		wfw_monitor.int21_fail_count, wfw_monitor.int31_fail_count);
+		if (wfw_monitor.r3_fopen_count > 0) {
+			int n = wfw_monitor.r3_fopen_count;
+			if (n > 8)
+				n = 8;
+			dolog("r3_open_files:");
+			for (int i = 0; i < n; i++) {
+				const char *name = wfw_monitor.r3_fopen_log[i].name[0] ?
+					wfw_monitor.r3_fopen_log[i].name : "<unreadable>";
+				dolog(" [%d:\"%s\"]", i, name);
+			}
+			dolog("\n");
+		}
+		if (wfw_monitor.int41_module_count > 0) {
+			dolog("int41_modules:");
+			for (int i = 0; i < wfw_monitor.int41_module_count; i++) {
+				dolog(" [%04x %s h=%04x cs=%04x]",
+					wfw_monitor.int41_modules[i].ax,
+					wfw_monitor.int41_modules[i].name[0] ?
+						wfw_monitor.int41_modules[i].name : "?",
+					wfw_monitor.int41_modules[i].hmod,
+					wfw_monitor.int41_modules[i].call_cs);
+			}
+			dolog("\n");
+		}
+	if (wfw_monitor.pm_r3_int2f_count > 0) {
+		int n = wfw_monitor.pm_r3_int2f_count;
+		if (n > 16)
+			n = 16;
+		dolog("r3_int2f:");
+		for (int i = 0; i < n; i++)
+			dolog(" %04x", wfw_monitor.pm_r3_int2f_ax[i]);
+		dolog(" 16xx=%u", wfw_monitor.pm_r3_168a_count);
+		if (wfw_monitor.pm_r3_168a_str[0])
+			dolog(" 168a=\"%s\"", wfw_monitor.pm_r3_168a_str);
+		dolog("\n");
+	}
+	if (wfw_monitor.int2f_ret_count > 0) {
+		dolog("r3_int2f_ret:");
+		for (int i = 0; i < wfw_monitor.int2f_ret_count; i++) {
+			dolog(" [%04x>%04x ds:si=%04x:%04x es:di=%04x:%04x cf=%u]",
+				wfw_monitor.int2f_ret_log[i].call_ax,
+				wfw_monitor.int2f_ret_log[i].ret_ax,
+				wfw_monitor.int2f_ret_log[i].ret_ds,
+				wfw_monitor.int2f_ret_log[i].ret_si,
+				wfw_monitor.int2f_ret_log[i].ret_es,
+				wfw_monitor.int2f_ret_log[i].ret_di,
+				wfw_monitor.int2f_ret_log[i].cf);
+		}
+		dolog("\n");
+	}
+	if (wfw_monitor.r3_gp_count > 0) {
+		dolog("r3_gp:");
+		for (int i = 0; i < wfw_monitor.r3_gp_count; i++) {
+			dolog(" %04x:%08x/e=%04x",
+				wfw_monitor.r3_gp_log[i].cs,
+				wfw_monitor.r3_gp_log[i].eip,
+				wfw_monitor.r3_gp_log[i].err);
+			if (wfw_monitor.r3_gp_log[i].dec[0])
+				dolog("/d=%s", wfw_monitor.r3_gp_log[i].dec);
+		}
+		dolog("\n");
+	}
+	if (wfw_monitor.r3_pf_count > 0) {
+		dolog("r3_pf:");
+		for (int i = 0; i < wfw_monitor.r3_pf_count; i++) {
+			dolog(" %04x:%08x/e=%04x c2=%08x",
+				wfw_monitor.r3_pf_log[i].cs,
+				wfw_monitor.r3_pf_log[i].eip,
+				wfw_monitor.r3_pf_log[i].err,
+				wfw_monitor.r3_pf_log[i].cr2);
+			if (wfw_monitor.r3_pf_log[i].dec[0])
+				dolog("/d=%s", wfw_monitor.r3_pf_log[i].dec);
+		}
+		dolog("\n");
+	}
+	if (wfw_monitor.r3_hipf_count > 0) {
+		dolog("r3_hipf: cr3=%08x (%u entries, last %u)\n",
+			wfw_monitor.r3_hipf[((wfw_monitor.r3_hipf_pos - 1) % 16)].cr3,
+			wfw_monitor.r3_hipf_count,
+			(wfw_monitor.r3_hipf_pos > 16) ? 16u : wfw_monitor.r3_hipf_count);
+		int start = (wfw_monitor.r3_hipf_count < 16) ? 0 :
+			(int)(wfw_monitor.r3_hipf_pos % 16);
+		for (int i = 0; i < wfw_monitor.r3_hipf_count; i++) {
+			int idx = (start + i) % 16;
+			dolog("  %04x:%08x cr2=%08x e=%04x pde=%08x pte=%08x%s\n",
+				wfw_monitor.r3_hipf[idx].cs,
+				wfw_monitor.r3_hipf[idx].eip,
+				wfw_monitor.r3_hipf[idx].cr2,
+				wfw_monitor.r3_hipf[idx].err,
+				wfw_monitor.r3_hipf[idx].pde,
+				wfw_monitor.r3_hipf[idx].pte,
+				(wfw_monitor.r3_hipf[idx].pde & 1) ?
+					((wfw_monitor.r3_hipf[idx].pte & 1) ? " P" : " pde=P pte=NP") :
+					" pde=NP");
+		}
+	}
+	dolog("dpmi: 0006=%u 0703=%u 0007=%u 0008=%u 0501=%u 0004=%u ret31=%u ret21=%u\n",
+		dpmi_0006, dpmi_0703, dpmi_0007, dpmi_0008, dpmi_0501, dpmi_0004,
+		wfw_monitor.int31_ret_count, wfw_monitor.int21_ret_count);
+	if (wfw_monitor.int31_hist_len > 0) {
+		dolog("int31_hist(%u funcs):", wfw_monitor.int31_hist_len);
+		for (int i = 0; i < wfw_monitor.int31_hist_len; i++)
+			dolog(" %04x=%u", wfw_monitor.int31_hist[i].ax,
+				wfw_monitor.int31_hist[i].count);
+		dolog("\n");
+	}
+	if (wfw_monitor.dpmi_alloc_count > 0) {
+		/* Find the last faulting CR2 from r3_hipf for range check */
+		uint32_t last_cr2 = 0;
+		if (wfw_monitor.r3_hipf_count > 0) {
+			int li = ((int)wfw_monitor.r3_hipf_pos - 1 + 16) % 16;
+			last_cr2 = wfw_monitor.r3_hipf[li].cr2;
+		}
+		for (int i = 0; i < wfw_monitor.dpmi_alloc_count; i++) {
+			uint32_t base = wfw_monitor.dpmi_alloc_log[i].ret_addr;
+			uint32_t size = wfw_monitor.dpmi_alloc_log[i].req_size;
+			uint32_t end = base + size;
+			const char *contains = "";
+			if (last_cr2 && last_cr2 >= base && last_cr2 < end)
+				contains = " <<CR2-IN";
+			else if (last_cr2 && !wfw_monitor.dpmi_alloc_log[i].cf)
+				contains = " cr2-OUT";
+			dolog("dpmi_alloc[%d]: %04x size=%08x addr=%08x-%08x h=%08x cf=%u%s\n",
+				i, wfw_monitor.dpmi_alloc_log[i].func,
+				size, base, end,
+				wfw_monitor.dpmi_alloc_log[i].ret_handle,
+				wfw_monitor.dpmi_alloc_log[i].cf ? 1u : 0u,
+				contains);
+		}
+	}
+	if (wfw_monitor.fatal_pf_captured) {
+		dolog("fatal_pf: %04x:%08x cr2=%08x\n",
+			wfw_monitor.fatal_pf.cs, wfw_monitor.fatal_pf.eip,
+			wfw_monitor.fatal_pf.cr2);
+		dolog("  eax=%08x ebx=%08x ecx=%08x edx=%08x\n",
+			wfw_monitor.fatal_pf.eax, wfw_monitor.fatal_pf.ebx,
+			wfw_monitor.fatal_pf.ecx, wfw_monitor.fatal_pf.edx);
+		dolog("  esi=%08x edi=%08x ebp=%08x esp=%08x\n",
+			wfw_monitor.fatal_pf.esi, wfw_monitor.fatal_pf.edi,
+			wfw_monitor.fatal_pf.ebp, wfw_monitor.fatal_pf.esp);
+		dolog("  ds=%04x(b=%08x l=%08x) es=%04x(b=%08x l=%08x) ss=%04x(b=%08x)\n",
+			wfw_monitor.fatal_pf.ds, wfw_monitor.fatal_pf.ds_base,
+			wfw_monitor.fatal_pf.ds_limit,
+			wfw_monitor.fatal_pf.es, wfw_monitor.fatal_pf.es_base,
+			wfw_monitor.fatal_pf.es_limit,
+			wfw_monitor.fatal_pf.ss, wfw_monitor.fatal_pf.ss_base);
+		dolog("  cs_lim=%08x fs=%04x gs=%04x\n",
+			wfw_monitor.fatal_pf.cs_limit,
+			wfw_monitor.fatal_pf.fs, wfw_monitor.fatal_pf.gs);
+		/* Check if DS_base+DS_limit exceeds any DPMI allocation */
+		uint32_t ds_end = wfw_monitor.fatal_pf.ds_base + wfw_monitor.fatal_pf.ds_limit;
+		for (int i = 0; i < wfw_monitor.dpmi_alloc_count; i++) {
+			uint32_t a_base = wfw_monitor.dpmi_alloc_log[i].ret_addr;
+			uint32_t a_end = a_base + wfw_monitor.dpmi_alloc_log[i].req_size;
+			if (wfw_monitor.fatal_pf.ds_base >= a_base &&
+			    wfw_monitor.fatal_pf.ds_base < a_end) {
+				dolog("  DS in alloc[%d]: base+%05x, seg_end=%08x alloc_end=%08x overshoot=%+d\n",
+					i,
+					(unsigned)(wfw_monitor.fatal_pf.ds_base - a_base),
+					ds_end, a_end,
+					(int)(ds_end - a_end));
+				break;
+			}
+		}
+	}
+	if (wfw_monitor.segchk_last.valid) {
+		dolog("segchk_last: %04x:%08x seg=%s rwm=%u size=%u why=%s sel=%04x flags=%04x lim=%08x off=%08x\n",
+			wfw_monitor.segchk_last.cs, wfw_monitor.segchk_last.eip,
+			seg_name(wfw_monitor.segchk_last.seg),
+			(unsigned)wfw_monitor.segchk_last.rwm,
+			(unsigned)wfw_monitor.segchk_last.size,
+			(wfw_monitor.segchk_last.why == 1) ? "write" :
+			((wfw_monitor.segchk_last.why == 2) ? "limit" : "?"),
+			wfw_monitor.segchk_last.sel,
+			wfw_monitor.segchk_last.flags,
+			wfw_monitor.segchk_last.limit,
+			wfw_monitor.segchk_last.addr);
+		dolog("  ctx: bx=%04x(bl=%02x) di=%04x bp=%04x",
+			wfw_monitor.segchk_last.bx,
+			(unsigned)wfw_monitor.segchk_last.bl,
+			wfw_monitor.segchk_last.di,
+			wfw_monitor.segchk_last.bp);
+		if (wfw_monitor.segchk_last.ds_word_ok)
+			dolog(" seg:[off]=%04x", wfw_monitor.segchk_last.ds_word);
+		if (wfw_monitor.segchk_last.ss_bp_m6_ok)
+			dolog(" ss:[bp-6]=%04x", wfw_monitor.segchk_last.ss_bp_m6);
+		dolog("\n");
+	}
+	if (wfw_monitor.dpmi_seg_log_count > 0) {
+		dolog("dpmi_desc_ops: (%u entries)\n", wfw_monitor.dpmi_seg_log_count);
+		for (int i = 0; i < wfw_monitor.dpmi_seg_log_count; i++) {
+			uint16_t f = wfw_monitor.dpmi_seg_log[i].func;
+			const char *rcf = !wfw_monitor.dpmi_seg_log[i].ret_valid ? "cf=?" :
+				(wfw_monitor.dpmi_seg_log[i].ret_cf ? "cf=1" : "cf=0");
+			const char *fn = f==1?"AllocLDT":f==7?"SetBase":f==8?"SetLim":
+				f==9?"SetRights":f==0xa?"CreateAlias":f==0xb?"GetDesc":
+				f==0xc?"SetDesc":"?";
+			if (f == 0x000C)
+				dolog("  [%2d] %04x(%s) sel=%04x w1=%08x w2=%08x %s\n",
+					i, f, fn, wfw_monitor.dpmi_seg_log[i].sel,
+					wfw_monitor.dpmi_seg_log[i].val,
+					wfw_monitor.dpmi_seg_log[i].extra, rcf);
+			else if (f == 0x0001)
+				dolog("  [%2d] %04x(%s) cnt=%u ret_sel=%04x %s\n",
+					i, f, fn,
+					(unsigned)wfw_monitor.dpmi_seg_log[i].val,
+					wfw_monitor.dpmi_seg_log[i].sel, rcf);
+			else if (f == 0x000A)
+				dolog("  [%2d] %04x(%s) src=%04x alias=%04x %s\n",
+					i, f, fn,
+					wfw_monitor.dpmi_seg_log[i].sel,
+					(uint16_t)(wfw_monitor.dpmi_seg_log[i].val & 0xffff),
+					rcf);
+			else if (f == 0x000B) {
+				if (wfw_monitor.dpmi_seg_log[i].ret_valid &&
+				    !wfw_monitor.dpmi_seg_log[i].ret_cf)
+					dolog("  [%2d] %04x(%s) sel=%04x w1=%08x w2=%08x %s\n",
+						i, f, fn,
+						wfw_monitor.dpmi_seg_log[i].sel,
+						wfw_monitor.dpmi_seg_log[i].val,
+						wfw_monitor.dpmi_seg_log[i].extra,
+						rcf);
+				else
+					dolog("  [%2d] %04x(%s) sel=%04x buf=%08x %s\n",
+						i, f, fn,
+						wfw_monitor.dpmi_seg_log[i].sel,
+						wfw_monitor.dpmi_seg_log[i].val,
+						rcf);
+			}
+			else
+				dolog("  [%2d] %04x(%s) sel=%04x val=%08x %s\n",
+					i, f, fn, wfw_monitor.dpmi_seg_log[i].sel,
+					wfw_monitor.dpmi_seg_log[i].val, rcf);
+		}
+	}
+	if (wfw_monitor.sel0127_prov.count > 0) {
+		dolog("sel0127_prov: DS<-0127 loaded %u times\n",
+			(unsigned)wfw_monitor.sel0127_prov.count);
+		/* Decode descriptor: base = w1[31:16] | w2[7:0]<<16 | w2[31:24]<<24
+		 *                    limit = w2[19:16]<<16 | w1[15:0], G=w2[23] */
+		#define DESC_BASE(w1,w2) (((w1)>>16)|(((w2)&0xff)<<16)|((w2)&0xff000000))
+		#define DESC_LIMIT(w1,w2) ({ \
+			uint32_t _l = (((w2)&0xf0000)|((w1)&0xffff)); \
+			if ((w2) & 0x800000) _l = (_l << 12) | 0xfff; _l; })
+		#define DESC_FLAGS(w2) (((w2) >> 8) & 0xffff)
+		dolog("  first@%04x:%08x: 0127=[%08x %08x] b=%08x l=%08x fl=%04x\n",
+			wfw_monitor.sel0127_prov.first_cs,
+			wfw_monitor.sel0127_prov.first_eip,
+			wfw_monitor.sel0127_prov.first_w1,
+			wfw_monitor.sel0127_prov.first_w2,
+			DESC_BASE(wfw_monitor.sel0127_prov.first_w1, wfw_monitor.sel0127_prov.first_w2),
+			DESC_LIMIT(wfw_monitor.sel0127_prov.first_w1, wfw_monitor.sel0127_prov.first_w2),
+			DESC_FLAGS(wfw_monitor.sel0127_prov.first_w2));
+		dolog("  first@same:          0117=[%08x %08x] b=%08x l=%08x fl=%04x\n",
+			wfw_monitor.sel0127_prov.first_adj_w1,
+			wfw_monitor.sel0127_prov.first_adj_w2,
+			DESC_BASE(wfw_monitor.sel0127_prov.first_adj_w1, wfw_monitor.sel0127_prov.first_adj_w2),
+			DESC_LIMIT(wfw_monitor.sel0127_prov.first_adj_w1, wfw_monitor.sel0127_prov.first_adj_w2),
+			DESC_FLAGS(wfw_monitor.sel0127_prov.first_adj_w2));
+		if (wfw_monitor.sel0127_prov.count > 1) {
+			dolog("  last@%04x:%08x:  0127=[%08x %08x] b=%08x l=%08x fl=%04x\n",
+				wfw_monitor.sel0127_prov.last_cs,
+				wfw_monitor.sel0127_prov.last_eip,
+				wfw_monitor.sel0127_prov.last_w1,
+				wfw_monitor.sel0127_prov.last_w2,
+				DESC_BASE(wfw_monitor.sel0127_prov.last_w1, wfw_monitor.sel0127_prov.last_w2),
+				DESC_LIMIT(wfw_monitor.sel0127_prov.last_w1, wfw_monitor.sel0127_prov.last_w2),
+				DESC_FLAGS(wfw_monitor.sel0127_prov.last_w2));
+			dolog("  last@same:           0117=[%08x %08x] b=%08x l=%08x fl=%04x\n",
+				wfw_monitor.sel0127_prov.last_adj_w1,
+				wfw_monitor.sel0127_prov.last_adj_w2,
+				DESC_BASE(wfw_monitor.sel0127_prov.last_adj_w1, wfw_monitor.sel0127_prov.last_adj_w2),
+				DESC_LIMIT(wfw_monitor.sel0127_prov.last_adj_w1, wfw_monitor.sel0127_prov.last_adj_w2),
+				DESC_FLAGS(wfw_monitor.sel0127_prov.last_adj_w2));
+		}
+		#undef DESC_BASE
+		#undef DESC_LIMIT
+		#undef DESC_FLAGS
+	}
+	if (wfw_monitor.segchk_insn_captured) {
+		dolog("segchk_insn @%04x:%08x bytes:",
+			wfw_monitor.segchk_last.cs, wfw_monitor.segchk_last.eip);
+		for (int i = 0; i < wfw_monitor.segchk_insn_len; i++)
+			dolog(" %02x", wfw_monitor.segchk_insn_bytes[i]);
+		dolog("\n");
+	}
+	if (wfw_monitor.ds0127_load_count > 0) {
+		static const char *const srcn[6] = {
+			"?", "mov_ds_reg", "mov_ds_mem", "pop_ds", "lds", "other"
+		};
+		static const char *const r16n[8] = {
+			"AX", "CX", "DX", "BX", "SP", "BP", "SI", "DI"
+		};
+		dolog("ds0127_load: (%u entries)\n", wfw_monitor.ds0127_load_count);
+		for (int i = 0; i < wfw_monitor.ds0127_load_count; i++) {
+			uint8_t sk = wfw_monitor.ds0127_load_log[i].src_kind;
+			dolog("  [%2d] %04x:%08x src=%s",
+				i,
+				wfw_monitor.ds0127_load_log[i].cs,
+				wfw_monitor.ds0127_load_log[i].eip,
+				(sk <= 5) ? srcn[sk] : "?");
+			if (sk == 1 && wfw_monitor.ds0127_load_log[i].src_reg < 8) {
+				dolog(" reg=%s val=%04x",
+					r16n[wfw_monitor.ds0127_load_log[i].src_reg],
+					wfw_monitor.ds0127_load_log[i].src_val);
+			} else if (sk == 3) {
+				dolog(" ss:sp=%04x:%08x val=%04x",
+					wfw_monitor.ds0127_load_log[i].ss,
+					wfw_monitor.ds0127_load_log[i].sp,
+					wfw_monitor.ds0127_load_log[i].src_val);
+			} else if (wfw_monitor.ds0127_load_log[i].src_val) {
+				dolog(" val=%04x", wfw_monitor.ds0127_load_log[i].src_val);
+			}
+			dolog(" bx=%04x di=%04x bp=%04x",
+				wfw_monitor.ds0127_load_log[i].bx,
+				wfw_monitor.ds0127_load_log[i].di,
+				wfw_monitor.ds0127_load_log[i].bp);
+			if (wfw_monitor.ds0127_load_log[i].bp_m6_ok)
+				dolog(" [ss:bp-6]=%04x", wfw_monitor.ds0127_load_log[i].bp_m6_val);
+			dolog(" op=%02x", wfw_monitor.ds0127_load_log[i].op);
+			if (wfw_monitor.ds0127_load_log[i].op == 0x8e)
+				dolog(" modrm=%02x", wfw_monitor.ds0127_load_log[i].modrm);
+			dolog("\n");
+			dolog("      bytes:");
+			for (int b = 0; b < wfw_monitor.ds0127_load_log[i].blen; b++)
+				dolog(" %02x", wfw_monitor.ds0127_load_log[i].bytes[b]);
+			dolog("\n");
+		}
+	}
+	if (wfw_monitor.ldt_watch_count > 0) {
+		dolog("ldt_watch: (%u writes off=0x118..0x12f)\n",
+			wfw_monitor.ldt_watch_count);
+		for (int i = 0; i < wfw_monitor.ldt_watch_count; i++) {
+			int idx = (int)wfw_monitor.ldt_watch_pos - (int)wfw_monitor.ldt_watch_count + i;
+			while (idx < 0)
+				idx += 24;
+			idx %= 24;
+			dolog("  [%2d] r%u %04x:%08x p=%08x sz=%u val=%08x off=%03x sel=%04x\n",
+				i,
+				(unsigned)wfw_monitor.ldt_watch_log[idx].cpl,
+				wfw_monitor.ldt_watch_log[idx].cs,
+				wfw_monitor.ldt_watch_log[idx].eip,
+				wfw_monitor.ldt_watch_log[idx].phys,
+				(unsigned)wfw_monitor.ldt_watch_log[idx].size,
+				wfw_monitor.ldt_watch_log[idx].val,
+				(unsigned)wfw_monitor.ldt_watch_log[idx].ldt_off,
+				wfw_monitor.ldt_watch_log[idx].sel);
+		}
+	}
+	/* TR/TSS snapshot for VM86 I/O permission diagnosis. */
+	{
+		int tr_type = cpu->seg[SEG_TR].flags & 0xf;
+		uint16_t tr_sel = cpu->seg[SEG_TR].sel;
+		uint32_t tr_base = cpu->seg[SEG_TR].base;
+		uint32_t tr_lim = cpu->seg[SEG_TR].limit;
+		bool tr32 = (tr_type == 9 || tr_type == 11);
+		bool iob_ok = false;
+		bool irb_ok = false;
+		uint16_t iobase = 0xffff;
+		char p20 = '?', p21 = '?', pa0 = '?', pa1 = '?';
+		char ir21 = '?', ir2f = '?';
+
+		if ((cpu->cr0 & 1) && tr32 && tr_lim >= 103 &&
+		    read_seg_u16_noexcept(cpu, SEG_TR, 102, 0, &iobase)) {
+			iob_ok = (iobase <= tr_lim);
+			if (iob_ok) {
+				const uint16_t ports[4] = { 0x20, 0x21, 0xA0, 0xA1 };
+				char *outs[4] = { &p20, &p21, &pa0, &pa1 };
+				for (int i = 0; i < 4; i++) {
+					uint32_t byte_off = (uint32_t)iobase + (ports[i] >> 3);
+					uint8_t perm;
+					if (byte_off > tr_lim) {
+						*outs[i] = 'X';
+					} else if (!read_seg_u8_noexcept(cpu, SEG_TR, byte_off, 0, &perm)) {
+						*outs[i] = '?';
+					} else {
+						*outs[i] = (perm & (1u << (ports[i] & 7))) ? 'D' : 'A';
+					}
+				}
+			}
+			/* IRB occupies 32 bytes immediately before I/O bitmap. */
+			if (iobase >= 32) {
+				uint32_t irb_base = (uint32_t)iobase - 32;
+				uint32_t b21 = irb_base + (0x21 >> 3);
+				uint32_t b2f = irb_base + (0x2F >> 3);
+				if (b21 <= tr_lim && b2f <= tr_lim) {
+					uint8_t v21, v2f;
+					if (read_seg_u8_noexcept(cpu, SEG_TR, b21, 0, &v21) &&
+					    read_seg_u8_noexcept(cpu, SEG_TR, b2f, 0, &v2f)) {
+						irb_ok = true;
+						ir21 = ((v21 >> (0x21 & 7)) & 1) ? '1' : '0';
+						ir2f = ((v2f >> (0x2F & 7)) & 1) ? '1' : '0';
+					}
+				}
+			}
+		}
+
+		dolog("tss: tr=%04x b=%08x l=%05x ty=%02x iob=%04x(%c) bm20=%c bm21=%c bma0=%c bma1=%c ir21=%c ir2f=%c\n",
+			tr_sel, tr_base, tr_lim, tr_type, iobase, iob_ok ? 'Y' : 'N',
+			p20, p21, pa0, pa1, irb_ok ? ir21 : '?', irb_ok ? ir2f : '?');
+	}
+	if (wfw_monitor.r3_first_captured) {
+		bool psp_valid = (wfw_monitor.psp_header[0] == 0xCD && wfw_monitor.psp_header[1] == 0x20);
+		dolog("psp: valid=%u es_base=%08x cmdtail_len=%u env=%04x->%08x src=%s\n",
+			psp_valid ? 1u : 0u, wfw_monitor.psp_ds_base, wfw_monitor.psp_cmdtail_len,
+			wfw_monitor.psp_env_seg, wfw_monitor.psp_env_lin,
+			wfw_monitor.psp_env_is_sel ? "sel" : "seg");
+	}
+	dolog("vm86: gp_total=%u soft_total=%u int21_soft=%u int2f_soft=%u int21_gp_log=%u\n",
+		gp_total, wfw_monitor.v86_softint_total, wfw_monitor.v86_int21_count,
+		wfw_monitor.v86_int2f_count, wfw_monitor.v86_int21_ah_count);
+	if (wfw_monitor.v86_int13_count > 0) {
+		dolog("int13: calls=%u ret=%u fail=%u p%u req=ax=%04x bx=%04x cx=%04x dx=%04x es=%04x ret=ax=%04x bx=%04x cx=%04x dx=%04x es=%04x cf=%u\n",
+			wfw_monitor.v86_int13_count, wfw_monitor.v86_int13_ret_count,
+			wfw_monitor.v86_int13_fail_count, wfw_monitor.v86_int13_last_path,
+			wfw_monitor.v86_int13_req_ax, wfw_monitor.v86_int13_req_bx,
+			wfw_monitor.v86_int13_req_cx, wfw_monitor.v86_int13_req_dx,
+			wfw_monitor.v86_int13_req_es, wfw_monitor.v86_int13_ret_ax,
+			wfw_monitor.v86_int13_ret_bx, wfw_monitor.v86_int13_ret_cx,
+			wfw_monitor.v86_int13_ret_dx, wfw_monitor.v86_int13_ret_es,
+			wfw_monitor.v86_int13_ret_cf);
+	}
+	if (wfw_monitor.abort_tail_count > 0) {
+		int cnt = wfw_monitor.abort_tail_count;
+		if (cnt > 10)
+			cnt = 10;
+		dolog("abort_trail:");
+		for (int i = 0; i < cnt; i++) {
+			int idx = (int)wfw_monitor.abort_tail_pos - cnt + i;
+			while (idx < 0)
+				idx += 16;
+			idx %= 16;
+			dolog(" [%02x/%c%d ah=%02x %04x:%08x ax=%04x bx=%04x cx=%04x dx=%04x ds=%04x]",
+				wfw_monitor.abort_tail[idx].vec,
+				wfw_monitor.abort_tail[idx].mode,
+				wfw_monitor.abort_tail[idx].cpl,
+				wfw_monitor.abort_tail[idx].ah,
+				wfw_monitor.abort_tail[idx].cs,
+				wfw_monitor.abort_tail[idx].ip,
+				wfw_monitor.abort_tail[idx].ax,
+				wfw_monitor.abort_tail[idx].bx,
+				wfw_monitor.abort_tail[idx].cx,
+				wfw_monitor.abort_tail[idx].dx,
+				wfw_monitor.abort_tail[idx].ds);
+		}
+		dolog("\n");
+	}
+	if (wfw_monitor.r3_ret_tail_count > 0) {
+		int cnt = wfw_monitor.r3_ret_tail_count;
+		if (cnt > 10)
+			cnt = 10;
+		dolog("r3_tail:");
+		for (int i = 0; i < cnt; i++) {
+			int idx = (int)wfw_monitor.r3_ret_tail_pos - cnt + i;
+			while (idx < 0)
+				idx += 16;
+			idx %= 16;
+			dolog(" [%02x %04x>%04x cf=%u %04x:%08x bx=%04x cx=%04x dx=%04x ds=%04x]",
+				wfw_monitor.r3_ret_tail[idx].vec,
+				wfw_monitor.r3_ret_tail[idx].in_ax,
+				wfw_monitor.r3_ret_tail[idx].out_ax,
+				wfw_monitor.r3_ret_tail[idx].cf,
+				wfw_monitor.r3_ret_tail[idx].out_cs,
+				wfw_monitor.r3_ret_tail[idx].out_ip,
+				wfw_monitor.r3_ret_tail[idx].out_bx,
+				wfw_monitor.r3_ret_tail[idx].out_cx,
+				wfw_monitor.r3_ret_tail[idx].out_dx,
+				wfw_monitor.r3_ret_tail[idx].out_ds);
+		}
+		dolog("\n");
+	}
+	if (wfw_monitor.flow_count > 0) {
+		int ordered[WFW_FLOW_RING_SIZE];
+		int pick_core[48];
+		int pick_abort[16];
+		int ncore = 0;
+		int nabort = 0;
+		int scan = wfw_monitor.flow_count;
+		if (scan > WFW_FLOW_RING_SIZE)
+			scan = WFW_FLOW_RING_SIZE;
+		for (int i = 0; i < scan; i++) {
+			int idx = (int)wfw_monitor.flow_pos - scan + i;
+			while (idx < 0)
+				idx += WFW_FLOW_RING_SIZE;
+			idx %= WFW_FLOW_RING_SIZE;
+			ordered[i] = idx;
+		}
+
+		for (int k = 0; k < scan && (ncore < 48 || nabort < 16); k++) {
+			int idx = (int)wfw_monitor.flow_pos - 1 - k;
+			while (idx < 0)
+				idx += WFW_FLOW_RING_SIZE;
+			idx %= WFW_FLOW_RING_SIZE;
+			if (wfw_monitor.flow_ring[idx].tag == 'A') {
+				if (nabort < 16)
+					pick_abort[nabort++] = idx;
+			} else {
+				if (ncore < 48)
+					pick_core[ncore++] = idx;
+			}
+		}
+
+		if (ncore > 0) {
+			dolog("flow_core:");
+			for (int pi = ncore - 1; pi >= 0; pi--) {
+				int idx = pick_core[pi];
+				switch (wfw_monitor.flow_ring[idx].tag) {
+				case 'R':
+					dolog(" [R%c%u/%02x %04x:%08x in=%04x ax=%04x bx=%04x cf=%u]",
+					      wfw_monitor.flow_ring[idx].mode, wfw_monitor.flow_ring[idx].cpl,
+					      wfw_monitor.flow_ring[idx].vec, wfw_monitor.flow_ring[idx].cs,
+					      wfw_monitor.flow_ring[idx].ip,
+					      (uint16_t)(wfw_monitor.flow_ring[idx].extra >> 16),
+					      wfw_monitor.flow_ring[idx].ax, wfw_monitor.flow_ring[idx].bx,
+					      (unsigned)(wfw_monitor.flow_ring[idx].extra & 1));
+					break;
+				case 'E':
+					if (wfw_monitor.flow_ring[idx].vec == EX_PF)
+						dolog(" [E%c%u/%02x %04x:%08x c2=%08x ax=%04x bx=%04x]",
+						      wfw_monitor.flow_ring[idx].mode, wfw_monitor.flow_ring[idx].cpl,
+						      wfw_monitor.flow_ring[idx].vec, wfw_monitor.flow_ring[idx].cs,
+						      wfw_monitor.flow_ring[idx].ip, wfw_monitor.flow_ring[idx].extra,
+						      wfw_monitor.flow_ring[idx].ax, wfw_monitor.flow_ring[idx].bx);
+					else
+						dolog(" [E%c%u/%02x %04x:%08x err=%x ax=%04x bx=%04x]",
+						      wfw_monitor.flow_ring[idx].mode, wfw_monitor.flow_ring[idx].cpl,
+						      wfw_monitor.flow_ring[idx].vec, wfw_monitor.flow_ring[idx].cs,
+						      wfw_monitor.flow_ring[idx].ip, wfw_monitor.flow_ring[idx].extra,
+						      wfw_monitor.flow_ring[idx].ax, wfw_monitor.flow_ring[idx].bx);
+					break;
+				case 'D':
+					dolog(" [D%c%u/%02x %04x:%08x err=%x ax=%04x bx=%04x]",
+					      wfw_monitor.flow_ring[idx].mode, wfw_monitor.flow_ring[idx].cpl,
+					      wfw_monitor.flow_ring[idx].vec, wfw_monitor.flow_ring[idx].cs,
+					      wfw_monitor.flow_ring[idx].ip, wfw_monitor.flow_ring[idx].extra,
+					      wfw_monitor.flow_ring[idx].ax, wfw_monitor.flow_ring[idx].bx);
+					break;
+				case 'H':
+					dolog(" [H%c%u/%02x %04x:%08x ax=%04x src=%04x]",
+					      wfw_monitor.flow_ring[idx].mode, wfw_monitor.flow_ring[idx].cpl,
+					      wfw_monitor.flow_ring[idx].vec, wfw_monitor.flow_ring[idx].cs,
+					      wfw_monitor.flow_ring[idx].ip, wfw_monitor.flow_ring[idx].ax,
+					      (uint16_t)wfw_monitor.flow_ring[idx].extra);
+					break;
+				case 'K':
+					dolog(" [K%c%u/%02x %04x:%08x req=%04x ret=%04x bx=%04x cf=%u]",
+					      wfw_monitor.flow_ring[idx].mode, wfw_monitor.flow_ring[idx].cpl,
+					      wfw_monitor.flow_ring[idx].vec, wfw_monitor.flow_ring[idx].cs,
+					      wfw_monitor.flow_ring[idx].ip,
+					      (uint16_t)(wfw_monitor.flow_ring[idx].extra >> 16),
+					      wfw_monitor.flow_ring[idx].ax,
+					      wfw_monitor.flow_ring[idx].bx,
+					      (unsigned)(wfw_monitor.flow_ring[idx].extra & 1));
+					break;
+				case 'Q':
+					dolog(" [Q%c%u/%02x %04x:%08x in=%04x out=%04x bx=%04x r=%u cf=%u]",
+					      wfw_monitor.flow_ring[idx].mode, wfw_monitor.flow_ring[idx].cpl,
+					      wfw_monitor.flow_ring[idx].vec, wfw_monitor.flow_ring[idx].cs,
+					      wfw_monitor.flow_ring[idx].ip,
+					      (uint16_t)(wfw_monitor.flow_ring[idx].extra >> 16),
+					      wfw_monitor.flow_ring[idx].ax,
+					      wfw_monitor.flow_ring[idx].bx,
+					      (unsigned)((wfw_monitor.flow_ring[idx].extra >> 8) & 0xff),
+					      (unsigned)(wfw_monitor.flow_ring[idx].extra & 1));
+					break;
+				default:
+					dolog(" [%c%c%u/%02x %04x:%08x ax=%04x bx=%04x ex=%x]",
+					      wfw_monitor.flow_ring[idx].tag, wfw_monitor.flow_ring[idx].mode,
+					      wfw_monitor.flow_ring[idx].cpl, wfw_monitor.flow_ring[idx].vec,
+					      wfw_monitor.flow_ring[idx].cs, wfw_monitor.flow_ring[idx].ip,
+					      wfw_monitor.flow_ring[idx].ax, wfw_monitor.flow_ring[idx].bx,
+					      wfw_monitor.flow_ring[idx].extra);
+					break;
+				}
+			}
+			dolog("\n");
+		}
+		if (nabort > 0) {
+			dolog("flow_abort:");
+			for (int pi = nabort - 1; pi >= 0; pi--) {
+				int idx = pick_abort[pi];
+				dolog(" [A%c%u/%02x %04x:%08x ah=%02x ax=%04x bx=%04x]",
+				      wfw_monitor.flow_ring[idx].mode, wfw_monitor.flow_ring[idx].cpl,
+				      wfw_monitor.flow_ring[idx].vec, wfw_monitor.flow_ring[idx].cs,
+				      wfw_monitor.flow_ring[idx].ip,
+				      (unsigned)(wfw_monitor.flow_ring[idx].extra & 0xff),
+				      wfw_monitor.flow_ring[idx].ax, wfw_monitor.flow_ring[idx].bx);
+			}
+			dolog("\n");
+		}
+			/* Event immediately preceding the first abort-site DOS call.
+			 * Skip contiguous abort-site entries and print the nearest
+			 * non-abort event so the ring-0 origin is always visible. */
+			{
+				int first_abort_pos = -1;
+				for (int i = 0; i < scan; i++) {
+					if (wfw_monitor.flow_ring[ordered[i]].tag == 'A') {
+						first_abort_pos = i;
+						break;
+					}
+				}
+				if (first_abort_pos >= 0) {
+					int prev = first_abort_pos - 1;
+					while (prev >= 0 && wfw_monitor.flow_ring[ordered[prev]].tag == 'A')
+						prev--;
+					if (prev >= 0) {
+						int idx = ordered[prev];
+						dolog("pre_abort_origin: [%c%c%u/%02x %04x:%08x ax=%04x bx=%04x ex=%x]\n",
+						      wfw_monitor.flow_ring[idx].tag,
+						      wfw_monitor.flow_ring[idx].mode,
+						      wfw_monitor.flow_ring[idx].cpl,
+						      wfw_monitor.flow_ring[idx].vec,
+						      wfw_monitor.flow_ring[idx].cs,
+						      wfw_monitor.flow_ring[idx].ip,
+						      wfw_monitor.flow_ring[idx].ax,
+						      wfw_monitor.flow_ring[idx].bx,
+						      wfw_monitor.flow_ring[idx].extra);
+					}
+				}
+			}
+		}
+		dolog("vm86_gpvec:13=%u 16=%u 1a=%u 1c=%u 21=%u 28=%u 2a=%u 2f=%u 4b=%u\n",
+			wfw_monitor.v86_int_gp_counts[0x13], wfw_monitor.v86_int_gp_counts[0x16],
+			wfw_monitor.v86_int_gp_counts[0x1a], wfw_monitor.v86_int_gp_counts[0x1c],
+			wfw_monitor.v86_int_gp_counts[0x21], wfw_monitor.v86_int_gp_counts[0x28],
+			wfw_monitor.v86_int_gp_counts[0x2a], wfw_monitor.v86_int_gp_counts[0x2f],
+			wfw_monitor.v86_int_gp_counts[0x4b]);
+		if (wfw_monitor.lowvec_softint_total > 0) {
+			dolog("lowvec_softint: total=%u 11=%u 13=%u 16=%u 19=%u 1a=%u 1c=%u\n",
+				wfw_monitor.lowvec_softint_total,
+				wfw_monitor.lowvec_softint_hist[0x11],
+				wfw_monitor.lowvec_softint_hist[0x13],
+				wfw_monitor.lowvec_softint_hist[0x16],
+				wfw_monitor.lowvec_softint_hist[0x19],
+				wfw_monitor.lowvec_softint_hist[0x1a],
+				wfw_monitor.lowvec_softint_hist[0x1c]);
+		}
+		if (wfw_monitor.vm86_int_evt_count > 0) {
+			dolog("vm86_evt:");
+			for (int i = 0; i < wfw_monitor.vm86_int_evt_count; i++) {
+				dolog(" [%02x p%u i%u ax=%04x %04x:%04x]",
+					wfw_monitor.vm86_int_evt[i].vec,
+					wfw_monitor.vm86_int_evt[i].path,
+					wfw_monitor.vm86_int_evt[i].iopl,
+					wfw_monitor.vm86_int_evt[i].ax,
+					wfw_monitor.vm86_int_evt[i].cs,
+					wfw_monitor.vm86_int_evt[i].ip);
+			}
+			dolog("\n");
+		}
+	if (wfw_monitor.iopl3_captured) {
+		dolog("iopl3: after_irets=%u from=%04x:%08x to=%04x:%08x fl=%08x ivt2f=%04x:%04x\n",
+			wfw_monitor.iopl3_iret_count,
+			wfw_monitor.iopl3_from_cs, wfw_monitor.iopl3_from_eip,
+			wfw_monitor.iopl3_to_cs, wfw_monitor.iopl3_to_ip,
+			wfw_monitor.iopl3_eflags,
+			wfw_monitor.iopl3_ivt_2f >> 16, wfw_monitor.iopl3_ivt_2f & 0xffff);
+	} else {
+		dolog("iopl3: never_reached (pm_to_vm86_irets=%u)\n", wfw_monitor.iopl3_iret_count);
+	}
+	if (wfw_monitor.post_iopl3_fault_captured) {
+		dolog("post_iopl3: exc=%02x@%04x:%08x fl=%08x err=%08x",
+			wfw_monitor.post_iopl3_excno, wfw_monitor.post_iopl3_cs,
+			wfw_monitor.post_iopl3_eip, wfw_monitor.post_iopl3_fl,
+			wfw_monitor.post_iopl3_err);
+		if (wfw_monitor.post_iopl3_decoded[0])
+			dolog(" dec=%s", wfw_monitor.post_iopl3_decoded);
+		if (wfw_monitor.post_iopl3_blen > 0) {
+			dolog(" b=");
+			for (int i = 0; i < wfw_monitor.post_iopl3_blen; i++)
+				dolog("%02x", wfw_monitor.post_iopl3_bytes[i]);
+		}
+		if (wfw_monitor.post_iopl3_last_evt >= 0 &&
+		    wfw_monitor.post_iopl3_last_evt < (int8_t)wfw_monitor.vm86_int_evt_count) {
+			int k = wfw_monitor.post_iopl3_last_evt;
+			dolog(" prev=[%02x p%u i%u ax=%04x %04x:%04x]",
+				wfw_monitor.vm86_int_evt[k].vec,
+				wfw_monitor.vm86_int_evt[k].path,
+				wfw_monitor.vm86_int_evt[k].iopl,
+				wfw_monitor.vm86_int_evt[k].ax,
+				wfw_monitor.vm86_int_evt[k].cs,
+				wfw_monitor.vm86_int_evt[k].ip);
+		}
+		dolog("\n");
+	}
+	if (vm86_trip.gen == cpu->diag_gen) {
+		if (vm86_trip.has_first_bad) {
+			dolog("trip: n=%u frozen=%u first=#%02x@%04x:%08x dec=%s\n",
+				vm86_trip.count, vm86_trip.frozen ? 1u : 0u,
+				vm86_trip.first_bad_exc, vm86_trip.first_bad_cs,
+				vm86_trip.first_bad_ip, vm86_trip.first_bad_decoded);
+		} else {
+			dolog("trip: n=%u frozen=%u first=<none>\n",
+				vm86_trip.count, vm86_trip.frozen ? 1u : 0u);
+		}
+	}
+	if (wfw_monitor.bios_hot_count > 0) {
+		dolog("bios_hot:");
+		for (int i = 0; i < wfw_monitor.bios_hot_count; i++) {
+			dolog(" [%04x:%04x %s x%u refl=%u adv=%u",
+				wfw_monitor.bios_hot[i].cs, wfw_monitor.bios_hot[i].ip,
+				(wfw_monitor.bios_hot[i].exc == EX_GP) ? "#GP" : "#UD",
+				wfw_monitor.bios_hot[i].count,
+				wfw_monitor.bios_hot[i].resume_same,
+				wfw_monitor.bios_hot[i].resume_other);
+			if (wfw_monitor.bios_hot[i].decoded[0])
+				dolog(" dec=%s", wfw_monitor.bios_hot[i].decoded);
+			if (wfw_monitor.bios_hot[i].blen > 0) {
+				dolog(" b=");
+				for (int j = 0; j < wfw_monitor.bios_hot[i].blen; j++)
+					dolog("%02x", wfw_monitor.bios_hot[i].bytes[j]);
+			}
+			dolog("]");
+		}
+		dolog("\n");
+	}
+		if (wfw_monitor.ud63_hot_count > 0) {
+			dolog("op63:");
+		for (int i = 0; i < wfw_monitor.ud63_hot_count; i++) {
+			uint32_t adv = (uint32_t)wfw_monitor.ud63_hot[i].resume_next4 +
+				       (uint32_t)wfw_monitor.ud63_hot[i].resume_next8 +
+				       (uint32_t)wfw_monitor.ud63_hot[i].resume_other;
+			dolog(" [%04x:%04x x%u refl=%u adv=%u(+4=%u +8=%u ro=%u) ax=%04x>%04x bx=%04x cx=%04x dx=%04x si=%04x di=%04x ss:sp=%04x:%04x fl=%08x rfl=%08x cf=%u",
+				wfw_monitor.ud63_hot[i].cs, wfw_monitor.ud63_hot[i].ip,
+				wfw_monitor.ud63_hot[i].count,
+				wfw_monitor.ud63_hot[i].resume_same,
+				adv,
+				wfw_monitor.ud63_hot[i].resume_next4,
+				wfw_monitor.ud63_hot[i].resume_next8,
+				wfw_monitor.ud63_hot[i].resume_other,
+				wfw_monitor.ud63_hot[i].ax,
+				wfw_monitor.ud63_hot[i].out_ax,
+				wfw_monitor.ud63_hot[i].bx,
+				wfw_monitor.ud63_hot[i].cx, wfw_monitor.ud63_hot[i].dx,
+				wfw_monitor.ud63_hot[i].si, wfw_monitor.ud63_hot[i].di,
+				wfw_monitor.ud63_hot[i].ss,
+				(uint16_t)(wfw_monitor.ud63_hot[i].sp & 0xffff),
+				wfw_monitor.ud63_hot[i].fl,
+				wfw_monitor.ud63_hot[i].out_fl,
+				wfw_monitor.ud63_hot[i].cf_set);
+			if (wfw_monitor.ud63_hot[i].blen > 0) {
+				dolog(" b=");
+				for (int j = 0; j < wfw_monitor.ud63_hot[i].blen; j++)
+					dolog("%02x", wfw_monitor.ud63_hot[i].bytes[j]);
+			}
+			dolog("]");
+			}
+			dolog("\n");
+		}
+		if (wfw_monitor.ud63_fe95_0127.seen > 0) {
+			dolog("op63_fe95_0127: seen=%u resumed=%u changed=%u pending=%u\n",
+				(unsigned)wfw_monitor.ud63_fe95_0127.seen,
+				(unsigned)wfw_monitor.ud63_fe95_0127.resumed,
+				(unsigned)wfw_monitor.ud63_fe95_0127.desc_changed,
+				wfw_monitor.pending_ud63_fe95_0127 ? 1u : 0u);
+			dolog("  pre@%04x:%04x ds=%04x ax=%04x fl=%08x 0127=[%08x %08x]",
+				wfw_monitor.ud63_fe95_0127.pre_cs,
+				wfw_monitor.ud63_fe95_0127.pre_ip,
+				wfw_monitor.ud63_fe95_0127.pre_ds,
+				wfw_monitor.ud63_fe95_0127.pre_ax,
+				wfw_monitor.ud63_fe95_0127.pre_fl,
+				wfw_monitor.ud63_fe95_0127.pre_w1,
+				wfw_monitor.ud63_fe95_0127.pre_w2);
+			if (wfw_monitor.ud63_fe95_0127.pre_w1 != 0xffffffffu ||
+			    wfw_monitor.ud63_fe95_0127.pre_w2 != 0xffffffffu) {
+				dolog(" b=%08x l=%08x fl=%04x",
+					wfw_desc_base_u32(wfw_monitor.ud63_fe95_0127.pre_w1,
+							wfw_monitor.ud63_fe95_0127.pre_w2),
+					wfw_desc_limit_u32(wfw_monitor.ud63_fe95_0127.pre_w1,
+							 wfw_monitor.ud63_fe95_0127.pre_w2),
+					wfw_desc_flags_u16(wfw_monitor.ud63_fe95_0127.pre_w2));
+			}
+			dolog("\n");
+			if (wfw_monitor.ud63_fe95_0127.resumed > 0) {
+				dolog("  post->%04x:%04x ds_now=%04x ds_tgt=%04x ax=%04x fl=%08x 0127=[%08x %08x]",
+					wfw_monitor.ud63_fe95_0127.post_cs,
+					wfw_monitor.ud63_fe95_0127.post_ip,
+					wfw_monitor.ud63_fe95_0127.post_ds,
+					wfw_monitor.ud63_fe95_0127.resume_ds,
+					wfw_monitor.ud63_fe95_0127.post_ax,
+					wfw_monitor.ud63_fe95_0127.post_fl,
+					wfw_monitor.ud63_fe95_0127.post_w1,
+					wfw_monitor.ud63_fe95_0127.post_w2);
+				if (wfw_monitor.ud63_fe95_0127.post_w1 != 0xffffffffu ||
+				    wfw_monitor.ud63_fe95_0127.post_w2 != 0xffffffffu) {
+					dolog(" b=%08x l=%08x fl=%04x",
+						wfw_desc_base_u32(wfw_monitor.ud63_fe95_0127.post_w1,
+								wfw_monitor.ud63_fe95_0127.post_w2),
+						wfw_desc_limit_u32(wfw_monitor.ud63_fe95_0127.post_w1,
+								 wfw_monitor.ud63_fe95_0127.post_w2),
+						wfw_desc_flags_u16(wfw_monitor.ud63_fe95_0127.post_w2));
+				}
+				dolog("\n");
+			}
+			dolog("  near_changed: %04x=%u %04x=%u %04x=%u %04x=%u\n",
+				wfw_ud63_near_sels[0], (unsigned)wfw_monitor.ud63_fe95_0127.near_changed[0],
+				wfw_ud63_near_sels[1], (unsigned)wfw_monitor.ud63_fe95_0127.near_changed[1],
+				wfw_ud63_near_sels[2], (unsigned)wfw_monitor.ud63_fe95_0127.near_changed[2],
+				wfw_ud63_near_sels[3], (unsigned)wfw_monitor.ud63_fe95_0127.near_changed[3]);
+			dolog("  near_pre: ");
+			for (int k = 0; k < 4; k++) {
+				if (k)
+					dolog(" ");
+				if (wfw_monitor.ud63_fe95_0127.pre_near_ok & (1u << k)) {
+					dolog("%04x=[%08x %08x]",
+						wfw_ud63_near_sels[k],
+						wfw_monitor.ud63_fe95_0127.pre_near_w1[k],
+						wfw_monitor.ud63_fe95_0127.pre_near_w2[k]);
+				} else {
+					dolog("%04x=[???????? ????????]", wfw_ud63_near_sels[k]);
+				}
+			}
+			dolog("\n");
+			if (wfw_monitor.ud63_fe95_0127.resumed > 0) {
+				dolog("  near_post:");
+				for (int k = 0; k < 4; k++) {
+					if (k)
+						dolog(" ");
+					if (wfw_monitor.ud63_fe95_0127.post_near_ok & (1u << k)) {
+						dolog("%04x=[%08x %08x]",
+							wfw_ud63_near_sels[k],
+							wfw_monitor.ud63_fe95_0127.post_near_w1[k],
+							wfw_monitor.ud63_fe95_0127.post_near_w2[k]);
+					} else {
+						dolog("%04x=[???????? ????????]", wfw_ud63_near_sels[k]);
+					}
+				}
+				dolog("\n");
+			}
+			dolog("  cb_retax: ax5=%u other=%u last=%04x\n",
+				(unsigned)wfw_monitor.ud63_fe95_0127.ret_ax5,
+				(unsigned)wfw_monitor.ud63_fe95_0127.ret_ax_other,
+				wfw_monitor.ud63_fe95_0127.ret_ax_last);
+			if (wfw_monitor.ud63_fe95_0127.t6ca7_count > 0) {
+				dolog("  cb_t6ca7: count=%u bit2_set=%u bit2_clear=%u last=%02x ss:bp=%04x:%04x\n",
+					(unsigned)wfw_monitor.ud63_fe95_0127.t6ca7_count,
+					(unsigned)wfw_monitor.ud63_fe95_0127.t6ca7_bit_set,
+					(unsigned)wfw_monitor.ud63_fe95_0127.t6ca7_bit_clear,
+					(unsigned)wfw_monitor.ud63_fe95_0127.t6ca7_last_byte,
+					wfw_monitor.ud63_fe95_0127.t6ca7_last_ss,
+					wfw_monitor.ud63_fe95_0127.t6ca7_last_bp);
+			}
+			if (wfw_monitor.ud63_fe95_0127.j6cab_count > 0 ||
+			    wfw_monitor.ud63_fe95_0127.j6cab_pending) {
+				dolog("  cb_j6cab: count=%u taken=%u not=%u other=%u pending=%u zf=%u from=%04x:%04x tgt=%04x fall=%04x to=%04x:%04x\n",
+					(unsigned)wfw_monitor.ud63_fe95_0127.j6cab_count,
+					(unsigned)wfw_monitor.ud63_fe95_0127.j6cab_taken,
+					(unsigned)wfw_monitor.ud63_fe95_0127.j6cab_not_taken,
+					(unsigned)wfw_monitor.ud63_fe95_0127.j6cab_other,
+					wfw_monitor.ud63_fe95_0127.j6cab_pending ? 1u : 0u,
+					(unsigned)wfw_monitor.ud63_fe95_0127.j6cab_last_zf,
+					wfw_monitor.ud63_fe95_0127.j6cab_last_from_cs,
+					wfw_monitor.ud63_fe95_0127.j6cab_last_from_ip,
+					wfw_monitor.ud63_fe95_0127.j6cab_last_tgt,
+					wfw_monitor.ud63_fe95_0127.j6cab_last_fall,
+					wfw_monitor.ud63_fe95_0127.j6cab_last_to_cs,
+					wfw_monitor.ud63_fe95_0127.j6cab_last_to_ip);
+			}
+			if (wfw_monitor.ud63_fe95_0127.ax5_transitions > 0) {
+				dolog("  cb_ax5: trans=%u from=%04x:%04x ax=%04x to=%04x:%04x ax=%04x b=",
+					(unsigned)wfw_monitor.ud63_fe95_0127.ax5_transitions,
+					wfw_monitor.ud63_fe95_0127.ax5_from_cs,
+					wfw_monitor.ud63_fe95_0127.ax5_from_ip,
+					wfw_monitor.ud63_fe95_0127.ax5_from_ax,
+					wfw_monitor.ud63_fe95_0127.ax5_to_cs,
+					wfw_monitor.ud63_fe95_0127.ax5_to_ip,
+					wfw_monitor.ud63_fe95_0127.ax5_to_ax);
+				if (wfw_monitor.ud63_fe95_0127.ax5_from_blen == 0) {
+					dolog("??");
+				} else {
+					for (int j = 0; j < wfw_monitor.ud63_fe95_0127.ax5_from_blen; j++)
+						dolog("%02x", wfw_monitor.ud63_fe95_0127.ax5_from_bytes[j]);
+				}
+				dolog("\n");
+			}
+			if (wfw_monitor.ud63_fe95_0127.trace_done ||
+			    wfw_monitor.ud63_fe95_0127.trace_active) {
+				dolog("  cb_trace: active=%u done=%u steps=%u entry_ax=%04x",
+					wfw_monitor.ud63_fe95_0127.trace_active ? 1u : 0u,
+					wfw_monitor.ud63_fe95_0127.trace_done ? 1u : 0u,
+					(unsigned)wfw_monitor.ud63_fe95_0127.trace_count,
+					wfw_monitor.ud63_fe95_0127.trace_entry_ax);
+				if (wfw_monitor.ud63_fe95_0127.trace_ax5_valid)
+					dolog(" ax5@%04x:%04x %04x>%04x",
+						wfw_monitor.ud63_fe95_0127.trace_ax5_cs,
+						wfw_monitor.ud63_fe95_0127.trace_ax5_ip,
+						wfw_monitor.ud63_fe95_0127.trace_ax5_prev,
+						wfw_monitor.ud63_fe95_0127.trace_ax5_ax);
+				dolog("\n");
+				for (int t = 0; t < wfw_monitor.ud63_fe95_0127.trace_count; t++) {
+					dolog("    [%2d] %04x:%04x ax=%04x bx=%04x cx=%04x dx=%04x si=%04x di=%04x bp=%04x sp=%04x fl=%08x b=",
+						t,
+						wfw_monitor.ud63_fe95_0127.trace[t].cs,
+						wfw_monitor.ud63_fe95_0127.trace[t].ip,
+						wfw_monitor.ud63_fe95_0127.trace[t].ax,
+						wfw_monitor.ud63_fe95_0127.trace[t].bx,
+						wfw_monitor.ud63_fe95_0127.trace[t].cx,
+						wfw_monitor.ud63_fe95_0127.trace[t].dx,
+						wfw_monitor.ud63_fe95_0127.trace[t].si,
+						wfw_monitor.ud63_fe95_0127.trace[t].di,
+						wfw_monitor.ud63_fe95_0127.trace[t].bp,
+						wfw_monitor.ud63_fe95_0127.trace[t].sp,
+						wfw_monitor.ud63_fe95_0127.trace[t].fl);
+					if (wfw_monitor.ud63_fe95_0127.trace[t].blen == 0)
+						dolog("??");
+					else
+						for (int j = 0; j < wfw_monitor.ud63_fe95_0127.trace[t].blen; j++)
+							dolog("%02x", wfw_monitor.ud63_fe95_0127.trace[t].bytes[j]);
+					dolog("\n");
+				}
+			}
+		}
+	if (wfw_monitor.swint_dpl_count > 0) {
+			dolog("swint_dpl:");
+		for (int i = 0; i < wfw_monitor.swint_dpl_count; i++) {
+			dolog(" [%02x x%u first=%04x:%08x/e=%x rs=%u rn=%u ro=%u ax=%04x>%04x bx=%04x>%04x cf=%u fl=%08x]",
+				wfw_monitor.swint_dpl[i].vec,
+				wfw_monitor.swint_dpl[i].count,
+				wfw_monitor.swint_dpl[i].first_cs,
+				wfw_monitor.swint_dpl[i].first_ip,
+				wfw_monitor.swint_dpl[i].first_err,
+				wfw_monitor.swint_dpl[i].resume_same,
+				wfw_monitor.swint_dpl[i].resume_next,
+				wfw_monitor.swint_dpl[i].resume_other,
+				wfw_monitor.swint_dpl[i].in_ax,
+				wfw_monitor.swint_dpl[i].out_ax,
+				wfw_monitor.swint_dpl[i].in_bx,
+				wfw_monitor.swint_dpl[i].out_bx,
+				wfw_monitor.swint_dpl[i].cf_set,
+				wfw_monitor.swint_dpl[i].out_fl);
+		}
+		dolog("\n");
+	}
+	if (wfw_monitor.dpl_tail_count > 0) {
+		int cnt = wfw_monitor.dpl_tail_count;
+		if (cnt > 12)
+			cnt = 12;
+		dolog("dpl_tail:");
+		for (int i = 0; i < cnt; i++) {
+			int idx = (int)wfw_monitor.dpl_tail_pos - cnt + i;
+			while (idx < 0)
+				idx += 16;
+			idx %= 16;
+			dolog(" [%02x %04x>%04x bx=%04x>%04x r=%u cf=%u %04x:%08x=>%04x:%08x]",
+				wfw_monitor.dpl_tail[idx].vec,
+				wfw_monitor.dpl_tail[idx].in_ax,
+				wfw_monitor.dpl_tail[idx].out_ax,
+				wfw_monitor.dpl_tail[idx].in_bx,
+				wfw_monitor.dpl_tail[idx].out_bx,
+				wfw_monitor.dpl_tail[idx].rcls,
+				wfw_monitor.dpl_tail[idx].cf,
+				wfw_monitor.dpl_tail[idx].in_cs,
+				wfw_monitor.dpl_tail[idx].in_ip,
+				wfw_monitor.dpl_tail[idx].out_cs,
+				wfw_monitor.dpl_tail[idx].out_ip);
+		}
+		dolog("\n");
+	}
+	if (wfw_monitor.seg100f_base_count > 0) {
+		dolog("sel100f:");
+		for (int i = 0; i < wfw_monitor.seg100f_base_count; i++)
+			dolog(" %05x", wfw_monitor.seg100f_bases[i]);
+		dolog("\n");
+	}
+	if (wfw_monitor.has_fatal) {
+		dolog("fatal: exc=%02x@%04x:%08x ds=%04x es=%04x ss:esp=%04x:%08x fl=%08x cpl=%u vm=%u ext=%u pe=%u",
+			wfw_monitor.fatal_excno, wfw_monitor.fatal_cs, wfw_monitor.fatal_eip,
+			wfw_monitor.fatal_ds, wfw_monitor.fatal_es,
+			wfw_monitor.fatal_ss, wfw_monitor.fatal_esp, wfw_monitor.fatal_efl,
+			wfw_monitor.fatal_cpl, wfw_monitor.fatal_vm,
+			wfw_monitor.fatal_ext, wfw_monitor.fatal_pusherr);
+		if (wfw_monitor.fatal_decoded[0])
+			dolog(" dec=%s", wfw_monitor.fatal_decoded);
+		if (wfw_monitor.fatal_blen > 0) {
+			dolog(" b=");
+			for (int i = 0; i < wfw_monitor.fatal_blen; i++)
+				dolog("%02x", wfw_monitor.fatal_bytes[i]);
+		}
+		dolog("\n");
+	}
+	{
+		int n = exc_ring_pos > 8 ? 8 : exc_ring_pos;
+		if (n > 0) {
+			int start = exc_ring_pos - n;
+			dolog("tail:");
+			for (int i = start; i < exc_ring_pos; i++) {
+				int j = i & EXC_RING_MASK;
+				if (exc_ring[j].no == EX_PF)
+					dolog(" %c%02d@%04x:%08x/e=%x/c2=%08x",
+						exc_ring[j].mode, exc_ring[j].no,
+						exc_ring[j].cs, exc_ring[j].ip,
+						exc_ring[j].err, exc_ring[j].cr2);
+				else
+					dolog(" %c%02d@%04x:%08x/e=%x",
+						exc_ring[j].mode, exc_ring[j].no,
+						exc_ring[j].cs, exc_ring[j].ip,
+						exc_ring[j].err);
+			}
+			dolog("\n");
+		}
+	}
+	dolog("=== End WfW Boot Monitor ===\n");
 }
 
 static void cpu_diag_log_int21(CPUI386 *cpu)
@@ -2937,24 +5802,32 @@ static void cpu_diag_log_int21(CPUI386 *cpu)
 		dolog("  at CS:EIP=%04x:%08x %s FL=%08x\n",
 			cpu->seg[SEG_CS].sel, cpu->ip,
 			cpu_mode_name(cpu->flags, cpu->cr0), cpu->flags);
-		if (cpu_diag_str_has_win386(text)) {
-			win386_diag.active = true;
-			win386_diag.code_cs = 0;
-			win386_diag.int21_count = 0;
-			win386_diag.int2f_count = 0;
-			win386_diag.pm_exc_count = 0;
+			if (cpu_diag_str_has_win386(text)) {
+				win386_diag.active = true;
+				win386_diag.code_cs = 0;
+				win386_diag.int21_count = 0;
+				win386_diag.int2f_count = 0;
+				win386_diag.pm_exc_count = 0;
+				memset(&wfw_monitor, 0, sizeof(wfw_monitor));
+				memset(&vm86_trip, 0, sizeof(vm86_trip));
+				vm86_trip.gen = cpu->diag_gen;
+				memset(&dpmi_trace, 0, sizeof(dpmi_trace));
+				wfw_monitor.pending_bios_fault_idx = -1;
+				wfw_monitor.pending_ud63_idx = -1;
+				wfw_monitor.pending_swint_dpl_idx = -1;
+				wfw_monitor.post_iopl3_last_evt = -1;
+				wfw_monitor.a20_state = (cpu->a20_mask == 0xFFFFFFFF) ? 1 : 0;
+			wfw_monitor.ivt_2f_at_start = *(uint32_t*)(cpu->phys_mem + 0x2f * 4);
 			dolog("=== WIN386 trace start ===\n");
 		}
 		return;
 	}
 
-	if (win386_diag.active && ah != 0x40 && ah != 0x09 && win386_diag.int21_count < 160) {
+	if (win386_diag.active && ah != 0x40 && ah != 0x09) {
 		win386_diag.int21_count++;
-		dolog("=== WIN386 INT21 #%u === AH=%02x AL=%02x AX=%04x BX=%04x CX=%04x DX=%04x DS=%04x ES=%04x at %04x:%08x\n",
-			win386_diag.int21_count, ah, al, ax, bx, cx, dx,
-			cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
-			cpu->seg[SEG_CS].sel, cpu->ip);
 	}
+	if (win386_diag.active)
+		wfw_abort_tail_push(cpu, 0x21, ax, bx, cx, dx);
 
 	if (ah == 0x4c || ah == 0x31 || ah == 0x00 || ah == 0x27) {
 		dolog("=== INT 21h TERMINATE ===\n");
@@ -2967,13 +5840,18 @@ static void cpu_diag_log_int21(CPUI386 *cpu)
 			dolog("  last VM86 fault: exc=%02x CS:EIP=%04x:%08x FL=%08x err=%08x %s\n",
 				vm86_last_fault.excno, vm86_last_fault.cs, vm86_last_fault.ip,
 				vm86_last_fault.fl, vm86_last_fault.err, vm86_last_fault.decoded);
-			cpu_diag_vm86_fault_ring_dump_tail(24);
-			cpu_diag_vm86_iret_ring_dump_tail(24);
+			/* Only dump full tail during WIN386 session to avoid
+			 * repetitive dumps from parent process exits */
+			if (win386_diag.active) {
+				cpu_diag_vm86_fault_ring_dump_tail(8);
+				cpu_diag_vm86_iret_ring_dump_tail(8);
+			}
 		}
 		if (win386_diag.active) {
 			if (win386_diag.code_cs == 0)
 				win386_diag.code_cs = cpu->seg[SEG_CS].sel;
 			if (cpu->seg[SEG_CS].sel == win386_diag.code_cs) {
+				wfw_monitor_dump(cpu, "WIN386 exit");
 				dolog("=== WIN386 trace stop ===\n");
 				dolog("  exit code AL=%02x CS=%04x int21=%u int2f=%u pm_exc=%u\n",
 					al, cpu->seg[SEG_CS].sel, win386_diag.int21_count,
@@ -3024,21 +5902,19 @@ static void cpu_diag_log_int21(CPUI386 *cpu)
 
 static void cpu_diag_log_int2f(CPUI386 *cpu)
 {
-	u16 ax, bx, cx, dx;
 	if (!cpu_diag_enabled)
 		return;
 	cpu_diag_win386_sync(cpu);
-	if (!win386_diag.active || win386_diag.int2f_count >= 160)
+	if (!win386_diag.active)
 		return;
-	ax = lreg16(0);
-	bx = lreg16(3);
-	cx = lreg16(1);
-	dx = lreg16(2);
+	{
+		uint16_t ax = lreg16(0);
+		uint16_t bx = lreg16(3);
+		uint16_t cx = lreg16(1);
+		uint16_t dx = lreg16(2);
+		wfw_abort_tail_push(cpu, 0x2f, ax, bx, cx, dx);
+	}
 	win386_diag.int2f_count++;
-	dolog("=== WIN386 INT2F #%u === AX=%04x BX=%04x CX=%04x DX=%04x DS=%04x ES=%04x at %04x:%08x\n",
-		win386_diag.int2f_count, ax, bx, cx, dx,
-		cpu->seg[SEG_DS].sel, cpu->seg[SEG_ES].sel,
-		cpu->seg[SEG_CS].sel, cpu->ip);
 }
 
 /*
@@ -3658,6 +6534,8 @@ static void cpu_diag_log_int2f(CPUI386 *cpu)
 	} else if (reg == 3) { \
 		sreg32(rm, cpu->cr3); \
 	} else if (reg == 4) { \
+		/* CR4 exists on Pentium+ (gen >= 5), not 486. */ \
+		if (cpu->gen < 5) THROW0(EX_UD); \
 		sreg32(rm, cpu->cr4); \
 	} else THROW0(EX_UD);
 
@@ -3689,6 +6567,8 @@ static void cpu_diag_log_int2f(CPUI386 *cpu)
 		SEQ_INVALIDATE(cpu); \
 		if (unlikely(cpu_diag_enabled && pf_diag.active)) pf_diag.cr3_write_count++; \
 	} else if (reg == 4) { \
+		/* CR4 exists on Pentium+ (gen >= 5), not 486. */ \
+		if (cpu->gen < 5) THROW0(EX_UD); \
 		u32 new_cr4 = lreg32(rm) & CR4_PSE; \
 		if ((new_cr4 ^ cpu->cr4) & CR4_PSE) { \
 			tlb_clear(cpu); \
@@ -3716,6 +6596,28 @@ static bool call_isr_vm86_softint(CPUI386 *cpu, int no);
  * Also faster than letting the BIOS do PM transitions for block copies. */
 static bool bios_hle_int(CPUI386 *cpu, int intno)
 {
+	if (intno == 0x11) {
+		/* INT 11h: Equipment list from BDA (40:10).
+		 * Normalize noisy high bits for Win3.x compatibility probes. */
+		u16 val = 0;
+		if (0x411u < (u32)cpu->phys_mem_size)
+			val = cpu->phys_mem[0x410] | ((u16)cpu->phys_mem[0x411] << 8);
+		val &= 0x0fff;
+		if ((val & 0x0030) == 0)
+			val = (u16)((val & ~0x0030) | 0x0020);
+		sreg16(0, val);
+		return true;
+	}
+
+	if (intno == 0x12) {
+		/* INT 12h: Conventional memory size in KB from BDA (40:13). */
+		u16 val = 0;
+		if (0x414u < (u32)cpu->phys_mem_size)
+			val = cpu->phys_mem[0x413] | ((u16)cpu->phys_mem[0x414] << 8);
+		sreg16(0, val);
+		return true;
+	}
+
 	if (intno != 0x15) return false;
 
 	u8 ah = (lreg32(0) >> 8) & 0xFF;
@@ -3767,6 +6669,20 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 		return true;
 	}
 
+	if (ah == 0x88) {
+		/* INT 15h/AH=88h — Get Extended Memory Size.
+		 * Returns extended memory in KB (above 1MB) in AX, max 63MB.
+		 * HLE avoids any BIOS code path issues. */
+		long ext_kb = (cpu->phys_mem_size - 1024 * 1024) / 1024;
+		if (ext_kb > 0xFC00) ext_kb = 0xFC00;
+		if (ext_kb < 0) ext_kb = 0;
+		sreg16(0, (u16)ext_kb);
+		refresh_flags(cpu);
+		cpu->cc.mask = 0;
+		cpu->flags &= ~CF;
+		return true;
+	}
+
 	return false;
 }
 
@@ -3777,30 +6693,100 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 	} else if (unlikely(cpu_diag_enabled) && li(i) == 0x2f) { \
 		cpu_diag_log_int2f(cpu); \
 	} \
-	if (li(i) == 0x10 && ((cpu->flags & VM) || !(cpu->cr0 & 1))) { \
-		dolog("INT10h AH=%02x AL=%02x BX=%04x at %04x:%04x\n", \
-			(lreg16(0) >> 8) & 0xff, lreg16(0) & 0xff, \
-			lreg16(3), SEGi(SEG_CS) & 0xffff, cpu->ip & 0xffff); \
+	if (unlikely(cpu_diag_enabled) && li(i) == 0x10 && \
+		((cpu->flags & VM) || !(cpu->cr0 & 1))) { \
+		if (win386_diag.active) { \
+			uint8_t _ah10 = (lreg16(0) >> 8) & 0xff; \
+			uint8_t _al10 = lreg16(0) & 0xff; \
+			wfw_monitor.int10h_count++; \
+			wfw_monitor.last_int10h_ah = _ah10; \
+			wfw_monitor.last_int10h_al = _al10; \
+			if (_ah10 == 0x0e && wfw_monitor.tty_pos < sizeof(wfw_monitor.tty_buf)-1) \
+				wfw_monitor.tty_buf[wfw_monitor.tty_pos++] = _al10; \
+		} \
 	} \
-	if (((cpu->flags & VM) || !(cpu->cr0 & 1)) && bios_hle_int(cpu, li(i))) { \
-		cpu->ip = cpu->next_ip; \
-	} else if ((cpu->flags & VM)) { \
-		if(get_IOPL(cpu) < 3) { \
-			if (unlikely(cpu_diag_enabled) && cpu_diag_event_allow(cpu, &cpu_diag_events.vm86_int_iopl)) { \
-				refresh_flags(cpu); \
-				dolog("=== VM86 INT blocked by IOPL #%u ===\n", cpu_diag_events.vm86_int_iopl); \
-				dolog("  INT %02x at CS:EIP=%04x:%08x CPL=%d FL=%08x IOPL=%d\n", \
-					li(i), cpu->seg[SEG_CS].sel, cpu->ip, cpu->cpl, cpu->flags, get_IOPL(cpu)); \
-				dump_cs_bytes(cpu, "  opcodes @CS:EIP:", 8); \
-				dump_idt_vector(cpu, li(i), "VM86 INT gate"); \
+	if (unlikely(cpu_diag_enabled) && win386_diag.active && \
+		li(i) == 0x15 && ((cpu->flags & VM) || !(cpu->cr0 & 1))) { \
+		wfw_monitor.int15h_count++; \
+		wfw_monitor.last_int15h_ah = (lreg16(0) >> 8) & 0xff; \
+	} \
+		if (((cpu->flags & VM) || !(cpu->cr0 & 1)) && bios_hle_int(cpu, li(i))) { \
+			cpu->ip = cpu->next_ip; \
+		} else if ((cpu->flags & VM)) { \
+			if(get_IOPL(cpu) < 3) { \
+				wfw_monitor_log_vm86_int_event(cpu, (uint8_t)li(i), 0); \
+				if (unlikely(cpu_diag_enabled) && win386_diag.active) { \
+					wfw_monitor.v86_int_gp_counts[(uint8_t)li(i)]++; \
+					if (li(i) == 0x21 && wfw_monitor.v86_int21_ah_count < 16) \
+						wfw_monitor.v86_int21_ah_log[wfw_monitor.v86_int21_ah_count++] = \
+							(lreg16(0) >> 8) & 0xff; \
 			} \
-			THROW(EX_GP, 0); \
+			if (unlikely(cpu_diag_enabled) && cpu_diag_event_allow(cpu, &cpu_diag_events.vm86_int_iopl)) { \
+				dolog("V86 INT %02x blocked IOPL #%u at %04x:%04x\n", \
+					li(i), cpu_diag_events.vm86_int_iopl, \
+					cpu->seg[SEG_CS].sel, cpu->ip & 0xffff); \
+				} \
+				THROW(EX_GP, 0); \
+			} \
+			/* With VM86+IOPL=3, consult the Interrupt Redirection Bitmap. \
+			 * If redirected, this will raise #GP for the VMM to intercept. */ \
+			TRY(check_v86_int_redirect(cpu, li(i))); \
+			uint16_t _ax_int = lreg16(0); \
+			bool _use_idt = vm86_iopl3_softint_via_idt && \
+				vm86_iopl3_int_uses_idt(li(i), _ax_int); \
+			uint8_t _v86_int_path = _use_idt ? 2 : 1; \
+			wfw_monitor_log_vm86_int_event(cpu, (uint8_t)li(i), _v86_int_path); \
+			if (unlikely(cpu_diag_enabled) && win386_diag.active) { \
+				wfw_monitor.v86_softint_total++; \
+				if (li(i) == 0x13) { \
+					wfw_monitor.v86_int13_count++; \
+					wfw_monitor.v86_int13_last_path = _v86_int_path; \
+					wfw_monitor.v86_int13_req_ax = lreg16(0); \
+					wfw_monitor.v86_int13_req_bx = lreg16(3); \
+					wfw_monitor.v86_int13_req_cx = lreg16(1); \
+					wfw_monitor.v86_int13_req_dx = lreg16(2); \
+					wfw_monitor.v86_int13_req_es = cpu->seg[SEG_ES].sel; \
+					wfw_monitor.pending_v86_int13 = true; \
+					wfw_monitor.pending_v86_int13_ret_cs = cpu->seg[SEG_CS].sel; \
+					wfw_monitor.pending_v86_int13_ret_ip = cpu->next_ip & 0xffff; \
+				} \
+				if (li(i) == 0x2f) { \
+				wfw_monitor.v86_int2f_count++; \
+				uint16_t _ax = lreg16(0); \
+				uint8_t _hp = wfw_monitor.v86_int2f_hist_pos; \
+				if (_hp < 8) { \
+					bool _dup = false; \
+					for (int _j = 0; _j < _hp; _j++) \
+						if (wfw_monitor.v86_int2f_ax_hist[_j] == _ax) { _dup = true; break; } \
+					if (!_dup) wfw_monitor.v86_int2f_ax_hist[wfw_monitor.v86_int2f_hist_pos++] = _ax; \
+				} \
+				if (_ax == 0x1687) { \
+					/* DPMI detection — save IVT data, set return trace */ \
+					uint32_t _ivt = *(uint32_t*)(cpu->phys_mem + 0x2f * 4); \
+					dpmi_trace.ivt_phys_cs = _ivt >> 16; \
+					dpmi_trace.ivt_phys_ip = _ivt & 0xffff; \
+					dpmi_trace.ret_cs = cpu->seg[SEG_CS].sel; \
+					dpmi_trace.ret_ip = cpu->next_ip & 0xffff; \
+					dpmi_trace.ret_active = true; \
+				} \
+			} else if (li(i) == 0x21) { \
+				wfw_monitor.v86_int21_count++; \
+			} \
 		} \
 		uword oldip = cpu->ip; \
 		cpu->ip = cpu->next_ip; \
-		if (!call_isr_vm86_softint(cpu, li(i))) { \
-			cpu->ip = oldip; \
-			return false; \
+		if (_use_idt) { \
+			/* VM86 IDT-compat path uses normal software-INT semantics
+			 * (including DPL checks) to preserve VMM trap behavior. */ \
+			if (!call_isr(cpu, li(i), false, 0)) { \
+				cpu->ip = oldip; \
+				return false; \
+			} \
+		} else { \
+			if (!call_isr_vm86_softint(cpu, li(i))) { \
+				cpu->ip = oldip; \
+				return false; \
+			} \
 		} \
 	} else { \
 		uword oldip = cpu->ip; \
@@ -3826,7 +6812,8 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 		uword vm_from_ip = cpu->ip; \
 		/* Fast path: direct memory read if 6 bytes won't cross page. \
 		 * MUST NOT use in V86 mode — paging maps linear != physical. */ \
-		if (likely(((sp & 0xfff) <= 0xffa) && !(cpu->flags & VM))) { \
+		if (likely(((sp & 0xfff) <= 0xffa) && !(cpu->flags & VM) && \
+			   !(cpu_diag_enabled && win386_diag.active))) { \
 			uint8_t *stack = cpu->phys_mem + cpu->seg[SEG_SS].base + (sp & sp_mask); \
 			newip = *(uint16_t *)(stack + 0); \
 			newcs = *(uint16_t *)(stack + 2); \
@@ -3853,6 +6840,8 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 			cpu_diag_vm86_iret_ring_push(cpu, vm_from_cs, vm_from_ip, vm_from_ss, sp, \
 						     newcs, newip, cpu->flags, true); \
 		} \
+			if (unlikely(cpu_diag_enabled && vm_iret_exec)) \
+				wfw_monitor_note_int13_return(cpu, (uint16_t)newcs, (uint16_t)newip, cpu->flags); \
 	} else { \
 		/* 32-bit IRETD in real/V86 mode */ \
 		uword sp = lreg32(4); \
@@ -3865,7 +6854,8 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 		uword vm_from_ip = cpu->ip; \
 		/* Fast path: direct memory read if 12 bytes won't cross page. \
 		 * MUST NOT use in V86 mode — paging maps linear != physical. */ \
-		if (likely(((sp & 0xfff) <= 0xff4) && !(cpu->flags & VM))) { \
+		if (likely(((sp & 0xfff) <= 0xff4) && !(cpu->flags & VM) && \
+			   !(cpu_diag_enabled && win386_diag.active))) { \
 			uint8_t *stack = cpu->phys_mem + cpu->seg[SEG_SS].base + (sp & sp_mask); \
 			newip = *(uint32_t *)(stack + 0); \
 			newcs = *(uint32_t *)(stack + 4) & 0xffff; \
@@ -3892,6 +6882,8 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 			cpu_diag_vm86_iret_ring_push(cpu, vm_from_cs, vm_from_ip, vm_from_ss, sp, \
 						     newcs, newip, cpu->flags, false); \
 		} \
+			if (unlikely(cpu_diag_enabled && vm_iret_exec)) \
+				wfw_monitor_note_int13_return(cpu, (uint16_t)newcs, (uint16_t)newip, cpu->flags); \
 	} \
 	if (cpu->intr && (cpu->flags & IF)) return true;
 
@@ -4218,15 +7210,18 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 #define STOS_helper2(BIT, ABIT) \
 	OptAddr memld; \
 	uword cx = lreg ## ABIT(1); \
-	/* Fast path: entire REP fits in single page, forward, RAM-only */ \
-	if (cx > 0 && dir > 0) { \
+	/* Fast path: entire REP fits in single LINEAR page, forward, RAM-only */ \
+	if (I386_STOS_FASTPATH && ABIT == 32 && cpu->a20_mask == 0xFFFFFFFFu && \
+	    cx > 0 && dir > 0 && (cpu->cr0 & 1) && !(cpu->flags & VM)) { \
 		uword dst_log = lreg ## ABIT(7); \
+		uword dst_lin = cpu->seg[SEG_ES].base + dst_log; \
 		uword bytes = cx * (BIT / 8); \
 		if (bytes <= 4096 && \
-		    (dst_log >> 12) == ((dst_log + bytes - 1) >> 12)) { \
+		    (dst_lin >> 12) == ((dst_lin + bytes - 1) >> 12)) { \
 			TRY(translate ## BIT(cpu, &memld, 2, SEG_ES, dst_log)); \
 			if (!in_iomem(memld.addr1) && \
-			    memld.addr1 + bytes <= cpu->phys_mem_size) { \
+			    memld.addr1 + bytes <= cpu->phys_mem_size && \
+			    seg_span_fast_ok(cpu, SEG_ES, 2, dst_log, bytes)) { \
 				u8 *dest = cpu->phys_mem + memld.addr1; \
 				if (BIT == 8) { \
 					memset(dest, ax, cx); \
@@ -4344,15 +7339,20 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 #define MOVS_helper2(BIT, ABIT) \
 	OptAddr memls, memld; \
 	uword cx = lreg ## ABIT(1); \
-	/* Fast path: entire REP fits in single pages, forward, RAM-only, non-overlapping */ \
-	if (cx > 0 && dir > 0 && curr_seg == SEG_DS) { \
+	/* Fast path: entire REP fits in single LINEAR pages, forward, RAM-only, non-overlapping */ \
+	if (I386_MOVS_FASTPATH && ABIT == 32 && cpu->a20_mask == 0xFFFFFFFFu && \
+	    cx > 0 && dir > 0 && curr_seg == SEG_DS && (cpu->cr0 & 1) && !(cpu->flags & VM)) { \
 		uword src_log = lreg ## ABIT(6); \
 		uword dst_log = lreg ## ABIT(7); \
+		uword src_lin = cpu->seg[curr_seg].base + src_log; \
+		uword dst_lin = cpu->seg[SEG_ES].base + dst_log; \
 		uword bytes = cx * (BIT / 8); \
-		/* Check logical addresses stay within same pages */ \
+		/* Check LINEAR addresses stay within same pages */ \
 		if (bytes <= 4096 && \
-		    (src_log >> 12) == ((src_log + bytes - 1) >> 12) && \
-		    (dst_log >> 12) == ((dst_log + bytes - 1) >> 12)) { \
+		    (src_lin >> 12) == ((src_lin + bytes - 1) >> 12) && \
+		    (dst_lin >> 12) == ((dst_lin + bytes - 1) >> 12) && \
+		    seg_span_fast_ok(cpu, curr_seg, 1, src_log, bytes) && \
+		    seg_span_fast_ok(cpu, SEG_ES, 2, dst_log, bytes)) { \
 			TRY(translate ## BIT(cpu, &memls, 1, curr_seg, src_log)); \
 			TRY(translate ## BIT(cpu, &memld, 2, SEG_ES, dst_log)); \
 			if (!in_iomem(memls.addr1) && !in_iomem(memld.addr1) && \
@@ -4952,7 +7952,32 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 
 #define LTR(a, la, sa) \
 	if (cpu->cpl != 0) THROW(EX_GP, 0); \
-	TRY(set_seg(cpu, SEG_TR, la(a)));
+	{ \
+		uword __ltr_sel = la(a) & 0xffff; \
+		uword __ltr_w1, __ltr_w2; \
+		bool __ltr_s, __ltr_p; \
+		int __ltr_type; \
+		if ((__ltr_sel & ~0x3) == 0) THROW(EX_GP, 0); \
+		if (__ltr_sel & 0x4) THROW(EX_GP, __ltr_sel & ~0x3); \
+		TRY(read_desc(cpu, __ltr_sel, &__ltr_w1, &__ltr_w2)); \
+		__ltr_s = (__ltr_w2 >> 12) & 1; \
+		__ltr_p = (__ltr_w2 >> 15) & 1; \
+		__ltr_type = (__ltr_w2 >> 8) & 0xf; \
+		/* LTR accepts only available 32-bit TSS (type 9). */ \
+		if (__ltr_s || __ltr_type != 9) THROW(EX_GP, __ltr_sel & ~0x3); \
+		if (!__ltr_p) THROW(EX_NP, __ltr_sel & ~0x3); \
+		TRY(set_seg(cpu, SEG_TR, __ltr_sel)); \
+		/* Mark descriptor busy (type 9 -> 0xB), mirroring task_switch(). */ \
+		{ \
+			uword __ltr_desc = cpu->gdt.base + (__ltr_sel & ~0x7); \
+			OptAddr __ltr_meml; \
+			TRY(translate_laddr(cpu, &__ltr_meml, 3, __ltr_desc + 4, 4, 0)); \
+			uword __ltr_hi = load32(cpu, &__ltr_meml); \
+			__ltr_hi |= 0x200; \
+			store32(cpu, &__ltr_meml, __ltr_hi); \
+			cpu->seg[SEG_TR].flags |= 2; \
+		} \
+	}
 
 #define STR(a, la, sa) \
 	sa(a, cpu->seg[SEG_TR].sel);
@@ -5018,15 +8043,20 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 #define LFSw(...) LSEGw(FS, __VA_ARGS__)
 #define LGSw(...) LSEGw(GS, __VA_ARGS__)
 
-static bool check_ioperm(CPUI386 *cpu, int port, int bit)
+static bool check_ioperm(CPUI386 *cpu, int port, int bit_width)
 {
-	/* I/O bitmap checks are only required when current privilege is not
-	 * sufficient for direct I/O (or in VM86 when IOPL < 3). */
+	/* Locked rule (Intel 80386 PRM + IA-32 SDM):
+	 * - VM86: IN/OUT always consult the TSS I/O bitmap (independent of IOPL).
+	 * - PM non-VM86: consult bitmap only when CPL > IOPL.
+	 * References:
+	 *   80386 PRM ch.8 (I/O protection): "In virtual 8086 mode, the processor
+	 *   consults the map without regard for IOPL."
+	 *   IA-32 SDM vol.1, I/O permission bitmap semantics (checks in VM86). */
 	bool need_iobitmap = false;
 	if (cpu->cr0 & 1) {
 		int iopl = get_IOPL(cpu);
 		if (cpu->flags & VM)
-			need_iobitmap = (iopl < 3);
+			need_iobitmap = true;
 		else
 			need_iobitmap = (cpu->cpl > iopl);
 	}
@@ -5034,27 +8064,78 @@ static bool check_ioperm(CPUI386 *cpu, int port, int bit)
 		return true;
 
 	/* No usable 32-bit TSS I/O bitmap metadata -> deny. */
-	if (cpu->seg[SEG_TR].limit < 103)
+	{
+		int tr_type = cpu->seg[SEG_TR].flags & 0xf;
+		if (tr_type != 9 && tr_type != 11) {
+			vm86_trip_push(cpu, VM86_TRIP_I, (uint8_t)bit_width,
+				       cpu->seg[SEG_TR].sel, cpu->ip,
+				       0xffff, (uint16_t)port, cpu->flags,
+				       cpu->seg[SEG_CS].sel, 0xffffffffu, 0xffff,
+				       ((uint32_t)VM86_TRIP_IO_BAD_TR << 16), NULL, 0);
+			THROW(EX_GP, 0);
+		}
+	}
+	if (cpu->seg[SEG_TR].limit < 103) {
+		vm86_trip_push(cpu, VM86_TRIP_I, (uint8_t)bit_width,
+			       cpu->seg[SEG_TR].sel, cpu->ip,
+			       0xffff, (uint16_t)port, cpu->flags,
+			       cpu->seg[SEG_CS].sel, cpu->seg[SEG_TR].limit, 0xffff,
+			       ((uint32_t)VM86_TRIP_IO_BAD_TR_LIMIT << 16), NULL, 0);
 		THROW(EX_GP, 0);
+	}
 
 	OptAddr meml;
 	TRY(translate(cpu, &meml, 1, SEG_TR, 102, 2, 0));
 	u32 iobase = load16(cpu, &meml);
-	if (iobase > cpu->seg[SEG_TR].limit)
+	if (iobase > cpu->seg[SEG_TR].limit) {
+		vm86_trip_push(cpu, VM86_TRIP_I, (uint8_t)bit_width,
+			       cpu->seg[SEG_TR].sel, cpu->ip,
+			       (uint16_t)iobase, (uint16_t)port, cpu->flags,
+			       cpu->seg[SEG_CS].sel, iobase, 0xffff,
+			       ((uint32_t)VM86_TRIP_IO_BAD_IOBASE << 16), NULL, 0);
 		THROW(EX_GP, 0);
+	}
 
-	/* Check each requested port bit against the I/O permission bitmap.
-	 * Any 1 bit means access is denied. */
-	for (int b = 0; b < bit; b++) {
+	/* x86 I/O bitmap is indexed by I/O PORT bytes, not operand bits.
+	 * IN/OUT 8/16/32 access 1/2/4 consecutive ports respectively. */
+	int port_bytes = (bit_width + 7) >> 3;
+	for (int b = 0; b < port_bytes; b++) {
 		u32 p = (u32)port + (u32)b;
 		u32 byte_off = iobase + (p >> 3);
-		if (byte_off > cpu->seg[SEG_TR].limit)
+		if (byte_off > cpu->seg[SEG_TR].limit) {
+			vm86_trip_push(cpu, VM86_TRIP_I, (uint8_t)bit_width,
+				       cpu->seg[SEG_TR].sel, cpu->ip,
+				       (uint16_t)iobase, (uint16_t)port, cpu->flags,
+				       cpu->seg[SEG_CS].sel, byte_off, 0xffff,
+				       ((uint32_t)VM86_TRIP_IO_BAD_BYTE_OOR << 16), NULL, 0);
 			THROW(EX_GP, 0);
+		}
 		TRY(translate(cpu, &meml, 1, SEG_TR, byte_off, 1, 0));
 		u8 perm = load8(cpu, &meml);
-		if (perm & (1u << (p & 7)))
+		if (perm & (1u << (p & 7))) {
+			vm86_trip_push(cpu, VM86_TRIP_I, (uint8_t)bit_width,
+				       cpu->seg[SEG_TR].sel, cpu->ip,
+				       (uint16_t)iobase, (uint16_t)port, cpu->flags,
+				       cpu->seg[SEG_CS].sel, byte_off, 0xffff,
+				       ((uint32_t)VM86_TRIP_IO_BAD_BIT << 16) |
+				       ((uint32_t)perm << 8) | (p & 7), NULL, 0);
 			THROW(EX_GP, 0);
+		}
 	}
+	return true;
+}
+
+/* V86 Interrupt Redirection Bitmap check (Intel SDM Vol 3, Section 20.3.3).
+ * With IOPL=3 in V86 mode, the IRB in the TSS determines per-vector whether
+ * INT n goes through the real-mode IVT (bit=0) or causes #GP (bit=1).
+ * Returns true if INT should proceed through IVT, false/#GP if redirected. */
+static bool check_v86_int_redirect(CPUI386 *cpu, int intno)
+{
+	(void)cpu;
+	(void)intno;
+	/* 80386 target behavior: VM86 INT n with IOPL=3 uses real-mode IVT.
+	 * The Interrupt Redirection Bitmap is a VME-era mechanism and should
+	 * not alter INT dispatch in this emulator's 386 mode. */
 	return true;
 }
 
@@ -5230,9 +8311,13 @@ static bool larsl_helper(CPUI386 *cpu, int sel, uword *ar, uword *sl, int *zf)
 		return true;
 	}
 
+	int dpl = (w2 >> 13) & 0x3;
+	int rpl = sel & 0x3;
+	int maxpl = cpu->cpl > rpl ? cpu->cpl : rpl;
 	if ((w2 >> 12) & 1) {
-		int dpl = (w2 >> 13) & 0x3;
-		if (((w2 >> 10) & 0x3) != 0x3 && (cpu->cpl > dpl || (sel & 0x3) > dpl)) {
+		bool code = (w2 >> 11) & 1;
+		bool conforming = code && ((w2 >> 10) & 1);
+		if ((!code || !conforming) && dpl < maxpl) {
 			*zf = 0;
 			return true;
 		}
@@ -5253,6 +8338,10 @@ static bool larsl_helper(CPUI386 *cpu, int sel, uword *ar, uword *sl, int *zf)
 				*zf = 0;
 				return true;
 			}
+		}
+		if (dpl < maxpl) {
+			*zf = 0;
+			return true;
 		}
 	}
 
@@ -5292,20 +8381,25 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 	}
 
 	int dpl = (w2 >> 13) & 0x3;
-	if (((w2 >> 10) & 0x3) != 0x3 && (cpu->cpl > dpl || (sel & 0x3) > dpl)) {
+	int rpl = sel & 0x3;
+	int maxpl = cpu->cpl > rpl ? cpu->cpl : rpl;
+	bool code = (w2 >> 11) & 0x1;
+	bool rw = (w2 >> 9) & 0x1;
+	bool conforming = code && ((w2 >> 10) & 0x1);
+	if ((!code || !conforming) && dpl < maxpl) {
 		*zf = 0;
 		return true;
 	}
 
-	if (((w2 >> 11) & 0x1) == 0) {
-		/* data */
-		if (wr && ((w2 >> 9) & 0x1) == 0) {
+	if (!code) {
+		/* Data segments are always readable; VERW additionally requires writable. */
+		if (wr && !rw) {
 			*zf = 0;
 			return true;
 		}
 	} else {
-		/* code */
-		if (!wr && ((w2 >> 9) & 0x1) == 0) {
+		/* Code segments are never writable for VERW. */
+		if (wr || !rw) {
 			*zf = 0;
 			return true;
 		}
@@ -5406,25 +8500,26 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 	sb(b, dst); \
 	sa(a, cpu->cc.dst);
 
-#define CMPXCHb(...) CMPXCH_helper(8, __VA_ARGS__)
-#define CMPXCHw(...) CMPXCH_helper(16, __VA_ARGS__)
-#define CMPXCHd(...) CMPXCH_helper(32, __VA_ARGS__)
-#define XADDb(...) XADD_helper(8, __VA_ARGS__)
-#define XADDw(...) XADD_helper(16, __VA_ARGS__)
-#define XADDd(...) XADD_helper(32, __VA_ARGS__)
+#define CMPXCHb(...) do { if (cpu->gen < 4) THROW0(EX_UD); CMPXCH_helper(8, __VA_ARGS__); } while (0);
+#define CMPXCHw(...) do { if (cpu->gen < 4) THROW0(EX_UD); CMPXCH_helper(16, __VA_ARGS__); } while (0);
+#define CMPXCHd(...) do { if (cpu->gen < 4) THROW0(EX_UD); CMPXCH_helper(32, __VA_ARGS__); } while (0);
+#define XADDb(...) do { if (cpu->gen < 4) THROW0(EX_UD); XADD_helper(8, __VA_ARGS__); } while (0);
+#define XADDw(...) do { if (cpu->gen < 4) THROW0(EX_UD); XADD_helper(16, __VA_ARGS__); } while (0);
+#define XADDd(...) do { if (cpu->gen < 4) THROW0(EX_UD); XADD_helper(32, __VA_ARGS__); } while (0);
 
-#define INVLPG(addr) do { tlb_clear(cpu); SEQ_INVALIDATE(cpu); \
+#define INVLPG(addr) do { if (cpu->gen < 4) THROW0(EX_UD); tlb_clear(cpu); SEQ_INVALIDATE(cpu); \
 	if (unlikely(cpu_diag_enabled && pf_diag.active)) pf_diag.invlpg_count++; } while(0);
 
 #define BSWAPw(a, la, sa) THROW0(EX_UD);
 
 #define BSWAPd(a, la, sa) \
+	if (cpu->gen < 4) THROW0(EX_UD); \
 	u32 src = la(a); \
 	u32 dst = ((src & 0xff) << 24) | (((src >> 8) & 0xff) << 16) | (((src >> 16) & 0xff) << 8) | ((src >> 24) & 0xff); \
 	sa(a, dst);
 
-#define INVD()    // Invalidate cache without writeback - NOP for emulator
-#define WBINVD()  // Write back and invalidate cache - NOP for emulator
+#define INVD() do { if (cpu->gen < 4) THROW0(EX_UD); } while (0)    // NOP for emulator
+#define WBINVD() do { if (cpu->gen < 4) THROW0(EX_UD); } while (0)  // NOP for emulator
 
 // 586 and later...
 #define UD0() THROW0(EX_UD);
@@ -5450,6 +8545,7 @@ static const u32 cpuid_signature[] = {
 };
 
 #define CPUID() \
+	if (cpu->gen < 5) THROW0(EX_UD); \
 	switch (REGi(0)) { \
 	case 0: \
 		REGi(0) = 1; \
@@ -5485,6 +8581,7 @@ static const u32 cpuid_signature[] = {
  * This provides more realistic timing for DOS-era benchmarks that use RDTSC.
  */
 #define RDTSC() \
+	if (cpu->gen < 5) THROW0(EX_UD); \
 	/* Lazy-sync TSC from cycle counter (avoids 64-bit increment per instruction) */ \
 	cpu->tsc += (uint32_t)((uint32_t)cpu->cycle - (uint32_t)cpu->tsc_sync_cycle); \
 	cpu->tsc_sync_cycle = cpu->cycle; \
@@ -5493,6 +8590,7 @@ static const u32 cpuid_signature[] = {
 
 #define Mq Ms
 #define CMPXCH8B(addr) \
+	if (cpu->gen < 5) THROW0(EX_UD); \
 	OptAddr meml1, meml2; \
 	TRY(translate32(cpu, &meml1, 3, curr_seg, addr)); \
 	TRY(translate32(cpu, &meml2, 3, curr_seg, addr + 4)); \
@@ -5510,14 +8608,17 @@ static const u32 cpuid_signature[] = {
 	cpu->cc.mask &= ~ZF;
 
 #define CMOVw(a, b, la, sa, lb, sb) \
+	if (cpu->gen < 6) THROW0(EX_UD); \
 	COND() \
 	if (cond) sa(a, lb(b));
 
 #define CMOVd(a, b, la, sa, lb, sb) \
+	if (cpu->gen < 6) THROW0(EX_UD); \
 	COND() \
 	if (cond) sa(a, lb(b));
 
 #define WRMSR() \
+	if (cpu->gen < 5) THROW0(EX_UD); \
 	if (cpu->cpl != 0) THROW(EX_GP, 0); \
 	switch (REGi(1)) { \
 	case 0x174: cpu->sysenter.cs = REGi(0); break; \
@@ -5527,6 +8628,7 @@ static const u32 cpuid_signature[] = {
 	}
 
 #define RDMSR() \
+	if (cpu->gen < 5) THROW0(EX_UD); \
 	if (cpu->cpl != 0) THROW(EX_GP, 0); \
 	switch (REGi(1)) { \
 	case 0x174: REGi(0) = cpu->sysenter.cs; REGi(2) = 0; break; \
@@ -5552,6 +8654,7 @@ static void __sysenter(CPUI386 *cpu, int pl, int cs)
 }
 
 #define SYSENTER() \
+	if (cpu->gen < 6) THROW0(EX_UD); \
 	if (!(cpu->cr0 & 1) || (cpu->sysenter.cs & ~0x3) == 0) THROW(EX_GP, 0); \
 	cpu->flags &= ~(VM | IF); \
 	__sysenter(cpu, 0, cpu->sysenter.cs); \
@@ -5559,6 +8662,7 @@ static void __sysenter(CPUI386 *cpu, int pl, int cs)
 	cpu->next_ip = cpu->sysenter.eip;
 
 #define SYSEXIT() \
+	if (cpu->gen < 6) THROW0(EX_UD); \
 	if (!(cpu->cr0 & 1) || (cpu->sysenter.cs & ~0x3) == 0 || cpu->cpl) THROW(EX_GP, 0); \
 	__sysenter(cpu, 3, cpu->sysenter.cs + 16); \
 	REGi(4) = REGi(1); \
@@ -5637,6 +8741,35 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 
 	if (code16) cpu->next_ip &= 0xffff;
 	cpu->ip = cpu->next_ip;
+	if (unlikely(wfw_monitor.ud63_fe95_0127.trace_active))
+		wfw_ud63_trace_step(cpu);
+
+	/* One-shot DPMI trace: capture INT 2Fh/1687h return and entry point call */
+	if (unlikely(dpmi_trace.ret_active) && (cpu->flags & VM) &&
+	    cpu->seg[SEG_CS].sel == dpmi_trace.ret_cs &&
+	    (cpu->ip & 0xffff) == dpmi_trace.ret_ip) {
+		dpmi_trace.ret_active = false;
+		dpmi_trace.returned = true;
+		dpmi_trace.ret_ax = lreg16(0);
+		dpmi_trace.ret_bx = lreg16(3);
+		dpmi_trace.ret_dx = lreg16(2);
+		dpmi_trace.ret_si = lreg16(6);
+		dpmi_trace.ret_es = cpu->seg[SEG_ES].sel;
+		dpmi_trace.ret_di = lreg16(7);
+		if (dpmi_trace.ret_ax == 0) {
+			dpmi_trace.entry_cs = dpmi_trace.ret_es;
+			dpmi_trace.entry_ip = dpmi_trace.ret_di;
+			dpmi_trace.entry_active = true;
+		}
+	}
+	if (unlikely(dpmi_trace.entry_active) && (cpu->flags & VM) &&
+	    cpu->seg[SEG_CS].sel == dpmi_trace.entry_cs &&
+	    (cpu->ip & 0xffff) == dpmi_trace.entry_ip) {
+		dpmi_trace.entry_active = false;
+		dpmi_trace.entry_called = true;
+		dpmi_trace.entry_ax = lreg16(0);
+		dpmi_trace.entry_es = cpu->seg[SEG_ES].sel;
+	}
 
 	/* Save TF before this instruction — POPF/IRET may change it, but
 	 * the trap fires based on TF state when the instruction started. */
@@ -5653,7 +8786,10 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	/* Sequential fast path: if the previous instruction was on the same page
 	 * and execution is sequential (ip advanced by exactly pf_pos bytes),
 	 * derive physical address directly without TLB lookup. */
-	if (likely(cpu->seq_active)) {
+	/* VM86 correctness first: disable sequential prefetch shortcut in VM mode.
+	 * VM86 frequently transitions through fault/reflect paths, and we prefer
+	 * conservative fetch behavior over speculative carry-over here. */
+	if (likely(cpu->seq_active) && likely(!(cpu->flags & VM))) {
 		uword prev_len = cpu->pf_pos;
 		if (likely(cpu->ip == cpu->seq_prev_ip + prev_len)) {
 			uword nphys = cpu->seq_phys + prev_len;
@@ -5688,10 +8824,15 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			cpu->pf_ptr = cpu->phys_mem + (cpu->ifetch.xaddr ^ pf_laddr);
 			b1 = cpu->pf_ptr[0];
 #ifdef I386_SEQ_FASTPATH
-			/* Start sequential tracking from this TLB-validated address */
-			cpu->seq_phys = cpu->ifetch.xaddr ^ pf_laddr;
-			cpu->seq_prev_ip = cpu->ip;
-			cpu->seq_active = true;
+			/* Keep seq fastpath disabled in VM86 for correctness. */
+			if (likely(!(cpu->flags & VM))) {
+				/* Start sequential tracking from this TLB-validated address */
+				cpu->seq_phys = cpu->ifetch.xaddr ^ pf_laddr;
+				cpu->seq_prev_ip = cpu->ip;
+				cpu->seq_active = true;
+			} else {
+				cpu->seq_active = false;
+			}
 #endif
 			cpu->pf_pos = 1;
 			cpu->pf_avail = 8;
@@ -5786,11 +8927,15 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 		HANDLE_PREFIX(3e, curr_seg = SEG_DS)
 		HANDLE_PREFIX(64, curr_seg = SEG_FS)
 		HANDLE_PREFIX(65, curr_seg = SEG_GS)
-		/* Prefix fusion for 0x66: inline common operations */
-		pfx66: {
-			opsz16 = !code16;
-			TRY(fetch8(cpu, &b1));
-			int reg = b1 & 7;
+			/* Prefix fusion for 0x66: inline common operations */
+			pfx66: {
+				opsz16 = !code16;
+				TRY(fetch8(cpu, &b1));
+				/* VM86 correctness first: route prefixed ops through the
+				 * normal dispatcher instead of 32-bit fused shortcuts. */
+				if (unlikely(cpu->flags & VM))
+					goto *pfxlabel[b1];
+				int reg = b1 & 7;
 			/* INC r16/r32 (0x40-0x47) */
 			if (b1 >= 0x40 && b1 <= 0x47) {
 				int cf = get_CF(cpu);
@@ -6099,8 +9244,8 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 		goto f0xb8;
 	}
 
-	fast_call_rel32: {  /* CALL rel32 (0xE8) */
-		if (likely(!opsz16 && cpu->pf_pos + 4 <= cpu->pf_avail)) {
+		fast_call_rel32: {  /* CALL rel32 (0xE8) */
+			if (likely(!opsz16 && !(cpu->flags & VM) && cpu->pf_pos + 4 <= cpu->pf_avail)) {
 			int p = cpu->pf_pos;
 			sword d = (s32)(cpu->pf_ptr[p] | ((u32)cpu->pf_ptr[p+1] << 8)
 			         | ((u32)cpu->pf_ptr[p+2] << 16) | ((u32)cpu->pf_ptr[p+3] << 24));
@@ -6131,8 +9276,8 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 		}
 		goto f0xe8;
 	}
-	fast_ret: {  /* RET near (0xC3) */
-		if (likely(!opsz16)) {
+		fast_ret: {  /* RET near (0xC3) */
+			if (likely(!opsz16 && !(cpu->flags & VM))) {
 			uword sp = lreg32(4);
 			uword pop_addr = sp & sp_mask;
 			/* Inline TLB read for flat mode (skip translate32 chain) */
@@ -6155,8 +9300,8 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 		}
 		goto f0xc3;
 	}
-	fast_jmp_rel32: {  /* JMP rel32 (0xE9) */
-		if (likely(!opsz16 && cpu->pf_pos + 4 <= cpu->pf_avail)) {
+		fast_jmp_rel32: {  /* JMP rel32 (0xE9) */
+			if (likely(!opsz16 && !(cpu->flags & VM) && cpu->pf_pos + 4 <= cpu->pf_avail)) {
 			int p = cpu->pf_pos;
 			sword d = (s32)(cpu->pf_ptr[p] | ((u32)cpu->pf_ptr[p+1] << 8)
 			         | ((u32)cpu->pf_ptr[p+2] << 16) | ((u32)cpu->pf_ptr[p+3] << 24));
@@ -6174,8 +9319,8 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 		}
 		goto f0xeb;
 	}
-	fast_0x0f: {  /* Fast path for Jcc rel32 (0F 80-8F) */
-		if (likely(!adsz16 && cpu->pf_pos + 5 <= cpu->pf_avail)) {
+	fast_0x0f: {  /* Fast path for Jcc rel32 (0F 80-8F, no 66h override) */
+		if (likely(!opsz16 && cpu->pf_pos + 5 <= cpu->pf_avail)) {
 			u8 b2 = cpu->pf_ptr[cpu->pf_pos];
 			if (likely((b2 & 0xf0) == 0x80)) {
 				int p = cpu->pf_pos + 1;
@@ -6746,6 +9891,11 @@ static bool pmcall(CPUI386 *cpu, bool opsz16, uword addr, int sel, bool isjmp)
 			OptAddr msp0, mss0;
 			uword oldss = cpu->seg[SEG_SS].sel;
 			uword oldsp = REGi(4);
+			uword saved_cg_ss_sel = cpu->seg[SEG_SS].sel;
+			uword saved_cg_ss_base = cpu->seg[SEG_SS].base;
+			uword saved_cg_ss_limit = cpu->seg[SEG_SS].limit;
+			uword saved_cg_ss_flags = cpu->seg[SEG_SS].flags;
+			uword saved_cg_sp_mask = cpu->sp_mask;
 			uword params[31];
 			uword sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
 
@@ -6782,14 +9932,14 @@ static bool pmcall(CPUI386 *cpu, bool opsz16, uword addr, int sel, bool isjmp)
 			if (!gate16) {
 				OptAddr meml1, meml2, meml3, meml4;
 				uword sp = lreg32(4);
-				TRY1(translate(cpu, &meml1, 2, SEG_SS, (sp - 4 * 1) & sp_mask, 4, 0));
-				TRY1(translate(cpu, &meml2, 2, SEG_SS, (sp - 4 * 2) & sp_mask, 4, 0));
-				TRY1(translate(cpu, &meml3, 2, SEG_SS, (sp - 4 * (3 + wc)) & sp_mask, 4, 0));
-				TRY1(translate(cpu, &meml4, 2, SEG_SS, (sp - 4 * (4 + wc)) & sp_mask, 4, 0));
+				if (!translate(cpu, &meml1, 2, SEG_SS, (sp - 4 * 1) & sp_mask, 4, 0)) goto call_gate_pvl_fail;
+				if (!translate(cpu, &meml2, 2, SEG_SS, (sp - 4 * 2) & sp_mask, 4, 0)) goto call_gate_pvl_fail;
+				if (!translate(cpu, &meml3, 2, SEG_SS, (sp - 4 * (3 + wc)) & sp_mask, 4, 0)) goto call_gate_pvl_fail;
+				if (!translate(cpu, &meml4, 2, SEG_SS, (sp - 4 * (4 + wc)) & sp_mask, 4, 0)) goto call_gate_pvl_fail;
 
 				for (int i = 0; i < wc; i++) {
 					OptAddr meml;
-					TRY1(translate(cpu, &meml, 2, SEG_SS, (sp - 4 * (2 + wc - i)) & sp_mask, 4, 0));
+					if (!translate(cpu, &meml, 2, SEG_SS, (sp - 4 * (2 + wc - i)) & sp_mask, 4, 0)) goto call_gate_pvl_fail;
 					saddr32(&meml, params[i]);
 				}
 
@@ -6801,14 +9951,14 @@ static bool pmcall(CPUI386 *cpu, bool opsz16, uword addr, int sel, bool isjmp)
 			} else {
 				OptAddr meml1, meml2, meml3, meml4;
 				uword sp = lreg32(4);
-				TRY1(translate(cpu, &meml1, 2, SEG_SS, (sp - 2 * 1) & sp_mask, 2, 0));
-				TRY1(translate(cpu, &meml2, 2, SEG_SS, (sp - 2 * 2) & sp_mask, 2, 0));
-				TRY1(translate(cpu, &meml3, 2, SEG_SS, (sp - 2 * (3 + wc)) & sp_mask, 2, 0));
-				TRY1(translate(cpu, &meml4, 2, SEG_SS, (sp - 2 * (4 + wc)) & sp_mask, 2, 0));
+				if (!translate(cpu, &meml1, 2, SEG_SS, (sp - 2 * 1) & sp_mask, 2, 0)) goto call_gate_pvl_fail;
+				if (!translate(cpu, &meml2, 2, SEG_SS, (sp - 2 * 2) & sp_mask, 2, 0)) goto call_gate_pvl_fail;
+				if (!translate(cpu, &meml3, 2, SEG_SS, (sp - 2 * (3 + wc)) & sp_mask, 2, 0)) goto call_gate_pvl_fail;
+				if (!translate(cpu, &meml4, 2, SEG_SS, (sp - 2 * (4 + wc)) & sp_mask, 2, 0)) goto call_gate_pvl_fail;
 
 				for (int i = 0; i < wc; i++) {
 					OptAddr meml;
-					TRY1(translate(cpu, &meml, 2, SEG_SS, (sp - 2 * (2 + wc - i)) & sp_mask, 2, 0));
+					if (!translate(cpu, &meml, 2, SEG_SS, (sp - 2 * (2 + wc - i)) & sp_mask, 2, 0)) goto call_gate_pvl_fail;
 					saddr16(&meml, params[i]);
 				}
 
@@ -6820,6 +9970,17 @@ static bool pmcall(CPUI386 *cpu, bool opsz16, uword addr, int sel, bool isjmp)
 			}
 			}
 			newcs = (newcs & 0xfffc) | newdpl;
+			goto call_gate_pvl_ok;
+		call_gate_pvl_fail:
+			cpu->seg[SEG_SS].sel = saved_cg_ss_sel;
+			cpu->seg[SEG_SS].base = saved_cg_ss_base;
+			cpu->seg[SEG_SS].limit = saved_cg_ss_limit;
+			cpu->seg[SEG_SS].flags = saved_cg_ss_flags;
+			cpu->sp_mask = saved_cg_sp_mask;
+			update_seg_flat(cpu, SEG_SS);
+			REGi(4) = oldsp;
+			return false;
+		call_gate_pvl_ok:;
 		} else {
 			// same privilege
 			if (!isjmp) {
@@ -6843,7 +10004,7 @@ static bool pmcall(CPUI386 *cpu, bool opsz16, uword addr, int sel, bool isjmp)
 			newcs = (newcs & 0xfffc) | cpu->cpl;
 		}
 
-		TRY1(set_seg(cpu, SEG_CS, newcs));
+		TRY(set_seg(cpu, SEG_CS, newcs));
 
 		cpu->next_ip = newip;
 	}
@@ -6871,7 +10032,7 @@ static int __call_isr_check_cs(CPUI386 *cpu, int sel, int ext, int *csdpl)
 	if ((sel & ~0x3) == 0 || off + 7 > limit)
 		THROW(EX_GP, ext);
 
-	TRY1(translate_laddr(cpu, &meml, 1, base + off + 4, 4, 0));
+	TRY(translate_laddr(cpu, &meml, 1, base + off + 4, 4, 0));
 	uword w2 = load32(cpu, &meml);
 	int s = (w2 >> 12) & 1;
 	bool code = (w2 >> 8) & 0x8;
@@ -6909,11 +10070,7 @@ static int __call_isr_check_cs(CPUI386 *cpu, int sel, int ext, int *csdpl)
 	}
 }
 
-/* Exception ring buffer — file-scope for post-mortem dump from cpui386_step */
-#define EXC_RING_SIZE 1024
-#define EXC_RING_MASK (EXC_RING_SIZE - 1)
-static struct { uint8_t no; uint8_t mode; uint16_t cs; uint32_t ip; uint32_t err; uint32_t cr2; } exc_ring[EXC_RING_SIZE];
-static int exc_ring_pos = 0;
+/* exc_ring buffer and EXC_RING_SIZE/MASK defined earlier (near wfw_monitor_dump) */
 /* Delayed ring buffer dump: set to wall-clock time when a trigger fires;
  * cpui386_step checks and dumps 2 seconds later to capture post-trigger events. */
 static uint32_t exc_ring_delayed_dump_time = 0;
@@ -6953,6 +10110,22 @@ static bool IRAM_ATTR call_isr_vm86_softint(CPUI386 *cpu, int no)
 	newcs = w1 >> 16;
 	newip = w1 & 0xffff;
 
+	/* DPMI trace: save paged IVT target and first byte at handler */
+	if (unlikely(no == 0x2f && cpu_diag_enabled && win386_diag.active &&
+	    lreg16(0) == 0x1687)) {
+		dpmi_trace.ivt_paged_cs = newcs;
+		dpmi_trace.ivt_paged_ip = newip;
+		dpmi_trace.ivt_mismatch = (w1 != *(uint32_t*)(cpu->phys_mem + 0x2f * 4));
+		/* Read first byte through paging (VMM may remap handler page) */
+		uint32_t target_lin = (uint32_t)newcs * 16 + newip;
+		OptAddr meml_fb;
+		if (translate_laddr(cpu, &meml_fb, 1, target_lin, 1, 3))
+			dpmi_trace.target_first_byte = load8(cpu, &meml_fb);
+		/* Also check physical byte for comparison */
+		if (target_lin < (uint32_t)cpu->phys_mem_size)
+			dpmi_trace.target_phys_byte = cpu->phys_mem[target_lin];
+	}
+
 	TRY(translate(cpu, &meml1, 2, SEG_SS, (sp - 2 * 1) & sp_mask, 2, 3));
 	TRY(translate(cpu, &meml2, 2, SEG_SS, (sp - 2 * 2) & sp_mask, 2, 3));
 	TRY(translate(cpu, &meml3, 2, SEG_SS, (sp - 2 * 3) & sp_mask, 2, 3));
@@ -6964,7 +10137,7 @@ static bool IRAM_ATTR call_isr_vm86_softint(CPUI386 *cpu, int no)
 	saddr16(&meml3, cpu->ip);
 	set_sp(sp - 2 * 3, sp_mask);
 
-	TRY1(set_seg(cpu, SEG_CS, newcs));
+	TRY(set_seg(cpu, SEG_CS, newcs));
 	cpu->next_ip = newip;
 	cpu->ip = newip;
 	cpu->flags &= ~(IF | TF);
@@ -7051,6 +10224,385 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		}
 	}
 
+	/* WfW boot monitor counters — only active when win386 diag is running.
+	 * Note: exc_counts[] is incremented at the exception dispatch site
+	 * (not here) to avoid counting PIC IRQs that share vectors 0-31. */
+	if (unlikely(cpu_diag_enabled) && win386_diag.active) {
+		/* Dense causal timeline: PM ring-3 entries + VM86 low vectors. */
+		if ((cpu->cr0 & 1) && !(cpu->flags & VM) && cpu->cpl == 3) {
+			uint32_t ex = 0;
+			if (no == EX_PF)
+				ex = cpu->cr2;
+			else if (pusherr)
+				ex = cpu->excerr;
+			/* Vector 30h is very chatty in this workload and hides decisive events. */
+			if (no != 0x30)
+				wfw_flow_push_here(cpu, (no < 32) ? 'E' : 'I', (uint8_t)no, ex);
+		} else if ((cpu->flags & VM) && !ext && no < 0x20) {
+			uint32_t ex = pusherr ? cpu->excerr : 0;
+			wfw_flow_push_here(cpu, 'L', (uint8_t)no, ex);
+		}
+		if (!ext && no < 32) {
+			wfw_monitor.lowvec_softint_total++;
+			wfw_monitor.lowvec_softint_hist[no]++;
+		}
+		if (no < 32) {
+			wfw_monitor.has_fatal = true;
+			wfw_monitor.fatal_excno = no;
+			wfw_monitor.fatal_cs = cpu->seg[SEG_CS].sel;
+			wfw_monitor.fatal_ds = cpu->seg[SEG_DS].sel;
+			wfw_monitor.fatal_es = cpu->seg[SEG_ES].sel;
+			wfw_monitor.fatal_eip = cpu->ip;
+			wfw_monitor.fatal_ss = cpu->seg[SEG_SS].sel;
+			wfw_monitor.fatal_esp = REGi(4);
+			refresh_flags(cpu);
+			wfw_monitor.fatal_efl = cpu->flags;
+			wfw_monitor.fatal_cpl = cpu->cpl;
+			wfw_monitor.fatal_vm = (cpu->flags & VM) ? 1 : 0;
+			wfw_monitor.fatal_ext = (uint8_t)(ext ? 1 : 0);
+			wfw_monitor.fatal_pusherr = (uint8_t)(pusherr ? 1 : 0);
+			wfw_capture_decode_and_bytes(cpu, wfw_monitor.fatal_decoded,
+						     sizeof(wfw_monitor.fatal_decoded),
+						     wfw_monitor.fatal_bytes,
+						     &wfw_monitor.fatal_blen);
+			if (wfw_monitor.iopl3_captured && !wfw_monitor.post_iopl3_fault_captured) {
+				wfw_monitor.post_iopl3_fault_captured = true;
+				wfw_monitor.post_iopl3_excno = no;
+				wfw_monitor.post_iopl3_cs = cpu->seg[SEG_CS].sel;
+				wfw_monitor.post_iopl3_eip = cpu->ip;
+				wfw_monitor.post_iopl3_fl = cpu->flags;
+				wfw_monitor.post_iopl3_err = pusherr ? cpu->excerr : 0;
+				wfw_monitor.post_iopl3_last_evt = (wfw_monitor.vm86_int_evt_count > 0)
+					? (int8_t)(wfw_monitor.vm86_int_evt_count - 1) : (int8_t)-1;
+				wfw_capture_decode_and_bytes(cpu, wfw_monitor.post_iopl3_decoded,
+							     sizeof(wfw_monitor.post_iopl3_decoded),
+							     wfw_monitor.post_iopl3_bytes,
+							     &wfw_monitor.post_iopl3_blen);
+			}
+		}
+		if (cpu->flags & VM)
+			wfw_monitor.vm86_ints++;
+		else if (cpu->cr0 & 1) {
+			wfw_monitor.pm_ints++;
+			if (cpu->cpl == 3) {
+				wfw_monitor.pm_ring3_ints++;
+				/* Capture initial PM ring-3 state (first ring-3 event) */
+				if (!wfw_monitor.r3_first_captured) {
+					wfw_monitor.r3_first_captured = true;
+					wfw_monitor.r3_first_cs = cpu->seg[SEG_CS].sel;
+					wfw_monitor.r3_first_ds = cpu->seg[SEG_DS].sel;
+					wfw_monitor.r3_first_es = cpu->seg[SEG_ES].sel;
+					wfw_monitor.r3_first_ss = cpu->seg[SEG_SS].sel;
+					wfw_monitor.r3_first_eip = cpu->ip;
+					wfw_monitor.r3_first_esp = REGi(4);
+					wfw_monitor.r3_first_eax = REGi(0);
+					/* Dump PSP from ES (DPMI spec: ES=PSP selector after mode switch).
+					 * PSP:80h = command tail length, PSP:81h = command tail.
+					 * PSP:2Ch = environment (selector in PM, segment in RM). */
+					uint32_t es_base = cpu->seg[SEG_ES].base;
+					wfw_monitor.psp_ds_base = es_base; /* reuse field for ES base */
+					if (es_base + 0x100 <= (uint32_t)cpu->phys_mem_size) {
+						for (int j = 0; j < 16; j++)
+							wfw_monitor.psp_header[j] = cpu->phys_mem[es_base + j];
+						wfw_monitor.psp_cmdtail_len = cpu->phys_mem[es_base + 0x80];
+						int clen = wfw_monitor.psp_cmdtail_len;
+						if (clen > 127) clen = 127;
+						for (int j = 0; j < clen; j++)
+							wfw_monitor.psp_cmdtail[j] = cpu->phys_mem[es_base + 0x81 + j];
+						wfw_monitor.psp_cmdtail[clen] = '\0';
+						/* Get environment from PSP:2Ch.
+						 * In PM after DPMI mode switch, VMM converts this from
+						 * a real-mode segment to a PM selector. Detect which by
+						 * checking if bit 2 (TI=LDT) is set. */
+							wfw_monitor.psp_env_seg = cpu->phys_mem[es_base + 0x2c] |
+								(cpu->phys_mem[es_base + 0x2d] << 8);
+							uint32_t env_lin = 0;
+							bool env_found = false;
+							bool env_from_sel = false;
+							if ((wfw_monitor.psp_env_seg & 4) && (cpu->cr0 & CR0_PG)) {
+								/* PM selector — look up base in LDT via page walk */
+								uint32_t ldt_lin = cpu->seg[SEG_LDT].base;
+								uint32_t desc_off = (wfw_monitor.psp_env_seg >> 3) * 8;
+								if (desc_off + 7 <= cpu->seg[SEG_LDT].limit) {
+									/* Walk page table: LDT linear → physical */
+									uint32_t pde_addr = (cpu->cr3 & 0xfffff000)
+										+ (((ldt_lin + desc_off) >> 22) & 0x3ff) * 4;
+									if (pde_addr + 4 <= (uint32_t)cpu->phys_mem_size) {
+										uint32_t pde = *(uint32_t*)&cpu->phys_mem[pde_addr];
+										if (pde & 1) {
+											uint32_t pte_addr = (pde & 0xfffff000)
+											+ (((ldt_lin + desc_off) >> 12) & 0x3ff) * 4;
+										if (pte_addr + 4 <= (uint32_t)cpu->phys_mem_size) {
+											uint32_t pte = *(uint32_t*)&cpu->phys_mem[pte_addr];
+											if (pte & 1) {
+												uint32_t phys = (pte & 0xfffff000)
+													+ ((ldt_lin + desc_off) & 0xfff);
+													if (phys + 8 <= (uint32_t)cpu->phys_mem_size) {
+														uint8_t *d = &cpu->phys_mem[phys];
+														env_lin = d[2] | (d[3]<<8) | (d[4]<<16) | (d[7]<<24);
+														env_found = true;
+														env_from_sel = true;
+													}
+												}
+											}
+										}
+									}
+							}
+						}
+						if (!env_found) {
+							/* Fallback: treat as real-mode segment */
+							env_lin = (uint32_t)wfw_monitor.psp_env_seg << 4;
+							env_found = (env_lin > 0);
+							}
+							wfw_monitor.psp_env_lin = env_lin;
+							wfw_monitor.psp_env_is_sel = env_from_sel;
+						if (env_found && env_lin + 256 <= (uint32_t)cpu->phys_mem_size) {
+							for (int j = 0; j < 255; j++)
+								wfw_monitor.psp_env[j] = cpu->phys_mem[env_lin + j];
+							wfw_monitor.psp_env[255] = '\0';
+						}
+					}
+				}
+				if (no < 32) {
+					wfw_monitor.pm_ring3_faults++;
+					wfw_monitor.pm_ring3_exc_hist[no]++;
+					wfw_monitor.pm_r3_last_cs = cpu->seg[SEG_CS].sel;
+					wfw_monitor.pm_r3_last_eip = cpu->ip;
+					wfw_monitor.pm_r3_last_exc = no;
+					/* Capture ring-3 #GP details */
+					if (no == EX_GP && wfw_monitor.r3_gp_count < 8) {
+						int gi = wfw_monitor.r3_gp_count++;
+						uint8_t gp_bytes[8];
+						uint8_t gp_blen = 0;
+						wfw_monitor.r3_gp_log[gi].cs = cpu->seg[SEG_CS].sel;
+						wfw_monitor.r3_gp_log[gi].eip = cpu->ip;
+						wfw_monitor.r3_gp_log[gi].err = cpu->excerr;
+						wfw_capture_decode_and_bytes(cpu,
+							wfw_monitor.r3_gp_log[gi].dec,
+							sizeof(wfw_monitor.r3_gp_log[gi].dec),
+							gp_bytes, &gp_blen);
+					}
+					/* Capture ring-3 #PF details (CR2 + error code + decode). */
+					if (no == EX_PF && wfw_monitor.r3_pf_count < 8) {
+						int pi = wfw_monitor.r3_pf_count++;
+						uint8_t pf_bytes[8];
+						uint8_t pf_blen = 0;
+						wfw_monitor.r3_pf_log[pi].cs = cpu->seg[SEG_CS].sel;
+						wfw_monitor.r3_pf_log[pi].eip = cpu->ip;
+						wfw_monitor.r3_pf_log[pi].err = cpu->excerr;
+						wfw_monitor.r3_pf_log[pi].cr2 = cpu->cr2;
+						wfw_capture_decode_and_bytes(cpu,
+							wfw_monitor.r3_pf_log[pi].dec,
+							sizeof(wfw_monitor.r3_pf_log[pi].dec),
+							pf_bytes, &pf_blen);
+					}
+					/* High-address #PF page table snapshot (ring buffer, last 16).
+					 * Captures PDE/PTE state BEFORE VMM's handler runs. */
+					if (no == EX_PF && cpu->cr2 >= 0x80000000u) {
+						int hi = wfw_monitor.r3_hipf_pos % 16;
+						wfw_monitor.r3_hipf[hi].cr2 = cpu->cr2;
+						wfw_monitor.r3_hipf[hi].err = cpu->excerr;
+						wfw_monitor.r3_hipf[hi].cs = cpu->seg[SEG_CS].sel;
+						wfw_monitor.r3_hipf[hi].eip = cpu->ip;
+						wfw_monitor.r3_hipf[hi].cr3 = cpu->cr3;
+						/* Walk page tables from CR3 */
+						uint32_t _cr2 = cpu->cr2;
+						uint32_t _cr3 = cpu->cr3;
+						uint32_t pde_pa = (_cr3 & ~0xFFFu) | ((_cr2 >> 20) & 0xFFCu);
+						uint32_t pde = 0, pte = 0;
+						if (pde_pa + 3 < (uint32_t)cpu->phys_mem_size)
+							pde = *(uint32_t *)(cpu->phys_mem + pde_pa);
+						if (pde & 1) {
+							uint32_t pte_pa = (pde & ~0xFFFu) | ((_cr2 >> 10) & 0xFFCu);
+							if (pte_pa + 3 < (uint32_t)cpu->phys_mem_size)
+								pte = *(uint32_t *)(cpu->phys_mem + pte_pa);
+						}
+						wfw_monitor.r3_hipf[hi].pde = pde;
+						wfw_monitor.r3_hipf[hi].pte = pte;
+						wfw_monitor.r3_hipf_pos++;
+						if (wfw_monitor.r3_hipf_count < 16)
+							wfw_monitor.r3_hipf_count++;
+						/* Full register snapshot for last high-address PF
+						 * (the unresolvable one is always last) */
+						{
+							wfw_monitor.fatal_pf.cr2 = cpu->cr2;
+							wfw_monitor.fatal_pf.cs = cpu->seg[SEG_CS].sel;
+							wfw_monitor.fatal_pf.eip = cpu->ip;
+							wfw_monitor.fatal_pf.eax = REGi(0);
+							wfw_monitor.fatal_pf.ebx = REGi(3);
+							wfw_monitor.fatal_pf.ecx = REGi(1);
+							wfw_monitor.fatal_pf.edx = REGi(2);
+							wfw_monitor.fatal_pf.esi = REGi(6);
+							wfw_monitor.fatal_pf.edi = REGi(7);
+							wfw_monitor.fatal_pf.ebp = REGi(5);
+							wfw_monitor.fatal_pf.esp = REGi(4);
+							wfw_monitor.fatal_pf.ds = cpu->seg[SEG_DS].sel;
+							wfw_monitor.fatal_pf.es = cpu->seg[SEG_ES].sel;
+							wfw_monitor.fatal_pf.ss = cpu->seg[SEG_SS].sel;
+							wfw_monitor.fatal_pf.fs = cpu->seg[SEG_FS].sel;
+							wfw_monitor.fatal_pf.gs = cpu->seg[SEG_GS].sel;
+							wfw_monitor.fatal_pf.ds_base = cpu->seg[SEG_DS].base;
+							wfw_monitor.fatal_pf.es_base = cpu->seg[SEG_ES].base;
+							wfw_monitor.fatal_pf.ss_base = cpu->seg[SEG_SS].base;
+							wfw_monitor.fatal_pf.ds_limit = cpu->seg[SEG_DS].limit;
+							wfw_monitor.fatal_pf.es_limit = cpu->seg[SEG_ES].limit;
+							wfw_monitor.fatal_pf.cs_limit = cpu->seg[SEG_CS].limit;
+							wfw_monitor.fatal_pf_captured = true;
+						}
+					}
+				} else {
+					wfw_monitor.pm_ring3_irqs++;
+				}
+				/* Track PM ring-3 software INTs */
+				if (no == 0x2f) {
+					uint16_t ax2f = REGi(0) & 0xffff;
+					if (wfw_monitor.pm_r3_int2f_count < 16)
+						wfw_monitor.pm_r3_int2f_ax[wfw_monitor.pm_r3_int2f_count] = ax2f;
+					wfw_monitor.pm_r3_int2f_count++;
+					/* For 168Ah, capture DS:SI string */
+					if (ax2f == 0x168a && wfw_monitor.pm_r3_168a_count == 0) {
+						uint32_t lin = cpu->seg[SEG_DS].base + (REGi(6) & 0xffff);
+						int j;
+						for (j = 0; j < 15; j++) {
+							if (lin + j >= (uint32_t)cpu->phys_mem_size) break;
+							uint8_t ch = cpu->phys_mem[lin + j];
+							if (ch == 0) break;
+							wfw_monitor.pm_r3_168a_str[j] = ch;
+						}
+						wfw_monitor.pm_r3_168a_str[j] = '\0';
+					}
+					if ((ax2f & 0xff00) == 0x1600)
+						wfw_monitor.pm_r3_168a_count++;
+					wfw_monitor.pending_int2f = true;
+					wfw_monitor.pending_int2f_ax = ax2f;
+				}
+				if (no == 0x21) {
+					int idx = wfw_monitor.pm_r3_int21_count % 16;
+					uint8_t ah = (REGi(0) >> 8) & 0xff;
+					wfw_monitor.pm_r3_int21_ah_ring[idx] = ah;
+					if (wfw_monitor.pm_r3_int21_first_count < 16)
+						wfw_monitor.pm_r3_int21_ah_first[wfw_monitor.pm_r3_int21_first_count++] = ah;
+					wfw_monitor.pm_r3_int21_count++;
+					wfw_monitor.pending_int21 = true;
+					wfw_monitor.pending_int21_ah = ah;
+					/* Capture filename for AH=3Dh (Open File).
+					 * Use translated DS:DX reads (not raw phys_mem) so PM ring-3
+					 * paging/segments still produce valid names in the monitor. */
+					if (ah == 0x3d && wfw_monitor.r3_fopen_count < 8) {
+						int fi = wfw_monitor.r3_fopen_count++;
+						uword off = (uword)(REGi(2) & 0xffff);
+						cpu_diag_copy_seg_string(cpu, SEG_DS, off, cpu->cpl, 0,
+								 wfw_monitor.r3_fopen_log[fi].name,
+								 sizeof(wfw_monitor.r3_fopen_log[fi].name));
+					}
+				} else if (no == 0x31) {
+					uint16_t ax31 = REGi(0) & 0xffff;
+					int idx = wfw_monitor.pm_r3_int31_count % 16;
+					wfw_monitor.pm_r3_int31_ax_ring[idx] = ax31;
+					if (wfw_monitor.pm_r3_int31_first_count < 16)
+						wfw_monitor.pm_r3_int31_ax_first[wfw_monitor.pm_r3_int31_first_count++] = ax31;
+					/* Histogram: count calls per function code */
+					int hi;
+					for (hi = 0; hi < wfw_monitor.int31_hist_len; hi++)
+						if (wfw_monitor.int31_hist[hi].ax == ax31) break;
+					if (hi < wfw_monitor.int31_hist_len)
+						wfw_monitor.int31_hist[hi].count++;
+					else if (wfw_monitor.int31_hist_len < 24) {
+						wfw_monitor.int31_hist[wfw_monitor.int31_hist_len].ax = ax31;
+						wfw_monitor.int31_hist[wfw_monitor.int31_hist_len].count = 1;
+						wfw_monitor.int31_hist_len++;
+					}
+					/* Capture BX (selector) for Get Segment Base (0006) calls */
+					if (ax31 == 0x0006) {
+						uint16_t bx = REGi(3) & 0xffff;
+						if (wfw_monitor.int31_0006_count < 16)
+							wfw_monitor.int31_0006_bx[wfw_monitor.int31_0006_count++] = bx;
+						/* Last-16 ring buffer for selectors */
+						wfw_monitor.int31_0006_bx_ring[wfw_monitor.int31_0006_ret_count % 16] = bx;
+						wfw_monitor.pending_dpmi_bx = bx;
+					}
+					/* Capture SetSegBase(0007) target bases for selector 0x100F */
+					if (ax31 == 0x0007 && (REGi(3) & 0xffff) == 0x100f) {
+						uint32_t base = ((uint32_t)(REGi(1) & 0xffff) << 16) | (REGi(2) & 0xffff);
+						if (wfw_monitor.seg100f_base_count < 8) {
+							/* Only store unique bases */
+							int dup = 0;
+							for (int k = 0; k < wfw_monitor.seg100f_base_count; k++)
+								if (wfw_monitor.seg100f_bases[k] == base) { dup = 1; break; }
+							if (!dup)
+								wfw_monitor.seg100f_bases[wfw_monitor.seg100f_base_count++] = base;
+						}
+					}
+					/* Log all descriptor-mutating DPMI calls */
+					if (wfw_monitor.dpmi_seg_log_count < 32) {
+						uint16_t f = ax31;
+						if (f == 0x0007 || f == 0x0008 || f == 0x0009 ||
+						    f == 0x000A || f == 0x000B || f == 0x000C ||
+						    f == 0x0001) {
+							int si = wfw_monitor.dpmi_seg_log_count++;
+							wfw_monitor.dpmi_seg_log[si].func = f;
+							wfw_monitor.dpmi_seg_log[si].sel = REGi(3) & 0xffff;
+							wfw_monitor.dpmi_seg_log[si].val = 0;
+							wfw_monitor.dpmi_seg_log[si].extra = 0;
+							wfw_monitor.dpmi_seg_log[si].ret_cf = 0;
+							wfw_monitor.dpmi_seg_log[si].ret_valid = 0;
+							if (f == 0x0001) {
+								/* AllocLDT: CX=count, return AX=first sel */
+								wfw_monitor.dpmi_seg_log[si].sel = 0; /* filled on IRET */
+								wfw_monitor.dpmi_seg_log[si].val = REGi(1) & 0xffff; /* CX=count */
+							} else if (f == 0x000C) {
+								/* SetDesc: BX=sel, ES:(E)DI→8-byte descriptor */
+								/* Read descriptor bytes from ES:(E)DI with page walk */
+								{
+									uint32_t di = cpu->code16 ? (REGi(7) & 0xffff) : REGi(7);
+									uint32_t desc_la = cpu->seg[SEG_ES].base + di;
+									uint32_t d0 = 0, d1 = 0;
+									for (int dw = 0; dw < 2; dw++) {
+										uint32_t la = desc_la + dw * 4;
+										uint32_t pa = la;
+										if (cpu->cr0 & (1u << 31)) {
+											uint32_t pde_a = (cpu->cr3 & 0xfffff000) | ((la >> 20) & 0xffc);
+											if (pde_a + 4 > (uint32_t)cpu->phys_mem_size) break;
+											uint32_t pde = *(uint32_t *)&cpu->phys_mem[pde_a];
+											if (!(pde & 1)) break;
+											uint32_t pte_a = (pde & 0xfffff000) | ((la >> 10) & 0xffc);
+											if (pte_a + 4 > (uint32_t)cpu->phys_mem_size) break;
+											uint32_t pte = *(uint32_t *)&cpu->phys_mem[pte_a];
+											if (!(pte & 1)) break;
+											pa = (pte & 0xfffff000) | (la & 0xfff);
+										}
+										if (pa + 4 <= (uint32_t)cpu->phys_mem_size) {
+											if (dw == 0) d0 = *(uint32_t *)&cpu->phys_mem[pa];
+											else         d1 = *(uint32_t *)&cpu->phys_mem[pa];
+										}
+									}
+									wfw_monitor.dpmi_seg_log[si].val = d0;
+									wfw_monitor.dpmi_seg_log[si].extra = d1;
+								}
+							} else if (f == 0x000B) {
+								/* GetDesc: BX=selector, ES:(E)DI destination buffer */
+								uint32_t di = cpu->code16 ? (REGi(7) & 0xffff) : REGi(7);
+								wfw_monitor.dpmi_seg_log[si].val = cpu->seg[SEG_ES].base + di;
+							} else {
+								/* 0007/0008/0009: BX=sel, CX:DX=value
+								 * 000A(CreateAlias): BX=src sel, AX=ret alias (on IRET) */
+								wfw_monitor.dpmi_seg_log[si].val =
+									((uint32_t)(REGi(1) & 0xffff) << 16) | (REGi(2) & 0xffff);
+							}
+						}
+					}
+					/* Capture input params for Allocate/Resize Memory Block */
+					if (ax31 == 0x0501 || ax31 == 0x0503)
+						wfw_monitor.pending_alloc_size =
+							((uint32_t)(REGi(3) & 0xffff) << 16) | (REGi(1) & 0xffff);
+					wfw_monitor.pm_r3_int31_count++;
+					wfw_monitor.pending_dpmi = true;
+					wfw_monitor.pending_dpmi_ax = ax31;
+				}
+			}
+		}
+	}
+
 	if (!(cpu->cr0 & 1)) {
 		/* REAL-ADDRESS-MODE */
 		uword sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
@@ -7069,7 +10621,7 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 			OptAddr meml;
 			uword base = cpu->idt.base;
 			int off = no * 4;
-			TRY1(translate_laddr(cpu, &meml, 1, base + off, 4, 0));
+			TRY(translate_laddr(cpu, &meml, 1, base + off, 4, 0));
 			uword w1 = load32(cpu, &meml);
 			newcs = w1 >> 16;
 			newip = w1 & 0xffff;
@@ -7094,7 +10646,8 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		uword ss_base = cpu->seg[SEG_SS].base;
 		uword new_sp = (sp - 6) & sp_mask;
 
-		if (likely((sp & 0xfff) >= 6)) {
+		if (likely((sp & 0xfff) >= 6 &&
+			   !(cpu_diag_enabled && win386_diag.active))) {
 			/* Fast path: direct memory write, no page crossing */
 			uint8_t *stack = cpu->phys_mem + ss_base + new_sp;
 			refresh_flags(cpu);
@@ -7105,9 +10658,9 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		} else {
 			/* Slow path: stack crosses page boundary, use translate */
 			OptAddr meml1, meml2, meml3;
-			TRY1(translate(cpu, &meml1, 2, SEG_SS, (sp - 2 * 1) & sp_mask, 2, 0));
-			TRY1(translate(cpu, &meml2, 2, SEG_SS, (sp - 2 * 2) & sp_mask, 2, 0));
-			TRY1(translate(cpu, &meml3, 2, SEG_SS, (sp - 2 * 3) & sp_mask, 2, 0));
+			TRY(translate(cpu, &meml1, 2, SEG_SS, (sp - 2 * 1) & sp_mask, 2, 0));
+			TRY(translate(cpu, &meml2, 2, SEG_SS, (sp - 2 * 2) & sp_mask, 2, 0));
+			TRY(translate(cpu, &meml3, 2, SEG_SS, (sp - 2 * 3) & sp_mask, 2, 0));
 			refresh_flags(cpu);
 			cpu->cc.mask = 0;
 			saddr16(&meml1, cpu->flags);
@@ -7116,7 +10669,7 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		}
 		sreg32(4, new_sp);
 
-		TRY1(set_seg(cpu, SEG_CS, newcs));
+		TRY(set_seg(cpu, SEG_CS, newcs));
 		cpu->next_ip = newip;
 		cpu->ip = newip;
 		cpu->flags &= ~(IF|TF);
@@ -7132,9 +10685,9 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		THROW(EX_GP, off | 2 | ext);
 	}
 
-	TRY1(translate_laddr(cpu, &meml, 1, base + off, 4, 0));
+	TRY(translate_laddr(cpu, &meml, 1, base + off, 4, 0));
 	uword w1 = load32(cpu, &meml);
-	TRY1(translate_laddr(cpu, &meml, 1, base + off + 4, 4, 0));
+	TRY(translate_laddr(cpu, &meml, 1, base + off + 4, 4, 0));
 	uword w2 = load32(cpu, &meml);
 
 	int gt = (w2 >> 8) & 0xf;
@@ -7145,19 +10698,100 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 
 	int dpl = (w2 >> 13) & 0x3;
 	if (!ext && dpl < cpu->cpl) {
-		if (unlikely(cpu_diag_enabled) && cpu_diag_event_allow(cpu, &cpu_diag_events.swint_dpl)) {
-			uword gate_target = (w1 & 0xffff) | (w2 & 0xffff0000);
-			refresh_flags(cpu);
-			dolog("=== SW INT DPL reject #%u ===\n", cpu_diag_events.swint_dpl);
-			dolog("  vec=%02x ext=%d gate_dpl=%d cpl=%d err=%x\n",
-				no, ext, dpl, cpu->cpl, off | 2);
-			dolog("  gate raw=%08x %08x type=%x p=%d target=%04x:%08x\n",
-				w1, w2, gt, (w2 >> 15) & 1, w1 >> 16, gate_target);
-			dolog("  at CS:EIP=%04x:%08x FL=%08x IOPL=%d VM=%d\n",
-				cpu->seg[SEG_CS].sel, cpu->ip, cpu->flags, get_IOPL(cpu), !!(cpu->flags & VM));
-			dump_cs_bytes(cpu, "  opcodes @CS:EIP:", 8);
+		/* Win3.x/WfW compat: some PM ring-3 probes issue INT 11h/12h and
+		 * expect BIOS-equivalent values. If they hit a DPL gate and the
+		 * VMM reflection path doesn't synthesize AX, startup can abort.
+		 * Return BDA-backed values directly for these two vectors. */
+		if (unlikely(win386_diag.active) && (no == 0x11 || no == 0x12)) {
+			uint16_t val = 0;
+			uint32_t off = (no == 0x11) ? 0x410u : 0x413u;
+			if (off + 1 < (uint32_t)cpu->phys_mem_size)
+				val = cpu->phys_mem[off] | ((uint16_t)cpu->phys_mem[off + 1] << 8);
+			if (no == 0x11) {
+				/* Some BIOS paths leave high equipment bits noisy (e.g. C065).
+				 * Normalize to architecturally meaningful bits for Win3.x probes:
+				 * keep low 12 bits and force a color text baseline if video bits are 00. */
+				val &= 0x0fff;
+				if ((val & 0x0030) == 0x0000)
+					val = (uint16_t)((val & ~0x0030) | 0x0020);
+			}
+			sreg16(0, val);
+			wfw_flow_push_here(cpu, 'H', (uint8_t)no, val);
+			if (unlikely(cpu_diag_enabled) &&
+			    cpu_diag_event_allow(cpu, &cpu_diag_events.swint_dpl)) {
+				dolog("SW INT compat #%u vec=%02x AX<=%04x from BDA[%03x] at %04x:%08x\n",
+					cpu_diag_events.swint_dpl, no, val, off,
+					cpu->seg[SEG_CS].sel, cpu->ip);
+				}
+				return true;
+		} else {
+swint_dpl_reject:
+			if (unlikely(cpu_diag_enabled) && win386_diag.active) {
+				int si = wfw_swint_dpl_find_or_add((uint8_t)no);
+				if (si >= 0 && si < wfw_monitor.swint_dpl_count) {
+					wfw_monitor.swint_dpl[si].count++;
+				if (wfw_monitor.swint_dpl[si].first_cs == 0 &&
+				    wfw_monitor.swint_dpl[si].first_ip == 0) {
+					wfw_monitor.swint_dpl[si].first_cs = cpu->seg[SEG_CS].sel;
+					wfw_monitor.swint_dpl[si].first_ip = cpu->ip;
+					wfw_monitor.swint_dpl[si].first_err = (off | 2);
+				}
+				wfw_monitor.swint_dpl[si].in_ax = REGi(0) & 0xffff;
+				wfw_monitor.swint_dpl[si].in_bx = REGi(3) & 0xffff;
+				wfw_monitor.pending_swint_dpl_idx = (int8_t)si;
+				wfw_monitor.pending_swint_cs = cpu->seg[SEG_CS].sel;
+				wfw_monitor.pending_swint_ip = cpu->ip;
+				wfw_monitor.pending_swint_next_ip = cpu->next_ip;
+			}
+				/* INT 41h module name capture (LOADMODULE/LOADDLL) */
+				if (no == 0x41 && wfw_monitor.int41_module_count < 8) {
+					uint16_t ax41 = REGi(0) & 0xffff;
+					if (ax41 == 0x005a || ax41 == 0x005c) {
+						int mi = wfw_monitor.int41_module_count;
+						uint16_t hmod;
+						if (ax41 == 0x005a)
+							hmod = REGi(1) & 0xffff; /* CX for LOADDLL */
+						else
+							hmod = REGi(3) & 0xffff; /* BX for LOADMODULE */
+						wfw_monitor.int41_modules[mi].ax = ax41;
+						wfw_monitor.int41_modules[mi].hmod = hmod;
+						wfw_monitor.int41_modules[mi].call_cs = cpu->seg[SEG_CS].sel;
+						read_ne_module_name(cpu, hmod,
+							wfw_monitor.int41_modules[mi].name,
+							sizeof(wfw_monitor.int41_modules[mi].name));
+						/* If primary register didn't yield a name, try alternatives */
+						if (!wfw_monitor.int41_modules[mi].name[0]) {
+							uint16_t alts[] = {
+								(uint16_t)(ax41 == 0x005a ? (REGi(3) & 0xffff) : (REGi(1) & 0xffff)),
+								(uint16_t)(REGi(6) & 0xffff),
+								(uint16_t)(REGi(7) & 0xffff),
+								cpu->seg[SEG_ES].sel
+							};
+							for (int a = 0; a < 4; a++) {
+								if (alts[a] == hmod || (alts[a] & ~7) == 0)
+									continue;
+								read_ne_module_name(cpu, alts[a],
+									wfw_monitor.int41_modules[mi].name,
+									sizeof(wfw_monitor.int41_modules[mi].name));
+								if (wfw_monitor.int41_modules[mi].name[0]) {
+									wfw_monitor.int41_modules[mi].hmod = alts[a];
+									break;
+								}
+							}
+						}
+						wfw_monitor.int41_module_count++;
+					}
+				}
+			}
+			if (unlikely(cpu_diag_enabled) &&
+			    cpu_diag_event_allow(cpu, &cpu_diag_events.swint_dpl)) {
+				dolog("SW INT DPL reject #%u vec=%02x dpl=%d cpl=%d at %04x:%08x\n",
+					cpu_diag_events.swint_dpl, no, dpl, cpu->cpl,
+					cpu->seg[SEG_CS].sel, cpu->ip);
+			}
+			wfw_flow_push_here(cpu, 'D', (uint8_t)no, (uint32_t)(off | 2));
+			THROW(EX_GP, off | 2);
 		}
-		THROW(EX_GP, off | 2);
 	}
 
 	int p = (w2 >> 15) & 1;
@@ -7169,12 +10803,9 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 	/* task gate */
 	if (gt == 5) {
 		if (unlikely(cpu_diag_enabled) && cpu_diag_event_allow(cpu, &cpu_diag_events.task_gate)) {
-			refresh_flags(cpu);
-			dolog("=== Task gate dispatch #%u ===\n", cpu_diag_events.task_gate);
-			dolog("  vec=%02x ext=%d gate raw=%08x %08x selector=%04x\n",
-				no, ext, w1, w2, w1 >> 16);
-			dolog("  from CS:EIP=%04x:%08x SS:ESP=%04x:%08x CPL=%d FL=%08x\n",
-				cpu->seg[SEG_CS].sel, cpu->ip, cpu->seg[SEG_SS].sel, REGi(4), cpu->cpl, cpu->flags);
+			dolog("Task gate #%u vec=%02x sel=%04x from %04x:%08x\n",
+				cpu_diag_events.task_gate, no, w1 >> 16,
+				cpu->seg[SEG_CS].sel, cpu->ip);
 		}
 		return task_switch(cpu, w1 >> 16, TS_CALL);
 	}
@@ -7340,6 +10971,8 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		}
 		case 3: /* from v8086 */ {
 //		dolog("int from v8086\n");
+		if (unlikely(cpu_diag_enabled) && win386_diag.active)
+			wfw_monitor.v86_to_ring0++;
 		if (csdpl != 0) THROW(EX_GP, newcs & ~0x3);
 		if (gate16) THROW(EX_GP, off | 2 | ext);
 //		dolog("call_isr %d %x PVL %d => 0\n", no, no, cpu->cpl, csdpl);
@@ -7353,35 +10986,25 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		TRY(translate(cpu, &mss0, 1, SEG_TR, 8 + 8 * newpl, 4, 0));
 		newsp = load32(cpu, &msp0);
 		newss = load32(cpu, &mss0) & 0xffff;
-				if (unlikely(cpu_diag_enabled) && cpu_diag_event_allow(cpu, &cpu_diag_events.vm86_isr_entry)) {
+				if (unlikely(cpu_diag_enabled) && !vm86_trip_silence_live_logs(cpu) &&
+				    cpu_diag_event_allow(cpu, &cpu_diag_events.vm86_isr_entry)) {
 					char decoded[80];
 					bool is_io, needs_stack_dump;
 					int io_port, io_bits;
-					refresh_flags(cpu);
-					dolog("=== VM86 -> ring0 ISR entry #%u ===\n", cpu_diag_events.vm86_isr_entry);
-					dolog("  vec=%02x ext=%d pusherr=%d gate=%x target=%04x:%08x\n",
-						no, ext, pusherr, gt, newcs, newip);
-					dolog("  old CS:EIP=%04x:%08x SS:ESP=%04x:%08x\n",
-					cpu->seg[SEG_CS].sel, cpu->ip, oldss, oldsp);
-				dolog("  TSS->ring0 SS:ESP=%04x:%08x TR=%04x base=%08x limit=%x\n",
-					newss, newsp, cpu->seg[SEG_TR].sel, cpu->seg[SEG_TR].base, cpu->seg[SEG_TR].limit);
-					if (pusherr)
-						dolog("  FL=%08x IOPL=%d VM=%d err=%08x\n",
-							cpu->flags, get_IOPL(cpu), !!(cpu->flags & VM), cpu->excerr);
-					else
-						dolog("  FL=%08x IOPL=%d VM=%d err=<none>\n",
-							cpu->flags, get_IOPL(cpu), !!(cpu->flags & VM));
-					dump_cs_bytes(cpu, "  vm86 fault bytes:", 8);
 					vm86_decode_fault_instruction(cpu, decoded, sizeof(decoded),
 								     &is_io, &io_port, &io_bits, &needs_stack_dump);
-					dolog("  vm86 trap decode: %s\n", decoded);
-					if (needs_stack_dump)
-						vm86_dump_stack_words(cpu, 5);
-					if (is_io && io_port >= 0)
-						vm86_log_ioperm_probe(cpu, io_port, io_bits);
+					dolog("V86->r0 #%u vec=%02x %04x:%04x->%04x:%08x r0stk=%04x:%08x %s\n",
+						cpu_diag_events.vm86_isr_entry, no,
+						cpu->seg[SEG_CS].sel, cpu->ip & 0xffff, newcs, newip,
+						newss, newsp, decoded);
 				}
-			uword oldflags = cpu->flags;
-			int oldcpl = cpu->cpl;
+			vm86_trip_push(cpu, VM86_TRIP_V, (uint8_t)no,
+				       cpu->seg[SEG_CS].sel, cpu->ip,
+				       cpu->seg[SEG_SS].sel, REGi(4), cpu->flags,
+				       newcs & 0xffff, newip, newss & 0xffff,
+				       newsp, NULL, 0);
+				uword oldflags = cpu->flags;
+				int oldcpl = cpu->cpl;
 			cpu->flags &= ~VM;
 			cpu->cpl = newpl;
 			REGi(4) = newsp;
@@ -7396,15 +11019,15 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		OptAddr memlg, memlf, memld, memle;
 		OptAddr meml1, meml2, meml3, meml4, meml5, meml6;
 		uword sp = lreg32(4);
-		TRY1(translate(cpu, &memlg, 2, SEG_SS, (sp - 4 * 1) & sp_mask, 4, 0));
-		TRY1(translate(cpu, &memlf, 2, SEG_SS, (sp - 4 * 2) & sp_mask, 4, 0));
-		TRY1(translate(cpu, &memld, 2, SEG_SS, (sp - 4 * 3) & sp_mask, 4, 0));
-		TRY1(translate(cpu, &memle, 2, SEG_SS, (sp - 4 * 4) & sp_mask, 4, 0));
-		TRY1(translate(cpu, &meml1, 2, SEG_SS, (sp - 4 * 5) & sp_mask, 4, 0));
-		TRY1(translate(cpu, &meml2, 2, SEG_SS, (sp - 4 * 6) & sp_mask, 4, 0));
-		TRY1(translate(cpu, &meml3, 2, SEG_SS, (sp - 4 * 7) & sp_mask, 4, 0));
-		TRY1(translate(cpu, &meml4, 2, SEG_SS, (sp - 4 * 8) & sp_mask, 4, 0));
-		TRY1(translate(cpu, &meml5, 2, SEG_SS, (sp - 4 * 9) & sp_mask, 4, 0));
+		if (!translate(cpu, &memlg, 2, SEG_SS, (sp - 4 * 1) & sp_mask, 4, 0)) goto v86_stack_fail;
+		if (!translate(cpu, &memlf, 2, SEG_SS, (sp - 4 * 2) & sp_mask, 4, 0)) goto v86_stack_fail;
+		if (!translate(cpu, &memld, 2, SEG_SS, (sp - 4 * 3) & sp_mask, 4, 0)) goto v86_stack_fail;
+		if (!translate(cpu, &memle, 2, SEG_SS, (sp - 4 * 4) & sp_mask, 4, 0)) goto v86_stack_fail;
+		if (!translate(cpu, &meml1, 2, SEG_SS, (sp - 4 * 5) & sp_mask, 4, 0)) goto v86_stack_fail;
+		if (!translate(cpu, &meml2, 2, SEG_SS, (sp - 4 * 6) & sp_mask, 4, 0)) goto v86_stack_fail;
+		if (!translate(cpu, &meml3, 2, SEG_SS, (sp - 4 * 7) & sp_mask, 4, 0)) goto v86_stack_fail;
+		if (!translate(cpu, &meml4, 2, SEG_SS, (sp - 4 * 8) & sp_mask, 4, 0)) goto v86_stack_fail;
+		if (!translate(cpu, &meml5, 2, SEG_SS, (sp - 4 * 9) & sp_mask, 4, 0)) goto v86_stack_fail;
 		if (pusherr) {
 			TRY(translate(cpu, &meml6, 2, SEG_SS, (sp - 4 * 10) & sp_mask, 4, 0));
 		}
@@ -7429,21 +11052,32 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 		}
 
 		newcs = (newcs & (~3)) | newpl;
-		TRY1(set_seg(cpu, SEG_DS, 0));
-		TRY1(set_seg(cpu, SEG_ES, 0));
-		TRY1(set_seg(cpu, SEG_FS, 0));
-		TRY1(set_seg(cpu, SEG_GS, 0));
+		if (!set_seg(cpu, SEG_DS, 0)) goto v86_stack_fail;
+		if (!set_seg(cpu, SEG_ES, 0)) goto v86_stack_fail;
+		if (!set_seg(cpu, SEG_FS, 0)) goto v86_stack_fail;
+		if (!set_seg(cpu, SEG_GS, 0)) goto v86_stack_fail;
 		cpu->flags &= ~(TF | RF | NT);
-		TRY1(set_seg(cpu, SEG_CS, newcs));
+		if (!set_seg(cpu, SEG_CS, newcs)) goto v86_stack_fail;
 		cpu->next_ip = newip;
 		cpu->ip = newip;
 		if (gt == 0x6 || gt == 0xe)
 			cpu->flags &= ~IF;
 		return true;
+	v86_stack_fail:
+		cpu->flags = oldflags;
+		cpu->cpl = oldcpl;
+		cpu->seg[SEG_SS].sel = oldss;
+		cpu->seg[SEG_SS].base = (uword)oldss << 4;
+		cpu->seg[SEG_SS].limit = 0xffff;
+		cpu->seg[SEG_SS].flags = 0;
+		cpu->sp_mask = 0xffff;
+		update_seg_flat(cpu, SEG_SS);
+		REGi(4) = oldsp;
+		return false;
 	}
 	default: assert(false);
 	}
-	TRY1(set_seg(cpu, SEG_CS, newcs));
+	TRY(set_seg(cpu, SEG_CS, newcs));
 	cpu->next_ip = newip;
 	cpu->ip = newip;
 	cpu->flags &= ~(TF | RF | NT);
@@ -7505,7 +11139,8 @@ static bool __pmiret_check_cs_outer(CPUI386 *cpu, int sel)
 	if (!conforming) {
 		if (dpl != rpl) THROW(EX_GP, sel & ~0x3);
 	} else {
-		if (dpl <= cpu->cpl) THROW(EX_GP, sel & ~0x3);
+		/* Conforming outer return: DPL must be <= target RPL. */
+		if (dpl > rpl) THROW(EX_GP, sel & ~0x3);
 	}
 
 	if (!p) {
@@ -7587,62 +11222,76 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 		uword vm_ds = laddr32(&meml_vmds);
 		uword vm_fs = laddr32(&meml_vmfs);
 		uword vm_gs = laddr32(&meml_vmgs);
-		if (unlikely(cpu_diag_enabled) && cpu_diag_event_allow(cpu, &cpu_diag_events.iret_to_vm86)) {
-			refresh_flags(cpu);
-			dolog("=== IRET to VM86 #%u ===\n", cpu_diag_events.iret_to_vm86);
-			dolog("  return CS:EIP=%04x:%08x FL=%08x from CPL=%d (old FL=%08x)\n",
-				newcs, newip, newflags, cpu->cpl, oldflags);
-			dolog("  vm frame SS:ESP=%04x:%08x ES=%04x DS=%04x FS=%04x GS=%04x\n",
-				vm_ss & 0xffff, vm_esp, vm_es & 0xffff, vm_ds & 0xffff, vm_fs & 0xffff, vm_gs & 0xffff);
-			dolog("  at CS:EIP=%04x:%08x stack SS:ESP=%04x:%08x\n",
-				cpu->seg[SEG_CS].sel, cpu->ip, cpu->seg[SEG_SS].sel, sp);
-		}
-		/* Detect VMM dispatching to VGA/system BIOS via V86 exec */
-		if (unlikely(cpu_diag_enabled) && ((newcs & 0xFFFF) == 0xC000 || (newcs & 0xFFFF) == 0xF000)) {
-			dolog("VMM BIOS dispatch: AH=%02x AL=%02x BX=%04x to %04x:%04x\n",
-				(lreg16(0) >> 8) & 0xff, lreg16(0) & 0xff,
-				lreg16(3), newcs & 0xffff, newip & 0xffff);
-		}
-		/* Detect VMM crashing a VM: IRET to VM86 with CS=0000 */
-		if (unlikely(cpu_diag_enabled) && (newcs & 0xFFFF) == 0) {
-			refresh_flags(cpu);
-			dolog("=== IRET-to-VM86 CRASH: target CS=0000 EIP=%08x ===\n", newip);
-			dolog("  from PM CS:EIP=%04x:%08x SS:ESP=%04x:%08x CPL=%d\n",
-				cpu->seg[SEG_CS].sel, cpu->ip, cpu->seg[SEG_SS].sel, sp,
-				cpu->seg[SEG_CS].sel & 3);
-			dolog("  newflags=%08x oldflags=%08x\n", newflags, oldflags);
-			dolog("  vm frame SS:ESP=%04x:%08x ES=%04x DS=%04x FS=%04x GS=%04x\n",
-				vm_ss & 0xffff, vm_esp, vm_es & 0xffff, vm_ds & 0xffff, vm_fs & 0xffff, vm_gs & 0xffff);
-			/* Dump BDA video fields */
-			dolog("  BDA video mode (0449h)=%02x\n",
-				(uint8_t)cpu->phys_mem[0x449]);
-			dolog("  BDA dcc_index (048Ah)=%02x video_ctl (0487h)=%02x video_switches (0488h)=%02x\n",
-				(uint8_t)cpu->phys_mem[0x48A],
-				(uint8_t)cpu->phys_mem[0x487],
-				(uint8_t)cpu->phys_mem[0x488]);
-			dolog("  BDA video_rows (0484h)=%02x char_height (0485h)=%04x crtc_addr (0463h)=%04x\n",
-				(uint8_t)cpu->phys_mem[0x484],
-				*(uint16_t*)(cpu->phys_mem + 0x485),
-				*(uint16_t*)(cpu->phys_mem + 0x463));
-			/* Dump PM stack to see VMM call chain (return addresses) */
-			for (int si = 0; si < 16; si++) {
-				OptAddr saddr;
-				if (translate(cpu, &saddr, 1, SEG_SS, (sp + si * 4) & sp_mask, 4, 0))
-					break;
-				dolog("  [ESP+%02x] = %08x\n", si * 4, laddr32(&saddr));
+			if (unlikely(cpu_diag_enabled) && !vm86_trip_silence_live_logs(cpu) &&
+			    cpu_diag_event_allow(cpu, &cpu_diag_events.iret_to_vm86)) {
+				dolog("IRET->V86 #%u %04x:%08x FL=%08x SS:ESP=%04x:%08x\n",
+					cpu_diag_events.iret_to_vm86, newcs, newip, newflags,
+					vm_ss & 0xffff, vm_esp);
 			}
-			dump_cs_bytes(cpu, "  PM IRET site:", 16);
-			/* Dump VGA I/O trace ring for diagnosis */
-			vga_dump_io_trace();
+			{
+				uint8_t segbytes[8];
+				segbytes[0] = vm_es & 0xff;
+				segbytes[1] = (vm_es >> 8) & 0xff;
+				segbytes[2] = vm_ds & 0xff;
+				segbytes[3] = (vm_ds >> 8) & 0xff;
+				segbytes[4] = vm_fs & 0xff;
+				segbytes[5] = (vm_fs >> 8) & 0xff;
+				segbytes[6] = vm_gs & 0xff;
+				segbytes[7] = (vm_gs >> 8) & 0xff;
+				vm86_trip_push(cpu, VM86_TRIP_R, 0,
+					       cpu->seg[SEG_CS].sel, cpu->ip,
+					       vm_ss & 0xffff, vm_esp, newflags,
+					       newcs & 0xffff, newip, 0,
+					       0, segbytes, 8);
+			}
+			/* Detect VMM crashing a VM: IRET to VM86 with CS=0000 */
+			if (unlikely(cpu_diag_enabled) && (newcs & 0xFFFF) == 0) {
+				dolog("VMM CRASH: IRET->V86 CS=0000 EIP=%08x from %04x:%08x FL=%08x BDA_mode=%02x\n",
+				newip, cpu->seg[SEG_CS].sel, cpu->ip, newflags,
+				(uint8_t)cpu->phys_mem[0x449]);
 		}
-		cpu->flags = newflags;
-		TRY1(set_seg(cpu, SEG_CS, newcs));
+		/* One-shot: capture first PM→V86 IRET that sets IOPL=3 */
+		if (unlikely(cpu_diag_enabled) && win386_diag.active &&
+		    !wfw_monitor.iopl3_captured) {
+			wfw_monitor.iopl3_iret_count++;
+			if ((newflags & IOPL) == IOPL) { /* IOPL=3 */
+				wfw_monitor.iopl3_captured = true;
+				wfw_monitor.iopl3_from_cs = cpu->seg[SEG_CS].sel;
+				wfw_monitor.iopl3_from_eip = cpu->ip;
+				wfw_monitor.iopl3_to_cs = newcs & 0xffff;
+				wfw_monitor.iopl3_to_ip = newip;
+				wfw_monitor.iopl3_eflags = newflags;
+				wfw_monitor.iopl3_ivt_2f = *(uint32_t*)(cpu->phys_mem + 0x2f * 4);
+			}
+		}
+			if (unlikely(cpu_diag_enabled) && isiret)
+				wfw_swint_dpl_note_resume(cpu, (uint16_t)(newcs & 0xffff), newip, newflags);
+			if (unlikely(cpu_diag_enabled) && isiret)
+				wfw_ud63_note_resume(cpu, (uint16_t)(newcs & 0xffff), newip, newflags,
+						     (uint16_t)(vm_ds & 0xffff));
+			if (unlikely(cpu_diag_enabled) && win386_diag.active &&
+			    wfw_monitor.pending_bios_fault_idx >= 0 &&
+			    wfw_monitor.pending_bios_fault_idx < (int8_t)wfw_monitor.bios_hot_count) {
+			int bi = wfw_monitor.pending_bios_fault_idx;
+			if (wfw_monitor.bios_hot[bi].cs == (uint16_t)(newcs & 0xffff) &&
+			    wfw_monitor.bios_hot[bi].ip == (uint16_t)(newip & 0xffff))
+				wfw_monitor.bios_hot[bi].resume_same++;
+			else
+					wfw_monitor.bios_hot[bi].resume_other++;
+			}
+			if (unlikely(cpu_diag_enabled) && isiret)
+				wfw_monitor_note_int13_return(cpu, (uint16_t)(newcs & 0xffff),
+						      (uint16_t)(newip & 0xffff), newflags);
+			if (unlikely(cpu_diag_enabled) && win386_diag.active)
+				wfw_monitor.pending_bios_fault_idx = -1;
+				cpu->flags = newflags;
+		TRY(set_seg(cpu, SEG_CS, newcs));
 		set_sp(sp + 12, sp_mask);
 		cpu->next_ip = newip;
-		TRY1(set_seg(cpu, SEG_SS, vm_ss));
-		TRY1(set_seg(cpu, SEG_ES, vm_es));
-		TRY1(set_seg(cpu, SEG_DS, vm_ds));
-		TRY1(set_seg(cpu, SEG_FS, vm_fs));
+		TRY(set_seg(cpu, SEG_SS, vm_ss));
+		TRY(set_seg(cpu, SEG_ES, vm_es));
+		TRY(set_seg(cpu, SEG_DS, vm_ds));
+		TRY(set_seg(cpu, SEG_FS, vm_fs));
 		TRY(set_seg(cpu, SEG_GS, vm_gs));
 		set_sp(vm_esp, 0xffffffff);
 	} else {
@@ -7652,9 +11301,14 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 			// return to same level
 			TRY(__pmiret_check_cs_same(cpu, newcs));
 //			dolog("pmiret PVL %d => %d %04x:%08x\n", cpu->cpl, newcs & 3, newcs, newip);
+			if (unlikely(cpu_diag_enabled) && isiret)
+				wfw_swint_dpl_note_resume(cpu, (uint16_t)(newcs & 0xffff), newip, newflags);
+			if (unlikely(cpu_diag_enabled) && isiret)
+				wfw_ud63_note_resume(cpu, (uint16_t)(newcs & 0xffff), newip, newflags,
+						     cpu->seg[SEG_DS].sel);
 			if (isiret)
 				cpu->flags = newflags;
-			TRY1(set_seg(cpu, SEG_CS, newcs));
+			TRY(set_seg(cpu, SEG_CS, newcs));
 
 			if (opsz16) {
 				set_sp(sp + 4 + off, sp_mask);
@@ -7682,12 +11336,178 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 
 			if (isiret)
 				cpu->flags = newflags;
-			TRY1(set_seg(cpu, SEG_CS, newcs));
-			TRY1(set_seg(cpu, SEG_SS, newss));
+			if (unlikely(cpu_diag_enabled) && isiret)
+				wfw_swint_dpl_note_resume(cpu, (uint16_t)(newcs & 0xffff), newip, newflags);
+			if (unlikely(cpu_diag_enabled) && isiret)
+				wfw_ud63_note_resume(cpu, (uint16_t)(newcs & 0xffff), newip, newflags,
+						     cpu->seg[SEG_DS].sel);
+			TRY(set_seg(cpu, SEG_CS, newcs));
+			TRY(set_seg(cpu, SEG_SS, newss));
 			uword newsp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
 			set_sp(newsp, newsp_mask);
 			cpu->next_ip = newip;
 			clear_segs(cpu);
+			/* DPMI/INT21h return capture + failure detection on ring-0→ring-3 IRET */
+			if (unlikely(cpu_diag_enabled && win386_diag.active) && isiret) {
+				/* Unified PM ring-3 return tail (compact, bounded). */
+				{
+					uint8_t vec = 0;
+					uint16_t in_ax = 0;
+					if (wfw_monitor.pending_dpmi) {
+						vec = 0x31;
+						in_ax = wfw_monitor.pending_dpmi_ax;
+					} else if (wfw_monitor.pending_int21) {
+						vec = 0x21;
+						in_ax = (uint16_t)wfw_monitor.pending_int21_ah << 8;
+					} else if (wfw_monitor.pending_int2f) {
+						vec = 0x2f;
+						in_ax = wfw_monitor.pending_int2f_ax;
+					}
+					if (vec) {
+						int ti = wfw_monitor.r3_ret_tail_pos % 16;
+						wfw_monitor.r3_ret_tail[ti].vec = vec;
+						wfw_monitor.r3_ret_tail[ti].in_ax = in_ax;
+						wfw_monitor.r3_ret_tail[ti].out_ax = REGi(0) & 0xffff;
+						wfw_monitor.r3_ret_tail[ti].out_bx = REGi(3) & 0xffff;
+						wfw_monitor.r3_ret_tail[ti].out_cx = REGi(1) & 0xffff;
+						wfw_monitor.r3_ret_tail[ti].out_dx = REGi(2) & 0xffff;
+						wfw_monitor.r3_ret_tail[ti].out_ds = cpu->seg[SEG_DS].sel;
+						wfw_monitor.r3_ret_tail[ti].out_cs = (uint16_t)(newcs & 0xffff);
+						wfw_monitor.r3_ret_tail[ti].out_ip = newip;
+						wfw_monitor.r3_ret_tail[ti].cf = !!(newflags & CF);
+						wfw_monitor.r3_ret_tail_pos++;
+						if (wfw_monitor.r3_ret_tail_count < 16)
+							wfw_monitor.r3_ret_tail_count++;
+						wfw_flow_push_raw(cpu, 'R', vec,
+							       wfw_mode_from_state(newflags, cpu->cr0),
+							       newcs & 3, (uint16_t)(newcs & 0xffff), newip,
+							       ((uint32_t)in_ax << 16) |
+							       ((newflags & CF) ? 1u : 0u));
+					}
+				}
+				if (wfw_monitor.pending_dpmi) {
+					/* Capture return values for first 8 DPMI calls */
+					if (wfw_monitor.int31_ret_count < 8) {
+						int ri = wfw_monitor.int31_ret_count++;
+						wfw_monitor.int31_ret_log[ri].call_ax = wfw_monitor.pending_dpmi_ax;
+						wfw_monitor.int31_ret_log[ri].ret_ax = REGi(0) & 0xffff;
+						wfw_monitor.int31_ret_log[ri].ret_cx = REGi(1) & 0xffff;
+						wfw_monitor.int31_ret_log[ri].ret_dx = REGi(2) & 0xffff;
+						wfw_monitor.int31_ret_log[ri].cf = !!(newflags & CF);
+					}
+					/* Capture 0006 return values in ring buffer */
+					if (wfw_monitor.pending_dpmi_ax == 0x0006) {
+						int ri = wfw_monitor.int31_0006_ret_count % 16;
+						wfw_monitor.int31_0006_ret_ring[ri].bx = wfw_monitor.pending_dpmi_bx;
+						wfw_monitor.int31_0006_ret_ring[ri].base =
+							((uint32_t)(REGi(1) & 0xffff) << 16) | (REGi(2) & 0xffff);
+						wfw_monitor.int31_0006_ret_count++;
+					}
+					/* Capture 0501/0503 return: linear address + handle */
+					if ((wfw_monitor.pending_dpmi_ax == 0x0501 ||
+					     wfw_monitor.pending_dpmi_ax == 0x0503) &&
+					    wfw_monitor.dpmi_alloc_count < 8) {
+						int ai = wfw_monitor.dpmi_alloc_count++;
+						wfw_monitor.dpmi_alloc_log[ai].func = wfw_monitor.pending_dpmi_ax;
+						wfw_monitor.dpmi_alloc_log[ai].req_size = wfw_monitor.pending_alloc_size;
+						wfw_monitor.dpmi_alloc_log[ai].ret_addr =
+							((uint32_t)(REGi(3) & 0xffff) << 16) | (REGi(1) & 0xffff);
+						wfw_monitor.dpmi_alloc_log[ai].ret_handle =
+							((uint32_t)(REGi(6) & 0xffff) << 16) | (REGi(7) & 0xffff);
+						wfw_monitor.dpmi_alloc_log[ai].cf = !!(newflags & CF);
+					}
+					/* Capture descriptor-op returns:
+					 * 0001 AllocLDT (AX=first selector),
+					 * 000A CreateAlias (AX=alias selector),
+					 * 000B GetDesc (descriptor at ES:(E)DI buffer). */
+					if (wfw_monitor.pending_dpmi_ax == 0x0001 ||
+					    wfw_monitor.pending_dpmi_ax == 0x000A ||
+					    wfw_monitor.pending_dpmi_ax == 0x000B ||
+					    wfw_monitor.pending_dpmi_ax == 0x0007 ||
+					    wfw_monitor.pending_dpmi_ax == 0x0008 ||
+					    wfw_monitor.pending_dpmi_ax == 0x0009 ||
+					    wfw_monitor.pending_dpmi_ax == 0x000C) {
+						int di = -1;
+						for (int k = wfw_monitor.dpmi_seg_log_count - 1; k >= 0; k--) {
+							if (wfw_monitor.dpmi_seg_log[k].func == wfw_monitor.pending_dpmi_ax &&
+							    !wfw_monitor.dpmi_seg_log[k].ret_valid) {
+								di = k;
+								break;
+							}
+						}
+						if (di >= 0) {
+							wfw_monitor.dpmi_seg_log[di].ret_valid = 1;
+							wfw_monitor.dpmi_seg_log[di].ret_cf = !!(newflags & CF);
+							if (!(newflags & CF)) {
+								if (wfw_monitor.pending_dpmi_ax == 0x0001) {
+									wfw_monitor.dpmi_seg_log[di].sel = REGi(0) & 0xffff;
+								} else if (wfw_monitor.pending_dpmi_ax == 0x000A) {
+									wfw_monitor.dpmi_seg_log[di].val = REGi(0) & 0xffff;
+								} else if (wfw_monitor.pending_dpmi_ax == 0x000B) {
+									/* Read returned 8-byte descriptor from saved linear buffer */
+									uint32_t la = wfw_monitor.dpmi_seg_log[di].val;
+									uint8_t b[8];
+									bool ok = true;
+									for (int j = 0; j < 8; j++) {
+										if (!read_laddr_u8_noexcept(cpu, la + (uint32_t)j,
+												     (newcs & 3), &b[j])) {
+											ok = false;
+											break;
+										}
+									}
+									if (ok) {
+										wfw_monitor.dpmi_seg_log[di].val =
+											(uint32_t)b[0] |
+											((uint32_t)b[1] << 8) |
+											((uint32_t)b[2] << 16) |
+											((uint32_t)b[3] << 24);
+										wfw_monitor.dpmi_seg_log[di].extra =
+											(uint32_t)b[4] |
+											((uint32_t)b[5] << 8) |
+											((uint32_t)b[6] << 16) |
+											((uint32_t)b[7] << 24);
+									}
+								}
+							}
+						}
+					}
+					if ((newflags & CF) && wfw_monitor.int31_fail_count < 8) {
+						int fi = wfw_monitor.int31_fail_count++;
+						wfw_monitor.int31_fail_log[fi].ax = wfw_monitor.pending_dpmi_ax;
+						wfw_monitor.int31_fail_log[fi].ret_eip = newip;
+					}
+					wfw_monitor.pending_dpmi = false;
+				}
+				if (wfw_monitor.pending_int21) {
+					/* Capture return values for first 8 INT 21h calls */
+					if (wfw_monitor.int21_ret_count < 8) {
+						int ri = wfw_monitor.int21_ret_count++;
+						wfw_monitor.int21_ret_log[ri].call_ah = wfw_monitor.pending_int21_ah;
+						wfw_monitor.int21_ret_log[ri].ret_ax = REGi(0) & 0xffff;
+						wfw_monitor.int21_ret_log[ri].cf = !!(newflags & CF);
+					}
+					if ((newflags & CF) && wfw_monitor.int21_fail_count < 8) {
+						int fi = wfw_monitor.int21_fail_count++;
+						wfw_monitor.int21_fail_log[fi].ah = wfw_monitor.pending_int21_ah;
+						wfw_monitor.int21_fail_log[fi].ret_eip = newip;
+					}
+					wfw_monitor.pending_int21 = false;
+				}
+				if (wfw_monitor.pending_int2f) {
+					/* Capture return values for first 4 INT 2Fh calls */
+					if (wfw_monitor.int2f_ret_count < 4) {
+						int ri = wfw_monitor.int2f_ret_count++;
+						wfw_monitor.int2f_ret_log[ri].call_ax = wfw_monitor.pending_int2f_ax;
+						wfw_monitor.int2f_ret_log[ri].ret_ax = REGi(0) & 0xffff;
+						wfw_monitor.int2f_ret_log[ri].ret_ds = cpu->seg[SEG_DS].sel;
+						wfw_monitor.int2f_ret_log[ri].ret_si = REGi(6) & 0xffff;
+						wfw_monitor.int2f_ret_log[ri].ret_es = cpu->seg[SEG_ES].sel;
+						wfw_monitor.int2f_ret_log[ri].ret_di = REGi(7) & 0xffff;
+						wfw_monitor.int2f_ret_log[ri].cf = !!(newflags & CF);
+					}
+					wfw_monitor.pending_int2f = false;
+				}
+			}
 		}
 	}
 	if (isiret)
@@ -8080,6 +11900,12 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		}
 		int orig_exc = cpu->excno;
 		cpu->next_ip = cpu->ip;
+
+		/* Count real exceptions here (not in call_isr) to avoid
+		 * conflating with PIC IRQs sharing vectors 0-31. */
+		if (unlikely(cpu_diag_enabled) && win386_diag.active && orig_exc < 32)
+			wfw_monitor.exc_counts[orig_exc]++;
+
 		if (cpu_diag_enabled)
 			cpu_diag_win386_sync(cpu);
 
@@ -8151,15 +11977,17 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 			}
 		}
 
-		/* Capture ALL VM86 exceptions in fault ring (not just #GP/#UD)
-		 * so we can see #PF, #SS, etc. that may cause VMM to crash the VM. */
-		if (cpu_diag_enabled && (cpu->flags & VM)) {
-			char last_decoded[80];
-			if (orig_exc == EX_GP || orig_exc == EX_UD) {
-				bool last_is_io, last_needs_stack_dump;
-				int last_io_port, last_io_bits;
-				vm86_decode_fault_instruction(cpu, last_decoded, sizeof(last_decoded),
-							      &last_is_io, &last_io_port, &last_io_bits, &last_needs_stack_dump);
+			/* Capture ALL VM86 exceptions in fault ring (not just #GP/#UD)
+			 * so we can see #PF, #SS, etc. that may cause VMM to crash the VM. */
+			if (cpu_diag_enabled && (cpu->flags & VM)) {
+				char last_decoded[80];
+				uint8_t trip_bytes[8];
+				uint8_t trip_blen = wfw_capture_cs_bytes(cpu, trip_bytes);
+				if (orig_exc == EX_GP || orig_exc == EX_UD) {
+					bool last_is_io, last_needs_stack_dump;
+					int last_io_port, last_io_bits;
+					vm86_decode_fault_instruction(cpu, last_decoded, sizeof(last_decoded),
+								      &last_is_io, &last_io_port, &last_io_bits, &last_needs_stack_dump);
 			} else if (orig_exc == EX_PF) {
 				snprintf(last_decoded, sizeof(last_decoded), "#PF CR2=%08x err=%x", cpu->cr2, cpu->excerr);
 			} else {
@@ -8171,11 +11999,16 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 				snprintf(last_decoded, sizeof(last_decoded), "%s(%d) err=%x", name, orig_exc,
 					 pusherr ? cpu->excerr : 0);
 			}
-			if (vm86_last_fault.gen != cpu->diag_gen) {
-				memset(&vm86_last_fault, 0, sizeof(vm86_last_fault));
-				vm86_last_fault.gen = cpu->diag_gen;
-			}
-			cpu_diag_vm86_fault_ring_push(cpu, orig_exc, pusherr, last_decoded);
+				if (vm86_last_fault.gen != cpu->diag_gen) {
+					memset(&vm86_last_fault, 0, sizeof(vm86_last_fault));
+					vm86_last_fault.gen = cpu->diag_gen;
+				}
+				vm86_trip_push(cpu, VM86_TRIP_E, (uint8_t)orig_exc,
+					       cpu->seg[SEG_CS].sel, cpu->ip,
+					       cpu->seg[SEG_SS].sel, REGi(4), cpu->flags,
+					       0, pusherr ? cpu->excerr : 0, 0,
+					       0, trip_bytes, trip_blen);
+				cpu_diag_vm86_fault_ring_push(cpu, orig_exc, pusherr, last_decoded);
 
 			/* Detect VM86 crash: execution at IVT area (seg 0, low offset)
 			 * means the VMM failed to handle an instruction and crashed the
@@ -8195,54 +12028,130 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 			vm86_last_fault.err = pusherr ? cpu->excerr : 0;
 			snprintf(vm86_last_fault.decoded, sizeof(vm86_last_fault.decoded), "%s", last_decoded);
 
-			if (orig_exc == EX_GP || orig_exc == EX_UD) {
-				uint8_t *slot = (orig_exc == EX_GP) ? &cpu_diag_events.vm86_gp_decode :
-								      &cpu_diag_events.vm86_ud_decode;
-				if (cpu_diag_event_allow(cpu, slot)) {
+				if (orig_exc == EX_GP || orig_exc == EX_UD) {
+					uint16_t cs_sel = cpu->seg[SEG_CS].sel;
+					uint16_t ip16 = cpu->ip & 0xffff;
+						if (orig_exc == EX_UD && trip_blen > 0 && trip_bytes[0] == 0x63 &&
+						    win386_diag.active) {
+							int ui = wfw_ud63_find_or_add(cs_sel, ip16);
+							if (ui >= 0 && ui < wfw_monitor.ud63_hot_count) {
+							wfw_monitor.ud63_hot[ui].count++;
+							wfw_monitor.ud63_hot[ui].ax = REGi(0) & 0xffff;
+							wfw_monitor.ud63_hot[ui].bx = REGi(3) & 0xffff;
+							wfw_monitor.ud63_hot[ui].cx = REGi(1) & 0xffff;
+							wfw_monitor.ud63_hot[ui].dx = REGi(2) & 0xffff;
+							wfw_monitor.ud63_hot[ui].si = REGi(6) & 0xffff;
+							wfw_monitor.ud63_hot[ui].di = REGi(7) & 0xffff;
+							wfw_monitor.ud63_hot[ui].ss = cpu->seg[SEG_SS].sel;
+							wfw_monitor.ud63_hot[ui].sp = REGi(4);
+							wfw_monitor.ud63_hot[ui].fl = cpu->flags;
+							if (wfw_monitor.ud63_hot[ui].blen == 0)
+								wfw_monitor.ud63_hot[ui].blen =
+									wfw_capture_cs_bytes(cpu, wfw_monitor.ud63_hot[ui].bytes);
+								wfw_monitor.pending_ud63_idx = (int8_t)ui;
+								wfw_monitor.pending_ud63_cs = cs_sel;
+								wfw_monitor.pending_ud63_ip = cpu->ip;
+								/* Focused probe: ARPL resize callback at FE95:1638.
+								 * Snapshot sel 0127 descriptor before handler runs,
+								 * then compare with post-IRET snapshot. */
+								if (cs_sel == 0xfe95 && ip16 == 0x1638) {
+									uint32_t w1 = 0xffffffffu, w2 = 0xffffffffu;
+									if (wfw_read_ldt_desc_noexcept(cpu, 0x0127, &w1, &w2)) {
+										wfw_monitor.ud63_fe95_0127.pre_w1 = w1;
+										wfw_monitor.ud63_fe95_0127.pre_w2 = w2;
+									} else {
+										wfw_monitor.ud63_fe95_0127.pre_w1 = 0xffffffffu;
+										wfw_monitor.ud63_fe95_0127.pre_w2 = 0xffffffffu;
+									}
+									wfw_monitor.ud63_fe95_0127.seen++;
+									wfw_monitor.ud63_fe95_0127.pre_cs = cs_sel;
+									wfw_monitor.ud63_fe95_0127.pre_ip = ip16;
+									wfw_monitor.ud63_fe95_0127.pre_ds = cpu->seg[SEG_DS].sel;
+									wfw_monitor.ud63_fe95_0127.pre_ax = REGi(0) & 0xffff;
+									wfw_monitor.ud63_fe95_0127.pre_fl = cpu->flags;
+									wfw_ud63_snapshot_near_desc(cpu,
+										wfw_monitor.ud63_fe95_0127.pre_near_w1,
+										wfw_monitor.ud63_fe95_0127.pre_near_w2,
+										&wfw_monitor.ud63_fe95_0127.pre_near_ok);
+									if (!wfw_monitor.ud63_fe95_0127.trace_done) {
+										wfw_monitor.ud63_fe95_0127.trace_active = true;
+										wfw_monitor.ud63_fe95_0127.trace_count = 0;
+										wfw_monitor.ud63_fe95_0127.trace_entry_ax = REGi(0) & 0xffff;
+										wfw_monitor.ud63_fe95_0127.trace_prev_ax =
+											wfw_monitor.ud63_fe95_0127.trace_entry_ax;
+										wfw_monitor.ud63_fe95_0127.trace_ax5_valid = false;
+										wfw_monitor.ud63_fe95_0127.trace_ax5_prev = 0;
+										wfw_monitor.ud63_fe95_0127.trace_ax5_ax = 0;
+										wfw_monitor.ud63_fe95_0127.trace_ax5_cs = 0;
+										wfw_monitor.ud63_fe95_0127.trace_ax5_ip = 0;
+									}
+									wfw_monitor.ud63_fe95_0127.j6cab_pending = false;
+									wfw_monitor.ud63_fe95_0127.step_prev_valid = false;
+									wfw_monitor.pending_ud63_fe95_0127 = true;
+								}
+							}
+						}
+					if (cs_sel == 0xff57 ||
+					    (cs_sel >= 0xf000 && ip16 >= 0xff00))
+						vm86_trip_mark_first_bad(cpu, (uint8_t)orig_exc, cs_sel, cpu->ip, last_decoded);
+					if (win386_diag.active && cs_sel >= 0xc000) {
+						int bi = wfw_bios_hot_find_or_add(cs_sel, ip16, (uint8_t)orig_exc);
+						if (bi >= 0 && bi < wfw_monitor.bios_hot_count) {
+						wfw_monitor.bios_hot[bi].count++;
+						if (wfw_monitor.bios_hot[bi].decoded[0] == '\0')
+							snprintf(wfw_monitor.bios_hot[bi].decoded,
+								 sizeof(wfw_monitor.bios_hot[bi].decoded),
+								 "%s", last_decoded);
+						if (wfw_monitor.bios_hot[bi].blen == 0)
+							wfw_monitor.bios_hot[bi].blen =
+								wfw_capture_cs_bytes(cpu, wfw_monitor.bios_hot[bi].bytes);
+						wfw_monitor.pending_bios_fault_idx = (int8_t)bi;
+					}
+				}
+				/* BIOS privileged instruction detection: always log
+				 * #GP at BIOS addresses (f000/c000+) regardless of
+				 * event counter — these reveal SeaBIOS encoding issues. */
+				if (orig_exc == EX_GP && cs_sel >= 0xc000 && win386_diag.active) {
 					char decoded[80];
 					bool is_io, needs_stack_dump;
 					int io_port, io_bits;
-					refresh_flags(cpu);
-					dolog("=== VM86 #%s pre-delivery #%u ===\n",
-						(orig_exc == EX_GP) ? "GP" : "UD", *slot);
-					if (pusherr)
-						dolog("  CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x IOPL=%d err=%08x\n",
-							cpu->seg[SEG_CS].sel, cpu->ip,
-							cpu->seg[SEG_SS].sel, REGi(4),
-							cpu->flags, get_IOPL(cpu), cpu->excerr);
-					else
-						dolog("  CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x IOPL=%d err=<none>\n",
-							cpu->seg[SEG_CS].sel, cpu->ip,
-							cpu->seg[SEG_SS].sel, REGi(4),
-							cpu->flags, get_IOPL(cpu));
-					dump_cs_bytes(cpu, "  vm86 fault bytes:", 8);
 					vm86_decode_fault_instruction(cpu, decoded, sizeof(decoded),
 								     &is_io, &io_port, &io_bits, &needs_stack_dump);
-					dolog("  vm86 trap decode: %s\n", decoded);
-					if (needs_stack_dump)
-						vm86_dump_stack_words(cpu, 5);
-					if (is_io && io_port >= 0)
-						vm86_log_ioperm_probe(cpu, io_port, io_bits);
+						/* Track LGDT/LIDT/LMSW specifically */
+						if (decoded[0] == '0' && decoded[1] == 'F') {
+							wfw_monitor.bios_lgdt_count++;
+							if (!vm86_trip_silence_live_logs(cpu))
+								dolog("*** V86 BIOS #GP %04x:%04x %s (SeaBIOS privileged!)\n",
+									cs_sel, cpu->ip & 0xffff, decoded);
+						} else if (!is_io) {
+							wfw_monitor.bios_priv_count++;
+							/* Only log first few — these can be frequent during
+							 * VM86 trap/reflect phases (CLI/STI/PUSHF/POPF). */
+							if (wfw_monitor.bios_priv_count <= 8 &&
+							    !vm86_trip_silence_live_logs(cpu))
+								dolog("V86 BIOS #GP %04x:%04x %s\n",
+									cs_sel, cpu->ip & 0xffff, decoded);
+						}
+					}
+
+					uint8_t *slot = (orig_exc == EX_GP) ? &cpu_diag_events.vm86_gp_decode :
+									      &cpu_diag_events.vm86_ud_decode;
+					if (!vm86_trip_silence_live_logs(cpu) && cpu_diag_event_allow(cpu, slot)) {
+						char decoded[80];
+						bool is_io, needs_stack_dump;
+						int io_port, io_bits;
+					vm86_decode_fault_instruction(cpu, decoded, sizeof(decoded),
+								     &is_io, &io_port, &io_bits, &needs_stack_dump);
+					dolog("V86 #%s #%u %04x:%04x %s\n",
+						(orig_exc == EX_GP) ? "GP" : "UD", *slot,
+						cpu->seg[SEG_CS].sel, cpu->ip & 0xffff, decoded);
 				}
 			}
 		}
 
 		if (cpu_diag_enabled && !(cpu->flags & VM) && win386_diag.active &&
-		    win386_diag.pm_exc_count < 80 && orig_exc < 32) {
+		    orig_exc < 32) {
 			win386_diag.pm_exc_count++;
-			refresh_flags(cpu);
-			dolog("=== WIN386 PM EXC #%u ===\n", win386_diag.pm_exc_count);
-			if (pusherr)
-				dolog("  exc=%02x CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x err=%08x\n",
-					orig_exc, cpu->seg[SEG_CS].sel, cpu->ip,
-					cpu->seg[SEG_SS].sel, REGi(4), cpu->flags, cpu->excerr);
-			else
-				dolog("  exc=%02x CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x err=<none>\n",
-					orig_exc, cpu->seg[SEG_CS].sel, cpu->ip,
-					cpu->seg[SEG_SS].sel, REGi(4), cpu->flags);
-			if (orig_exc == EX_PF)
-				dolog("  CR2=%08x CR3=%08x\n", cpu->cr2, cpu->cr3);
-			dump_cs_bytes(cpu, "  pm fault bytes:", 8);
 		}
 
 		if (unlikely(!call_isr(cpu, cpu->excno, pusherr, 1))) {
@@ -8251,23 +12160,21 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 			int second_exc = cpu->excno;
 			refresh_flags(cpu);
 
-			/* One-shot full dump on first delivery failure */
+			if (unlikely(cpu_diag_enabled) && win386_diag.active)
+				wfw_monitor.isr_failures++;
+
+			/* One-shot dump on first delivery failure */
 			if (cpu_diag_enabled) {
 				static bool isr_fail_dumped = false;
 				static int isrf_diag_gen = -1;
 				if (isrf_diag_gen != cpu->diag_gen) { isrf_diag_gen = cpu->diag_gen; isr_fail_dumped = false; }
 				if (!isr_fail_dumped) {
 					isr_fail_dumped = true;
-					dolog("=== call_isr failure: exc %d during exc %d (class %d+%d) ===\n",
+					dolog("ISR fail: exc %d during %d (%d+%d) %04x:%08x %s CR2=%08x\n",
 						second_exc, orig_exc,
-						exc_class_386(orig_exc), exc_class_386(second_exc));
-					dolog("CS:EIP=%04x:%08x SS:ESP=%04x:%08x FL=%08x CR0=%08x %s\n",
+						exc_class_386(orig_exc), exc_class_386(second_exc),
 						cpu->seg[SEG_CS].sel, cpu->ip,
-						cpu->seg[SEG_SS].sel, REGi(4),
-						cpu->flags, cpu->cr0,
-						(cpu->flags & VM) ? "V86" : "PM");
-					dolog("CR2=%08x CR3=%08x CPL=%d\n",
-						cpu->cr2, cpu->cr3, cpu->cpl);
+						(cpu->flags & VM) ? "V86" : "PM", cpu->cr2);
 				}
 			}
 
@@ -8284,15 +12191,21 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 			int c2 = exc_class_386(second_exc);
 			if (c1 != 0 && c1 == c2) {
 				/* Escalate to #DF with error code 0 */
+				if (unlikely(cpu_diag_enabled) && win386_diag.active)
+					wfw_monitor.exc_counts[EX_DF]++;
 				cpu->excerr = 0;
 				if (!call_isr(cpu, EX_DF, true, 1))
 					goto triple_fault;
 			} else {
 				/* Service second exception sequentially */
+				if (unlikely(cpu_diag_enabled) && win386_diag.active && second_exc < 32)
+					wfw_monitor.exc_counts[second_exc]++;
 				bool pusherr2 = exc_pushes_error_code(second_exc);
 				cpu->next_ip = cpu->ip;
 				if (!call_isr(cpu, second_exc, pusherr2, 1)) {
 					/* Second delivery also failed — escalate to #DF */
+					if (unlikely(cpu_diag_enabled) && win386_diag.active)
+						wfw_monitor.exc_counts[EX_DF]++;
 					cpu->excerr = 0;
 					if (!call_isr(cpu, EX_DF, true, 1))
 						goto triple_fault;
@@ -8334,6 +12247,8 @@ triple_fault:
 			dolog("CR2=%08x CR3=%08x CPL=%d\n",
 				cpu->cr2, cpu->cr3, cpu->cpl);
 		}
+		if (win386_diag.active)
+			wfw_monitor_dump(cpu, "triple fault");
 		dolog("triple fault — resetting CPU\n");
 		cpui386_reset(cpu);
 	}
@@ -8468,6 +12383,10 @@ void cpui386_set_a20(CPUI386 *cpu, int enabled)
 {
 	uint32_t new_mask = enabled ? 0xFFFFFFFF : 0xFFEFFFFF;
 	if (cpu->a20_mask != new_mask) {
+		if (unlikely(cpu_diag_enabled) && win386_diag.active) {
+			wfw_monitor.a20_toggles++;
+			wfw_monitor.a20_state = enabled;
+		}
 		cpu->a20_mask = new_mask;
 		tlb_clear(cpu);
 		cpu->ifetch.laddr = -1;

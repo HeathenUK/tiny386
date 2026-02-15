@@ -4096,3 +4096,167 @@ static void vga_initmode(VGAState *s)
 
     s->ar_index = 0x20;
 }
+
+/* VGA register snapshot/validation for boot diagnostics */
+void vga_snapshot_regs(VGAState *s, uint8_t *sr, uint8_t *gr, uint8_t *cr,
+                       uint8_t *ar, uint8_t *msr)
+{
+    memcpy(sr, s->sr, 5);
+    memcpy(gr, s->gr, 9);
+    memcpy(cr, s->cr, 25);
+    memcpy(ar, s->ar, 21);
+    *msr = s->msr;
+}
+
+void vga_validate_mode(VGAState *s, int mode)
+{
+    /* Expected register values for standard VGA modes */
+    static const uint8_t mode03_sr[5] = {0x00,0x00,0x03,0x00,0x02};
+    static const uint8_t mode03_gr[9] = {0x00,0x00,0x00,0x00,0x00,0x10,0x0E,0x00,0xFF};
+    static const uint8_t mode03_cr[25] = {
+        0x5F,0x4F,0x50,0x82,0x55,0x81,0xBF,0x1F,0x00,0x4F,0x0D,0x0E,0x00,
+        0x00,0x00,0x00,0x9C,0x8E,0x8F,0x28,0x1F,0x96,0xB9,0xA3,0xFF};
+    static const uint8_t mode03_ar[21] = {
+        0x00,0x01,0x02,0x03,0x04,0x05,0x14,0x07,0x38,0x39,0x3A,0x3B,
+        0x3C,0x3D,0x3E,0x3F,0x0C,0x00,0x0F,0x08,0x00};
+    static const uint8_t mode03_msr = 0x67;
+
+    static const uint8_t mode10_sr[5] = {0x00,0x01,0x0F,0x00,0x06};
+    static const uint8_t mode10_gr[9] = {0x00,0x00,0x00,0x00,0x00,0x00,0x05,0x0F,0xFF};
+    static const uint8_t mode10_cr[25] = {
+        0x5F,0x4F,0x50,0x82,0x54,0x80,0xBF,0x1F,0x00,0x40,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x83,0x85,0x5D,0x28,0x0F,0x63,0xBA,0xE3,0xFF};
+    static const uint8_t mode10_ar[21] = {
+        0x00,0x01,0x02,0x03,0x04,0x05,0x14,0x07,0x38,0x39,0x3A,0x3B,
+        0x3C,0x3D,0x3E,0x3F,0x01,0x00,0x0F,0x00,0x00};
+    static const uint8_t mode10_msr = 0xA3;
+
+    const uint8_t *exp_sr, *exp_gr, *exp_cr, *exp_ar;
+    uint8_t exp_msr;
+    const char *mode_name;
+
+    if (mode == 0x03) {
+        exp_sr = mode03_sr; exp_gr = mode03_gr; exp_cr = mode03_cr;
+        exp_ar = mode03_ar; exp_msr = mode03_msr; mode_name = "03h";
+    } else if (mode == 0x10) {
+        exp_sr = mode10_sr; exp_gr = mode10_gr; exp_cr = mode10_cr;
+        exp_ar = mode10_ar; exp_msr = mode10_msr; mode_name = "10h";
+    } else {
+        fprintf(stderr, "VGA validate: no reference for mode %02xh\n", mode);
+        return;
+    }
+
+    bool any_diff = false;
+    char buf[256];
+    int pos;
+
+    if (s->msr != exp_msr) {
+        fprintf(stderr, "VGA mode %s: MSR=%02x (expected %02x)\n",
+                mode_name, s->msr, exp_msr);
+        any_diff = true;
+    }
+
+    /* Check SR */
+    pos = 0;
+    for (int i = 0; i < 5; i++) {
+        if (s->sr[i] != exp_sr[i])
+            pos += snprintf(buf + pos, sizeof(buf) - pos, " SR%d=%02x(exp %02x)", i, s->sr[i], exp_sr[i]);
+    }
+    if (pos > 0) { fprintf(stderr, "VGA mode %s:%s\n", mode_name, buf); any_diff = true; }
+
+    /* Check GR */
+    pos = 0;
+    for (int i = 0; i < 9; i++) {
+        if (s->gr[i] != exp_gr[i])
+            pos += snprintf(buf + pos, sizeof(buf) - pos, " GR%d=%02x(exp %02x)", i, s->gr[i], exp_gr[i]);
+    }
+    if (pos > 0) { fprintf(stderr, "VGA mode %s:%s\n", mode_name, buf); any_diff = true; }
+
+    /* Check CR */
+    pos = 0;
+    for (int i = 0; i < 25; i++) {
+        if (s->cr[i] != exp_cr[i])
+            pos += snprintf(buf + pos, sizeof(buf) - pos, " CR%02x=%02x(exp %02x)", i, s->cr[i], exp_cr[i]);
+    }
+    if (pos > 0) { fprintf(stderr, "VGA mode %s:%s\n", mode_name, buf); any_diff = true; }
+
+    /* Check AR */
+    pos = 0;
+    for (int i = 0; i < 21; i++) {
+        if (s->ar[i] != exp_ar[i])
+            pos += snprintf(buf + pos, sizeof(buf) - pos, " AR%02x=%02x(exp %02x)", i, s->ar[i], exp_ar[i]);
+    }
+    if (pos > 0) { fprintf(stderr, "VGA mode %s:%s\n", mode_name, buf); any_diff = true; }
+
+    if (!any_diff)
+        fprintf(stderr, "VGA mode %s: all registers match expected values\n", mode_name);
+}
+
+/* Validate current VGA state against a known mode — callable from i386.c */
+void vga_validate_current(int mode)
+{
+    if (vga_trace_state)
+        vga_validate_mode(vga_trace_state, mode);
+}
+
+/* Dump current VGA register state for boot monitor */
+/* Dump last N non-blank lines from text mode screen buffer */
+void vga_dump_screen_text(int max_lines)
+{
+    VGAState *s = vga_trace_state;
+    if (!s) return;
+    /* Only meaningful in text mode (GR6 bit 0 = 0) */
+    if (s->gr[6] & 1) return;  /* graphics mode, skip */
+    int cols = s->cr[1] + 1;   /* CRTC end horizontal display + 1 */
+    if (cols < 40 || cols > 132) cols = 80;
+    int rows = 25;
+    /* Text buffer in VGA RAM: start_addr from CRTC, then *4 for VGA RAM offset.
+     * Each char is 2 bytes (char + attr) in VGA RAM at stride 2. */
+    uint32_t start_addr = s->cr[0x0d] | (s->cr[0x0c] << 8);
+    uint32_t text_start = start_addr * 4;
+    uint8_t *vram = s->vga_ram + text_start;
+    uint32_t text_size = cols * rows * 2;
+    if (text_start + text_size > (uint32_t)s->vga_ram_size) return;
+    /* Find last non-blank line */
+    int last_line = -1;
+    for (int r = rows - 1; r >= 0; r--) {
+        for (int c = 0; c < cols; c++) {
+            uint8_t ch = vram[(r * cols + c) * 2]; /* char byte, stride=2 */
+            if (ch != ' ' && ch != 0) { last_line = r; goto found; }
+        }
+    }
+found:
+    if (last_line < 0) return;
+    int first_line = last_line - max_lines + 1;
+    if (first_line < 0) first_line = 0;
+    fprintf(stderr, "Screen text (lines %d-%d):\n", first_line, last_line);
+    for (int r = first_line; r <= last_line; r++) {
+        char line[136];
+        int len = 0;
+        for (int c = 0; c < cols && len < (int)sizeof(line)-1; c++) {
+            uint8_t ch = vram[(r * cols + c) * 2];
+            line[len++] = (ch >= 0x20 && ch < 0x7f) ? ch : '.';
+        }
+        /* trim trailing spaces */
+        while (len > 0 && line[len-1] == ' ') len--;
+        line[len] = '\0';
+        fprintf(stderr, "  |%s|\n", line);
+    }
+}
+
+void vga_dump_regs_summary(void)
+{
+    VGAState *s = vga_trace_state;
+    if (!s) return;
+    fprintf(stderr, "VGA state: mode=%02xh MSR=%02x\n",
+        s->gr[6] & 1 ? 0xFF : 0x03, s->msr);  /* rough guess */
+    fprintf(stderr, "  SR:");
+    for (int i = 0; i < 5; i++) fprintf(stderr, " %02x", s->sr[i]);
+    fprintf(stderr, "  GR:");
+    for (int i = 0; i < 9; i++) fprintf(stderr, " %02x", s->gr[i]);
+    fprintf(stderr, "\n  CR:");
+    for (int i = 0; i < 25; i++) fprintf(stderr, " %02x", s->cr[i]);
+    fprintf(stderr, "\n  AR:");
+    for (int i = 0; i < 21; i++) fprintf(stderr, " %02x", s->ar[i]);
+    fprintf(stderr, "\n");
+}
