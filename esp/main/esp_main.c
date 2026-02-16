@@ -379,6 +379,11 @@ void bsp_device_restart_to_launcher(void) {
 }
 void storage_init(void);
 
+/* Forward-declare psram statics so i386_task can reset them on INI switch */
+static char *psram;
+static long psram_off;
+static long psram_len;
+
 static void i386_task(void *arg)
 {
 	(void)arg;
@@ -455,8 +460,9 @@ static void i386_task(void *arg)
 		ini_path = def;
 	}
 
-	/* Save initial pcram offset so we can rewind on INI switch */
+	/* Save initial offsets so we can rewind on INI switch */
 	long pcram_off_base = pcram_off;
+	long psram_off_base = psram_off;
 
 	/* ── Main emulation loop (re-enters on INI switch) ──────────── */
 	for (;;) {
@@ -469,11 +475,14 @@ static void i386_task(void *arg)
 		}
 
 		/* INI switch requested — tear down and reinitialise */
-		fprintf(stderr, "INI switch: resetting pcram (%ld -> %ld)\n",
-		        pcram_off, pcram_off_base);
+		fprintf(stderr, "INI switch: resetting pcram (%ld -> %ld) psram (%ld -> %ld)\n",
+		        pcram_off, pcram_off_base, psram_off, psram_off_base);
 		pcram_off = pcram_off_base;
 		memset(pcram + pcram_off_base, 0,
 		       pcram_len - pcram_off_base);
+		psram_off = psram_off_base;
+		memset(psram + psram_off_base, 0,
+		       psram_len - psram_off_base);
 
 		/* Clear BIT0 so that vga_task / input_task know PC is gone */
 		xEventGroupClearBits(global_event_group, BIT0);
@@ -486,10 +495,6 @@ static void i386_task(void *arg)
 
 	vTaskDelete(NULL);
 }
-
-static char *psram;
-static long psram_off;
-static long psram_len;
 
 long psram_remaining(void)
 {

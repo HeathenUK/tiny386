@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: MIT
+#
+# BitScrambler program for planar VGA (EGA/VGA 16-color) to packed I4 conversion.
+#
+# Input:  32 bits = P0[7:0] | P1[7:0]<<8 | P2[7:0]<<16 | P3[7:0]<<24
+#         (4 interleaved plane bytes representing 8 pixels)
+#
+# Output: 32 bits = 8 packed 4-bit pixel indices
+#         Pixel N color index = {P3[7-N], P2[7-N], P1[7-N], P0[7-N]}
+#         Pixel 0 (leftmost/MSB) in bits [3:0], pixel 7 (rightmost/LSB) in bits [31:28]
+#
+# I/O ratio is 1:1 (32 bits in, 32 bits out per iteration).
+# Single-instruction loop body: reads 4 bytes, permutes all 32 bits, writes 4 bytes.
+
+cfg eof_on downstream
+cfg trailing_bytes 4
+cfg prefetch true
+
+loop:
+    # Pixel 0 (MSB of each plane): out[3:0] = {P3[7], P2[7], P1[7], P0[7]}
+    #   = {in[31], in[23], in[15], in[7]}
+    # Pixel 1: out[7:4] = {in[30], in[22], in[14], in[6]}
+    # Pixel 2: out[11:8] = {in[29], in[21], in[13], in[5]}
+    # Pixel 3: out[15:12] = {in[28], in[20], in[12], in[4]}
+    # Pixel 4: out[19:16] = {in[27], in[19], in[11], in[3]}
+    # Pixel 5: out[23:20] = {in[26], in[18], in[10], in[2]}
+    # Pixel 6: out[27:24] = {in[25], in[17], in[9], in[1]}
+    # Pixel 7 (LSB of each plane): out[31:28] = {in[24], in[16], in[8], in[0]}
+    set 0 7, set 1 15, set 2 23, set 3 31,
+    set 4 6, set 5 14, set 6 22, set 7 30,
+    set 8 5, set 9 13, set 10 21, set 11 29,
+    set 12 4, set 13 12, set 14 20, set 15 28,
+    set 16 3, set 17 11, set 18 19, set 19 27,
+    set 20 2, set 21 10, set 22 18, set 23 26,
+    set 24 1, set 25 9, set 26 17, set 27 25,
+    set 28 0, set 29 8, set 30 16, set 31 24,
+    write 32,
+    read 32,
+    jmp loop

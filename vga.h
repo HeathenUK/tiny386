@@ -23,6 +23,9 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr);
 /* Adaptive frame skipping (0=disabled, 1-10=max frames to skip) */
 extern int vga_frame_skip_max;
 
+/* Initialize BitScrambler for hardware-accelerated planar VGA rendering */
+void vga_bitscrambler_init(void);
+
 
 void vbe_write(VGAState *s, uint32_t offset, uint32_t val);
 uint32_t vbe_read(VGAState *s, uint32_t offset);
@@ -54,6 +57,7 @@ void vga_snapshot_regs(VGAState *s, uint8_t *sr, uint8_t *gr, uint8_t *cr,
 void vga_validate_mode(VGAState *s, int mode);
 void vga_validate_current(int mode);
 void vga_dump_regs_summary(void);
+void vga_dump_vram_to_file(VGAState *s, const char *path, int fb_height);
 void vga_dump_screen_text(int max_lines);
 
 typedef struct PCIDevice PCIDevice;

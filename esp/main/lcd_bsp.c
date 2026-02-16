@@ -32,6 +32,9 @@
 #include "ini_selector.h"
 #include "esp_cache.h"
 #include "vga_font_8x16.h"
+#include "driver/jpeg_encode.h"
+#include "../../pc.h"
+#include "../../vga.h"
 
 static const char *TAG = "lcd_bsp";
 
@@ -474,6 +477,99 @@ void lcd_draw(int x_start, int y_start, int x_end, int y_end, void *src)
 	(void)src;
 }
 
+/* ── JPEG screenshot capture ─────────────────────────────────── */
+static jpeg_encoder_handle_t jpeg_enc = NULL;
+
+static void screenshot_capture(uint16_t *fb, int width, int height)
+{
+	if (!fb || width <= 0 || height <= 0) {
+		toast_show("Screenshot: no framebuffer");
+		return;
+	}
+
+	if (!jpeg_enc) {
+		toast_show("Screenshot: no encoder");
+		return;
+	}
+
+	size_t in_size = (size_t)width * height * 2;
+
+	/* Allocate output buffer with proper cache-line alignment for DMA */
+	size_t out_alloc = in_size / 5 + 4096;
+	jpeg_encode_memory_alloc_cfg_t out_mem_cfg = {
+		.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER,
+	};
+	size_t out_actual = 0;
+	uint8_t *out_buf = (uint8_t *)jpeg_alloc_encoder_mem(
+		out_alloc, &out_mem_cfg, &out_actual);
+	if (!out_buf) {
+		ESP_LOGE(TAG, "JPEG output buffer alloc failed (%u bytes)", (unsigned)out_alloc);
+		toast_show("Screenshot: no memory");
+		return;
+	}
+
+	/* Encode RGB565 → JPEG */
+	jpeg_encode_cfg_t enc_cfg = {
+		.width = width,
+		.height = height,
+		.src_type = JPEG_ENCODE_IN_FORMAT_RGB565,
+		.sub_sample = JPEG_DOWN_SAMPLING_YUV420,
+		.image_quality = 80,
+	};
+
+	uint32_t jpg_size = 0;
+	esp_err_t ret = jpeg_encoder_process(jpeg_enc, &enc_cfg,
+		(const uint8_t *)fb, in_size,
+		out_buf, out_actual, &jpg_size);
+	if (ret != ESP_OK) {
+		ESP_LOGE(TAG, "JPEG encode failed: %s", esp_err_to_name(ret));
+		free(out_buf);
+		toast_show("Screenshot: encode failed");
+		return;
+	}
+
+	/* Generate filename from uptime timestamp (avoids collision) */
+	char fname[48];
+	snprintf(fname, sizeof(fname), "/sdcard/scr_%08lu.jpg",
+	         (unsigned long)esp_log_timestamp());
+
+	FILE *f = fopen(fname, "wb");
+	if (!f) {
+		ESP_LOGE(TAG, "Failed to create %s", fname);
+		free(out_buf);
+		toast_show("Screenshot: SD error");
+		return;
+	}
+	size_t written = fwrite(out_buf, 1, jpg_size, f);
+	fclose(f);
+	free(out_buf);
+
+	if (written != jpg_size) {
+		ESP_LOGE(TAG, "Screenshot write incomplete: %u/%lu",
+		         (unsigned)written, (unsigned long)jpg_size);
+		toast_show("Screenshot: write error");
+		return;
+	}
+
+	ESP_LOGI(TAG, "Screenshot: %s (%lu bytes)", fname, (unsigned long)jpg_size);
+
+	/* Dump VRAM plane data to a .txt file alongside the screenshot */
+	if (globals.pc) {
+		PC *pc = (PC *)globals.pc;
+		if (pc->vga) {
+			char txtname[48];
+			snprintf(txtname, sizeof(txtname), "/sdcard/scr_%08lu.txt",
+			         (unsigned long)esp_log_timestamp());
+			vga_dump_vram_to_file(pc->vga, txtname, height);
+		}
+	}
+
+	char msg[48];
+	snprintf(msg, sizeof(msg), "Screenshot %luKB saved",
+	         (unsigned long)(jpg_size / 1024));
+	toast_show(msg);
+}
+
 void vga_task(void *arg)
 {
 	// BSP already initialized in app_main - just get panel handle
@@ -490,6 +586,19 @@ void vga_task(void *arg)
 
 	// Initialize drive activity LEDs
 	led_activity_init();
+
+	// Pre-init JPEG encoder while internal DMA SRAM is still available
+	{
+		jpeg_encode_engine_cfg_t cfg = {
+			.intr_priority = 0,
+			.timeout_ms = 3000,
+		};
+		esp_err_t jerr = jpeg_new_encoder_engine(&cfg, &jpeg_enc);
+		if (jerr != ESP_OK) {
+			ESP_LOGW(TAG, "JPEG encoder init failed: %s (screenshots disabled)",
+			         esp_err_to_name(jerr));
+		}
+	}
 
 	// Allocate framebuffers (after BSP init, like trackmatsu)
 	size_t fb_size = VGA_MAX_WIDTH * VGA_MAX_HEIGHT * sizeof(uint16_t);
@@ -546,6 +655,12 @@ void vga_task(void *arg)
 		/* ── Normal VGA rendering ────────────────────────────── */
 		// Step the VGA emulator (vga_step + vga_refresh)
 		pc_vga_step(globals.pc);
+
+		/* Screenshot capture (before rotation/overlays) */
+		if (globals.screenshot_pending && globals.fb) {
+			globals.screenshot_pending = false;
+			screenshot_capture((uint16_t *)globals.fb, vga_width, vga_height);
+		}
 
 		// Rotate + overlay into our buffer, then DMA to panel FB at TE
 		if (globals.fb) {

@@ -32,6 +32,12 @@ set(BOARD_HEADER "board_tanmatsu.h")
 idf_component_register(SRCS ${COMMON_SRCS} ${OPL_SRCS} ${BOARD_SRCS}
                        INCLUDE_DIRS "." "../../")
 
+# Add BitScrambler dependency without overriding main component's auto-dependencies
+target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_driver_bitscrambler idf::esp_driver_jpeg)
+
+# BitScrambler program for planar VGA acceleration
+target_bitscrambler_add_src("planar_bs.bsasm")
+
 add_definitions(-include ${CMAKE_CURRENT_SOURCE_DIR}/${BOARD_HEADER})
 
 

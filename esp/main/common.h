@@ -87,6 +87,8 @@ struct Globals {
 	char ini_selected_path[256];  // Selected INI path (result from selector)
 
 	// INI switch (runtime)
+	bool screenshot_pending;      // Screenshot requested (Meta+S)
+
 	bool ini_switch_pending;      // Switch to different INI requested
 	char ini_switch_path[256];    // Path to new INI file
 	char current_ini_path[256];   // Currently loaded INI path

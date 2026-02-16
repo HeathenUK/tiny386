@@ -815,8 +815,9 @@ static void IRAM_ATTR iomem_write32(void *iomem, uword addr, u32 val)
 		addr -= vga_addr2;
 		if (addr + 3 < pc->vga_mem_size)
 			*(uint32_t *)&(pc->vga_mem[addr]) = val;
+		return;  /* BUG FIX: was falling through to spurious vga_mem_write32 */
 	}
-	vga_mem_write32(pc->vga, addr - 0xa0000, val);
+	/* No handler matched — ignore (was previously calling vga_mem_write32 spuriously) */
 }
 
 static bool IRAM_ATTR iomem_write_string(void *iomem, uword addr, uint8_t *buf, int len)

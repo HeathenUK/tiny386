@@ -365,6 +365,14 @@ static void input_task(void *arg)
 						continue;  // Don't pass Ctrl to emulator
 					}
 
+					// META+S -> Screenshot
+					if (meta_held && is_down && code == 0x1F) {
+						globals.screenshot_pending = true;
+						meta_consumed = true;
+						vTaskDelay(5 / portTICK_PERIOD_MS);
+						continue;
+					}
+
 					handle_scancode(code, is_down);
 				}
 
