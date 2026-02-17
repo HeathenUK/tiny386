@@ -325,20 +325,28 @@ static void ne2000_receive(void *opaque, const uint8_t *buf, int size)
     p[3] = total_len >> 8;
     index += 4;
 
-    /* write packet data */
+    /* write packet data — snapshot ring bounds to avoid races with
+     * the emulator thread writing NE2000 registers via I/O ports.
+     * Without this, a partial register update (e.g. Win95 PnP probing
+     * STOPPG mid-receive) can make avail=0 with index!=stop → infinite loop,
+     * which starves the WiFi SDIO RX task and eventually crashes. */
+    uint32_t r_start = s->start;
+    uint32_t r_stop  = s->stop;
     while (size > 0) {
-        if (index <= s->stop)
-            avail = s->stop - index;
+        if (index <= r_stop)
+            avail = r_stop - index;
         else
             avail = 0;
         len = size;
         if (len > avail)
             len = avail;
+        if (len == 0)
+            break;  /* ring misconfigured — drop rest of packet */
         memcpy(s->mem + index, buf, len);
         buf += len;
         index += len;
-        if (index == s->stop)
-            index = s->start;
+        if (index == r_stop)
+            index = r_start;
         size -= len;
     }
     s->curpag = next >> 8;

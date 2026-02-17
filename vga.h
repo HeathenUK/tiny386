@@ -49,6 +49,14 @@ void vga_get_modex_state(VGAState *s, uint8_t **ram, uint32_t *ram_size,
 uint8_t *vga_get_direct_ptr(VGAState *s);
 void vga_direct_mark_dirty(VGAState *s, uint32_t addr, int len);
 
+/* Text mode fast path - returns state for CPU inline text VRAM access + HLE */
+void vga_get_text_state(VGAState *s, uint8_t **ram, uint32_t *base,
+                        uint32_t *end, uint64_t **dirty);
+/* Set CRTC cursor position registers (called from HLE) */
+void vga_set_cursor_pos(VGAState *s, uint16_t addr);
+/* Set CRTC cursor shape registers (called from HLE) */
+void vga_set_cursor_shape(VGAState *s, uint8_t start, uint8_t end);
+
 /* Debug functions */
 void vga_debug_direct_conditions(VGAState *s);
 void vga_dump_io_trace(void);

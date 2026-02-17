@@ -630,6 +630,7 @@ void vga_task(void *arg)
 
 	ESP_LOGI(TAG, "Starting display loop");
 
+	bool pc_gone_cleared = false;
 	while (1) {
 		/* ── INI selector screen (no PC running yet) ──────────── */
 		if (globals.ini_selector_active) {
@@ -648,9 +649,18 @@ void vga_task(void *arg)
 
 		/* ── PC not ready — idle until BIT0 ──────────────────── */
 		if (!globals.pc) {
+			/* Clear display once when PC goes away (INI switch).
+			 * Without this, the old session's last frame lingers. */
+			if (!pc_gone_cleared) {
+				memset(fb_rotated, 0, fb_rot_size);
+				if (xSemaphoreTake(te_sem, pdMS_TO_TICKS(100)) == pdTRUE)
+					bsp_display_blit(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, fb_rotated);
+				pc_gone_cleared = true;
+			}
 			vTaskDelay(pdMS_TO_TICKS(50));
 			continue;
 		}
+		pc_gone_cleared = false;
 
 		/* ── Normal VGA rendering ────────────────────────────── */
 		// Step the VGA emulator (vga_step + vga_refresh)

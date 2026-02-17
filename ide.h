@@ -64,6 +64,7 @@ void ide_set_geometry(IDEIFState *s, int drive, int heads, int spt);
 void ide_sync(IDEIFState *ide, IDEIFState *ide2);
 void ide_close_files(IDEIFState *ide, IDEIFState *ide2);
 void ide_poll_async(void);
+void ide_reset_statics(void);
 
 /* Reusable block-image backend helpers (same path used by IDE/CD). */
 BlockDevice *ide_block_open_rw(const char *filename);

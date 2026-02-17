@@ -11,6 +11,11 @@ void mixer_callback (void *opaque, uint8_t *stream, int free);
 
 static int last_volume = -1;
 
+/* Silence detection: disable amplifier when no audio is playing
+ * to eliminate the constant high-pitched whine from the amp. */
+#define SILENCE_FRAMES_OFF  8   /* ~23ms at 44.1kHz/128 samples — fast mute */
+#define SILENCE_THRESHOLD   4   /* peak sample value below which = silent */
+
 static void i2s_bsp_task(void *arg)
 {
 	int core_id = esp_cpu_get_core_id();
@@ -31,10 +36,7 @@ static void i2s_bsp_task(void *arg)
 		vTaskDelete(NULL);
 		return;
 	}
-	fprintf(stderr, "i2s: handle OK, enabling amp\n");
-
-	// Enable amplifier (rate already set by BSP init)
-	bsp_audio_set_amplifier(true);
+	fprintf(stderr, "i2s: handle OK, amp starts OFF (silence gating)\n");
 
 	fprintf(stderr, "i2s: waiting BIT0 (PC)\n");
 	// Wait for PC to be initialized
@@ -53,6 +55,9 @@ static void i2s_bsp_task(void *arg)
 	last_volume = vol;
 
 	int16_t buf[128];
+	bool amp_on = false;
+	int silent_frames = SILENCE_FRAMES_OFF; /* start as "silent" so amp stays off */
+
 	i2s_channel_enable(tx_chan);
 	for (;;) {
 		size_t bwritten;
@@ -61,6 +66,30 @@ static void i2s_bsp_task(void *arg)
 		for (int i = 0; i < 128; i++) {
 			buf[i] = buf[i] / 2;
 		}
+
+		/* Check if this buffer has any audible content */
+		int16_t peak = 0;
+		for (int i = 0; i < 128; i++) {
+			int16_t v = buf[i];
+			if (v < 0) v = -v;
+			if (v > peak) peak = v;
+		}
+
+		if (peak > SILENCE_THRESHOLD) {
+			silent_frames = 0;
+			if (!amp_on) {
+				bsp_audio_set_amplifier(true);
+				amp_on = true;
+			}
+		} else {
+			if (silent_frames < SILENCE_FRAMES_OFF)
+				silent_frames++;
+			if (silent_frames >= SILENCE_FRAMES_OFF && amp_on) {
+				bsp_audio_set_amplifier(false);
+				amp_on = false;
+			}
+		}
+
 		i2s_channel_write(tx_chan, buf, 128 * 2, &bwritten, portMAX_DELAY);
 
 		/* Check if volume changed (from OSD or META+arrow) */

@@ -3762,6 +3762,44 @@ uint8_t *vga_get_direct_ptr(VGAState *s)
     return NULL;
 }
 
+/* Returns text mode state for CPU inline fast path + HLE.
+ * Sets *ram to VGA RAM pointer when in standard text mode, NULL otherwise. */
+void vga_get_text_state(VGAState *s, uint8_t **ram, uint32_t *base,
+                        uint32_t *end, uint64_t **dirty)
+{
+    int memmap = (s->gr[VGA_GFX_MISC] >> 2) & 3;
+    int is_odd_even = (s->gr[VGA_GFX_MODE] & 0x10) != 0;
+    int is_chain4 = (s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) != 0;
+    /* Standard text mode: odd/even mapping, not chain-4,
+     * memory map mode 2 (B0000) or 3 (B8000),
+     * normal plane selection (planes 0/1, not font planes 2/3) */
+    if (is_odd_even && !is_chain4 && (memmap == 2 || memmap == 3) &&
+        !(s->gr[VGA_GFX_PLANE_READ] & 2)) {
+        *ram = s->vga_ram;
+        *base = (memmap == 3) ? 0xB8000 : 0xB0000;
+        *end = *base + 0x8000;
+        *dirty = &s->dirty_pages;
+    } else {
+        *ram = NULL;
+        *base = *end = 0;
+        *dirty = NULL;
+    }
+}
+
+/* Set CRTC cursor position registers (called from HLE) */
+void vga_set_cursor_pos(VGAState *s, uint16_t addr)
+{
+    s->cr[0x0E] = addr >> 8;
+    s->cr[0x0F] = addr & 0xFF;
+}
+
+/* Set CRTC cursor shape registers (called from HLE) */
+void vga_set_cursor_shape(VGAState *s, uint8_t start, uint8_t end)
+{
+    s->cr[0x0A] = start & 0x3F;
+    s->cr[0x0B] = end & 0x1F;
+}
+
 /* Debug: report why direct mode is disabled */
 void vga_debug_direct_conditions(VGAState *s)
 {

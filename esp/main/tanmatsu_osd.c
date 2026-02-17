@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 
 #include "../../vga.h"  // For vga_frame_skip_max
 
@@ -50,7 +51,8 @@ typedef enum {
 	VIEW_HELP,
 	VIEW_FILEBROWSER,
 	VIEW_DELETE_CONFIRM,
-	VIEW_CREATE_HDD
+	VIEW_CREATE_HDD,
+	VIEW_COPY_PROGRESS
 } ViewMode;
 
 // Main menu items
@@ -180,6 +182,13 @@ struct OSD {
 	int create_fs_type;       // 0=FAT16, 1=FAT32
 	int create_sel;           // 0=name, 1=size, 2=partition, 3=create, 4=cancel
 
+	// Copy/paste state
+	char copy_src_path[MAX_PATH_LEN];  // Full path of file marked for copy (empty = nothing)
+	volatile int copy_progress_pct;     // 0-100, updated by copy task
+	volatile bool copy_done;            // Set true when copy completes or fails
+	volatile bool copy_cancel;          // Set true to request cancellation
+	char copy_dst_path[MAX_PATH_LEN];  // Full destination path
+	char copy_error[64];                // Error message (empty = success)
 };
 
 // Scancode defines
@@ -193,6 +202,8 @@ struct OSD {
 #define SC_D     0x20
 #define SC_Y     0x15
 #define SC_N     0x31
+#define SC_C     0x2e
+#define SC_V     0x2f
 
 // Convert scancode to uppercase character for filename input (FAT-compatible)
 static char scancode_to_char(int sc) {
@@ -237,6 +248,7 @@ static const struct {
 // Forward declarations
 static void populate_drive_paths(OSD *osd);
 static void scan_directory(OSD *osd);
+static void render_browser(OSD *osd, uint8_t *pixels, int w, int h, int pitch);
 
 // Separator checks for each menu
 static int is_main_separator(int item) {
@@ -767,6 +779,136 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	                    osd->sys_sel, "L/R:Adjust Esc:Back");
 }
 
+// Copy file task — runs on core 0 as a FreeRTOS task
+static void copy_file_task(void *arg)
+{
+	OSD *osd = (OSD *)arg;
+	printf("[copy] src=%s dst=%s\n", osd->copy_src_path, osd->copy_dst_path);
+	{
+		uint64_t total, free_bytes;
+		if (esp_vfs_fat_info("/sdcard", &total, &free_bytes) == ESP_OK)
+			printf("[copy] /sdcard: total=%lluMB free=%lluMB\n",
+			       (unsigned long long)(total/1024/1024),
+			       (unsigned long long)(free_bytes/1024/1024));
+		if (esp_vfs_fat_info("/usb", &total, &free_bytes) == ESP_OK)
+			printf("[copy] /usb: total=%lluMB free=%lluMB\n",
+			       (unsigned long long)(total/1024/1024),
+			       (unsigned long long)(free_bytes/1024/1024));
+	}
+
+	FILE *src = fopen(osd->copy_src_path, "rb");
+	FILE *dst = fopen(osd->copy_dst_path, "wb");
+	printf("[copy] fopen: src=%p dst=%p\n", src, dst);
+	if (!src || !dst) {
+		snprintf(osd->copy_error, sizeof(osd->copy_error),
+		         src ? "Can't create file!" : "Can't read source!");
+		if (src) fclose(src);
+		if (dst) { fclose(dst); unlink(osd->copy_dst_path); }
+		osd->copy_done = true;
+		vTaskDelete(NULL);
+		return;
+	}
+
+	// Get file size
+	fseek(src, 0, SEEK_END);
+	long file_size = ftell(src);
+	fseek(src, 0, SEEK_SET);
+	printf("[copy] file_size=%ld\n", file_size);
+	if (file_size <= 0) file_size = 1;  // avoid div-by-zero
+
+	uint8_t *buf = malloc(32768);
+	if (!buf) {
+		printf("[copy] malloc failed!\n");
+		snprintf(osd->copy_error, sizeof(osd->copy_error), "Out of memory!");
+		fclose(src);
+		fclose(dst);
+		unlink(osd->copy_dst_path);
+		osd->copy_done = true;
+		vTaskDelete(NULL);
+		return;
+	}
+
+	long copied = 0;
+	while (!osd->copy_cancel) {
+		size_t n = fread(buf, 1, 32768, src);
+		if (n == 0) break;
+		size_t wr = fwrite(buf, 1, n, dst);
+		if (wr != n) {
+			printf("[copy] write error: wrote %u of %u, errno=%d ferror=%d\n",
+			       (unsigned)wr, (unsigned)n, errno, ferror(dst));
+			snprintf(osd->copy_error, sizeof(osd->copy_error),
+			         errno == ENOSPC ? "Disk full!" : "Write error (e%d)!", errno);
+			break;
+		}
+		copied += n;
+		osd->copy_progress_pct = (int)((copied * 100) / file_size);
+	}
+
+	free(buf);
+	fclose(src);
+	fclose(dst);
+
+	if (osd->copy_cancel || osd->copy_error[0]) {
+		unlink(osd->copy_dst_path);
+		if (osd->copy_cancel && !osd->copy_error[0])
+			snprintf(osd->copy_error, sizeof(osd->copy_error), "Cancelled");
+	}
+	printf("[copy] done, error='%s'\n", osd->copy_error);
+	osd->copy_done = true;
+	vTaskDelete(NULL);
+}
+
+// Render copy progress dialog
+static void render_copy_progress(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
+{
+	// Check for completion every frame (key handler only runs on keypress)
+	if (osd->copy_done) {
+		if (osd->copy_error[0]) {
+			toast_show(osd->copy_error);
+		} else {
+			toast_show("File copied!");
+		}
+		scan_directory(osd);
+		osd->view = VIEW_FILEBROWSER;
+		render_browser(osd, pixels, w, h, pitch);
+		return;
+	}
+
+	int dialog_w = 300, dialog_h = 100;
+	int dx = (w - dialog_w) / 2, dy = (h - dialog_h) / 2;
+
+	// Background + border
+	draw_rect(pixels, w, h, pitch, dx, dy, dialog_w, dialog_h, COLOR_PANEL);
+	draw_rect(pixels, w, h, pitch, dx, dy, dialog_w, 1, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, dx, dy + dialog_h - 1, dialog_w, 1, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, dx, dy, 1, dialog_h, COLOR_BORDER);
+	draw_rect(pixels, w, h, pitch, dx + dialog_w - 1, dy, 1, dialog_h, COLOR_BORDER);
+
+	// Title
+	draw_text(pixels, w, h, pitch, dx + 10, dy + 8, "Copying...", COLOR_TITLE, 0);
+
+	// Filename (truncated)
+	const char *filename = strrchr(osd->copy_dst_path, '/');
+	filename = filename ? filename + 1 : osd->copy_dst_path;
+	draw_text(pixels, w, h, pitch, dx + 10, dy + 28, filename, COLOR_TEXT, dialog_w - 20);
+
+	// Progress bar
+	int bar_x = dx + 10, bar_y = dy + 50;
+	int bar_w = dialog_w - 20, bar_h = 16;
+	draw_rect(pixels, w, h, pitch, bar_x, bar_y, bar_w, bar_h, COLOR_BORDER);
+	int fill_w = (bar_w - 2) * osd->copy_progress_pct / 100;
+	if (fill_w > 0)
+		draw_rect(pixels, w, h, pitch, bar_x + 1, bar_y + 1, fill_w, bar_h - 2, COLOR_VALUE);
+
+	// Percentage text
+	char pct[8];
+	snprintf(pct, sizeof(pct), "%d%%", osd->copy_progress_pct);
+	draw_text(pixels, w, h, pitch, dx + dialog_w / 2 - 16, dy + 52, pct, COLOR_TEXT, 0);
+
+	// Help text
+	draw_text(pixels, w, h, pitch, dx + 10, dy + dialog_h - 18, "Esc:Cancel", COLOR_SEP, 0);
+}
+
 // Render delete confirmation dialog
 static void render_delete_confirm(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
@@ -815,18 +957,21 @@ static void build_mbr(uint8_t *mbr, int64_t total_bytes, int fs_type, int heads,
 	memcpy(mbr, tiny386_mbr_bootstrap, sizeof(tiny386_mbr_bootstrap));
 
 	uint32_t total_sectors = (uint32_t)(total_bytes / 512);
-	uint32_t lba_start = 63;
-	uint32_t lba_size = total_sectors - lba_start;
+	uint32_t cyl_size = heads * spt;
+	uint32_t lba_start = (uint32_t)spt;  // Start at second track (H=1,S=1,C=0)
+
+	// Align partition end to cylinder boundary for reliable CHS geometry detection
+	uint32_t total_cyls = total_sectors / cyl_size;
+	if (total_cyls < 1) total_cyls = 1;
+	uint32_t lba_size = total_cyls * cyl_size - lba_start;
 
 	// CHS start: H=1, S=1, C=0
 	uint8_t start_h = 1, start_s = 1, start_c = 0;
 
-	// CHS end: compute from geometry, cap cylinder at 1023
-	uint32_t last_lba = total_sectors - 1;
-	uint32_t c = last_lba / (heads * spt);
-	uint32_t rem = last_lba % (heads * spt);
-	uint32_t h = rem / spt;
-	uint32_t s = (rem % spt) + 1;
+	// CHS end: last sector of last cylinder (cylinder-aligned)
+	uint32_t c = total_cyls - 1;
+	uint32_t h = heads - 1;
+	uint32_t s = spt;
 	if (c > 1023) { c = 1023; h = heads - 1; s = spt; }
 
 	uint8_t end_h = (uint8_t)h;
@@ -843,7 +988,7 @@ static void build_mbr(uint8_t *mbr, int64_t total_bytes, int fs_type, int heads,
 	pe[1] = start_h;       // CHS start head
 	pe[2] = start_s_enc;   // CHS start sector + cyl high
 	pe[3] = start_c_enc;   // CHS start cylinder low
-	pe[4] = fs_type ? 0x0C : 0x06;  // Type: FAT32 LBA or FAT16B
+	pe[4] = fs_type ? 0x0B : 0x06;  // Type: FAT32 CHS or FAT16B
 	pe[5] = end_h;         // CHS end head
 	pe[6] = end_s;         // CHS end sector + cyl high
 	pe[7] = end_c;         // CHS end cylinder low
@@ -1219,6 +1364,14 @@ static void render_browser(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 			snprintf(line, sizeof(line), "  %s", osd->files[i].name);
 		}
 
+		// Highlight file marked for copy in yellow
+		if (osd->copy_src_path[0] && osd->files[i].is_dir == 0) {
+			char full[MAX_PATH_LEN];
+			snprintf(full, MAX_PATH_LEN, "%s/%s", osd->browser_path, osd->files[i].name);
+			if (strcmp(full, osd->copy_src_path) == 0)
+				color = COLOR_TITLE;
+		}
+
 		draw_text(pixels, w, h, pitch, browser_x + 8, y + 1, line, color, browser_w - 16);
 		y += line_h;
 	}
@@ -1232,7 +1385,7 @@ static void render_browser(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 
 	// Help text
 	draw_text(pixels, w, h, pitch, browser_x + 8, browser_y + browser_h - 20,
-	          "Enter:Select  D:Delete  Bksp:Up  Esc:Back", COLOR_SEP, 0);
+	          "Enter:Sel D:Del C:Copy V:Paste Bk:Up Esc:Back", COLOR_SEP, 0);
 }
 
 // Apply brightness setting
@@ -1898,6 +2051,78 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 				}
 			}
 			break;
+		case SC_C:
+			// Mark selected file for copy
+			if (osd->file_sel >= 0 && osd->file_sel < osd->file_count) {
+				FileEntry *f = &osd->files[osd->file_sel];
+				if (f->is_dir == 0) {
+					snprintf(osd->copy_src_path, MAX_PATH_LEN, "%s/%s",
+					         osd->browser_path, f->name);
+					char msg[48];
+					snprintf(msg, sizeof(msg), "Copied: %.38s", f->name);
+					toast_show(msg);
+				}
+			}
+			break;
+		case SC_V:
+			// Paste copied file into current directory
+			if (osd->copy_src_path[0]) {
+				const char *fname = strrchr(osd->copy_src_path, '/');
+				fname = fname ? fname + 1 : osd->copy_src_path;
+
+				snprintf(osd->copy_dst_path, MAX_PATH_LEN, "%s/%s",
+				         osd->browser_path, fname);
+
+				if (strcmp(osd->copy_src_path, osd->copy_dst_path) == 0) {
+					toast_show("Same location!");
+					break;
+				}
+
+				struct stat st;
+				if (stat(osd->copy_src_path, &st) != 0) {
+					toast_show("Source not found!");
+					break;
+				}
+				if (st.st_size > (1024*1024*1024L)) {
+					toast_show("File too large (>1GB)!");
+					break;
+				}
+				if (stat(osd->copy_dst_path, &st) == 0) {
+					toast_show("File already exists!");
+					break;
+				}
+
+				// Check free space on destination filesystem
+				{
+					const char *base = "/sdcard";
+					if (strncmp(osd->browser_path, "/usb", 4) == 0) base = "/usb";
+					uint64_t total, free_bytes;
+					if (esp_vfs_fat_info(base, &total, &free_bytes) == ESP_OK) {
+						if (free_bytes < (uint64_t)st.st_size) {
+							char msg[48];
+							snprintf(msg, sizeof(msg), "No space! %uMB free, need %uMB",
+							         (unsigned)(free_bytes / (1024*1024)),
+							         (unsigned)((st.st_size + 1024*1024 - 1) / (1024*1024)));
+							toast_show(msg);
+							break;
+						}
+					}
+				}
+
+				osd->copy_progress_pct = 0;
+				osd->copy_done = false;
+				osd->copy_cancel = false;
+				osd->copy_error[0] = '\0';
+				osd->view = VIEW_COPY_PROGRESS;
+				if (xTaskCreatePinnedToCore(copy_file_task, "filecopy", 8192,
+				                            osd, 5, NULL, 0) != pdPASS) {
+					toast_show("Can't start copy!");
+					osd->view = VIEW_FILEBROWSER;
+				}
+			} else {
+				toast_show("Nothing to paste!");
+			}
+			break;
 		case SC_ESC:
 		case SC_LEFT:
 			osd->view = VIEW_MOUNTING;
@@ -1928,6 +2153,12 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 
 	case VIEW_CREATE_HDD:
 		return handle_create_hdd_key(osd, keycode);
+
+	case VIEW_COPY_PROGRESS:
+		if (keycode == SC_ESC) {
+			osd->copy_cancel = true;
+		}
+		break;
 	}
 
 	return 0;
@@ -1977,6 +2208,9 @@ void osd_render(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		break;
 	case VIEW_CREATE_HDD:
 		render_create_hdd(osd, pixels, w, h, pitch);
+		break;
+	case VIEW_COPY_PROGRESS:
+		render_copy_progress(osd, pixels, w, h, pitch);
 		break;
 	}
 }

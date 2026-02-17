@@ -493,7 +493,14 @@ void pc_step(PC *pc)
 		}
 		step_time_accum = 0;
 		step_count = 0;
-		load_bios_and_reset(pc);
+		/* Guest-initiated reset (port 92/CF9): don't reload BIOS from SD.
+		 * On real hardware the BIOS ROM persists across resets.  Reloading
+		 * can fail if the IO task is holding the SDMMC bus, causing an
+		 * infinite triple-fault loop when the BIOS can't be read. */
+		memset(pc->phys_mem, 0, 0xa0000);  /* clear conventional memory */
+		i8042_reset(pc->i8042);
+		pc->port92 = 0;  /* A20 disabled at reset */
+		cpui386_reset(pc->cpu);
 	}
 
 	/* Update VGA direct access pointer (detects mode changes) */
@@ -518,6 +525,12 @@ void pc_step(PC *pc)
 		                    &pc->cpu_cb->vga_modex_plane_mask,
 		                    &pc->cpu_cb->vga_modex_read_plane,
 		                    &pc->cpu_cb->vga_modex_latch);
+
+		/* Update text mode fast path state */
+		vga_get_text_state(pc->vga, &pc->cpu_cb->vga_text_ram,
+		                   &pc->cpu_cb->vga_text_phys_base,
+		                   &pc->cpu_cb->vga_text_phys_end,
+		                   &pc->cpu_cb->vga_text_dirty_pages);
 	}
 
 	/* Check if VGA mode changed - reset batch for new program (dynamic mode only) */
@@ -1033,6 +1046,13 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 	vga_get_modex_state(pc->vga, &cb->vga_modex_ram, &cb->vga_modex_ram_size,
 	                    &cb->vga_modex_write_mode, &cb->vga_modex_plane_mask,
 	                    &cb->vga_modex_read_plane, &cb->vga_modex_latch);
+
+	/* Set up text mode fast path + HLE support */
+	vga_get_text_state(pc->vga, &cb->vga_text_ram, &cb->vga_text_phys_base,
+	                   &cb->vga_text_phys_end, &cb->vga_text_dirty_pages);
+	cb->vga_state = pc->vga;
+	cb->vga_set_cursor = (void(*)(void*,u16))vga_set_cursor_pos;
+	cb->vga_set_cursor_shape = (void(*)(void*,u8,u8))vga_set_cursor_shape;
 
 	pc->redraw = redraw;
 	pc->redraw_data = redraw_data;

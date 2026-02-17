@@ -67,8 +67,15 @@ void *pcmalloc(long size)
 int load_rom(void *phys_mem, const char *file, uword addr, int backward)
 {
 	if (file && file[0] == '/') {
+		if (!storage_sd_mounted()) {
+			fprintf(stderr, "ERROR: SD card not mounted, cannot load %s\n", file);
+			return 0;
+		}
 		FILE *fp = fopen(file, "rb");
-		assert(fp);
+		if (!fp) {
+			fprintf(stderr, "ERROR: Cannot open ROM file: %s\n", file);
+			return 0;
+		}
 		fseek(fp, 0, SEEK_END);
 		int len = ftell(fp);
 		rewind(fp);
@@ -83,7 +90,10 @@ int load_rom(void *phys_mem, const char *file, uword addr, int backward)
 		esp_partition_find_first(ESP_PARTITION_TYPE_ANY,
 					 ESP_PARTITION_SUBTYPE_ANY,
 					 file);
-	assert(part);
+	if (!part) {
+		fprintf(stderr, "ERROR: Partition or file not found: %s\n", file);
+		return 0;
+	}
 	int len = part->size;
 	if (backward)
 		esp_partition_read(part, 0, phys_mem + addr - len, len);
@@ -483,6 +493,15 @@ static void i386_task(void *arg)
 		psram_off = psram_off_base;
 		memset(psram + psram_off_base, 0,
 		       psram_len - psram_off_base);
+
+		/* Reset stale static pointers into the now-zeroed pools.
+		 * Without this, modules with "if (ptr) return;" guards
+		 * skip re-init and use dangling pointers into recycled memory.
+		 * The flags tables (128KB each in PSRAM) are the worst offender —
+		 * zeroed tables make ALL CMP/SUB/ADD 8-bit flag computations
+		 * return 0, which breaks SeaBIOS string processing entirely. */
+		i386_reset_flags_tables_for_reinit();
+		ide_reset_statics();
 
 		/* Clear BIT0 so that vga_task / input_task know PC is gone */
 		xEventGroupClearBits(global_event_group, BIT0);

@@ -1521,6 +1521,8 @@ typedef uint16_t flags8_arith_t[256][256];
 static uint8_t *flags_logic8 = NULL;
 static flags8_arith_t *flags_add8 = NULL;
 static flags8_arith_t *flags_sub8 = NULL;
+static bool flags_add8_from_heap = false;
+static bool flags_sub8_from_heap = false;
 
 /* Initialize 8-bit flags lookup tables */
 void i386_init_flags_tables(void)
@@ -1534,6 +1536,8 @@ void i386_init_flags_tables(void)
 	/* Try internal RAM for arithmetic tables (128KB each) - major speedup if fits */
 	flags_add8 = heap_caps_malloc(sizeof(flags8_arith_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	flags_sub8 = heap_caps_malloc(sizeof(flags8_arith_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	flags_add8_from_heap = (flags_add8 != NULL);
+	flags_sub8_from_heap = (flags_sub8 != NULL);
 	/* Fall back to PSRAM if internal RAM insufficient */
 	if (!flags_add8) flags_add8 = psmalloc(sizeof(flags8_arith_t));
 	if (!flags_sub8) flags_sub8 = psmalloc(sizeof(flags8_arith_t));
@@ -1596,6 +1600,20 @@ void i386_init_flags_tables(void)
 			(*flags_sub8)[s1][s2] = f;
 		}
 	}
+}
+
+/* Reset flags table pointers so they'll be re-initialized on next cpui386_new().
+ * Called during INI switch after PSRAM pool is zeroed — tables allocated from
+ * psmalloc() are now dangling.  Heap-allocated tables are still valid. */
+void i386_reset_flags_tables_for_reinit(void)
+{
+	/* flags_logic8 is always from heap (256 bytes) — still valid, keep it.
+	 * Only NULL-ify psram-allocated tables so init recreates them. */
+	if (!flags_add8_from_heap) flags_add8 = NULL;
+	if (!flags_sub8_from_heap) flags_sub8 = NULL;
+	/* If any psram table was reset, force full re-init (logic8 gates the check) */
+	if (!flags_add8 || !flags_sub8)
+		flags_logic8 = NULL;
 }
 
 static int get_PF(CPUI386 *cpu)
@@ -2000,11 +2018,14 @@ static void dump_idt_vector(CPUI386 *cpu, int vec, const char *tag)
 	int dpl = (w2 >> 13) & 0x3;
 	int p = (w2 >> 15) & 1;
 	uword newcs = (w1 >> 16) & 0xffff;
-	uword newip = (w1 & 0xffff) | (w2 & 0xffff0000);
+	bool diag_gate16 = (gt == 6 || gt == 7 || gt == 4);
+	uword newip = diag_gate16 ? (w1 & 0xffff)
+				  : ((w1 & 0xffff) | (w2 & 0xffff0000));
 
 	dolog("=== %s: IDT[%02x] raw=%08x %08x ===\n", tag, vec, w1, w2);
-	dolog("  type=%x dpl=%d p=%d target=%04x:%08x cpl=%d CS=%04x EIP=%08x\n",
-		gt, dpl, p, newcs, newip, cpu->cpl, cpu->seg[SEG_CS].sel, cpu->ip);
+	dolog("  type=%x(%s) dpl=%d p=%d target=%04x:%08x cpl=%d CS=%04x EIP=%08x\n",
+		gt, diag_gate16 ? "16" : "32", dpl, p, newcs, newip,
+		cpu->cpl, cpu->seg[SEG_CS].sel, cpu->ip);
 }
 
 /* Side-effect-safe IDT gate read for diagnostics. */
@@ -2161,14 +2182,21 @@ static inline uint16_t wfw_desc_flags_u16(uint32_t w2)
 }
 
 /* Read a raw LDT descriptor without throwing exceptions. */
-static bool wfw_read_ldt_desc_noexcept(CPUI386 *cpu, uint16_t sel, uint32_t *w1, uint32_t *w2)
+/* Side-effect-safe descriptor read — works for both GDT and LDT selectors. */
+static bool read_desc_noexcept(CPUI386 *cpu, uint16_t sel, uint32_t *w1, uint32_t *w2)
 {
-	if (!(sel & 4))
-		return false; /* GDT selector */
 	uint32_t off = (uint32_t)(sel & ~7u);
-	if (off + 7 > cpu->seg[SEG_LDT].limit)
+	uint32_t tbl_base, tbl_limit;
+	if (sel & 4) {
+		tbl_base = cpu->seg[SEG_LDT].base;
+		tbl_limit = cpu->seg[SEG_LDT].limit;
+	} else {
+		tbl_base = cpu->gdt.base;
+		tbl_limit = cpu->gdt.limit;
+	}
+	if (off + 7 > tbl_limit)
 		return false;
-	uint32_t la = cpu->seg[SEG_LDT].base + off;
+	uint32_t la = tbl_base + off;
 	uint8_t d[8];
 	for (int i = 0; i < 8; i++) {
 		if (!read_laddr_u8_noexcept(cpu, la + (uint32_t)i, 0, &d[i]))
@@ -2179,6 +2207,14 @@ static bool wfw_read_ldt_desc_noexcept(CPUI386 *cpu, uint16_t sel, uint32_t *w1,
 	*w2 = (uint32_t)d[4] | ((uint32_t)d[5] << 8) |
 	      ((uint32_t)d[6] << 16) | ((uint32_t)d[7] << 24);
 	return true;
+}
+
+/* Legacy alias for LDT-only reads. */
+static bool wfw_read_ldt_desc_noexcept(CPUI386 *cpu, uint16_t sel, uint32_t *w1, uint32_t *w2)
+{
+	if (!(sel & 4))
+		return false; /* GDT selector */
+	return read_desc_noexcept(cpu, sel, w1, w2);
 }
 
 static const uint16_t wfw_ud63_near_sels[4] = { 0x011c, 0x0124, 0x0127, 0x012c };
@@ -3044,7 +3080,8 @@ static bool IRAM_ATTR segcheck(CPUI386 *cpu, int rwm, int seg, uword addr, int s
 		}
 		/* Segment limit and writability checks (protected mode / VM86).
 		 * This must run before paging translation so out-of-bounds selector
-		 * accesses raise #GP/#SS rather than being misreported as #PF. */
+		 * accesses raise #GP/#SS rather than being misreported as #PF.
+		 * Re-enabled: proven not the cause of DOSX regression. */
 		{
 			uword flags = cpu->seg[seg].flags;
 			uword limit = cpu->seg[seg].limit;
@@ -3164,6 +3201,7 @@ static bool IRAM_ATTR segcheck(CPUI386 *cpu, int rwm, int seg, uword addr, int s
 				THROW(seg == SEG_SS ? EX_SS : EX_GP, 0);
 			}
 		}
+		/* (segcheck limits re-enabled — not the cause) */
 	}
 	return true;
 }
@@ -3283,6 +3321,13 @@ static u8 IRAM_ATTR load8(CPUI386 *cpu, OptAddr *res)
 			return (u8)(*cpu->cb.vga_modex_latch >> (cpu->cb.vga_modex_read_plane * 8));
 		}
 	}
+	/* Fast path for text mode reads (odd/even interleave) */
+	if (cpu->cb.vga_text_ram && addr >= cpu->cb.vga_text_phys_base
+	                         && addr < cpu->cb.vga_text_phys_end) {
+		u32 off = addr - cpu->cb.vga_text_phys_base;
+		u32 vram_off = ((off & ~1u) << 1) | (off & 1u);
+		return cpu->cb.vga_text_ram[vram_off];
+	}
 	if (in_iomem(addr) && cpu->cb.iomem_read8)
 		return cpu->cb.iomem_read8(cpu->cb.iomem, addr);
 	if (unlikely(addr >= cpu->phys_mem_size)) {
@@ -3301,6 +3346,20 @@ static u16 IRAM_ATTR load16(CPUI386 *cpu, OptAddr *res)
 	/* Fast path for VGA direct access (chain-4 mode) */
 	if (cpu->cb.vga_direct && in_vga_direct(res->addr1) && in_vga_direct(res->addr1 + 1))
 		return *(u16 *)(cpu->cb.vga_direct + res->addr1 - 0xa0000);
+	/* Fast path for text mode reads (odd/even interleave) */
+	if (cpu->cb.vga_text_ram && res->addr1 >= cpu->cb.vga_text_phys_base
+	                         && res->addr1 + 1 < cpu->cb.vga_text_phys_end) {
+		u32 off = res->addr1 - cpu->cb.vga_text_phys_base;
+		if (!(off & 1)) {
+			/* Aligned char+attr read: adjacent in VRAM */
+			return *(u16 *)(cpu->cb.vga_text_ram + (off << 1));
+		} else {
+			/* Unaligned: two separate byte reads */
+			u32 v0 = ((off & ~1u) << 1) | 1u;
+			u32 v1 = (((off + 1) & ~1u) << 1);
+			return cpu->cb.vga_text_ram[v0] | ((u16)cpu->cb.vga_text_ram[v1] << 8);
+		}
+	}
 	if (in_iomem(res->addr1) && cpu->cb.iomem_read16)
 		return cpu->cb.iomem_read16(cpu->cb.iomem, res->addr1);
 	if (unlikely(res->addr1 >= cpu->phys_mem_size)) {
@@ -3421,6 +3480,15 @@ static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 			/* wm == 0xFF means use callback (complex VGA state) */
 		}
 	}
+	/* Fast path for text mode writes (odd/even interleave) */
+	if (cpu->cb.vga_text_ram && addr >= cpu->cb.vga_text_phys_base
+	                         && addr < cpu->cb.vga_text_phys_end) {
+		u32 off = addr - cpu->cb.vga_text_phys_base;
+		u32 vram_off = ((off & ~1u) << 1) | (off & 1u);
+		cpu->cb.vga_text_ram[vram_off] = val;
+		*cpu->cb.vga_text_dirty_pages |= (1ULL << (vram_off >> 12));
+		return;
+	}
 	if (in_iomem(addr) && cpu->cb.iomem_write8) {
 		cpu->cb.iomem_write8(cpu->cb.iomem, addr, val);
 		return;
@@ -3460,6 +3528,23 @@ static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 		*(u16 *)(cpu->cb.vga_direct + res->addr1 - 0xa0000) = val;
 		if (cpu->cb.vga_direct_write_notify)
 			cpu->cb.vga_direct_write_notify(cpu->cb.iomem, res->addr1, 2);
+		return;
+	}
+	/* Fast path for text mode writes (odd/even interleave) */
+	if (cpu->cb.vga_text_ram && res->addr1 >= cpu->cb.vga_text_phys_base
+	                         && res->addr1 + 1 < cpu->cb.vga_text_phys_end) {
+		u32 off = res->addr1 - cpu->cb.vga_text_phys_base;
+		if (!(off & 1)) {
+			/* Aligned char+attr write: adjacent in VRAM */
+			*(u16 *)(cpu->cb.vga_text_ram + (off << 1)) = val;
+		} else {
+			/* Unaligned: two separate byte writes */
+			u32 v0 = ((off & ~1u) << 1) | 1u;
+			u32 v1 = (((off + 1) & ~1u) << 1);
+			cpu->cb.vga_text_ram[v0] = val & 0xFF;
+			cpu->cb.vga_text_ram[v1] = val >> 8;
+		}
+		*cpu->cb.vga_text_dirty_pages |= (1ULL << ((off << 1) >> 12));
 		return;
 	}
 	if (in_iomem(res->addr1) && cpu->cb.iomem_write16) {
@@ -3947,7 +4032,8 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 
 	/* Protected-mode data-segment null selector semantics:
 	 * DS/ES/FS/GS accept null selectors and become unusable until reloaded.
-	 * SS null is always invalid (#GP(0)). */
+	 * SS null is always invalid (#GP(0)).
+	 * Re-enabled: testing if this is the cause. */
 	if (!(sel & ~0x3)) {
 		if (seg == SEG_DS || seg == SEG_ES || seg == SEG_FS || seg == SEG_GS) {
 			cpu->seg[seg].sel = sel;
@@ -3975,8 +4061,16 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 	if (sel & ~0x3) {
 		switch(seg) {
 		case SEG_SS:
-			/* SS must reference present writable data at exact CPL/RPL. */
-			if (!s || code || !rw || dpl != cpu->cpl || rpl != cpu->cpl)
+			/* SS must be a present writable data segment. Structural
+			 * checks are enforced; DPL/RPL privilege checks are relaxed.
+			 *
+			 * On real 386, DPL/RPL mismatch #GPs and the OS handler
+			 * trap-and-emulates the load.  Win95 DOSX does this for
+			 * ring-3 code loading ring-0 SS (sel 0x0068 at CPL=3).
+			 * Our DOSX handler can't process that #GP correctly, so
+			 * we allow the load directly — same end result as the
+			 * trap-and-emulate path on real hardware. */
+			if (!s || code || !rw)
 				THROW(EX_GP, sel & ~0x3);
 			if (!p)
 				THROW(EX_SS, sel & ~0x3);
@@ -4685,7 +4779,8 @@ static void cpu_diag_log_cr0_transition(CPUI386 *cpu, uword old_cr0, uword new_c
 static struct { uint8_t no; uint8_t mode; uint16_t cs; uint32_t ip; uint32_t err; uint32_t cr2; } exc_ring[EXC_RING_SIZE];
 static int exc_ring_pos = 0;
 
-static void wfw_monitor_dump(CPUI386 *cpu, const char *reason)
+
+static void cpu_monitor_dump(CPUI386 *cpu, const char *reason)
 {
 	uint32_t gp_total = 0;
 	uint32_t dpmi_0006 = 0, dpmi_0703 = 0, dpmi_0007 = 0, dpmi_0008 = 0;
@@ -4713,7 +4808,7 @@ static void wfw_monitor_dump(CPUI386 *cpu, const char *reason)
 	if (wfw_monitor.tty_pos > 0)
 		wfw_monitor.tty_buf[wfw_monitor.tty_pos] = '\0';
 
-	dolog("=== WfW Boot Monitor (%s) ===\n", reason);
+	dolog("=== CPU Monitor (%s) ===\n", reason);
 	dolog("core: pm_int=%u vm86_int=%u v86_to_r0=%u isr_fail=%u mode_sw=%u a20_toggles=%u(state=%u)\n",
 		wfw_monitor.pm_ints, wfw_monitor.vm86_ints, wfw_monitor.v86_to_ring0,
 		wfw_monitor.isr_failures, wfw_monitor.mode_switches, wfw_monitor.a20_toggles,
@@ -5165,6 +5260,44 @@ static void wfw_monitor_dump(CPUI386 *cpu, const char *reason)
 		dolog("tss: tr=%04x b=%08x l=%05x ty=%02x iob=%04x(%c) bm20=%c bm21=%c bma0=%c bma1=%c ir21=%c ir2f=%c\n",
 			tr_sel, tr_base, tr_lim, tr_type, iobase, iob_ok ? 'Y' : 'N',
 			p20, p21, pa0, pa1, irb_ok ? ir21 : '?', irb_ok ? ir2f : '?');
+	}
+	/* Descriptor tables and key IDT vectors — always useful. */
+	dolog("gdt: base=%08x limit=%04x  idt: base=%08x limit=%04x  ldt: sel=%04x base=%08x limit=%04x\n",
+		cpu->gdt.base, cpu->gdt.limit, cpu->idt.base, cpu->idt.limit,
+		cpu->seg[SEG_LDT].sel, cpu->seg[SEG_LDT].base, cpu->seg[SEG_LDT].limit);
+	dolog("cr: cr0=%08x cr2=%08x cr3=%08x  efl=%08x cpl=%u\n",
+		cpu->cr0, cpu->cr2, cpu->cr3, cpu->flags, cpu->cpl);
+	dolog("seg: cs=%04x(b=%08x l=%08x f=%04x) ss=%04x(b=%08x l=%08x f=%04x)\n",
+		cpu->seg[SEG_CS].sel, cpu->seg[SEG_CS].base, cpu->seg[SEG_CS].limit,
+		cpu->seg[SEG_CS].flags,
+		cpu->seg[SEG_SS].sel, cpu->seg[SEG_SS].base, cpu->seg[SEG_SS].limit,
+		cpu->seg[SEG_SS].flags);
+	dolog("     ds=%04x(b=%08x) es=%04x(b=%08x) fs=%04x gs=%04x\n",
+		cpu->seg[SEG_DS].sel, cpu->seg[SEG_DS].base,
+		cpu->seg[SEG_ES].sel, cpu->seg[SEG_ES].base,
+		cpu->seg[SEG_FS].sel, cpu->seg[SEG_GS].sel);
+	dolog("reg: eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x esp=%08x eip=%08x\n",
+		REGi(0), REGi(3), REGi(1), REGi(2),
+		REGi(6), REGi(7), REGi(5), REGi(4), cpu->ip);
+	/* Dump key IDT vectors (#DF=8, #TS=10, #GP=13, #PF=14) */
+	if (cpu->cr0 & 1) {
+		static const int key_vecs[] = { 8, 10, 13, 14 };
+		static const char *key_names[] = { "#DF", "#TS", "#GP", "#PF" };
+		for (int ki = 0; ki < 4; ki++) {
+			uword iw1, iw2;
+			if (read_idt_vector_raw_noexcept(cpu, key_vecs[ki], &iw1, &iw2)) {
+				int igt = (iw2 >> 8) & 0xf;
+				int idpl = (iw2 >> 13) & 3;
+				int ip_ = (iw2 >> 15) & 1;
+				bool ig16 = (igt == 6 || igt == 7);
+				uword ioff = ig16 ? (iw1 & 0xffff)
+					         : ((iw1 & 0xffff) | (iw2 & 0xffff0000));
+				dolog("idt[%02x](%s): sel=%04x off=%08x ty=%x(%s) dpl=%d p=%d\n",
+					key_vecs[ki], key_names[ki],
+					(iw1 >> 16) & 0xffff, ioff,
+					igt, ig16 ? "16" : "32", idpl, ip_);
+			}
+		}
 	}
 	if (wfw_monitor.r3_first_captured) {
 		bool psp_valid = (wfw_monitor.psp_header[0] == 0xCD && wfw_monitor.psp_header[1] == 0x20);
@@ -5746,27 +5879,27 @@ static void wfw_monitor_dump(CPUI386 *cpu, const char *reason)
 		dolog("\n");
 	}
 	{
-		int n = exc_ring_pos > 8 ? 8 : exc_ring_pos;
+		int n = exc_ring_pos > 32 ? 32 : exc_ring_pos;
 		if (n > 0) {
 			int start = exc_ring_pos - n;
-			dolog("tail:");
+			dolog("exc_tail: last %d of %d exceptions\n", n, exc_ring_pos);
 			for (int i = start; i < exc_ring_pos; i++) {
 				int j = i & EXC_RING_MASK;
+				const char *ename = (exc_ring[j].no < 32) ? exc_names[exc_ring[j].no] : "IRQ";
 				if (exc_ring[j].no == EX_PF)
-					dolog(" %c%02d@%04x:%08x/e=%x/c2=%08x",
-						exc_ring[j].mode, exc_ring[j].no,
+					dolog("  [%4d] %c %s @%04x:%08x err=%04x cr2=%08x\n",
+						i, exc_ring[j].mode, ename,
 						exc_ring[j].cs, exc_ring[j].ip,
 						exc_ring[j].err, exc_ring[j].cr2);
 				else
-					dolog(" %c%02d@%04x:%08x/e=%x",
-						exc_ring[j].mode, exc_ring[j].no,
+					dolog("  [%4d] %c %s @%04x:%08x err=%04x\n",
+						i, exc_ring[j].mode, ename,
 						exc_ring[j].cs, exc_ring[j].ip,
 						exc_ring[j].err);
 			}
-			dolog("\n");
 		}
 	}
-	dolog("=== End WfW Boot Monitor ===\n");
+	dolog("=== End CPU Monitor ===\n");
 }
 
 static void cpu_diag_log_int21(CPUI386 *cpu)
@@ -5851,7 +5984,7 @@ static void cpu_diag_log_int21(CPUI386 *cpu)
 			if (win386_diag.code_cs == 0)
 				win386_diag.code_cs = cpu->seg[SEG_CS].sel;
 			if (cpu->seg[SEG_CS].sel == win386_diag.code_cs) {
-				wfw_monitor_dump(cpu, "WIN386 exit");
+				cpu_monitor_dump(cpu, "WIN386 exit");
 				dolog("=== WIN386 trace stop ===\n");
 				dolog("  exit code AL=%02x CS=%04x int21=%u int2f=%u pm_exc=%u\n",
 					al, cpu->seg[SEG_CS].sel, win386_diag.int21_count,
@@ -6616,6 +6749,378 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 			val = cpu->phys_mem[0x413] | ((u16)cpu->phys_mem[0x414] << 8);
 		sreg16(0, val);
 		return true;
+	}
+
+	/* BDA pointer for convenience — all HLE reads/writes use physical memory */
+	u8 *bda = (u8 *)cpu->phys_mem + 0x400;
+
+	/* In V86 mode with IOPL<3, the VMM intercepts INTs via #GP.
+	 * Don't HLE INT 10h/16h/1Ah there — let the VMM handle them.
+	 * V86 with IOPL=3 (EMM386-style) is safe — INTs go through IVT normally. */
+	bool v86_vmm = (cpu->flags & VM) && get_IOPL(cpu) < 3;
+
+	/* ---- INT 16h: Keyboard ---- */
+	if (intno == 0x16 && !v86_vmm) {
+		u8 ah16 = (lreg32(0) >> 8) & 0xFF;
+		u16 buf_head = bda[0x1A] | (bda[0x1B] << 8); /* offset from seg 0x40 */
+		u16 buf_tail = bda[0x1C] | (bda[0x1D] << 8);
+		u16 buf_start = bda[0x80] | (bda[0x81] << 8);
+		u16 buf_end = bda[0x82] | (bda[0x83] << 8);
+		if (buf_start == 0) buf_start = 0x1E;
+		if (buf_end == 0) buf_end = 0x3E;
+
+		if (ah16 == 0x01 || ah16 == 0x11) {
+			/* Check keystroke (non-blocking).
+			 * ZF=1 if empty, ZF=0 + AX=key if available. */
+			refresh_flags(cpu);
+			cpu->cc.mask = 0;
+			if (buf_head == buf_tail) {
+				cpu->flags |= ZF;
+			} else {
+				cpu->flags &= ~ZF;
+				u16 key = bda[buf_head] | (bda[buf_head + 1] << 8);
+				sreg16(0, key);
+			}
+			return true;
+		}
+
+		if (ah16 == 0x00 || ah16 == 0x10) {
+			/* Wait for keystroke (blocking).
+			 * If buffer empty, fall through to BIOS (which does HLT loop). */
+			if (buf_head == buf_tail)
+				return false;
+			u16 key = bda[buf_head] | (bda[buf_head + 1] << 8);
+			sreg16(0, key);
+			/* Advance head with wrap */
+			buf_head += 2;
+			if (buf_head >= buf_end)
+				buf_head = buf_start;
+			bda[0x1A] = buf_head & 0xFF;
+			bda[0x1B] = buf_head >> 8;
+			return true;
+		}
+
+		if (ah16 == 0x02) {
+			/* Get shift flags → AL = BDA[0x417] */
+			sreg8(0, bda[0x17]);
+			return true;
+		}
+
+		return false;
+	}
+
+	/* ---- INT 1Ah: Timer ---- */
+	if (intno == 0x1A && !v86_vmm) {
+		u8 ah1a = (lreg32(0) >> 8) & 0xFF;
+		if (ah1a == 0x00) {
+			/* Read system timer tick count from BDA 0x46C (32-bit) */
+			u32 ticks = bda[0x6C] | (bda[0x6D] << 8) |
+			            (bda[0x6E] << 16) | (bda[0x6F] << 24);
+			u8 midnight = bda[0x70];
+			bda[0x70] = 0; /* clear midnight flag */
+			sreg16(1, ticks >> 16);   /* CX = high word */
+			sreg16(2, ticks & 0xFFFF); /* DX = low word */
+			sreg8(0, midnight);       /* AL = midnight flag */
+			return true;
+		}
+		return false;
+	}
+
+	/* ---- INT 10h: Video ---- */
+	if (intno == 0x10 && !v86_vmm) {
+		/* Don't HLE INT 10h before BIOS has initialized the BDA.
+		 * After pc_reset(), RAM is zeroed — BDA mode=0/cols=0 means
+		 * the BIOS hasn't done AH=00h mode set yet. Let the real
+		 * BIOS POST run unimpeded to initialize everything. */
+		if (bda[0x49] == 0 && bda[0x4A] == 0)
+			return false;
+
+		u8 ah10 = (lreg32(0) >> 8) & 0xFF;
+		u8 al10 = lreg32(0) & 0xFF;
+
+		if (ah10 == 0x0F) {
+			/* Get video mode: AL=mode, AH=cols, BH=page */
+			u8 mode = bda[0x49];
+			u8 cols = bda[0x4A];
+			u8 page = bda[0x62];
+			sreg16(0, mode | ((u16)cols << 8)); /* AL=mode, AH=cols */
+			sreg16(3, (lreg16(3) & 0x00FF) | ((u16)page << 8)); /* BH=page */
+			return true;
+		}
+
+		if (ah10 == 0x03) {
+			/* Get cursor position: DH=row, DL=col, CH:CL=cursor shape */
+			u8 page = (lreg16(3) >> 8) & 0x07;
+			u16 pos_off = 0x50 + page * 2;
+			u8 col = bda[pos_off];
+			u8 row = bda[pos_off + 1];
+			u16 shape = bda[0x60] | (bda[0x61] << 8);
+			sreg16(2, col | ((u16)row << 8)); /* DL=col, DH=row */
+			sreg16(1, shape);                 /* CX=cursor shape */
+			return true;
+		}
+
+		if (ah10 == 0x02) {
+			/* Set cursor position: DH=row, DL=col, BH=page */
+			u8 page = (lreg16(3) >> 8) & 0x07;
+			u8 col = lreg16(2) & 0xFF;
+			u8 row = (lreg16(2) >> 8) & 0xFF;
+			u8 cols = bda[0x4A];
+			if (cols == 0) cols = 80;
+			u16 pos_off = 0x50 + page * 2;
+			bda[pos_off] = col;
+			bda[pos_off + 1] = row;
+			/* Update CRTC cursor if this is the active page */
+			u8 active_page = bda[0x62];
+			if (page == active_page && cpu->cb.vga_set_cursor) {
+				u16 page_off = bda[0x4E] | (bda[0x4F] << 8);
+				u16 cursor_addr = page_off / 2 + (u16)row * cols + col;
+				cpu->cb.vga_set_cursor(cpu->cb.vga_state, cursor_addr);
+			}
+			return true;
+		}
+
+		/* AH=01h (Set Cursor Shape) intentionally NOT HLE'd.
+		 * The BIOS performs CGA-to-VGA scan line conversion that
+		 * we'd need to replicate. Not worth it for a rare call. */
+
+		/* AH=06h/07h: Scroll window up/down — biggest single HLE win */
+		if ((ah10 == 0x06 || ah10 == 0x07) && cpu->cb.vga_text_ram) {
+			u8 lines = al10;
+			u8 attr = (lreg16(3) >> 8) & 0xFF; /* BH = fill attribute */
+			u8 top = (lreg16(1) >> 8) & 0xFF;  /* CH = top row */
+			u8 left = lreg16(1) & 0xFF;         /* CL = left col */
+			u8 bottom = (lreg16(2) >> 8) & 0xFF; /* DH = bottom row */
+			u8 right = lreg16(2) & 0xFF;          /* DL = right col */
+			u8 cols = bda[0x4A];
+			if (cols == 0) cols = 80;
+			u8 *vram = cpu->cb.vga_text_ram;
+			u16 page_off = bda[0x4E] | (bda[0x4F] << 8);
+			/* page_off is byte offset in CPU address space,
+			 * VRAM uses odd/even interleave: multiply by 2 */
+			u8 *base = vram + (u32)page_off * 2;
+			int row_stride = cols * 4; /* 4 bytes per char cell in VRAM */
+			int win_height = bottom - top + 1;
+			int win_width = right - left + 1;
+			if (win_height <= 0 || win_width <= 0)
+				return true;
+			bool full_width = (left == 0 && right == cols - 1);
+
+			/* Build fill pattern: char=0x20 (space), attr=BH */
+			/* VRAM layout: [char_byte, attr_byte, ?, ?] per cell */
+			/* For 16-bit fill: char | (attr << 8) */
+			u16 fill16 = 0x20 | ((u16)attr << 8);
+
+			if (lines == 0 || lines >= win_height) {
+				/* Clear entire window */
+				if (full_width) {
+					u8 *p = base + top * row_stride;
+					for (int r = 0; r < win_height; r++) {
+						for (int c = 0; c < cols; c++)
+							*(u16 *)(p + c * 4) = fill16;
+						p += row_stride;
+					}
+				} else {
+					for (int r = top; r <= bottom; r++) {
+						u8 *p = base + r * row_stride + left * 4;
+						for (int c = 0; c < win_width; c++)
+							*(u16 *)(p + c * 4) = fill16;
+					}
+				}
+			} else if (ah10 == 0x06) {
+				/* Scroll up */
+				if (full_width) {
+					memmove(base + top * row_stride,
+					        base + (top + lines) * row_stride,
+					        (win_height - lines) * row_stride);
+					/* Fill blank lines at bottom */
+					u8 *p = base + (bottom - lines + 1) * row_stride;
+					for (int r = 0; r < lines; r++) {
+						for (int c = 0; c < cols; c++)
+							*(u16 *)(p + c * 4) = fill16;
+						p += row_stride;
+					}
+				} else {
+					for (int r = top; r <= bottom - lines; r++) {
+						u8 *src = base + (r + lines) * row_stride + left * 4;
+						u8 *dst = base + r * row_stride + left * 4;
+						memcpy(dst, src, win_width * 4);
+					}
+					for (int r = bottom - lines + 1; r <= bottom; r++) {
+						u8 *p = base + r * row_stride + left * 4;
+						for (int c = 0; c < win_width; c++)
+							*(u16 *)(p + c * 4) = fill16;
+					}
+				}
+			} else {
+				/* Scroll down (AH=07h) */
+				if (full_width) {
+					memmove(base + (top + lines) * row_stride,
+					        base + top * row_stride,
+					        (win_height - lines) * row_stride);
+					/* Fill blank lines at top */
+					u8 *p = base + top * row_stride;
+					for (int r = 0; r < lines; r++) {
+						for (int c = 0; c < cols; c++)
+							*(u16 *)(p + c * 4) = fill16;
+						p += row_stride;
+					}
+				} else {
+					for (int r = bottom; r >= top + lines; r--) {
+						u8 *src = base + (r - lines) * row_stride + left * 4;
+						u8 *dst = base + r * row_stride + left * 4;
+						memcpy(dst, src, win_width * 4);
+					}
+					for (int r = top; r < top + lines; r++) {
+						u8 *p = base + r * row_stride + left * 4;
+						for (int c = 0; c < win_width; c++)
+							*(u16 *)(p + c * 4) = fill16;
+					}
+				}
+			}
+			/* Mark all VRAM dirty */
+			if (cpu->cb.vga_text_dirty_pages)
+				*cpu->cb.vga_text_dirty_pages = ~(uint64_t)0;
+			return true;
+		}
+
+		if (ah10 == 0x08 && cpu->cb.vga_text_ram) {
+			/* Read char+attr at cursor → AH=attr, AL=char */
+			u8 page = (lreg16(3) >> 8) & 0x07;
+			u8 cols = bda[0x4A];
+			if (cols == 0) cols = 80;
+			u16 pos_off = 0x50 + page * 2;
+			u8 col = bda[pos_off];
+			u8 row = bda[pos_off + 1];
+			u16 page_size = bda[0x4C] | (bda[0x4D] << 8);
+			if (page_size == 0) page_size = 4000;
+			u8 *vram = cpu->cb.vga_text_ram;
+			u32 voff = (u32)page * page_size * 2 +
+			           ((u32)row * cols + col) * 4;
+			u8 ch = vram[voff];
+			u8 at = vram[voff + 1];
+			sreg16(0, ch | ((u16)at << 8));
+			return true;
+		}
+
+		if (ah10 == 0x09 && cpu->cb.vga_text_ram) {
+			/* Write char+attr at cursor × CX copies (no cursor advance) */
+			u8 page = (lreg16(3) >> 8) & 0x07;
+			u8 attr = lreg16(3) & 0xFF; /* BL = attribute */
+			u16 count = lreg16(1); /* CX = repeat count */
+			u8 ch = al10;
+			u8 cols = bda[0x4A];
+			if (cols == 0) cols = 80;
+			u16 pos_off = 0x50 + page * 2;
+			u8 col = bda[pos_off];
+			u8 row = bda[pos_off + 1];
+			u16 page_size = bda[0x4C] | (bda[0x4D] << 8);
+			if (page_size == 0) page_size = 4000;
+			u8 *vram = cpu->cb.vga_text_ram;
+			u32 voff = (u32)page * page_size * 2 +
+			           ((u32)row * cols + col) * 4;
+			u16 fill = ch | ((u16)attr << 8);
+			for (u16 i = 0; i < count; i++) {
+				*(u16 *)(vram + voff) = fill;
+				voff += 4;
+			}
+			if (cpu->cb.vga_text_dirty_pages)
+				*cpu->cb.vga_text_dirty_pages = ~(uint64_t)0;
+			return true;
+		}
+
+		if (ah10 == 0x0A && cpu->cb.vga_text_ram) {
+			/* Write char at cursor × CX copies (preserve attr, no advance) */
+			u8 page = (lreg16(3) >> 8) & 0x07;
+			u16 count = lreg16(1); /* CX */
+			u8 ch = al10;
+			u8 cols = bda[0x4A];
+			if (cols == 0) cols = 80;
+			u16 pos_off = 0x50 + page * 2;
+			u8 col = bda[pos_off];
+			u8 row = bda[pos_off + 1];
+			u16 page_size = bda[0x4C] | (bda[0x4D] << 8);
+			if (page_size == 0) page_size = 4000;
+			u8 *vram = cpu->cb.vga_text_ram;
+			u32 voff = (u32)page * page_size * 2 +
+			           ((u32)row * cols + col) * 4;
+			for (u16 i = 0; i < count; i++) {
+				vram[voff] = ch; /* char byte only */
+				voff += 4;
+			}
+			if (cpu->cb.vga_text_dirty_pages)
+				*cpu->cb.vga_text_dirty_pages = ~(uint64_t)0;
+			return true;
+		}
+
+		if (ah10 == 0x0E && cpu->cb.vga_text_ram) {
+			/* Teletype output: write char + advance cursor + handle specials */
+			u8 ch = al10;
+			u8 page = bda[0x62]; /* active page */
+			u8 cols = bda[0x4A];
+			if (cols == 0) cols = 80;
+			u8 rows = bda[0x84];
+			if (rows == 0) rows = 24; /* BDA 0x84 stores max row (0-based) */
+			u16 pos_off = 0x50 + page * 2;
+			u8 col = bda[pos_off];
+			u8 row = bda[pos_off + 1];
+			u16 page_byte_off = bda[0x4E] | (bda[0x4F] << 8);
+			u8 *vram = cpu->cb.vga_text_ram;
+
+			if (ch == 0x0D) {
+				/* CR: move to beginning of line */
+				col = 0;
+			} else if (ch == 0x0A) {
+				/* LF: move down one line */
+				row++;
+			} else if (ch == 0x08) {
+				/* BS: move back one column */
+				if (col > 0) col--;
+			} else if (ch == 0x07) {
+				/* BEL: beep (no-op) */
+			} else {
+				/* Normal character: write and advance */
+				u32 voff = (u32)page_byte_off * 2 +
+				           ((u32)row * cols + col) * 4;
+				vram[voff] = ch;
+				/* Attribute is preserved (teletype doesn't change it) */
+				col++;
+				if (col >= cols) {
+					col = 0;
+					row++;
+				}
+			}
+
+			/* Scroll if past bottom row */
+			if (row > rows) {
+				/* Scroll up 1 line, full width */
+				int row_stride = cols * 4;
+				u8 *base = vram + (u32)page_byte_off * 2;
+				memmove(base, base + row_stride,
+				        rows * row_stride);
+				/* Clear last line with attr 0x07 (light gray on black) */
+				u8 *p = base + rows * row_stride;
+				u16 fill16 = 0x20 | (0x07 << 8);
+				for (int c = 0; c < cols; c++)
+					*(u16 *)(p + c * 4) = fill16;
+				row = rows;
+			}
+
+			/* Update BDA cursor */
+			bda[pos_off] = col;
+			bda[pos_off + 1] = row;
+			/* Update CRTC cursor */
+			if (cpu->cb.vga_set_cursor) {
+				u16 cursor_addr = page_byte_off / 2 +
+				                  (u16)row * cols + col;
+				cpu->cb.vga_set_cursor(cpu->cb.vga_state, cursor_addr);
+			}
+			if (cpu->cb.vga_text_dirty_pages)
+				*cpu->cb.vga_text_dirty_pages = ~(uint64_t)0;
+			return true;
+		}
+
+		return false;
 	}
 
 	if (intno != 0x15) return false;
@@ -7963,11 +8468,11 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 		__ltr_s = (__ltr_w2 >> 12) & 1; \
 		__ltr_p = (__ltr_w2 >> 15) & 1; \
 		__ltr_type = (__ltr_w2 >> 8) & 0xf; \
-		/* LTR accepts only available 32-bit TSS (type 9). */ \
-		if (__ltr_s || __ltr_type != 9) THROW(EX_GP, __ltr_sel & ~0x3); \
+		/* LTR accepts available 16-bit TSS (type 1) or 32-bit TSS (type 9). */ \
+		if (__ltr_s || (__ltr_type != 1 && __ltr_type != 9)) THROW(EX_GP, __ltr_sel & ~0x3); \
 		if (!__ltr_p) THROW(EX_NP, __ltr_sel & ~0x3); \
 		TRY(set_seg(cpu, SEG_TR, __ltr_sel)); \
-		/* Mark descriptor busy (type 9 -> 0xB), mirroring task_switch(). */ \
+		/* Mark descriptor busy (type 1->3 or 9->0xB). */ \
 		{ \
 			uword __ltr_desc = cpu->gdt.base + (__ltr_sel & ~0x7); \
 			OptAddr __ltr_meml; \
@@ -9842,8 +10347,11 @@ static bool pmcall(CPUI386 *cpu, bool opsz16, uword addr, int sel, bool isjmp)
 		cpu->next_ip = addr;
 	} else {
 		int newcs = w1 >> 16;
-		uword newip = (w1 & 0xffff) | (w2 & 0xffff0000);
 		int gt = (w2 >> 8) & 0xf;
+		/* 16-bit call gate (type 4): offset is w1[15:0] only.
+		 * 32-bit call gate (type 12): offset is w1[15:0] | w2[31:16]. */
+		uword newip = (gt == 4) ? (w1 & 0xffff)
+				        : ((w1 & 0xffff) | (w2 & 0xffff0000));
 		int wc = w2 & 31;
 
 		if (dpl < cpu->cpl || dpl < (sel & 3))
@@ -10070,7 +10578,7 @@ static int __call_isr_check_cs(CPUI386 *cpu, int sel, int ext, int *csdpl)
 	}
 }
 
-/* exc_ring buffer and EXC_RING_SIZE/MASK defined earlier (near wfw_monitor_dump) */
+/* exc_ring buffer and EXC_RING_SIZE/MASK defined earlier (near cpu_monitor_dump) */
 /* Delayed ring buffer dump: set to wall-clock time when a trigger fires;
  * cpui386_step checks and dumps 2 seconds later to capture post-trigger events. */
 static uint32_t exc_ring_delayed_dump_time = 0;
@@ -10167,6 +10675,179 @@ static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 			exc_ring[idx].err = pusherr ? cpu->excerr : 0;
 			exc_ring[idx].cr2 = (no == 14) ? cpu->cr2 : 0;
 			exc_ring_pos++;
+		}
+
+		/* Exception loop detector: if the same exception fires at the
+		 * same CS:EIP many times in a row, auto-dump and report.
+		 * Catches infinite #GP/#TS loops where the handler can't advance. */
+		{
+			static uint8_t loop_last_no = 0xff;
+			static uint16_t loop_last_cs = 0;
+			static uint32_t loop_last_ip = 0;
+			static uint16_t loop_repeat = 0;
+			static bool loop_dumped = false;
+			if (no < 32 && no == loop_last_no &&
+			    cpu->seg[SEG_CS].sel == loop_last_cs && cpu->ip == loop_last_ip) {
+				loop_repeat++;
+				if (loop_repeat == 64 && !loop_dumped) {
+					dolog("*** Exception loop detected: #%d x%u at %04x:%08x err=%04x ***\n",
+						no, loop_repeat, loop_last_cs, loop_last_ip,
+						pusherr ? cpu->excerr : 0);
+					/* Dump faulting instruction bytes */
+					{
+						uint8_t ibuf[16];
+						int ilen = 0;
+						OptAddr imeml;
+						for (int bi = 0; bi < 16; bi++) {
+							if (translate(cpu, &imeml, 1, SEG_CS,
+							    (cpu->ip + bi) & 0xffffffff, 1, 0)) {
+								ibuf[bi] = load8(cpu, &imeml);
+								ilen = bi + 1;
+							} else break;
+						}
+						if (ilen > 0) {
+							dolog("  fault insn @%04x:%08x:",
+								cpu->seg[SEG_CS].sel, cpu->ip);
+							for (int bi = 0; bi < ilen; bi++)
+								dolog(" %02x", ibuf[bi]);
+							dolog("\n");
+						}
+					}
+					/* If error code looks like a selector, dump that descriptor */
+					if (pusherr && (cpu->excerr & 0xfff8)) {
+						uint16_t fsel = cpu->excerr & 0xfffc;
+						uword fw1 = 0, fw2 = 0;
+						if (read_desc_noexcept(cpu, fsel, &fw1, &fw2)) {
+							uint32_t db = ((fw1 >> 16) | ((fw2 & 0xff) << 16) |
+								       (fw2 & 0xff000000));
+							uint32_t dl = (fw1 & 0xffff) | (fw2 & 0x0f0000);
+							if (fw2 & 0x800000) dl = (dl << 12) | 0xfff;
+							uint16_t df = (fw2 >> 8) & 0xffff;
+							dolog("  fault sel %04x: w1=%08x w2=%08x base=%08x lim=%08x fl=%04x (s=%u type=%x dpl=%u p=%u)\n",
+								fsel, fw1, fw2, db, dl, df,
+								(df >> 4) & 1, df & 0xf,
+								(df >> 5) & 3, (df >> 7) & 1);
+						} else {
+							dolog("  fault sel %04x: read_desc FAILED\n", fsel);
+						}
+					}
+					/* Dump handler code bytes and stack frame for the looping vector */
+					{
+						uword iw1 = 0, iw2 = 0;
+						if (read_idt_vector_raw_noexcept(cpu, no, &iw1, &iw2)) {
+							int igt = (iw2 >> 8) & 0xf;
+							bool ig16 = (igt == 6 || igt == 7);
+							uint16_t hcs_sel = iw1 >> 16;
+							uword hip = ig16 ? (iw1 & 0xffff)
+								         : ((iw1 & 0xffff) | (iw2 & 0xffff0000));
+							/* Read handler CS descriptor from GDT/LDT */
+							uword hw1 = 0, hw2 = 0;
+							if (read_desc_noexcept(cpu, hcs_sel, &hw1, &hw2)) {
+								uint32_t hbase = (hw1 >> 16) | ((hw2 & 0xff) << 16) |
+									         (hw2 & 0xff000000);
+								uint32_t hlim = (hw1 & 0xffff) | (hw2 & 0x0f0000);
+								if (hw2 & 0x800000) hlim = (hlim << 12) | 0xfff;
+								int hdb = (hw2 >> 22) & 1; /* D/B bit */
+								dolog("  handler CS=%04x: base=%08x lim=%08x D=%d type=%02x\n",
+									hcs_sel, hbase, hlim, hdb, (hw2 >> 8) & 0xff);
+								/* Dump first 48 bytes of handler code */
+								uint32_t hlin = hbase + hip;
+								dolog("  handler code @%04x:%08x (lin=%08x):",
+									hcs_sel, hip, hlin);
+								for (int bi = 0; bi < 48 && hlin + bi < (uint32_t)cpu->phys_mem_size; bi++)
+									dolog(" %02x", cpu->phys_mem[hlin + bi]);
+								dolog("\n");
+								/* If first insn is CALL rel16 (e8), follow and dump target */
+								if (hlin + 2 < (uint32_t)cpu->phys_mem_size &&
+								    cpu->phys_mem[hlin] == 0xe8) {
+									int16_t cdisp = (int16_t)(cpu->phys_mem[hlin+1] |
+									                          (cpu->phys_mem[hlin+2] << 8));
+									uint16_t ctgt = (uint16_t)(hip + 3 + cdisp);
+									uint32_t ctgt_lin = hbase + ctgt;
+									dolog("  common handler @%04x:%04x (lin=%08x):\n",
+										hcs_sel, ctgt, ctgt_lin);
+									for (int row = 0; row < 24; row++) {
+										int off = row * 16;
+										if (ctgt_lin + off >= (uint32_t)cpu->phys_mem_size) break;
+										dolog("    %04x:", ctgt + off);
+										for (int bi = 0; bi < 16 && ctgt_lin + off + bi < (uint32_t)cpu->phys_mem_size; bi++)
+											dolog(" %02x", cpu->phys_mem[ctgt_lin + off + bi]);
+										dolog("\n");
+									}
+								}
+							}
+							/* Dump ring-0 stack frame from TSS */
+							int tr_type = cpu->seg[SEG_TR].flags & 0xf;
+							uint32_t tr_base = cpu->seg[SEG_TR].base;
+							uint16_t r0_sp, r0_ss;
+							if (tr_type == 1 || tr_type == 3) {
+								/* 16-bit TSS: SP0@2, SS0@4 */
+								if (tr_base + 5 < (uint32_t)cpu->phys_mem_size) {
+									r0_sp = cpu->phys_mem[tr_base + 2] |
+									        (cpu->phys_mem[tr_base + 3] << 8);
+									r0_ss = cpu->phys_mem[tr_base + 4] |
+									        (cpu->phys_mem[tr_base + 5] << 8);
+									/* Read SS0 descriptor for base */
+									uword sw1 = 0, sw2 = 0;
+									if (read_desc_noexcept(cpu, r0_ss, &sw1, &sw2)) {
+										uint32_t ss_base = (sw1 >> 16) | ((sw2 & 0xff) << 16) |
+											           (sw2 & 0xff000000);
+										uint32_t ss_lim = (sw1 & 0xffff) | (sw2 & 0x0f0000);
+										if (sw2 & 0x800000) ss_lim = (ss_lim << 12) | 0xfff;
+										int ss_db = (sw2 >> 22) & 1;
+										dolog("  r0 stack: SS0=%04x(base=%08x lim=%08x B=%d) SP0=%04x\n",
+											r0_ss, ss_base, ss_lim, ss_db, r0_sp);
+										/* Dump 16 bytes below SP0 (the pushed frame) */
+										uint32_t slin = ss_base + r0_sp;
+										if (ig16) {
+											/* 16-bit gate pushes: SS(2) SP(2) FL(2) CS(2) IP(2) [err(2)] */
+											int frame_sz = pusherr ? 12 : 10;
+											uint32_t frame_top = slin - frame_sz;
+											dolog("  r0 frame @%08x (16-bit, %d bytes):",
+												frame_top, frame_sz);
+											for (int bi = 0; bi < frame_sz && frame_top + bi < (uint32_t)cpu->phys_mem_size; bi++)
+												dolog(" %02x", cpu->phys_mem[frame_top + bi]);
+											dolog("\n");
+											/* Decode frame fields */
+											if (frame_top + frame_sz <= (uint32_t)cpu->phys_mem_size) {
+												uint8_t *f = &cpu->phys_mem[frame_top];
+												if (pusherr) {
+													dolog("  frame: err=%04x IP=%04x CS=%04x FL=%04x SP=%04x SS=%04x\n",
+														f[0]|(f[1]<<8), f[2]|(f[3]<<8),
+														f[4]|(f[5]<<8), f[6]|(f[7]<<8),
+														f[8]|(f[9]<<8), f[10]|(f[11]<<8));
+												} else {
+													dolog("  frame: IP=%04x CS=%04x FL=%04x SP=%04x SS=%04x\n",
+														f[0]|(f[1]<<8), f[2]|(f[3]<<8),
+														f[4]|(f[5]<<8), f[6]|(f[7]<<8),
+														f[8]|(f[9]<<8));
+												}
+											}
+										}
+									}
+								}
+							} else if (tr_type == 9 || tr_type == 11) {
+								/* 32-bit TSS: ESP0@4, SS0@8 */
+								if (tr_base + 11 < (uint32_t)cpu->phys_mem_size) {
+									uint32_t r0_esp = *(uint32_t*)&cpu->phys_mem[tr_base + 4];
+									r0_ss = cpu->phys_mem[tr_base + 8] |
+									        (cpu->phys_mem[tr_base + 9] << 8);
+									dolog("  r0 stack (32-bit TSS): SS0=%04x ESP0=%08x\n",
+										r0_ss, r0_esp);
+								}
+							}
+						}
+					}
+					cpu_monitor_dump(cpu, "exc loop");
+					loop_dumped = true;
+				}
+			} else {
+				loop_last_no = no;
+				loop_last_cs = cpu->seg[SEG_CS].sel;
+				loop_last_ip = cpu->ip;
+				loop_repeat = 1;
+				loop_dumped = false;
+			}
 		}
 
 		/* Track nested exceptions while PF handler is active */
@@ -10812,8 +11493,11 @@ swint_dpl_reject:
 
 	/* TRAP-OR-INTERRUPT-GATE */
 	int newcs = w1 >> 16;
-	uword newip = (w1 & 0xffff) | (w2 & 0xffff0000);
 	bool gate16 = gt == 6 || gt == 7;
+	/* 16-bit gates (type 6/7): offset is w1[15:0] only.
+	 * 32-bit gates (type E/F): offset is w1[15:0] | w2[31:16]. */
+	uword newip = gate16 ? (w1 & 0xffff)
+			     : ((w1 & 0xffff) | (w2 & 0xffff0000));
 
 	int csdpl;
 	int isr_result = __call_isr_check_cs(cpu, newcs, ext, &csdpl);
@@ -10874,6 +11558,19 @@ swint_dpl_reject:
 			OptAddr msp0, mss0;
 			int newpl = csdpl;
 			int oldcpl = cpu->cpl;
+
+			/* Check for valid TR before stack switch.
+			 * 32-bit TSS (type 9/B) minimum limit = 0x67 (104 bytes).
+			 * 16-bit TSS (type 1/3) minimum limit = 0x2B (44 bytes). */
+			{
+			int __min_tss = (cpu->seg[SEG_TR].flags & 0x8) ? 0x67 : 0x2b;
+			if ((cpu->seg[SEG_TR].sel & ~7) == 0 || cpu->seg[SEG_TR].limit < __min_tss) {
+				dolog("call_isr: inter-PVL switch but TR is invalid (sel=%04x limit=%x)\n",
+					cpu->seg[SEG_TR].sel, cpu->seg[SEG_TR].limit);
+				THROW(EX_TS, 0);
+			}
+			}
+
 			uword oldss = cpu->seg[SEG_SS].sel;
 			uword oldsp = REGi(4);
 			uword saved_ss_sel = cpu->seg[SEG_SS].sel;
@@ -12248,7 +12945,7 @@ triple_fault:
 				cpu->cr2, cpu->cr3, cpu->cpl);
 		}
 		if (win386_diag.active)
-			wfw_monitor_dump(cpu, "triple fault");
+			cpu_monitor_dump(cpu, "triple fault");
 		dolog("triple fault — resetting CPU\n");
 		cpui386_reset(cpu);
 	}

@@ -3311,6 +3311,13 @@ typedef struct {
 
 static SectorCache *sector_cache = NULL;
 
+/* Reset stale pcram pointer so cache_init() will reinitialize.
+ * Called during INI switch after pcram pool is zeroed. */
+void ide_reset_statics(void)
+{
+    sector_cache = NULL;
+}
+
 static void cache_init(void)
 {
     if (sector_cache) return;
@@ -4069,10 +4076,17 @@ int ide_change_hdd(IDEIFState *sif, int drive, const char *filename)
         bf->extents = NULL;
         bf->num_extents = 0;
     }
+    /* Free read-ahead cache — must be NULL for RW raw SD so reads
+     * go through the wcache-aware path instead of the CD-ROM path */
+    if (bf->cache_buf) {
+        free(bf->cache_buf);
+        bf->cache_buf = NULL;
+    }
     bf->nb_sectors = 0;
     bf->start_offset = 0;
     bf->cache_start = -1;
     bf->cache_count = 0;
+    bf->dirty = 0;
     bf->cylinders = 0;
     bf->heads = 0;
     bf->sectors = 0;

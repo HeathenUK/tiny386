@@ -57,6 +57,15 @@ typedef struct {
 	u8 vga_modex_plane_mask;     /* Plane write mask (SR[2]) */
 	u8 vga_modex_read_plane;     /* Read plane (GR[4]) */
 	u32 *vga_modex_latch;        /* Pointer to latch register */
+
+	/* Text mode VGA fast path + HLE support (updated by pc_step) */
+	u8 *vga_text_ram;           /* Pointer to vga_ram[] (NULL when not text mode) */
+	u32 vga_text_phys_base;     /* Physical addr of text window (0xB8000 or 0xB0000) */
+	u32 vga_text_phys_end;      /* End of text window (base + 0x8000) */
+	uint64_t *vga_text_dirty_pages;  /* Pointer to VGAState.dirty_pages */
+	void *vga_state;            /* Opaque VGAState* for cursor updates */
+	void (*vga_set_cursor)(void *vga, u16 addr);   /* Program CRTC cursor pos */
+	void (*vga_set_cursor_shape)(void *vga, u8 start, u8 end); /* CRTC cursor shape */
 } CPU_CB;
 
 CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb);
@@ -87,5 +96,8 @@ uword cpu_getflags(CPUI386 *cpu);
 void cpu_abort(CPUI386 *cpu, int code);
 void cpui386_set_diag(CPUI386 *cpu, bool enabled);
 bool cpui386_is_halted(CPUI386 *cpu);
+
+/* Reset stale pool-allocated statics for INI switch (PSRAM/pcram zeroed) */
+void i386_reset_flags_tables_for_reinit(void);
 
 #endif /* I386_H */
