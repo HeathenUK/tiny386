@@ -50,6 +50,13 @@ extern void pie_write_8pixels(uint16_t *dst, uint16_t *colors);
 extern void pie_write_8pixels_doubled(uint16_t *dst, uint16_t *colors);
 extern void pie_memcpy_128(void *dst, const void *src, size_t n);
 extern void pie_render_8pixels_mode13(uint16_t *dst, const uint8_t *indices, const uint16_t *palette);
+extern void pie_render_glyph(uint8_t *tile, const uint8_t *font_ptr, int cheight,
+                              uint32_t fgcol, uint32_t bgcol, const uint16_t *mask_table);
+extern void pie_copy_tile_to_fb(uint8_t *dst, const uint8_t *tile, int cheight, int stride);
+
+/* Bit expansion LUT for PIE glyph rendering: 256 entries x 8 uint16_t = 4KB.
+ * For each possible font byte, stores 8 x 16-bit masks (0x0000 or 0xFFFF). */
+static uint16_t *glyph_bit_masks;
 
 //#define DEBUG_VBE
 //#define DEBUG_VGA_REG
@@ -444,7 +451,7 @@ struct VGAState {
 #ifndef LCD_WIDTH
 #define LCD_WIDTH 2048
 #endif
-    uint8_t tmpbuf[(LCD_WIDTH > 720 ? LCD_WIDTH : 720) * 3 * 2];
+    uint8_t tmpbuf[(LCD_WIDTH > 720 ? LCD_WIDTH : 720) * 3 * 2] __attribute__((aligned(16)));
 #endif
 };
 
@@ -1506,27 +1513,21 @@ static void vga_text_refresh(VGAState *s,
                     uint32_t cache_key = ch | ((cattr & 0x0f) << 8) | ((cattr >> 4) << 12) | (cheight << 16);
                     uint8_t *tile = glyph_cache_lookup(s, cache_key);
                     if (tile) {
-                        /* Cache hit - copy pre-rendered tile */
-                        uint8_t *d = dst;
-                        uint8_t *t = tile;
-                        for (int row = 0; row < cheight; row++) {
-                            memcpy(d, t, 16);  /* 8 pixels * 2 bytes */
-                            d += stride;
-                            t += 16;
-                        }
+                        /* Cache hit - PIE 128-bit copy from tile to framebuffer */
+                        pie_copy_tile_to_fb(dst, tile, cheight, stride);
                     } else {
                         /* Cache miss - render and store */
                         tile = glyph_cache_store(s, cache_key);
                         if (tile) {
-                            render_glyph_tile(tile, font_ptr, cheight, fgcol, bgcol);
-                            /* Copy to framebuffer */
-                            uint8_t *d = dst;
-                            uint8_t *t = tile;
-                            for (int row = 0; row < cheight; row++) {
-                                memcpy(d, t, 16);
-                                d += stride;
-                                t += 16;
+                            if (glyph_bit_masks) {
+                                pie_render_glyph(tile, font_ptr, cheight,
+                                                 fgcol, bgcol, glyph_bit_masks);
+                            } else {
+                                render_glyph_tile(tile, font_ptr, cheight,
+                                                  fgcol, bgcol);
                             }
+                            /* PIE 128-bit copy to framebuffer */
+                            pie_copy_tile_to_fb(dst, tile, cheight, stride);
                         } else {
                             /* No cache available - direct render */
                             vga_draw_glyph8(dst, stride, font_ptr, cheight, fgcol, bgcol);
@@ -3939,13 +3940,26 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
      * which have a much bigger performance impact. L2 cache (256KB) absorbs the
      * hot glyph working set (~25KB for a typical 80x25 screen). */
     s->font_cache = psram_malloc(256 * 16 * 4);
-    s->glyph_cache_tiles = psram_malloc(GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE);
+    s->glyph_cache_tiles = heap_caps_aligned_alloc(16, GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE, MALLOC_CAP_SPIRAM);
     if (s->glyph_cache_tiles) {
         memset(s->glyph_cache_tiles, 0, GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE);
         memset(s->glyph_cache_keys, 0xff, sizeof(s->glyph_cache_keys));  /* Invalid keys */
     }
     s->glyph_cache_counter = 0;
     s->font_cache_base = 0xffffffff;
+
+    /* Bit expansion LUT for PIE glyph rendering (4KB in PSRAM).
+     * Maps each possible font byte → 8 x 16-bit masks for PIE SIMD. */
+    if (!glyph_bit_masks) {
+        glyph_bit_masks = heap_caps_aligned_alloc(16, 256 * 16, MALLOC_CAP_SPIRAM);
+        if (glyph_bit_masks) {
+            for (int b = 0; b < 256; b++) {
+                for (int i = 0; i < 8; i++) {
+                    glyph_bit_masks[b * 8 + i] = (b & (0x80 >> i)) ? 0xFFFF : 0x0000;
+                }
+            }
+        }
+    }
 #endif
 
     vga_initmode(s);

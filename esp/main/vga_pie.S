@@ -220,3 +220,101 @@ pie_render_8pixels_mode13:
 
     ret
     .size   pie_render_8pixels_mode13, . - pie_render_8pixels_mode13
+
+/*
+ * Render a complete glyph using PIE SIMD and bit expansion LUT.
+ * For each font row, loads a pre-computed 128-bit mask from LUT,
+ * ANDs with broadcast xorcol, XORs with broadcast bgcol, stores 8 RGB565 pixels.
+ * ~10 instructions per row vs ~50 for scalar C.
+ *
+ * void pie_render_glyph(uint8_t *tile, const uint8_t *font_ptr, int cheight,
+ *                        uint32_t fgcol, uint32_t bgcol, const uint16_t *mask_table);
+ *   a0 = tile output pointer (16-byte aligned, 16 bytes per row)
+ *   a1 = font_ptr (font data, 4-byte stride between rows)
+ *   a2 = cheight (number of rows, typically 16)
+ *   a3 = fgcol (16-bit RGB565 foreground color)
+ *   a4 = bgcol (16-bit RGB565 background color)
+ *   a5 = mask_table (256 entries x 16 bytes, 16-byte aligned)
+ */
+    .global pie_render_glyph
+    .type   pie_render_glyph, @function
+pie_render_glyph:
+    beqz    a2, .Lrg_done
+
+    /* Compute xorcol = fgcol ^ bgcol */
+    xor     t0, a3, a4
+
+    /* Broadcast xorcol to q1 (8 x 16-bit) via stack.
+     * PIE load/store requires a-register as base pointer. */
+    addi    sp, sp, -32
+    slli    t1, t0, 16
+    or      t0, t0, t1          /* t0 = xorcol | xorcol */
+    sw      t0, 0(sp)
+    sw      t0, 4(sp)
+    sw      t0, 8(sp)
+    sw      t0, 12(sp)
+    mv      a3, sp              /* a3 = stack base (a-reg for PIE) */
+    esp.vld.128.ip q1, a3, 0
+
+    /* Broadcast bgcol to q2 (8 x 16-bit) via stack */
+    slli    t0, a4, 16
+    or      t0, t0, a4          /* t0 = bgcol | bgcol */
+    sw      t0, 16(sp)
+    sw      t0, 20(sp)
+    sw      t0, 24(sp)
+    sw      t0, 28(sp)
+    addi    a3, sp, 16          /* a3 = stack+16 (a-reg for PIE) */
+    esp.vld.128.ip q2, a3, 0
+
+    addi    sp, sp, 32
+
+.Lrg_loop:
+    /* Load font byte, compute mask table offset */
+    lbu     t0, 0(a1)
+    slli    t0, t0, 4           /* font_data * 16 */
+    add     a3, a5, t0          /* a3 = &mask_table[font_data] (a-reg) */
+
+    /* Load 128-bit mask: 8 x (0x0000 or 0xFFFF) */
+    esp.vld.128.ip q0, a3, 0
+
+    /* result = (mask & xorcol) ^ bgcol */
+    esp.andq q0, q0, q1
+    esp.xorq q0, q0, q2
+
+    /* Store 8 pixels, advance tile ptr by 16 */
+    esp.vst.128.ip q0, a0, 16
+
+    addi    a1, a1, 4           /* font_ptr += 4 */
+    addi    a2, a2, -1
+    bnez    a2, .Lrg_loop
+
+.Lrg_done:
+    ret
+    .size   pie_render_glyph, . - pie_render_glyph
+
+/*
+ * Copy tile rows to framebuffer using PIE 128-bit load/store.
+ * Source rows are contiguous (16 bytes each), dest rows are spaced by stride.
+ * ~5 instructions per row vs ~11 for scalar memcpy loop.
+ *
+ * void pie_copy_tile_to_fb(uint8_t *dst, const uint8_t *tile, int cheight, int stride);
+ *   a0 = framebuffer destination (16-byte aligned)
+ *   a1 = tile source (16-byte aligned, 16 bytes per row contiguous)
+ *   a2 = cheight (number of rows)
+ *   a3 = stride (framebuffer row stride in bytes)
+ */
+    .global pie_copy_tile_to_fb
+    .type   pie_copy_tile_to_fb, @function
+pie_copy_tile_to_fb:
+    beqz    a2, .Lct_done
+
+.Lct_loop:
+    esp.vld.128.ip q0, a1, 16  /* load 16 bytes from tile, advance src */
+    esp.vst.128.ip q0, a0, 0   /* store 16 bytes to framebuffer */
+    add     a0, a0, a3          /* advance dst by stride */
+    addi    a2, a2, -1
+    bnez    a2, .Lct_loop
+
+.Lct_done:
+    ret
+    .size   pie_copy_tile_to_fb, . - pie_copy_tile_to_fb
