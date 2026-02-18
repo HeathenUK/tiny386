@@ -2203,30 +2203,19 @@ static void vga_graphic_refresh(VGAState *s,
             const uint8_t *src = vram_line;
             int pixels_left = src_bytes;
 
-            /* Main loop: 16 pixels at a time */
+            /* Main loop: 16 pixels at a time using PIE SIMD palette lookup.
+             * pie_render_8pixels_mode13() interleaves address calculations
+             * with loads to hide RISC-V memory latency. */
             while (pixels_left >= 16) {
-                /* Pack pairs of colors into 32-bit words for efficient stores */
-                uint32_t c0 = pal[src[0]] | (pal[src[1]] << 16);
-                uint32_t c1 = pal[src[2]] | (pal[src[3]] << 16);
-                uint32_t c2 = pal[src[4]] | (pal[src[5]] << 16);
-                uint32_t c3 = pal[src[6]] | (pal[src[7]] << 16);
-                uint32_t c4 = pal[src[8]] | (pal[src[9]] << 16);
-                uint32_t c5 = pal[src[10]] | (pal[src[11]] << 16);
-                uint32_t c6 = pal[src[12]] | (pal[src[13]] << 16);
-                uint32_t c7 = pal[src[14]] | (pal[src[15]] << 16);
-                fb32[0] = c0; fb32[1] = c1; fb32[2] = c2; fb32[3] = c3;
-                fb32[4] = c4; fb32[5] = c5; fb32[6] = c6; fb32[7] = c7;
+                pie_render_8pixels_mode13((uint16_t *)fb32, src, pal);
+                pie_render_8pixels_mode13((uint16_t *)(fb32 + 4), src + 8, pal);
                 fb32 += 8;
                 src += 16;
                 pixels_left -= 16;
             }
             /* Handle remaining 8 pixels if any */
             if (pixels_left >= 8) {
-                uint32_t c0 = pal[src[0]] | (pal[src[1]] << 16);
-                uint32_t c1 = pal[src[2]] | (pal[src[3]] << 16);
-                uint32_t c2 = pal[src[4]] | (pal[src[5]] << 16);
-                uint32_t c3 = pal[src[6]] | (pal[src[7]] << 16);
-                fb32[0] = c0; fb32[1] = c1; fb32[2] = c2; fb32[3] = c3;
+                pie_render_8pixels_mode13((uint16_t *)fb32, src, pal);
             }
             goto next_line;
         }
