@@ -25,6 +25,8 @@ TEST386.COM
 test386.asm
 old_*.c
 shot.png
+*.jpg
+*.txt
 
 # BIOS binaries (built from seabios/)
 bios.bin
