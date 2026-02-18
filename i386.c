@@ -9643,40 +9643,79 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 #else
 
 	/* CMP+Jcc / TEST+Jcc macro-op fusion: after CMP or TEST sets cc fields,
-	 * peek at the next byte. If it's a short Jcc (0x70-0x7F), evaluate the
-	 * branch condition directly from cc.src1/src2/dst without a full
-	 * dispatch cycle or get_*F() calls. PF conditions (0x7A/0x7B) bail
-	 * out since parity computation isn't worth inlining. */
+	 * peek at the next byte(s). If it's a short Jcc (0x70-0x7F) or near Jcc
+	 * (0F 80-8F), evaluate the branch condition directly from cc.src1/src2/dst
+	 * without a full dispatch cycle or get_*F() calls. PF conditions (0xA/0xB)
+	 * bail out since parity computation isn't worth inlining. */
+
+/* Evaluate CC_SUB condition: _ci is condition index (0x0-0xF), result in _cond */
+#define EVAL_COND_SUB(_s1, _s2, _d, _ci, _cond) do { \
+	int _cf = (u32)(_s1) < (u32)(_s2); \
+	int _zf = ((_d) == 0); \
+	int _sf = ((sword)(_d) < 0); \
+	int _of = ((sword)(((_s1) ^ (_s2)) & ((_d) ^ (_s1))) < 0); \
+	switch (_ci) { \
+	case 0x0: _cond =  _of; break; \
+	case 0x1: _cond = !_of; break; \
+	case 0x2: _cond =  _cf; break; \
+	case 0x3: _cond = !_cf; break; \
+	case 0x4: _cond =  _zf; break; \
+	case 0x5: _cond = !_zf; break; \
+	case 0x6: _cond =  _zf || _cf; break; \
+	case 0x7: _cond = !_zf && !_cf; break; \
+	case 0x8: _cond =  _sf; break; \
+	case 0x9: _cond = !_sf; break; \
+	case 0xc: _cond =  _sf != _of; break; \
+	case 0xd: _cond =  _sf == _of; break; \
+	case 0xe: _cond =  _zf || (_sf != _of); break; \
+	default:  _cond = !_zf && (_sf == _of); break; \
+	} \
+} while(0)
+
+/* Evaluate CC_AND condition: CF=0, OF=0, only ZF and SF matter */
+#define EVAL_COND_AND(_d, _ci, _cond) do { \
+	int _zf = ((_d) == 0); \
+	int _sf = ((sword)(_d) < 0); \
+	switch (_ci) { \
+	case 0x0: _cond = 0; break; \
+	case 0x1: _cond = 1; break; \
+	case 0x2: _cond = 0; break; \
+	case 0x3: _cond = 1; break; \
+	case 0x4: _cond =  _zf; break; \
+	case 0x5: _cond = !_zf; break; \
+	case 0x6: _cond =  _zf; break; \
+	case 0x7: _cond = !_zf; break; \
+	case 0x8: _cond =  _sf; break; \
+	case 0x9: _cond = !_sf; break; \
+	case 0xc: _cond =  _sf; break; \
+	case 0xd: _cond = !_sf; break; \
+	case 0xe: _cond = _zf || _sf; break; \
+	default:  _cond = !_zf && !_sf; break; \
+	} \
+} while(0)
+
 #define TRY_FUSE_JCC_SUB(cpu) do { \
 	if (likely((cpu)->pf_pos + 1 < (cpu)->pf_avail)) { \
 		u8 _nb = (cpu)->pf_ptr[(cpu)->pf_pos]; \
 		if (likely((_nb & 0xF0) == 0x70) && (_nb & 0xf) != 0xa && (_nb & 0xf) != 0xb) { \
-			s8 _disp = (s8)(cpu)->pf_ptr[(cpu)->pf_pos + 1]; \
+			s32 _disp = (s8)(cpu)->pf_ptr[(cpu)->pf_pos + 1]; \
 			(cpu)->pf_pos += 2; (cpu)->next_ip += 2; (cpu)->cycle++; \
-			uword _s1 = (cpu)->cc.src1, _s2 = (cpu)->cc.src2, _d = (cpu)->cc.dst; \
-			int _cf = (u32)_s1 < (u32)_s2; \
-			int _zf = (_d == 0); \
-			int _sf = ((sword)_d < 0); \
-			int _of = ((sword)((_s1 ^ _s2) & (_d ^ _s1)) < 0); \
 			int _cond; \
-			switch (_nb & 0xf) { \
-			case 0x0: _cond =  _of; break; \
-			case 0x1: _cond = !_of; break; \
-			case 0x2: _cond =  _cf; break; \
-			case 0x3: _cond = !_cf; break; \
-			case 0x4: _cond =  _zf; break; \
-			case 0x5: _cond = !_zf; break; \
-			case 0x6: _cond =  _zf || _cf; break; \
-			case 0x7: _cond = !_zf && !_cf; break; \
-			case 0x8: _cond =  _sf; break; \
-			case 0x9: _cond = !_sf; break; \
-			case 0xc: _cond =  _sf != _of; break; \
-			case 0xd: _cond =  _sf == _of; break; \
-			case 0xe: _cond =  _zf || (_sf != _of); break; \
-			default:  _cond = !_zf && (_sf == _of); break; \
-			} \
+			EVAL_COND_SUB((cpu)->cc.src1, (cpu)->cc.src2, (cpu)->cc.dst, _nb & 0xf, _cond); \
 			if (_cond) { (cpu)->next_ip += _disp; SEQ_INVALIDATE(cpu); } \
 			continue; \
+		} \
+		if (_nb == 0x0F && (cpu)->pf_pos + 5 < (cpu)->pf_avail) { \
+			u8 _jop = (cpu)->pf_ptr[(cpu)->pf_pos + 1]; \
+			if ((_jop & 0xF0) == 0x80 && (_jop & 0xf) != 0xa && (_jop & 0xf) != 0xb) { \
+				const u8 *_p = &(cpu)->pf_ptr[(cpu)->pf_pos + 2]; \
+				s32 _disp = (s32)(_p[0] | ((u32)_p[1] << 8) | ((u32)_p[2] << 16) | ((u32)_p[3] << 24)); \
+				(cpu)->pf_pos += 6; (cpu)->next_ip += 6; (cpu)->cycle++; \
+				int _cond; \
+				EVAL_COND_SUB((cpu)->cc.src1, (cpu)->cc.src2, (cpu)->cc.dst, _jop & 0xf, _cond); \
+				if (_cond) { (cpu)->next_ip += _disp; SEQ_INVALIDATE(cpu); } \
+				continue; \
+			} \
 		} \
 	} \
 } while(0)
@@ -9685,29 +9724,24 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	if (likely((cpu)->pf_pos + 1 < (cpu)->pf_avail)) { \
 		u8 _nb = (cpu)->pf_ptr[(cpu)->pf_pos]; \
 		if (likely((_nb & 0xF0) == 0x70) && (_nb & 0xf) != 0xa && (_nb & 0xf) != 0xb) { \
-			s8 _disp = (s8)(cpu)->pf_ptr[(cpu)->pf_pos + 1]; \
+			s32 _disp = (s8)(cpu)->pf_ptr[(cpu)->pf_pos + 1]; \
 			(cpu)->pf_pos += 2; (cpu)->next_ip += 2; (cpu)->cycle++; \
-			int _zf = ((cpu)->cc.dst == 0); \
-			int _sf = ((sword)(cpu)->cc.dst < 0); \
 			int _cond; \
-			switch (_nb & 0xf) { \
-			case 0x0: _cond = 0; break;  /* JO: OF=0 */ \
-			case 0x1: _cond = 1; break;  /* JNO: !OF=1 */ \
-			case 0x2: _cond = 0; break;  /* JB: CF=0 */ \
-			case 0x3: _cond = 1; break;  /* JAE: !CF=1 */ \
-			case 0x4: _cond =  _zf; break; \
-			case 0x5: _cond = !_zf; break; \
-			case 0x6: _cond =  _zf; break;  /* JBE: ZF||CF, CF=0 */ \
-			case 0x7: _cond = !_zf; break;  /* JA: !ZF&&!CF, CF=0 */ \
-			case 0x8: _cond =  _sf; break; \
-			case 0x9: _cond = !_sf; break; \
-			case 0xc: _cond =  _sf; break;  /* JL: SF!=OF, OF=0 */ \
-			case 0xd: _cond = !_sf; break;  /* JGE: SF==OF, OF=0 */ \
-			case 0xe: _cond = _zf || _sf; break;  /* JLE: ZF||(SF!=OF), OF=0 */ \
-			default:  _cond = !_zf && !_sf; break; /* JG: !ZF&&(SF==OF), OF=0 */ \
-			} \
+			EVAL_COND_AND((cpu)->cc.dst, _nb & 0xf, _cond); \
 			if (_cond) { (cpu)->next_ip += _disp; SEQ_INVALIDATE(cpu); } \
 			continue; \
+		} \
+		if (_nb == 0x0F && (cpu)->pf_pos + 5 < (cpu)->pf_avail) { \
+			u8 _jop = (cpu)->pf_ptr[(cpu)->pf_pos + 1]; \
+			if ((_jop & 0xF0) == 0x80 && (_jop & 0xf) != 0xa && (_jop & 0xf) != 0xb) { \
+				const u8 *_p = &(cpu)->pf_ptr[(cpu)->pf_pos + 2]; \
+				s32 _disp = (s32)(_p[0] | ((u32)_p[1] << 8) | ((u32)_p[2] << 16) | ((u32)_p[3] << 24)); \
+				(cpu)->pf_pos += 6; (cpu)->next_ip += 6; (cpu)->cycle++; \
+				int _cond; \
+				EVAL_COND_AND((cpu)->cc.dst, _jop & 0xf, _cond); \
+				if (_cond) { (cpu)->next_ip += _disp; SEQ_INVALIDATE(cpu); } \
+				continue; \
+			} \
 		} \
 	} \
 } while(0)
