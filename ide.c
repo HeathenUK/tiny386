@@ -3801,6 +3801,49 @@ void ide_block_close(BlockDevice *bs)
     }
 }
 
+/* HLE accessors for INT 13h emulation */
+BlockDevice *ide_get_drive_bs(IDEIFState *s, int drive)
+{
+    if (!s || drive < 0 || drive > 1 || !s->drives[drive])
+        return NULL;
+    return s->drives[drive]->bs;
+}
+
+int ide_get_drive_cylinders(IDEIFState *s, int drive)
+{
+    if (!s || drive < 0 || drive > 1 || !s->drives[drive])
+        return 0;
+    return s->drives[drive]->cylinders;
+}
+
+int ide_get_drive_heads(IDEIFState *s, int drive)
+{
+    if (!s || drive < 0 || drive > 1 || !s->drives[drive])
+        return 0;
+    return s->drives[drive]->heads;
+}
+
+int ide_get_drive_sectors(IDEIFState *s, int drive)
+{
+    if (!s || drive < 0 || drive > 1 || !s->drives[drive])
+        return 0;
+    return s->drives[drive]->sectors;
+}
+
+int64_t ide_get_drive_nb_sectors(IDEIFState *s, int drive)
+{
+    if (!s || drive < 0 || drive > 1 || !s->drives[drive])
+        return 0;
+    return s->drives[drive]->nb_sectors;
+}
+
+int ide_is_drive_cd(IDEIFState *s, int drive)
+{
+    if (!s || drive < 0 || drive > 1 || !s->drives[drive])
+        return 0;
+    return s->drives[drive]->drive_kind == IDE_CD;
+}
+
 int ide_attach(IDEIFState *s, int drive, const char *filename)
 {
     BlockDevice *bs;

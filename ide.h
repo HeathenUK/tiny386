@@ -73,4 +73,12 @@ int ide_block_read(BlockDevice *bs, uint64_t sector_num, uint8_t *buf, int nsect
 int ide_block_write(BlockDevice *bs, uint64_t sector_num, const uint8_t *buf, int nsectors);
 int64_t ide_block_sector_count(BlockDevice *bs);
 void ide_block_close(BlockDevice *bs);
+
+/* HLE accessors: get drive info for INT 13h emulation */
+BlockDevice *ide_get_drive_bs(IDEIFState *s, int drive);
+int ide_get_drive_cylinders(IDEIFState *s, int drive);
+int ide_get_drive_heads(IDEIFState *s, int drive);
+int ide_get_drive_sectors(IDEIFState *s, int drive);
+int64_t ide_get_drive_nb_sectors(IDEIFState *s, int drive);
+int ide_is_drive_cd(IDEIFState *s, int drive);
 #endif /* IDE_H */

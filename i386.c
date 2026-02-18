@@ -9,6 +9,7 @@
 #include "esp_heap_caps.h"
 #include "i8259.h"
 #include "i8254.h"
+#include "pc.h"
 extern int pc_batch_size_setting;
 extern int pc_last_batch_size;
 extern int pc_pit_burst_setting;
@@ -7120,6 +7121,261 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 			return true;
 		}
 
+		return false;
+	}
+
+	/* ---- INT 13h: Disk ---- */
+	if (intno == 0x13 && !v86_vmm) {
+		u8 ah13 = (lreg32(0) >> 8) & 0xFF;
+		u8 dl = lreg32(2) & 0xFF; /* drive number */
+
+		/* Only handle hard drives (DL >= 0x80). Floppies use emulink. */
+		if (dl < 0x80)
+			return false;
+
+		/* Map DL to IDE controller + drive:
+		 * 0x80 = ide->drives[0], 0x81 = ide->drives[1],
+		 * 0x82 = ide2->drives[0], 0x83 = ide2->drives[1] */
+		PC *pc = (PC *)cpu->cb.io;
+		int drv_idx = dl - 0x80;
+		IDEIFState *ide_if;
+		int ide_drive;
+		if (drv_idx < 2) {
+			ide_if = pc->ide;
+			ide_drive = drv_idx;
+		} else if (drv_idx < 4) {
+			ide_if = pc->ide2;
+			ide_drive = drv_idx - 2;
+		} else {
+			return false;
+		}
+
+		BlockDevice *bs = ide_get_drive_bs(ide_if, ide_drive);
+		/* Don't HLE CD-ROMs — they have different sector sizes */
+		if (!bs || ide_is_drive_cd(ide_if, ide_drive))
+			return false;
+
+		int heads = ide_get_drive_heads(ide_if, ide_drive);
+		int spt = ide_get_drive_sectors(ide_if, ide_drive);
+		int cyls = ide_get_drive_cylinders(ide_if, ide_drive);
+		int64_t total_sectors = ide_get_drive_nb_sectors(ide_if, ide_drive);
+
+		/* Count hard drives present for AH=08h/15h */
+		int drive_count = 0;
+		for (int i = 0; i < 2; i++) {
+			if (ide_get_drive_bs(pc->ide, i) &&
+			    !ide_is_drive_cd(pc->ide, i))
+				drive_count++;
+		}
+		for (int i = 0; i < 2; i++) {
+			if (ide_get_drive_bs(pc->ide2, i) &&
+			    !ide_is_drive_cd(pc->ide2, i))
+				drive_count++;
+		}
+
+		if (ah13 == 0x00) {
+			/* Reset disk — noop for HLE */
+			sreg16(0, lreg16(0) & 0x00FF); /* AH = 0 */
+			refresh_flags(cpu);
+			cpu->cc.mask = 0;
+			cpu->flags &= ~CF;
+			return true;
+		}
+
+		if (ah13 == 0x02 || ah13 == 0x03) {
+			/* AH=02h: Read sectors (CHS), AH=03h: Write sectors (CHS)
+			 * AL=count, CH=cyl_lo, CL=sec(0-5)|cyl_hi(6-7), DH=head
+			 * ES:BX = buffer */
+			u8 count = lreg32(0) & 0xFF;
+			u16 cx = lreg16(1);
+			u8 dh = (lreg32(2) >> 8) & 0xFF;
+			int cyl = ((cx >> 8) & 0xFF) | ((cx & 0xC0) << 2);
+			int sec = cx & 0x3F;
+			int head = dh;
+
+			if (count == 0 || sec == 0 || spt == 0 || heads == 0) {
+				/* Invalid params — set error */
+				sreg16(0, (lreg16(0) & 0x00FF) | 0x0100); /* AH=1 */
+				refresh_flags(cpu);
+				cpu->cc.mask = 0;
+				cpu->flags |= CF;
+				return true;
+			}
+
+			/* Limit to 128 sectors per call (64KB) */
+			if (count > 128) count = 128;
+
+			uint64_t lba = ((uint64_t)cyl * heads + head) * spt + (sec - 1);
+			u32 buf_phys = (cpu->seg[SEG_ES].base + (lreg16(3) & 0xFFFF)) & cpu->a20_mask;
+
+			/* Bounds check */
+			if ((uint64_t)buf_phys + (uint64_t)count * 512 > (uint64_t)cpu->phys_mem_size ||
+			    lba + count > (uint64_t)total_sectors) {
+				sreg16(0, (lreg16(0) & 0x00FF) | 0x0400); /* AH=4, sector not found */
+				refresh_flags(cpu);
+				cpu->cc.mask = 0;
+				cpu->flags |= CF;
+				return true;
+			}
+
+			int ret;
+			if (ah13 == 0x02)
+				ret = ide_block_read(bs, lba, (u8 *)&cpu->phys_mem[buf_phys], count);
+			else
+				ret = ide_block_write(bs, lba, (const u8 *)&cpu->phys_mem[buf_phys], count);
+
+			if (ret < 0) {
+				sreg16(0, (lreg16(0) & 0x00FF) | 0x0400); /* AH=4 */
+				refresh_flags(cpu);
+				cpu->cc.mask = 0;
+				cpu->flags |= CF;
+				return true;
+			}
+
+			sreg16(0, count); /* AH=0, AL=sectors transferred */
+			refresh_flags(cpu);
+			cpu->cc.mask = 0;
+			cpu->flags &= ~CF;
+			return true;
+		}
+
+		if (ah13 == 0x08) {
+			/* Get drive parameters.
+			 * Returns: CH=max cyl low 8, CL=max sec | (max cyl hi << 6),
+			 *          DH=max head, DL=drive count, AH=0, CF=0 */
+			int max_cyl = cyls - 1;
+			int max_head = heads - 1;
+			int max_sec = spt;
+			sreg16(0, lreg16(0) & 0x00FF); /* AH=0 */
+			sreg16(1, (max_cyl & 0xFF) << 8 | (max_sec & 0x3F) | ((max_cyl >> 2) & 0xC0));
+			sreg16(2, (drive_count & 0xFF) | ((max_head & 0xFF) << 8)); /* DL=drive count, DH=max_head */
+			sreg16(3, (lreg16(3) & 0xFF00)); /* BL=0 (floppy type, N/A for HD) */
+			refresh_flags(cpu);
+			cpu->cc.mask = 0;
+			cpu->flags &= ~CF;
+			return true;
+		}
+
+		if (ah13 == 0x15) {
+			/* Get disk type. Returns AH=3 (hard disk) for fixed disks. */
+			/* CX:DX = total sectors */
+			u32 ts = (total_sectors > 0xFFFFFFFF) ? 0xFFFFFFFF : (u32)total_sectors;
+			sreg16(0, (lreg16(0) & 0x00FF) | 0x0300); /* AH=3 */
+			sreg16(1, (ts >> 16) & 0xFFFF); /* CX = high word */
+			sreg16(2, ts & 0xFFFF);         /* DX = low word */
+			refresh_flags(cpu);
+			cpu->cc.mask = 0;
+			cpu->flags &= ~CF;
+			return true;
+		}
+
+		if (ah13 == 0x41) {
+			/* Check extensions present.
+			 * BX=0x55AA on entry → BX=0xAA55, AH=version, CX=API bitmap */
+			if (lreg16(3) != 0x55AA)
+				return false;
+			sreg16(3, 0xAA55); /* BX = signature */
+			sreg16(0, (lreg16(0) & 0x00FF) | 0x2100); /* AH = 0x21 (version 2.1) */
+			sreg16(1, 0x0001); /* CX = API subset: extended disk access */
+			refresh_flags(cpu);
+			cpu->cc.mask = 0;
+			cpu->flags &= ~CF;
+			return true;
+		}
+
+		if (ah13 == 0x42 || ah13 == 0x43) {
+			/* Extended read/write. DAP at DS:SI:
+			 * [0] u8 size, [1] u8 0, [2] u16 count,
+			 * [4] u16 buf_off, [6] u16 buf_seg, [8] u64 lba */
+			u32 dap_phys = (cpu->seg[SEG_DS].base + (lreg16(6) & 0xFFFF)) & cpu->a20_mask;
+			if (dap_phys + 16 > (u32)cpu->phys_mem_size)
+				return false;
+
+			u8 *dap = (u8 *)&cpu->phys_mem[dap_phys];
+			u16 count = dap[2] | (dap[3] << 8);
+			u16 buf_off = dap[4] | (dap[5] << 8);
+			u16 buf_seg = dap[6] | (dap[7] << 8);
+			uint64_t lba = dap[8] | ((uint64_t)dap[9] << 8) |
+			               ((uint64_t)dap[10] << 16) | ((uint64_t)dap[11] << 24) |
+			               ((uint64_t)dap[12] << 32) | ((uint64_t)dap[13] << 40) |
+			               ((uint64_t)dap[14] << 48) | ((uint64_t)dap[15] << 56);
+
+			if (count == 0 || count > 128) {
+				sreg16(0, (lreg16(0) & 0x00FF) | 0x0100); /* AH=1 */
+				refresh_flags(cpu);
+				cpu->cc.mask = 0;
+				cpu->flags |= CF;
+				return true;
+			}
+
+			u32 buf_phys = (((u32)buf_seg << 4) + buf_off) & cpu->a20_mask;
+			if ((uint64_t)buf_phys + (uint64_t)count * 512 > (uint64_t)cpu->phys_mem_size ||
+			    lba + count > (uint64_t)total_sectors) {
+				sreg16(0, (lreg16(0) & 0x00FF) | 0x0400); /* AH=4 */
+				refresh_flags(cpu);
+				cpu->cc.mask = 0;
+				cpu->flags |= CF;
+				return true;
+			}
+
+			int ret;
+			if (ah13 == 0x42)
+				ret = ide_block_read(bs, lba, (u8 *)&cpu->phys_mem[buf_phys], count);
+			else
+				ret = ide_block_write(bs, lba, (const u8 *)&cpu->phys_mem[buf_phys], count);
+
+			if (ret < 0) {
+				sreg16(0, (lreg16(0) & 0x00FF) | 0x0400); /* AH=4 */
+				refresh_flags(cpu);
+				cpu->cc.mask = 0;
+				cpu->flags |= CF;
+				return true;
+			}
+
+			sreg16(0, lreg16(0) & 0x00FF); /* AH=0 */
+			refresh_flags(cpu);
+			cpu->cc.mask = 0;
+			cpu->flags &= ~CF;
+			return true;
+		}
+
+		if (ah13 == 0x48) {
+			/* Get extended drive parameters. Result buffer at DS:SI.
+			 * Minimum 26 bytes: [0] u16 size, [2] u16 flags,
+			 * [4] u32 cyls, [8] u32 heads, [12] u32 spt,
+			 * [16] u64 total_sectors, [24] u16 bytes_per_sector */
+			u32 res_phys = (cpu->seg[SEG_DS].base + (lreg16(6) & 0xFFFF)) & cpu->a20_mask;
+			if (res_phys + 26 > (u32)cpu->phys_mem_size)
+				return false;
+
+			u8 *res = (u8 *)&cpu->phys_mem[res_phys];
+			/* Size field: caller sets minimum, we write 26 */
+			res[0] = 26; res[1] = 0;
+			/* Flags: bit 1 = CHS info valid */
+			res[2] = 0x02; res[3] = 0;
+			/* Cylinders (u32) */
+			res[4] = cyls & 0xFF; res[5] = (cyls >> 8) & 0xFF;
+			res[6] = (cyls >> 16) & 0xFF; res[7] = 0;
+			/* Heads (u32) */
+			res[8] = heads & 0xFF; res[9] = (heads >> 8) & 0xFF;
+			res[10] = 0; res[11] = 0;
+			/* Sectors per track (u32) */
+			res[12] = spt & 0xFF; res[13] = (spt >> 8) & 0xFF;
+			res[14] = 0; res[15] = 0;
+			/* Total sectors (u64) */
+			for (int i = 0; i < 8; i++)
+				res[16 + i] = (total_sectors >> (i * 8)) & 0xFF;
+			/* Bytes per sector */
+			res[24] = 0x00; res[25] = 0x02; /* 512 */
+
+			sreg16(0, lreg16(0) & 0x00FF); /* AH=0 */
+			refresh_flags(cpu);
+			cpu->cc.mask = 0;
+			cpu->flags &= ~CF;
+			return true;
+		}
+
+		/* Unknown INT 13h function — fall through to BIOS */
 		return false;
 	}
 
