@@ -1489,7 +1489,7 @@ static int get_CF(CPUI386 *cpu)
 	assert(false);
 }
 
-static const DRAM_ATTR u8 parity_tab[256] = {
+static const TCM_DRAM_ATTR u8 parity_tab[256] = {
   1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
   0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
   0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
@@ -1519,6 +1519,7 @@ static const DRAM_ATTR u8 parity_tab[256] = {
  * Tables are 256 + 128KB + 128KB = ~256KB, stored in PSRAM on ESP32.
  */
 typedef uint16_t flags8_arith_t[256][256];
+static TCM_DRAM_ATTR uint8_t flags_logic8_tcm[256];
 static uint8_t *flags_logic8 = NULL;
 static flags8_arith_t *flags_add8 = NULL;
 static flags8_arith_t *flags_sub8 = NULL;
@@ -1528,12 +1529,12 @@ static bool flags_sub8_from_heap = false;
 /* Initialize 8-bit flags lookup tables */
 void i386_init_flags_tables(void)
 {
-	if (flags_logic8 != NULL)
-		return;  /* Already initialized */
-
 	extern void *psmalloc(long size);
-	/* flags_logic8 in internal RAM for speed (accessed on every logical op) */
-	flags_logic8 = heap_caps_malloc(256, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	/* flags_logic8 in TCM — always available, just point to it */
+	flags_logic8 = flags_logic8_tcm;
+
+	if (flags_add8 != NULL)
+		return;  /* Arithmetic tables already initialized */
 	/* Try internal RAM for arithmetic tables (128KB each) - major speedup if fits */
 	flags_add8 = heap_caps_malloc(sizeof(flags8_arith_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 	flags_sub8 = heap_caps_malloc(sizeof(flags8_arith_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -1543,9 +1544,8 @@ void i386_init_flags_tables(void)
 	if (!flags_add8) flags_add8 = psmalloc(sizeof(flags8_arith_t));
 	if (!flags_sub8) flags_sub8 = psmalloc(sizeof(flags8_arith_t));
 
-	if (!flags_logic8 || !flags_add8 || !flags_sub8) {
+	if (!flags_add8 || !flags_sub8) {
 		/* Allocation failed - will fall back to computed flags */
-		flags_logic8 = NULL;
 		flags_add8 = NULL;
 		flags_sub8 = NULL;
 		return;
@@ -1608,13 +1608,10 @@ void i386_init_flags_tables(void)
  * psmalloc() are now dangling.  Heap-allocated tables are still valid. */
 void i386_reset_flags_tables_for_reinit(void)
 {
-	/* flags_logic8 is always from heap (256 bytes) — still valid, keep it.
-	 * Only NULL-ify psram-allocated tables so init recreates them. */
+	/* flags_logic8 is in TCM (always valid). Only NULL-ify psram-allocated
+	 * arithmetic tables so init recreates them on next use. */
 	if (!flags_add8_from_heap) flags_add8 = NULL;
 	if (!flags_sub8_from_heap) flags_sub8 = NULL;
-	/* If any psram table was reset, force full re-init (logic8 gates the check) */
-	if (!flags_add8 || !flags_sub8)
-		flags_logic8 = NULL;
 }
 
 static int get_PF(CPUI386 *cpu)
@@ -13481,9 +13478,11 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 	/* Initialize flags lookup tables (256KB in PSRAM for fast flag computation) */
 	i386_init_flags_tables();
 
-	// Cache-aligned allocation for better memory access performance
-	CPUI386 *cpu = heap_caps_aligned_alloc(64, sizeof(CPUI386),
-	                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	/* Allocate CPU struct in TCM for fastest possible access (0-1 cycle).
+	 * TCM is 8KB on ESP32-P4; CPUI386 is ~800B — fits easily. */
+	static struct CPUI386 TCM_DRAM_ATTR cpu_tcm __attribute__((aligned(64)));
+	CPUI386 *cpu = &cpu_tcm;
+	memset(cpu, 0, sizeof(*cpu));
 	switch (gen) {
 	case 3: cpu->flags_mask = EFLAGS_MASK_386; break;
 	case 4: cpu->flags_mask = EFLAGS_MASK_486; break;
