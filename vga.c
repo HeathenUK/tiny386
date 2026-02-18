@@ -3945,15 +3945,12 @@ VGAState *vga_init(char *vga_ram, int vga_ram_size,
     s->vbe_regs[VBE_DISPI_INDEX_VIDEO_MEMORY_64K] = s->vga_ram_size >> 16;
 
 #ifdef TEXT_RENDER_OPT
-    /* Try internal RAM first for font cache (16KB) - accessed every char */
-    s->font_cache = heap_caps_malloc(256 * 16 * 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!s->font_cache) s->font_cache = psram_malloc(256 * 16 * 4);
-
-    /* Glyph tile cache (128KB) - try internal RAM, fall back to PSRAM */
-    s->glyph_cache_tiles = heap_caps_malloc(GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE,
-                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!s->glyph_cache_tiles)
-        s->glyph_cache_tiles = psram_malloc(GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE);
+    /* Font cache (16KB) and glyph tile cache (128KB) in PSRAM.
+     * This frees ~144KB internal SRAM for CPU flag tables (flags_sub8/flags_add8)
+     * which have a much bigger performance impact. L2 cache (256KB) absorbs the
+     * hot glyph working set (~25KB for a typical 80x25 screen). */
+    s->font_cache = psram_malloc(256 * 16 * 4);
+    s->glyph_cache_tiles = psram_malloc(GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE);
     if (s->glyph_cache_tiles) {
         memset(s->glyph_cache_tiles, 0, GLYPH_CACHE_SIZE * GLYPH_TILE_SIZE);
         memset(s->glyph_cache_keys, 0xff, sizeof(s->glyph_cache_keys));  /* Invalid keys */

@@ -1533,16 +1533,19 @@ void i386_init_flags_tables(void)
 	/* flags_logic8 in TCM — always available, just point to it */
 	flags_logic8 = flags_logic8_tcm;
 
-	if (flags_add8 != NULL)
+	if (flags_sub8 != NULL)
 		return;  /* Arithmetic tables already initialized */
-	/* Try internal RAM for arithmetic tables (128KB each) - major speedup if fits */
-	flags_add8 = heap_caps_malloc(sizeof(flags8_arith_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	/* Allocate flags_sub8 (CMP) first — it's hotter than flags_add8 (ADD).
+	 * VGA glyph+font caches are forced to PSRAM to free ~144KB SRAM for these. */
 	flags_sub8 = heap_caps_malloc(sizeof(flags8_arith_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-	flags_add8_from_heap = (flags_add8 != NULL);
 	flags_sub8_from_heap = (flags_sub8 != NULL);
-	/* Fall back to PSRAM if internal RAM insufficient */
-	if (!flags_add8) flags_add8 = psmalloc(sizeof(flags8_arith_t));
 	if (!flags_sub8) flags_sub8 = psmalloc(sizeof(flags8_arith_t));
+	flags_add8 = heap_caps_malloc(sizeof(flags8_arith_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	flags_add8_from_heap = (flags_add8 != NULL);
+	if (!flags_add8) flags_add8 = psmalloc(sizeof(flags8_arith_t));
+	fprintf(stderr, "flags_sub8: %s (%dKB), flags_add8: %s (%dKB)\n",
+		flags_sub8_from_heap ? "SRAM" : "PSRAM", (int)(sizeof(flags8_arith_t)/1024),
+		flags_add8_from_heap ? "SRAM" : "PSRAM", (int)(sizeof(flags8_arith_t)/1024));
 
 	if (!flags_add8 || !flags_sub8) {
 		/* Allocation failed - will fall back to computed flags */
