@@ -2505,6 +2505,12 @@ static int wcache_lookup(BlockDeviceFile *bf, uint64_t sector_num, uint8_t *buf)
     uint32_t t = __atomic_load_n(&wcache.tail, __ATOMIC_ACQUIRE);
     uint32_t h = __atomic_load_n(&wcache.head, __ATOMIC_ACQUIRE);
 
+    /* Fast path: if write queue is empty, nothing to look up */
+    if (t == h) {
+        wcache.lookup_fallback_misses++;
+        return 0;
+    }
+
     if (wcache_lookup_index(bf, sector_num, buf, t, h)) {
         wcache.lookup_hits++;
         return 1;
