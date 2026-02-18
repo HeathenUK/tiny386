@@ -137,10 +137,14 @@ CMOS *cmos_init(long mem_size, int irq, void *pic, void (*set_irq)(void *pic, in
 	c->data[0x16] = 0x02;  /* 640 >> 8 */
 
 	if (mem_size >= 1024 * 1024) {
-		/* Extended memory in KB above 1MB (CMOS 0x30/0x31).
-		 * Capped at 63MB (64512 KB = 0xFC00) per CMOS convention. */
+		/* Extended memory in KB above 1MB, capped at 63MB (0xFC00 KB).
+		 * CMOS 0x17/0x18 = POST-detected value (read by DOS extenders).
+		 * CMOS 0x30/0x31 = user-configured value (read by BIOS setup).
+		 * Both must be set — DOSX reads 0x17/0x18 for memory detection. */
 		long ext_kb = (mem_size - 1024 * 1024) / 1024;
 		if (ext_kb > 0xFC00) ext_kb = 0xFC00;
+		c->data[0x17] = ext_kb & 0xFF;
+		c->data[0x18] = (ext_kb >> 8) & 0xFF;
 		c->data[0x30] = ext_kb & 0xFF;
 		c->data[0x31] = (ext_kb >> 8) & 0xFF;
 
