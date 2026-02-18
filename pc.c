@@ -597,6 +597,18 @@ void pc_step(PC *pc)
 	if (collecting) t1 = get_uticks();  /* After peripherals */
 	cpui386_set_diag(pc->cpu, globals.cpu_debug_enabled);
 	cpui386_step(pc->cpu, batch_size);
+
+	/* HLT fast-forward: if CPU is still halted after peripheral servicing
+	 * and cpui386_step(), sleep until the next PIT IRQ instead of spinning.
+	 * This is done HERE (not inside cpui386_step) so that all peripherals
+	 * have been serviced first — keyboard, network, IDE, DMA can all
+	 * produce IRQs that should wake the CPU before we sleep. */
+	if (cpui386_is_halted(pc->cpu)) {
+		uint32_t sleep_us = pit_next_irq_us(pc->pit);
+		if (sleep_us > 10000) sleep_us = 10000;  /* Cap for responsiveness */
+		if (sleep_us > 1) usleep(sleep_us);
+	}
+
 	if (collecting) t2 = get_uticks();  /* After CPU */
 
 	/* Dynamic batch adjustment (only when pc_batch_size_setting == 0) */

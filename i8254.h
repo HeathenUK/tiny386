@@ -37,6 +37,10 @@ int pit_get_pending_irqs(PITState *pit);
 #include <stdbool.h>
 bool pit_fire_single_irq(PITState *pit);
 
+/* Calculate microseconds until next PIT channel 0 IRQ.
+ * Used by HLT fast-forward to sleep efficiently instead of spinning. */
+uint32_t pit_next_irq_us(PITState *pit);
+
 /* Optimized burst functions that avoid repeated get_uticks() calls.
  * pit_burst_start: validates mode, returns pending count and cached timing info.
  * pit_burst_fire: fires one IRQ without re-checking, returns true if fired. */

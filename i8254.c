@@ -506,6 +506,30 @@ bool pit_burst_fire(PITState *pit, uint32_t d, int irq)
 	return true;
 }
 
+uint32_t pit_next_irq_us(PITState *pit)
+{
+	PITChannelState *s = &pit->channels[0];
+	/* Only periodic modes (2/3) have predictable next-IRQ timing */
+	if (s->mode != 2 && s->mode != 3)
+		return 0;
+	if (s->irq == -1)
+		return 0;
+
+	uint32_t uticks = get_uticks();
+	uint32_t d = ((uint64_t)(uticks - s->count_load_time)) * PIT_FREQ / 1000000;
+
+	/* How many PIT ticks until the next IRQ fires? */
+	uint32_t ticks_into_period = (d - s->last_irq_count) % s->count;
+	uint32_t ticks_remaining = s->count - ticks_into_period;
+
+	/* Convert PIT ticks to microseconds: us = ticks * 1000000 / PIT_FREQ */
+	uint32_t us = (uint64_t)ticks_remaining * 1000000 / PIT_FREQ;
+
+	/* Cap at 10ms for UI responsiveness */
+	if (us > 10000) us = 10000;
+	return us;
+}
+
 uint64_t pit_get_load_count(PITState *pit, int channel)
 {
 	return pit->channels[channel].load_count;
