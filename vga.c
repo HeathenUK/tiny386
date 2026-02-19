@@ -1417,6 +1417,7 @@ static void vga_text_refresh(VGAState *s,
     globals.vga_mode_width = width1;
     globals.vga_mode_height = height1;
     globals.vga_pixel_double = 1;
+    globals.vga_pixel_double_y = 1;
     int stride = fb_dev->stride;
 #endif
     if (s->last_line_offset != line_offset ||
@@ -1853,9 +1854,11 @@ static void vga_graphic_refresh(VGAState *s,
      * Report native VGA dimensions and pixel doubling factor for PPA. */
     globals.vga_mode_width = (w < wx) ? w : wx;
     globals.vga_mode_height = (h < hx) ? h : hx;
-    /* For 256-color modes, we output native (half width) and PPA doubles.
-     * For text/EGA modes, output is already at intended resolution. */
+    /* For 256-color modes, horizontal pixel clock is halved so PPA must double width.
+     * Vertical doubling only needed when double-scan was active and we skipped it
+     * (tanmatsu_vdouble > 0).  320x400 modes (no double-scan) need pixel_double_y=1. */
     globals.vga_pixel_double = (shift_control >= 2 && !vbe_enabled(s)) ? 2 : 1;
+    globals.vga_pixel_double_y = (tanmatsu_vdouble > 0) ? tanmatsu_vdouble : 1;
     if (h > hx) h = hx;
     if (w > wx) w = wx;
     /* i0 stays 0 - no centering offset */

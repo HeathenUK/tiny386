@@ -115,29 +115,33 @@ static void IRAM_ATTR software_rotate_90cw_stride(uint16_t *src, uint16_t *dst,
 static float cached_scale_x = 0, cached_scale_y = 0;
 static int cached_offset_x = 0, cached_offset_y = 0;
 static int cached_out_w = 0, cached_out_h = 0;
-static int cached_mode_w = 0, cached_mode_h = 0, cached_pixel_double = 0;
+static int cached_mode_w = 0, cached_mode_h = 0;
+static int cached_pixel_double_x = 0, cached_pixel_double_y = 0;
 
 static void update_scale_params(void)
 {
-	/* Get native VGA dimensions and pixel doubling factor from vga.c */
+	/* Get native VGA dimensions and pixel doubling factors from vga.c */
 	int native_w = globals.vga_mode_width;
 	int native_h = globals.vga_mode_height;
-	int pixel_double = globals.vga_pixel_double;
+	int pdx = globals.vga_pixel_double;    /* horizontal (pixel clock halved) */
+	int pdy = globals.vga_pixel_double_y;  /* vertical (double-scan) */
 
 	/* Sanity check - fall back to framebuffer dimensions if not set */
 	if (native_w <= 0 || native_h <= 0) {
 		native_w = vga_width;
 		native_h = vga_height;
 	}
-	if (pixel_double <= 0) pixel_double = 1;
+	if (pdx <= 0) pdx = 1;
+	if (pdy <= 0) pdy = 1;
 
 	if (cached_mode_w == native_w && cached_mode_h == native_h &&
-	    cached_pixel_double == pixel_double)
+	    cached_pixel_double_x == pdx && cached_pixel_double_y == pdy)
 		return;
 
 	cached_mode_w = native_w;
 	cached_mode_h = native_h;
-	cached_pixel_double = pixel_double;
+	cached_pixel_double_x = pdx;
+	cached_pixel_double_y = pdy;
 
 	/* Mode changed - clear all rotated framebuffers to black to avoid
 	 * leaving behind artifacts in the outer areas not covered by the
@@ -151,11 +155,13 @@ static void update_scale_params(void)
 	}
 	ESP_LOGI(TAG, "Mode change: cleared rotated buffer");
 
-	/* Calculate intended VGA output dimensions (native * pixel_double).
-	 * For mode 13h: native 320x200, intended 640x400 (2x both dimensions).
-	 * For text mode: native 720x400, intended 720x400 (pixel_double=1). */
-	int intended_w = native_w * pixel_double;
-	int intended_h = native_h * pixel_double;
+	/* Calculate intended VGA output dimensions.
+	 * Horizontal (pdx) and vertical (pdy) doubling are separate because
+	 * 256-color modes always halve the pixel clock (pdx=2) but double-scan
+	 * may be disabled (pdy=1) — e.g., Win95 splash uses 320x400 where
+	 * only horizontal doubling applies, giving intended 640x400. */
+	int intended_w = native_w * pdx;
+	int intended_h = native_h * pdy;
 
 	/* Calculate uniform base scale to fit INTENDED dimensions in display.
 	 * After 270° rotation: intended_w -> display Y, intended_h -> display X */
@@ -163,14 +169,12 @@ static void update_scale_params(void)
 	float base_scale_y = (float)DISPLAY_WIDTH / intended_h;
 	float base_scale = (base_scale_x < base_scale_y) ? base_scale_x : base_scale_y;
 
-	/* Apply uniform scale to NATIVE dimensions:
-	 * Both scale_x and scale_y include pixel_double factor since vga.c
-	 * now outputs native resolution (320x200 for mode 13h) without any
-	 * software pixel doubling or scanline repetition.
+	/* Apply base scale to NATIVE dimensions, incorporating the respective
+	 * pixel doubling factor for each axis.
 	 * After rotation: native_w (with scale_x) -> display height
 	 *                 native_h (with scale_y) -> display width */
-	float ideal_scale_x = base_scale * pixel_double;
-	float ideal_scale_y = base_scale * pixel_double;
+	float ideal_scale_x = base_scale * pdx;
+	float ideal_scale_y = base_scale * pdy;
 
 	/* PPA supports 1/16 scale precision - quantize both scales */
 	int scale_x_16 = (int)(ideal_scale_x * 16.0f);
@@ -188,9 +192,9 @@ static void update_scale_params(void)
 	if (cached_offset_x < 0) cached_offset_x = 0;
 	if (cached_offset_y < 0) cached_offset_y = 0;
 
-	ESP_LOGI(TAG, "Scale: native %dx%d, double=%d, scale_x=%.3f scale_y=%.3f, "
+	ESP_LOGI(TAG, "Scale: native %dx%d, pdx=%d pdy=%d, scale_x=%.3f scale_y=%.3f, "
 	         "output %dx%d at (%d,%d)",
-	         native_w, native_h, pixel_double, cached_scale_x, cached_scale_y,
+	         native_w, native_h, pdx, pdy, cached_scale_x, cached_scale_y,
 	         cached_out_w, cached_out_h, cached_offset_x, cached_offset_y);
 }
 
@@ -408,8 +412,8 @@ static void IRAM_ATTR rotate_vga_to_display(uint16_t *fb, uint16_t *fb_rotated)
 		ESP_LOGI(TAG, "PPA blit: fb=%p (ext=%d) fb_rot=%p (ext=%d)",
 		         fb, esp_ptr_external_ram(fb),
 		         fb_rotated, esp_ptr_external_ram(fb_rotated));
-		ESP_LOGI(TAG, "VGA: %dx%d (x%d), scale %.3fx%.3f, out %dx%d at (%d,%d)",
-		         cached_mode_w, cached_mode_h, cached_pixel_double,
+		ESP_LOGI(TAG, "VGA: %dx%d (x%d/%d), scale %.3fx%.3f, out %dx%d at (%d,%d)",
+		         cached_mode_w, cached_mode_h, cached_pixel_double_x, cached_pixel_double_y,
 		         cached_scale_x, cached_scale_y,
 		         cached_out_w, cached_out_h, cached_offset_x, cached_offset_y);
 		ESP_LOGI(TAG, "Display: %dx%d", DISPLAY_WIDTH, DISPLAY_HEIGHT);

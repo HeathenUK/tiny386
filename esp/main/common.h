@@ -49,7 +49,8 @@ struct Globals {
 	int vga_height;
 	int vga_mode_width;   // Native VGA mode dimensions (before pixel doubling)
 	int vga_mode_height;
-	int vga_pixel_double; // Pixel doubling factor (1=none, 2=double width for mode 13h)
+	int vga_pixel_double; // Horizontal pixel doubling (1=none, 2=256-color chain-4)
+	int vga_pixel_double_y; // Vertical pixel doubling (1=none, 2=double-scan active)
 	uint32_t _Atomic vga_frame_gen; // Frame generation counter - incremented on each VGA render
 	int brightness;   // Current brightness (0-110 normalized)
 	int volume;       // Current volume (0-100)
