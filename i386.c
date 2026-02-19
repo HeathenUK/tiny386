@@ -1447,7 +1447,7 @@ enum {
 	CC_AND, CC_OR, CC_XOR,
 };
 
-static int get_CF(CPUI386 *cpu)
+static int IRAM_ATTR get_CF(CPUI386 *cpu)
 {
 	if (cpu->cc.mask & CF) {
 		switch(cpu->cc.op) {
@@ -1626,7 +1626,7 @@ void i386_reset_flags_tables_for_reinit(void)
 	if (!flags_sub8_from_heap) flags_sub8 = NULL;
 }
 
-static int get_PF(CPUI386 *cpu)
+static int IRAM_ATTR get_PF(CPUI386 *cpu)
 {
 	if (cpu->cc.mask & PF) {
 		return parity_tab[cpu->cc.dst & 0xff];
@@ -1635,7 +1635,7 @@ static int get_PF(CPUI386 *cpu)
 	}
 }
 
-static int get_AF(CPUI386 *cpu)
+static int IRAM_ATTR get_AF(CPUI386 *cpu)
 {
 	if (cpu->cc.mask & AF) {
 		switch(cpu->cc.op) {
@@ -1689,7 +1689,7 @@ static int IRAM_ATTR get_SF(CPUI386 *cpu)
 	}
 }
 
-static int get_OF(CPUI386 *cpu)
+static int IRAM_ATTR get_OF(CPUI386 *cpu)
 {
 	if (cpu->cc.mask & OF) {
 		switch(cpu->cc.op) {
