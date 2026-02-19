@@ -1870,6 +1870,7 @@ static inline void wfw_monitor_note_int13_return(CPUI386 *cpu, uint16_t ret_cs, 
 #define CR0_WP (0x10000)
 #define CR4_PSE (1<<4)
 #define tlb_size 1024
+#define tlb_mask (tlb_size - 1)  /* bitmask: faster than modulo on RISC-V */
 typedef struct {
 	enum {
 		ADDR_OK1,
@@ -3000,7 +3001,7 @@ static const char *seg_name(int seg)
 
 static bool IRAM_ATTR translate_lpgno(CPUI386 *cpu, int rwm, uword lpgno, uword laddr, int cpl, uword *paddr)
 {
-	struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
+	struct tlb_entry *ent = &(cpu->tlb.tab[lpgno & tlb_mask]);
 	if (ent->lpgno != lpgno || ent->generation != cpu->tlb.generation) {
 		if (!tlb_refill(cpu, ent, lpgno)) {
 			cpu->cr2 = laddr;
@@ -3270,7 +3271,7 @@ static bool IRAM_ATTR translate8r(CPUI386 *cpu, OptAddr *res, int seg, uword add
 
 	if (cpu->cr0 & CR0_PG) {
 		uword lpgno = laddr >> 12;
-		struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
+		struct tlb_entry *ent = &(cpu->tlb.tab[lpgno & tlb_mask]);
 		if (ent->lpgno != lpgno || ent->generation != cpu->tlb.generation) {
 			if (!tlb_refill(cpu, ent, lpgno)) {
 				cpu->cr2 = laddr;
@@ -9296,7 +9297,7 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 	{ int __seg = (curr_seg == -1) ? SEG_DS : curr_seg; \
 	  uword __inv_laddr = cpu->seg[__seg].base + (addr); \
 	  uword __inv_lpgno = __inv_laddr >> 12; \
-	  struct tlb_entry *__inv_ent = &(cpu->tlb.tab[__inv_lpgno % tlb_size]); \
+	  struct tlb_entry *__inv_ent = &(cpu->tlb.tab[__inv_lpgno & tlb_mask]); \
 	  if (__inv_ent->lpgno == __inv_lpgno) __inv_ent->lpgno = -1; \
 	  if ((cpu->ifetch.laddr >> 12) == __inv_lpgno) cpu->ifetch.laddr = -1; } \
 	SEQ_INVALIDATE(cpu); \
@@ -10155,7 +10156,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			/* Inline TLB write for flat mode (skip translate32 chain) */
 			if (likely(cpu->all_segs_flat && (push_addr & 0xfff) <= 0xffc)) {
 				uword lpgno = push_addr >> 12;
-				struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
+				struct tlb_entry *ent = &(cpu->tlb.tab[lpgno & tlb_mask]);
 				if (likely(ent->lpgno == lpgno &&
 				           ent->generation == cpu->tlb.generation &&
 				           !ent->pte_lookup[cpu->cpl > 0][1])) {
@@ -10183,7 +10184,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			/* Inline TLB read for flat mode (skip translate32 chain) */
 			if (likely(cpu->all_segs_flat && (pop_addr & 0xfff) <= 0xffc)) {
 				uword lpgno = pop_addr >> 12;
-				struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
+				struct tlb_entry *ent = &(cpu->tlb.tab[lpgno & tlb_mask]);
 				if (likely(ent->lpgno == lpgno &&
 				           ent->generation == cpu->tlb.generation &&
 				           !ent->pte_lookup[cpu->cpl > 0][0])) {
