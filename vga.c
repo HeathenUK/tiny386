@@ -2863,8 +2863,12 @@ void vga_ioport_write(VGAState *s, uint32_t addr, uint32_t val)
                     /* First time detecting mid-frame switch: set the scanline and
                      * capture current state as "before" (it has the top palette) */
                     s->palette_switch_scanline = s->hblank_poll_count / 8;
-                    if (s->palette_switch_scanline > 400)
-                        s->palette_switch_scanline = 400;
+                    /* Clamp to actual display height (CR12 + overflow bits) */
+                    int vde = (s->cr[0x12] |
+                               ((s->cr[0x07] & 0x02) << 7) |
+                               ((s->cr[0x07] & 0x40) << 3)) + 1;
+                    if (s->palette_switch_scanline > vde)
+                        s->palette_switch_scanline = vde;
                     memcpy(s->palette_before_switch, s->palette, 768);
                     s->palette_before_gen = s->palette_generation;
                 }
@@ -3857,10 +3861,12 @@ void vga_get_modex_state(VGAState *s, uint8_t **ram, uint32_t *ram_size,
 /* Mark VGA lines dirty after direct write (addr is VGA-relative, 0-0xFFFF) */
 void vga_direct_mark_dirty(VGAState *s, uint32_t addr, int len)
 {
-    /* Mark 4KB pages dirty for double buffering (addr is byte offset) */
-    /* For mode 13h: 320 pixels per line, addr / 320 = line number */
-    int line_start = addr / 320;
-    int line_end = (addr + len - 1) / 320;
+    /* Use actual line offset from CRT controller (CR13 * 8 bytes).
+     * Mode 13h = 320, text 80col = 160, Mode X varies. */
+    int bpl = s->cr[0x13] << 3;
+    if (bpl <= 0) bpl = 320;  /* fallback for uninitialized state */
+    int line_start = addr / bpl;
+    int line_end = (addr + len - 1) / bpl;
 
     /* Clamp to valid range */
     if (line_start < 0) line_start = 0;
