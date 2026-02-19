@@ -36,19 +36,21 @@ struct Globals {
 	QueueHandle_t input_queue;
 	void *fb_rotated;  // Rotated framebuffer (portrait 480x800)
 	void *osd;         // OSD context
-	bool osd_enabled;  // OSD visible
-	bool reset_pending; // Soft reset requested from OSD
-	bool emu_restart_pending; // Full emulator restart (reload config, reinit PC)
+	// Cross-core signal flags: set on core 0 (OSD/input/LCD), polled on core 1 (emu).
+	// _Atomic prevents -O3 from hoisting reads out of polling loops.
+	bool _Atomic osd_enabled;  // OSD visible
+	bool _Atomic reset_pending; // Soft reset requested from OSD
+	bool _Atomic emu_restart_pending; // Full emulator restart (reload config, reinit PC)
 	char emu_new_hda_path[256]; // New HDA path for restart (set by OSD)
-	bool vga_force_redraw; // Force full VGA redraw (e.g., after OSD closes)
-	bool batch_reset_pending; // Reset dynamic batch size (on VGA mode change)
+	bool _Atomic vga_force_redraw; // Force full VGA redraw (e.g., after OSD closes)
+	bool _Atomic batch_reset_pending; // Reset dynamic batch size (on VGA mode change)
 	uint8_t key_pressed[KEYCODE_MAX];  // Key state tracking
 	int vga_width;     // VGA framebuffer dimensions for OSD rendering
 	int vga_height;
 	int vga_mode_width;   // Native VGA mode dimensions (before pixel doubling)
 	int vga_mode_height;
 	int vga_pixel_double; // Pixel doubling factor (1=none, 2=double width for mode 13h)
-	uint32_t vga_frame_gen; // Frame generation counter - incremented on each VGA render
+	uint32_t _Atomic vga_frame_gen; // Frame generation counter - incremented on each VGA render
 	int brightness;   // Current brightness (0-110 normalized)
 	int volume;       // Current volume (0-100)
 	// Overlay bar for META+arrow feedback
@@ -59,8 +61,8 @@ struct Globals {
 	char toast_message[48];      // Current toast message
 	uint32_t toast_hide_time;    // Timestamp when toast should hide (0 = not active)
 	// Emulator stats for OSD display (lazy - only collected when viewing)
-	bool stats_collecting;        // Set true when Status panel is open
-	bool stats_bar_visible;       // Persistent stats bar overlay on VGA output
+	bool _Atomic stats_collecting;        // Set true when Status panel is open
+	bool _Atomic stats_bar_visible;       // Persistent stats bar overlay on VGA output
 	uint8_t emu_cpu_percent;      // CPU time percentage (0-100)
 	uint8_t emu_periph_percent;   // Peripheral time percentage (0-100)
 	uint16_t emu_batch_size;      // Current instruction batch size
@@ -87,17 +89,17 @@ struct Globals {
 	int cpu_gen;                  // CPU generation (3=386, 4=486, 5=586)
 	int fpu;                      // FPU enabled (0/1)
 	int mem_size_mb;              // Guest RAM in MB (actual, after PSRAM cap)
-	bool cpu_debug_enabled;       // CPU debug instrumentation enabled (OSD toggle)
+	bool _Atomic cpu_debug_enabled;       // CPU debug instrumentation enabled (OSD toggle)
 
 	// INI selector state
-	bool ini_selector_active;     // INI selector screen is showing
-	bool ini_selector_done;       // Selection complete, path is ready
+	bool _Atomic ini_selector_active;     // INI selector screen is showing
+	bool _Atomic ini_selector_done;       // Selection complete, path is ready
 	char ini_selected_path[256];  // Selected INI path (result from selector)
 
 	// INI switch (runtime)
-	bool screenshot_pending;      // Screenshot requested (Meta+S)
+	bool _Atomic screenshot_pending;      // Screenshot requested (Meta+S)
 
-	bool ini_switch_pending;      // Switch to different INI requested
+	bool _Atomic ini_switch_pending;      // Switch to different INI requested
 	char ini_switch_path[256];    // Path to new INI file
 	char current_ini_path[256];   // Currently loaded INI path
 };
