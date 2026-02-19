@@ -1948,14 +1948,12 @@ static void vga_graphic_refresh(VGAState *s,
                 build_bs_palette_luts(cur_palette, cpe_mask);
 
                 /* Dirty line check via hash comparison */
-#if 0 /* DIAG: disable to test framebuffer corruption theory */
                 if (y < VGA_MAX_LINES) {
                     uint32_t line_hash = vga_hash_line(vram + addr, vram_line_bytes);
                     if (line_hash == vga_prev_line_hash[y] && !vga_is_line_dirty(y))
                         goto next_line;  /* Unchanged — skip */
                     vga_prev_line_hash[y] = line_hash;
                 }
-#endif
 
                 /* Flush batch if palette or panning changed */
                 if (bs_batch_count > 0 &&
