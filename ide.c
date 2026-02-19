@@ -644,7 +644,7 @@ static int64_t ide_get_sector(IDEState *s)
         sector_num = ((s->select & 0x0f) << 24) | (s->hcyl << 16) |
             (s->lcyl << 8) | s->sector;
     } else {
-        sector_num = ((s->hcyl << 8) | s->lcyl) * 
+        sector_num = (int64_t)((s->hcyl << 8) | s->lcyl) *
             s->heads * s->sectors +
             (s->select & 0x0f) * s->sectors + (s->sector - 1);
     }
@@ -713,6 +713,13 @@ static void ide_sector_read_cb(void *opaque, int ret)
     IDEState *s = opaque;
     int n;
     EndTransferFunc *func;
+
+    if (ret < 0) {
+        s->status = READY_STAT | SEEK_STAT | ERR_STAT;
+        s->error = ABRT_ERR;
+        ide_set_irq(s);
+        return;
+    }
 
     n = s->io_nb_sectors;
 #if defined(DEBUG_USB_IDE)
@@ -785,6 +792,13 @@ static void ide_sector_write_cb2(void *opaque, int ret)
 {
     IDEState *s = opaque;
     int n;
+
+    if (ret < 0) {
+        s->status = READY_STAT | SEEK_STAT | ERR_STAT;
+        s->error = ABRT_ERR;
+        ide_set_irq(s);
+        return;
+    }
 
     n = s->io_nb_sectors;
     ide_set_sector(s, ide_get_sector(s) + n);
