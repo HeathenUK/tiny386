@@ -9579,10 +9579,10 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	/* Sequential fast path: if the previous instruction was on the same page
 	 * and execution is sequential (ip advanced by exactly pf_pos bytes),
 	 * derive physical address directly without TLB lookup. */
-	/* VM86 correctness first: disable sequential prefetch shortcut in VM mode.
-	 * VM86 frequently transitions through fault/reflect paths, and we prefer
-	 * conservative fetch behavior over speculative carry-over here. */
-	if (likely(cpu->seq_active) && likely(!(cpu->flags & VM))) {
+	/* Sequential prefetch shortcut: if previous instruction was on the same
+	 * page and execution is linear, derive physical address without TLB lookup.
+	 * Safe in VM86: SEQ_INVALIDATE resets on any exception/INT/IRET/Jcc. */
+	if (likely(cpu->seq_active)) {
 		uword prev_len = cpu->pf_pos;
 		if (likely(cpu->ip == cpu->seq_prev_ip + prev_len)) {
 			uword nphys = cpu->seq_phys + prev_len;
@@ -9617,15 +9617,10 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			cpu->pf_ptr = cpu->phys_mem + (cpu->ifetch.xaddr ^ pf_laddr);
 			b1 = cpu->pf_ptr[0];
 #ifdef I386_SEQ_FASTPATH
-			/* Keep seq fastpath disabled in VM86 for correctness. */
-			if (likely(!(cpu->flags & VM))) {
-				/* Start sequential tracking from this TLB-validated address */
-				cpu->seq_phys = cpu->ifetch.xaddr ^ pf_laddr;
-				cpu->seq_prev_ip = cpu->ip;
-				cpu->seq_active = true;
-			} else {
-				cpu->seq_active = false;
-			}
+			/* Start sequential tracking from this TLB-validated address */
+			cpu->seq_phys = cpu->ifetch.xaddr ^ pf_laddr;
+			cpu->seq_prev_ip = cpu->ip;
+			cpu->seq_active = true;
 #endif
 			cpu->pf_pos = 1;
 			cpu->pf_avail = 8;
