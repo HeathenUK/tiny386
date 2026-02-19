@@ -2449,10 +2449,13 @@ int vga_step(VGAState *s)
             s->st01 |= ST01_V_RETRACE;
             s->retrace_phase = 2;
             s->retrace_time = now + 833;
-            ret = 1;
         } else {
             s->st01 &= ~(ST01_V_RETRACE | ST01_DISP_ENABLE);
             s->retrace_phase = 0;
+            /* Render at end of vblank: gives the guest the full vblank
+             * period to complete cursor XOR and other vblank-synced work
+             * before we capture the framebuffer. */
+            ret = 1;
             /* Reset mid-frame palette tracking for new frame */
             s->hblank_poll_count = 0;
             s->retrace_time = now + 15000/3;
@@ -2680,10 +2683,11 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
                         s->st01 |= ST01_V_RETRACE;
                         s->retrace_phase = 2;
                         s->retrace_time = now + 833;
-                        s->render_pending = 1;  /* Signal vga_step to trigger render */
                     } else {
                         s->st01 &= ~(ST01_V_RETRACE | ST01_DISP_ENABLE);
                         s->retrace_phase = 0;
+                        /* Render at end of vblank (matches vga_step logic) */
+                        s->render_pending = 1;
                         /* Reset mid-frame palette tracking for new frame */
                         s->hblank_poll_count = 0;
                         s->retrace_time = now + 15000/3;
