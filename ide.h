@@ -74,6 +74,9 @@ int ide_block_write(BlockDevice *bs, uint64_t sector_num, const uint8_t *buf, in
 int64_t ide_block_sector_count(BlockDevice *bs);
 void ide_block_close(BlockDevice *bs);
 
+/* I/O stats for performance monitoring */
+void ide_get_io_stats(uint32_t *sectors_read, uint32_t *sectors_written);
+
 /* HLE accessors: get drive info for INT 13h emulation */
 BlockDevice *ide_get_drive_bs(IDEIFState *s, int drive);
 int ide_get_drive_cylinders(IDEIFState *s, int drive);

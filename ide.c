@@ -3755,12 +3755,16 @@ int ide_block_reopen_rw(BlockDevice *bs, const char *filename)
     return -1;
 }
 
+static uint32_t ide_stat_sectors_read;
+static uint32_t ide_stat_sectors_written;
+
 int ide_block_read(BlockDevice *bs, uint64_t sector_num, uint8_t *buf, int nsectors)
 {
     int ret;
     if (!bs || !buf || nsectors <= 0)
         return -1;
     ret = bs->read_async(bs, sector_num, buf, nsectors, NULL, NULL);
+    if (ret == 0) ide_stat_sectors_read += nsectors;
     return (ret <= 0) ? ret : -1;
 }
 
@@ -3770,7 +3774,14 @@ int ide_block_write(BlockDevice *bs, uint64_t sector_num, const uint8_t *buf, in
     if (!bs || !buf || nsectors <= 0)
         return -1;
     ret = bs->write_async(bs, sector_num, buf, nsectors, NULL, NULL);
+    if (ret == 0) ide_stat_sectors_written += nsectors;
     return (ret <= 0) ? ret : -1;
+}
+
+void ide_get_io_stats(uint32_t *sectors_read, uint32_t *sectors_written)
+{
+    *sectors_read = ide_stat_sectors_read;
+    *sectors_written = ide_stat_sectors_written;
 }
 
 int64_t ide_block_sector_count(BlockDevice *bs)

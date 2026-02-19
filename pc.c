@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "common.h"
+#include "esp_heap_caps.h"
 
 // Batch size setting: 0=auto (dynamic), or fixed value 512-4096
 int pc_batch_size_setting = 0;
@@ -508,6 +509,9 @@ void pc_step(PC *pc)
 		}
 		step_time_accum = 0;
 		step_count = 0;
+		/* Flush pending disk writes before resetting — SeaBIOS will
+		 * read from the same disk during POST and boot. */
+		ide_sync(pc->ide, pc->ide2);
 		/* Guest-initiated reset (port 64/92/CF9): don't reload BIOS from SD.
 		 * On real hardware the BIOS ROM persists across resets.  Reloading
 		 * can fail if the IO task is holding the SDMMC bus, causing an
@@ -569,6 +573,16 @@ void pc_step(PC *pc)
 	static uint32_t stat_calls = 0;
 	static uint32_t stat_last_report = 0;
 	static long stat_last_cycles = 0;
+	static uint32_t stat_last_seq_hits = 0;
+	static uint32_t stat_last_vga_frame_gen = 0;
+	static uint32_t stat_hlt_steps = 0;       /* Steps where CPU was halted */
+	static uint32_t stat_last_tlb_miss = 0;
+	static uint32_t stat_last_irq = 0;
+	static uint32_t stat_last_fusion = 0;
+	static uint32_t stat_last_hle_hit = 0;
+	static uint32_t stat_last_hle_call = 0;
+	static uint32_t stat_last_disk_read = 0;
+	static uint32_t stat_last_disk_written = 0;
 
 	uint32_t t0 = get_uticks();
 
@@ -619,15 +633,20 @@ void pc_step(PC *pc)
 	cpui386_step(pc->cpu, batch_size);
 
 	/* HLT fast-forward: if CPU is still halted after peripheral servicing
-	 * and cpui386_step(), sleep until the next PIT IRQ instead of spinning.
-	 * This is done HERE (not inside cpui386_step) so that all peripherals
-	 * have been serviced first — keyboard, network, IDE, DMA can all
-	 * produce IRQs that should wake the CPU before we sleep. */
+	 * and cpui386_step(), sleep until the next timer IRQ instead of spinning.
+	 * Consider both PIT (channel 0) and RTC periodic interrupt — SeaBIOS
+	 * uses RTC for INT 15h/AH=86h waits, so sleeping past RTC deadlines
+	 * causes massive slowdowns in BIOS delay loops. */
 	if (cpui386_is_halted(pc->cpu)) {
-		uint32_t sleep_us = pit_next_irq_us(pc->pit);
+		uint32_t pit_us = pit_next_irq_us(pc->pit);
+		uint32_t rtc_us = cmos_next_irq_us(pc->cmos);
+		uint32_t sleep_us = pit_us < rtc_us ? pit_us : rtc_us;
 		if (sleep_us > 10000) sleep_us = 10000;  /* Cap for responsiveness */
 		if (sleep_us > 1) usleep(sleep_us);
 	}
+
+	if (cpui386_is_halted(pc->cpu))
+		stat_hlt_steps++;
 
 	if (collecting) t2 = get_uticks();  /* After CPU */
 
@@ -665,17 +684,74 @@ void pc_step(PC *pc)
 
 		/* Update globals every ~2 seconds */
 		if (t2 - stat_last_report >= 2000000) {
+			uint32_t elapsed_us = t2 - stat_last_report;
 			uint32_t total = stat_cpu_us + stat_periph_us;
 			if (total > 0) {
 				globals.emu_cpu_percent = (stat_cpu_us * 100) / total;
 				globals.emu_periph_percent = (stat_periph_us * 100) / total;
-				globals.emu_calls_per_sec = (stat_calls * 1000000ULL) / (t2 - stat_last_report);
+				globals.emu_calls_per_sec = (stat_calls * 1000000ULL) / elapsed_us;
 			}
 			long cur_cycles = cpu_get_cycle(pc->cpu);
-			uint32_t elapsed_us = t2 - stat_last_report;
 			if (elapsed_us > 0) {
 				globals.emu_cycles_per_sec = (uint32_t)(((uint64_t)(cur_cycles - stat_last_cycles) * 1000000ULL) / elapsed_us);
 			}
+
+			/* Sequential fast-path hit rate */
+			uint32_t cur_seq = cpui386_get_seq_hits(pc->cpu);
+			uint32_t seq_delta = cur_seq - stat_last_seq_hits;
+			long cycle_delta = cur_cycles - stat_last_cycles;
+			if (cycle_delta > 0)
+				globals.emu_seq_pct = (uint8_t)((seq_delta * 100ULL) / cycle_delta);
+			stat_last_seq_hits = cur_seq;
+
+			/* VGA FPS */
+			uint32_t cur_vga_gen = globals.vga_frame_gen;
+			uint32_t vga_delta = cur_vga_gen - stat_last_vga_frame_gen;
+			globals.emu_vga_fps = (uint8_t)((vga_delta * 1000000ULL) / elapsed_us);
+			stat_last_vga_frame_gen = cur_vga_gen;
+
+			/* HLT idle percentage */
+			if (stat_calls > 0)
+				globals.emu_hlt_pct = (uint8_t)((stat_hlt_steps * 100ULL) / stat_calls);
+			stat_hlt_steps = 0;
+
+			/* CPU perf counters (TLB miss, IRQ, fusion, HLE) */
+			uint32_t cur_tlb, cur_irq, cur_fusion, cur_hle_hit, cur_hle_call;
+			cpui386_get_perf_counters(pc->cpu, &cur_tlb, &cur_irq,
+			                          &cur_fusion, &cur_hle_hit, &cur_hle_call);
+			if (elapsed_us > 0) {
+				globals.emu_tlb_miss_per_sec = (uint32_t)(((uint64_t)(cur_tlb - stat_last_tlb_miss) * 1000000ULL) / elapsed_us);
+				globals.emu_irq_per_sec = (uint32_t)(((uint64_t)(cur_irq - stat_last_irq) * 1000000ULL) / elapsed_us);
+			}
+			/* Fusion rate: fusions / total cycles */
+			uint32_t fusion_delta = cur_fusion - stat_last_fusion;
+			if (cycle_delta > 0)
+				globals.emu_fusion_pct = (uint8_t)((fusion_delta * 100ULL) / cycle_delta);
+			/* HLE hit rate: hits / calls (avoid div0) */
+			uint32_t hle_call_delta = cur_hle_call - stat_last_hle_call;
+			uint32_t hle_hit_delta = cur_hle_hit - stat_last_hle_hit;
+			if (hle_call_delta > 0)
+				globals.emu_hle_pct = (uint8_t)((hle_hit_delta * 100) / hle_call_delta);
+			stat_last_tlb_miss = cur_tlb;
+			stat_last_irq = cur_irq;
+			stat_last_fusion = cur_fusion;
+			stat_last_hle_hit = cur_hle_hit;
+			stat_last_hle_call = cur_hle_call;
+
+			/* Disk I/O KB/s */
+			uint32_t cur_disk_r, cur_disk_w;
+			ide_get_io_stats(&cur_disk_r, &cur_disk_w);
+			uint32_t disk_sectors = (cur_disk_r - stat_last_disk_read) +
+			                        (cur_disk_w - stat_last_disk_written);
+			if (elapsed_us > 0)
+				globals.emu_disk_kb_per_sec = (uint32_t)((uint64_t)disk_sectors * 512 * 1000000ULL / elapsed_us / 1024);
+			stat_last_disk_read = cur_disk_r;
+			stat_last_disk_written = cur_disk_w;
+
+			/* Heap diagnostics (once per 2s — lightweight) */
+			globals.emu_free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+			globals.emu_free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
 			stat_last_cycles = cur_cycles;
 			stat_cpu_us = 0;
 			stat_periph_us = 0;

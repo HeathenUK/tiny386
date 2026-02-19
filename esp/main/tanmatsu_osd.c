@@ -1733,6 +1733,7 @@ static void handle_sys_adjust(OSD *osd, int delta)
 		break;
 	case SYS_STATS_BAR:
 		globals.stats_bar_visible = !globals.stats_bar_visible;
+		globals.stats_collecting = globals.stats_bar_visible;
 		break;
 	case SYS_CPU_DEBUG:
 		globals.cpu_debug_enabled = !globals.cpu_debug_enabled;
@@ -2001,6 +2002,7 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 					pc_pit_burst_setting = osd->pit_burst;
 				} else if (osd->sys_sel == SYS_STATS_BAR) {
 					globals.stats_bar_visible = !globals.stats_bar_visible;
+					globals.stats_collecting = globals.stats_bar_visible;
 				} else if (osd->sys_sel == SYS_CPU_DEBUG) {
 				globals.cpu_debug_enabled = !globals.cpu_debug_enabled;
 			}

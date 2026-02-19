@@ -313,6 +313,21 @@ void cmos_update_irq(CMOS *s)
 	}
 }
 
+uint32_t cmos_next_irq_us(CMOS *s)
+{
+	/* If periodic interrupt is not enabled, no RTC wake source. */
+	if (!(s->data[RTC_REG_B] & REG_B_PIE) || s->irq_period == 0)
+		return UINT32_MAX;
+
+	uint32_t now = cmos_get_timer(s);
+	int32_t remaining = (int32_t)(s->irq_timeout - now);
+	if (remaining <= 0)
+		return 0;  /* IRQ already due */
+
+	/* Convert 32768 Hz ticks to microseconds */
+	return (uint64_t)(uint32_t)remaining * 1000000 / CMOS_FREQ;
+}
+
 uint8_t cmos_ioport_read(CMOS *cmos, int addr)
 {
 	if (addr == 0x70)

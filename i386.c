@@ -144,8 +144,10 @@ struct CPUI386 {
 
 	struct {
 		int size;
+		uint32_t generation;    /* incremented on CR3 write; entries must match */
 		struct tlb_entry {
 			uword lpgno;
+			uint32_t generation;
 			uword xaddr;
 			int (*pte_lookup)[2];
 			u8 *ppte;
@@ -194,6 +196,13 @@ struct CPUI386 {
 	bool seq_active;
 	uint32_t seq_hits;
 #endif
+
+	/* Performance counters — read once per 2s reporting window, near-zero cost */
+	uint32_t tlb_miss_count;   /* TLB refills (only when paging enabled) */
+	uint32_t irq_count;        /* Hardware IRQ deliveries */
+	uint32_t fusion_count;     /* CMP/TEST+Jcc macro-op fusions */
+	uint32_t hle_hit_count;    /* BIOS HLE calls intercepted */
+	uint32_t hle_call_count;   /* BIOS HLE calls attempted */
 };
 
 #define dolog(...) fprintf(stderr, __VA_ARGS__)
@@ -1875,6 +1884,16 @@ static void tlb_clear(CPUI386 *cpu)
 	for (int i = 0; i < tlb_size; i++) {
 		cpu->tlb.tab[i].lpgno = -1;
 	}
+	cpu->tlb.generation++;
+	cpu->ifetch.laddr = -1;
+}
+
+/* Lightweight TLB flush: increment generation so all existing entries
+ * become stale without touching them.  Used for CR3 writes and
+ * task switches where only the page directory changes. */
+static void IRAM_ATTR tlb_flush_generation(CPUI386 *cpu)
+{
+	cpu->tlb.generation++;
 	cpu->ifetch.laddr = -1;
 }
 
@@ -1901,6 +1920,7 @@ static u16 load16(CPUI386 *cpu, OptAddr *res);
 
 static bool IRAM_ATTR tlb_refill(CPUI386 *cpu, struct tlb_entry *ent, uword lpgno)
 {
+	cpu->tlb_miss_count++;
 	uint32_t a20 = cpu->a20_mask;
 	uword base_addr = (cpu->cr3 & ~0xfff) & a20;
 	uword i = lpgno >> 10;
@@ -1919,6 +1939,7 @@ static bool IRAM_ATTR tlb_refill(CPUI386 *cpu, struct tlb_entry *ent, uword lpgn
 	if ((cpu->cr4 & CR4_PSE) && (pde & (1 << 7))) {
 		uword phys_page = (pde & 0xffc00000) | ((lpgno & 0x3ff) << 12);
 		ent->lpgno = lpgno;
+		ent->generation = cpu->tlb.generation;
 		ent->xaddr = (phys_page & a20) ^ (lpgno << 12);
 		ent->pte_lookup = pte_lookup[!!(cpu->cr0 & CR0_WP)][(pde >> 1) & 3];
 		ent->ppte = &(mem[pde_addr]); /* dirty bit lives in PDE for 4MB pages */
@@ -1937,6 +1958,7 @@ static bool IRAM_ATTR tlb_refill(CPUI386 *cpu, struct tlb_entry *ent, uword lpgn
 //	mem[base_addr2 + j * 4] |= 1 << 6; // dirty
 
 	ent->lpgno = lpgno;
+	ent->generation = cpu->tlb.generation;
 	ent->xaddr = ((pte & ~0xfff) & a20) ^ (lpgno << 12);
 	pte = pte & ((pde & 7) | 0xfffffff8);
 	ent->pte_lookup = pte_lookup[!!(cpu->cr0 & CR0_WP)][(pte >> 1) & 3];
@@ -2979,7 +3001,7 @@ static const char *seg_name(int seg)
 static bool IRAM_ATTR translate_lpgno(CPUI386 *cpu, int rwm, uword lpgno, uword laddr, int cpl, uword *paddr)
 {
 	struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
-	if (ent->lpgno != lpgno) {
+	if (ent->lpgno != lpgno || ent->generation != cpu->tlb.generation) {
 		if (!tlb_refill(cpu, ent, lpgno)) {
 			cpu->cr2 = laddr;
 			cpu->excno = EX_PF;
@@ -3249,7 +3271,7 @@ static bool IRAM_ATTR translate8r(CPUI386 *cpu, OptAddr *res, int seg, uword add
 	if (cpu->cr0 & CR0_PG) {
 		uword lpgno = laddr >> 12;
 		struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
-		if (ent->lpgno != lpgno) {
+		if (ent->lpgno != lpgno || ent->generation != cpu->tlb.generation) {
 			if (!tlb_refill(cpu, ent, lpgno)) {
 				cpu->cr2 = laddr;
 				cpu->excno = EX_PF;
@@ -6697,7 +6719,7 @@ static void cpu_diag_log_int2f(CPUI386 *cpu)
 		cpu->cr2 = lreg32(rm); \
 	} else if (reg == 3) { \
 		cpu->cr3 = lreg32(rm); \
-		tlb_clear(cpu); \
+		tlb_flush_generation(cpu); \
 		SEQ_INVALIDATE(cpu); \
 		if (unlikely(cpu_diag_enabled && pf_diag.active)) pf_diag.cr3_write_count++; \
 	} else if (reg == 4) { \
@@ -6730,6 +6752,7 @@ static bool call_isr_vm86_softint(CPUI386 *cpu, int no);
  * Also faster than letting the BIOS do PM transitions for block copies. */
 static bool bios_hle_int(CPUI386 *cpu, int intno)
 {
+	cpu->hle_call_count++;
 	if (intno == 0x11) {
 		/* INT 11h: Equipment list from BDA (40:10).
 		 * Normalize noisy high bits for Win3.x compatibility probes. */
@@ -7472,6 +7495,7 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 		wfw_monitor.last_int15h_ah = (lreg16(0) >> 8) & 0xff; \
 	} \
 		if (((cpu->flags & VM) || !(cpu->cr0 & 1)) && bios_hle_int(cpu, li(i))) { \
+			cpu->hle_hit_count++; \
 			cpu->ip = cpu->next_ip; \
 		} else if ((cpu->flags & VM)) { \
 			if(get_IOPL(cpu) < 3) { \
@@ -9268,7 +9292,14 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
 #define XADDw(...) do { if (cpu->gen < 4) THROW0(EX_UD); XADD_helper(16, __VA_ARGS__); } while (0);
 #define XADDd(...) do { if (cpu->gen < 4) THROW0(EX_UD); XADD_helper(32, __VA_ARGS__); } while (0);
 
-#define INVLPG(addr) do { if (cpu->gen < 4) THROW0(EX_UD); tlb_clear(cpu); SEQ_INVALIDATE(cpu); \
+#define INVLPG(addr) do { if (cpu->gen < 4) THROW0(EX_UD); \
+	{ int __seg = (curr_seg == -1) ? SEG_DS : curr_seg; \
+	  uword __inv_laddr = cpu->seg[__seg].base + (addr); \
+	  uword __inv_lpgno = __inv_laddr >> 12; \
+	  struct tlb_entry *__inv_ent = &(cpu->tlb.tab[__inv_lpgno % tlb_size]); \
+	  if (__inv_ent->lpgno == __inv_lpgno) __inv_ent->lpgno = -1; \
+	  if ((cpu->ifetch.laddr >> 12) == __inv_lpgno) cpu->ifetch.laddr = -1; } \
+	SEQ_INVALIDATE(cpu); \
 	if (unlikely(cpu_diag_enabled && pf_diag.active)) pf_diag.invlpg_count++; } while(0);
 
 #define BSWAPw(a, la, sa) THROW0(EX_UD);
@@ -9703,7 +9734,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			int _cond; \
 			EVAL_COND_SUB((cpu)->cc.src1, (cpu)->cc.src2, (cpu)->cc.dst, _nb & 0xf, _cond); \
 			if (_cond) { (cpu)->next_ip += _disp; SEQ_INVALIDATE(cpu); } \
-			continue; \
+			(cpu)->fusion_count++; continue; \
 		} \
 		if (_nb == 0x0F && (cpu)->pf_pos + 5 < (cpu)->pf_avail) { \
 			u8 _jop = (cpu)->pf_ptr[(cpu)->pf_pos + 1]; \
@@ -9714,7 +9745,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 				int _cond; \
 				EVAL_COND_SUB((cpu)->cc.src1, (cpu)->cc.src2, (cpu)->cc.dst, _jop & 0xf, _cond); \
 				if (_cond) { (cpu)->next_ip += _disp; SEQ_INVALIDATE(cpu); } \
-				continue; \
+				(cpu)->fusion_count++; continue; \
 			} \
 		} \
 	} \
@@ -9729,7 +9760,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			int _cond; \
 			EVAL_COND_AND((cpu)->cc.dst, _nb & 0xf, _cond); \
 			if (_cond) { (cpu)->next_ip += _disp; SEQ_INVALIDATE(cpu); } \
-			continue; \
+			(cpu)->fusion_count++; continue; \
 		} \
 		if (_nb == 0x0F && (cpu)->pf_pos + 5 < (cpu)->pf_avail) { \
 			u8 _jop = (cpu)->pf_ptr[(cpu)->pf_pos + 1]; \
@@ -9740,7 +9771,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 				int _cond; \
 				EVAL_COND_AND((cpu)->cc.dst, _jop & 0xf, _cond); \
 				if (_cond) { (cpu)->next_ip += _disp; SEQ_INVALIDATE(cpu); } \
-				continue; \
+				(cpu)->fusion_count++; continue; \
 			} \
 		} \
 	} \
@@ -10126,6 +10157,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 				uword lpgno = push_addr >> 12;
 				struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
 				if (likely(ent->lpgno == lpgno &&
+				           ent->generation == cpu->tlb.generation &&
 				           !ent->pte_lookup[cpu->cpl > 0][1])) {
 					*(ent->ppte) |= (1 << 6); /* dirty */
 					pstore32(cpu, ent->xaddr ^ push_addr, cpu->next_ip);
@@ -10153,6 +10185,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 				uword lpgno = pop_addr >> 12;
 				struct tlb_entry *ent = &(cpu->tlb.tab[lpgno % tlb_size]);
 				if (likely(ent->lpgno == lpgno &&
+				           ent->generation == cpu->tlb.generation &&
 				           !ent->pte_lookup[cpu->cpl > 0][0])) {
 					set_sp(sp + 4, sp_mask);
 					cpu->next_ip = pload32(cpu, ent->xaddr ^ pop_addr);
@@ -10669,7 +10702,7 @@ static bool task_switch(CPUI386 *cpu, int tss, int sw_type)
 
 	TRY1(translate(cpu, &meml, 1, SEG_TR, 0x1c, 4, 0));
 	cpu->cr3 = load32(cpu, &meml);
-	tlb_clear(cpu);
+	tlb_flush_generation(cpu);
 	SEQ_INVALIDATE(cpu);
 
 	return true;
@@ -12647,6 +12680,7 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 	}
 
 	if ((cpu->flags & IF) && cpu->intr) {
+		cpu->irq_count++;
 		bool was_halted = cpu->halt;
 		cpu->intr = false;
 		cpu->halt = false;
@@ -13510,6 +13544,16 @@ uint32_t cpui386_get_seq_hits(CPUI386 *cpu)
 #endif
 }
 
+void cpui386_get_perf_counters(CPUI386 *cpu, uint32_t *tlb_miss, uint32_t *irq,
+                               uint32_t *fusion, uint32_t *hle_hit, uint32_t *hle_call)
+{
+	*tlb_miss = cpu->tlb_miss_count;
+	*irq = cpu->irq_count;
+	*fusion = cpu->fusion_count;
+	*hle_hit = cpu->hle_hit_count;
+	*hle_call = cpu->hle_call_count;
+}
+
 CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 {
 	/* Initialize flags lookup tables (256KB in PSRAM for fast flag computation) */
@@ -13529,6 +13573,7 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 	cpu->gen = gen;
 
 	cpu->tlb.size = tlb_size;
+	cpu->tlb.generation = 1;  /* start at 1 so default-zero entries miss */
 	// Allocate TLB in internal RAM for fastest access
 	cpu->tlb.tab = heap_caps_malloc(sizeof(struct tlb_entry) * tlb_size,
 	                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);

@@ -274,42 +274,51 @@ static void stats_draw_text(uint16_t *fb, int x, int y, const char *text, uint16
 
 // Render persistent stats bar at top of screen (logical landscape coords)
 static bool stats_bar_was_visible = false;
+#define STATS_BAR_H 36
 static void render_stats_bar(uint16_t *fb)
 {
 	if (!globals.stats_bar_visible) {
-		if (stats_bar_was_visible) {
-			// Clear the bar area — PPA doesn't overwrite this region
-			stats_fill_rect(fb, 0, 0, LOGICAL_WIDTH, 20, 0x0000);
-			stats_bar_was_visible = false;
-		}
+		stats_bar_was_visible = false;
 		return;
 	}
 	stats_bar_was_visible = true;
 
-	// Bar at top of logical landscape: full width, 20px tall
-	int bar_h = 20;
-	stats_fill_rect(fb, 0, 0, LOGICAL_WIDTH, bar_h, 0x18E3);
+	// Bar at top of logical landscape: full width, 2 lines
+	stats_fill_rect(fb, 0, 0, LOGICAL_WIDTH, STATS_BAR_H, 0x18E3);
 
-	// Format stats: IPS ~MHz | CPU/Periph% | VGA WxH fps | Seq% | Bat N | Calls/s
-	char line[100];
+	// Line 1: IPS ~MHz | CPU/IO% | VGA WxH fps | Seq% | Bat | HLT%
+	char line1[120];
 	uint32_t cps = globals.emu_cycles_per_sec;
 	int pos = 0;
 	if (cps >= 1000000) {
-		pos += snprintf(line + pos, sizeof(line) - pos, " %.1fM IPS ~%luMHz",
+		pos += snprintf(line1 + pos, sizeof(line1) - pos, " %.1fM ~%luMHz",
 		                cps / 1000000.0f, (unsigned long)(cps / 1000000));
 	} else {
-		pos += snprintf(line + pos, sizeof(line) - pos, " %luK IPS",
+		pos += snprintf(line1 + pos, sizeof(line1) - pos, " %luK",
 		                (unsigned long)(cps / 1000));
 	}
-	pos += snprintf(line + pos, sizeof(line) - pos,
-	                " CPU:%d%% IO:%d%% %dx%d %dfps Seq:%d%% Bat:%d",
+	pos += snprintf(line1 + pos, sizeof(line1) - pos,
+	                " CPU:%d%% IO:%d%% %dx%d %dfps Seq:%d%% Bat:%d HLT:%d%%",
 	                globals.emu_cpu_percent, globals.emu_periph_percent,
 	                globals.vga_mode_width, globals.vga_mode_height,
 	                globals.emu_vga_fps, globals.emu_seq_pct,
-	                globals.emu_batch_size);
+	                globals.emu_batch_size, globals.emu_hlt_pct);
 
-	// Draw text centered vertically in bar (bar_h=20, font=16, offset=2)
-	stats_draw_text(fb, 4, 2, line, 0xFFFF);
+	// Line 2: TLB/s | IRQ/s | Fus% | HLE% | Disk KB/s | SRAM | PSRAM
+	char line2[120];
+	uint32_t sram_kb = globals.emu_free_sram / 1024;
+	uint32_t psram_kb = globals.emu_free_psram / 1024;
+	snprintf(line2, sizeof(line2),
+	         " TLB:%luk/s IRQ:%lu/s Fus:%d%% HLE:%d%% Dsk:%lukB/s SRAM:%lukB PSRAM:%lukB",
+	         (unsigned long)(globals.emu_tlb_miss_per_sec / 1000),
+	         (unsigned long)globals.emu_irq_per_sec,
+	         globals.emu_fusion_pct, globals.emu_hle_pct,
+	         (unsigned long)globals.emu_disk_kb_per_sec,
+	         (unsigned long)sram_kb, (unsigned long)psram_kb);
+
+	// Draw two lines of text (font=16px, line spacing=18)
+	stats_draw_text(fb, 4, 1, line1, 0xFFFF);
+	stats_draw_text(fb, 4, 19, line2, 0xBDF7);  // Slightly dimmer for line 2
 }
 
 // Render brightness/volume overlay bar
@@ -679,7 +688,8 @@ void vga_task(void *arg)
 			 * pixels drawn in border areas by overlays persist. */
 			static bool had_overlay = false;
 			bool has_overlay = (globals.osd_enabled && globals.osd) ||
-			                   (globals.overlay_type != OVERLAY_NONE);
+			                   (globals.overlay_type != OVERLAY_NONE) ||
+			                   globals.stats_bar_visible;
 			if (had_overlay && !has_overlay) {
 				size_t sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
 				memset(fb_rotated, 0, sz);
@@ -703,11 +713,14 @@ void vga_task(void *arg)
 
 			/* Update overlay tracking (after render_overlay_bar may
 			 * have expired the timer and set overlay_type to NONE) */
-			had_overlay = (globals.osd_enabled && globals.osd) ||
-			              (globals.overlay_type != OVERLAY_NONE);
-
 			// Persistent stats bar (renders on top of everything including OSD)
 			render_stats_bar(fb_rotated);
+
+			/* Update overlay tracking (after render_overlay_bar and
+			 * render_stats_bar may have changed visibility state) */
+			had_overlay = (globals.osd_enabled && globals.osd) ||
+			              (globals.overlay_type != OVERLAY_NONE) ||
+			              globals.stats_bar_visible;
 
 			// Toast renders on top of everything (including OSD)
 			toast_render(fb_rotated);

@@ -68,6 +68,14 @@ struct Globals {
 	uint32_t emu_cycles_per_sec;  // Emulated CPU cycles per second (IPS)
 	uint8_t emu_seq_pct;          // Sequential fast path hit rate (0-100%)
 	uint8_t emu_vga_fps;          // VGA frames per second
+	uint8_t emu_hlt_pct;          // HLT idle percentage (0-100%)
+	uint32_t emu_tlb_miss_per_sec;  // TLB misses per second
+	uint32_t emu_irq_per_sec;      // Hardware IRQ deliveries per second
+	uint32_t emu_disk_kb_per_sec;   // Disk I/O KB/s (read+write combined)
+	uint8_t emu_hle_pct;           // HLE hit rate (0-100%)
+	uint8_t emu_fusion_pct;        // CMP/TEST+Jcc fusion rate (0-100%)
+	uint32_t emu_free_sram;        // Free internal SRAM bytes
+	uint32_t emu_free_psram;       // Free PSRAM (SPI RAM) bytes
 	// USB storage state
 	bool usb_storage_connected;   // True when USB mass storage is attached
 	bool usb_vfs_mounted;         // True when USB VFS is mounted at /usb
