@@ -14,5 +14,6 @@ uint16_t i8259_get_irr(PicState2 *s);
 uint16_t i8259_get_isr(PicState2 *s);
 uint16_t i8259_get_imr(PicState2 *s);
 int i8259_get_pending_irq(PicState2 *s);
+void i8259_reset(PicState2 *s);
 
 #endif /* I8259_H */

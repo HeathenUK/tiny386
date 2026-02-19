@@ -287,6 +287,12 @@ static void pit_reset(void *opaque)
 	}
 }
 
+void i8254_reset(PITState *pit)
+{
+	pit_reset(pit);
+	pit->channels[0].irq = 0;  /* Restore channel 0 IRQ (set by init) */
+}
+
 void i8254_update_irq(PITState *pit)
 {
 	uint32_t uticks = get_uticks();

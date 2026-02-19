@@ -19,6 +19,8 @@ int pc_pit_burst_setting = 1;
 #define cpu_raise_irq cpui386_raise_irq
 #define cpu_get_cycle cpui386_get_cycle
 
+static void pc_reset_request(void *p);
+
 static u8 pc_io_read(void *o, int addr)
 {
 	PC *pc = o;
@@ -282,9 +284,22 @@ static void pc_io_write(void *o, int addr, u8 val)
 		fflush(stdout);
 		return;
 	case 0x92:
-		pc->port92 = val;
+		pc->port92 = val & ~1;  /* Bit 0 is write-only (self-clearing reset) */
 		cpui386_set_a20(pc->cpu, (val >> 1) & 1);
+		if (val & 1)
+			pc_reset_request(pc);
 		return;
+	case 0xcf9: {
+		/* PCI reset control register.
+		 * Bit 1: Reset CPU (0=no, 1=yes)
+		 * Bit 2: System reset type (0=soft, 1=hard)
+		 * SeaBIOS writes 0x02 then 0x06 to trigger a hard reset. */
+		static uint8_t last_cf9 = 0;
+		if ((val & 0x04) && !(last_cf9 & 0x04))
+			pc_reset_request(pc);
+		last_cf9 = val;
+		return;
+	}
 	case 0x60:
 		kbd_write_data(pc->i8042, addr, val);
 		return;
@@ -493,11 +508,16 @@ void pc_step(PC *pc)
 		}
 		step_time_accum = 0;
 		step_count = 0;
-		/* Guest-initiated reset (port 92/CF9): don't reload BIOS from SD.
+		/* Guest-initiated reset (port 64/92/CF9): don't reload BIOS from SD.
 		 * On real hardware the BIOS ROM persists across resets.  Reloading
 		 * can fail if the IO task is holding the SDMMC bus, causing an
-		 * infinite triple-fault loop when the BIOS can't be read. */
+		 * infinite triple-fault loop when the BIOS can't be read.
+		 * Reset all devices — on real hardware, the reset signal resets
+		 * the entire bus.  Without PIC/PIT reset, SeaBIOS POST fails
+		 * because Win95 reprograms interrupt vectors and timer modes. */
 		memset(pc->phys_mem, 0, 0xa0000);  /* clear conventional memory */
+		i8259_reset(pc->pic);
+		i8254_reset(pc->pit);
 		i8042_reset(pc->i8042);
 		pc->port92 = 0;  /* A20 disabled at reset */
 		cpui386_reset(pc->cpu);
