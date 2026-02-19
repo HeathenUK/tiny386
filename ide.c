@@ -2438,6 +2438,9 @@ static void io_task(void *arg)
                 }
 
                 local_tail += batch;
+                /* Fence: SD writes complete before tail advances,
+                 * so producer won't reuse slots still being written. */
+                __atomic_thread_fence(__ATOMIC_RELEASE);
                 __atomic_store_n(&wcache.tail, local_tail, __ATOMIC_RELEASE);
             }
         }
@@ -2491,6 +2494,10 @@ static void wcache_enqueue(BlockDeviceFile *bf, uint64_t disk_sector,
         wcache.meta[slot].disk_sector = disk_sector + i;
         wcache.meta[slot].sd_sector = sd_sector + i;
         wcache_index_update(bf, disk_sector + i, seq);
+        /* Full fence: ensure data/meta/index writes are globally visible
+         * before the head pointer publish.  RELEASE alone is sufficient
+         * on GCC+RISC-V, but belt-and-suspenders for an I/O-bound path. */
+        __atomic_thread_fence(__ATOMIC_RELEASE);
         __atomic_store_n(&wcache.head, seq + 1, __ATOMIC_RELEASE);
     }
     xSemaphoreGive(wcache.not_empty);
@@ -2504,6 +2511,9 @@ static int wcache_lookup(BlockDeviceFile *bf, uint64_t sector_num, uint8_t *buf)
     wcache.lookup_calls++;
     uint32_t t = __atomic_load_n(&wcache.tail, __ATOMIC_ACQUIRE);
     uint32_t h = __atomic_load_n(&wcache.head, __ATOMIC_ACQUIRE);
+    /* Full fence: ensure subsequent index/meta/data reads see
+     * everything the producer wrote before publishing head. */
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
 
     /* Fast path: if write queue is empty, nothing to look up */
     if (t == h) {
