@@ -27,6 +27,7 @@
 #include "common.h"
 #include "bsp/display.h"
 #include "bsp/audio.h"
+#include "bsp/power.h"
 
 #include "../../vga.h"
 #include "../../misc.h"
@@ -595,6 +596,31 @@ static void render_generic_menu(uint8_t *pixels, int w, int h, int pitch,
 
 	// Title
 	draw_text(pixels, w, h, pitch, menu_x + 10, menu_y + 8, title, COLOR_TITLE, 0);
+
+	// Battery percentage (right-aligned in title bar, refreshed every 5s)
+	{
+		static uint8_t batt_pct = 0;
+		static bool batt_charging = false;
+		static bool batt_available = false;
+		static uint32_t batt_update_time = 0;
+		uint32_t now = esp_system_get_time();
+		if (now - batt_update_time > 5000000) {  // 5 seconds
+			batt_update_time = now;
+			bsp_power_battery_information_t info;
+			if (bsp_power_get_battery_information(&info) == ESP_OK) {
+				batt_available = info.battery_available;
+				batt_pct = info.remaining_percentage;
+				batt_charging = info.battery_charging;
+			}
+		}
+		if (batt_available) {
+			char batt_str[16];
+			snprintf(batt_str, sizeof(batt_str), batt_charging ? "%d%%+" : "%d%%", batt_pct);
+			int bw = get_text_width(batt_str);
+			draw_text(pixels, w, h, pitch, menu_x + menu_w - 10 - bw, menu_y + 8,
+			          batt_str, COLOR_VALUE, 0);
+		}
+	}
 
 	// Menu items
 	int y = menu_y + title_h;
