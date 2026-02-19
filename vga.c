@@ -2961,10 +2961,6 @@ void vbe_write(VGAState *s, uint32_t offset, uint32_t val)
             if (!(val & VBE_DISPI_NOCLEARMEM)) {
                 uint32_t clear_size = s->vbe_regs[VBE_DISPI_INDEX_YRES] * s->vbe_line_offset;
                 memset(s->vga_ram, 0, clear_size);
-                /* Mark all affected pages dirty for double buffering */
-                uint32_t end_page = (clear_size - 1) >> 12;
-                for (uint32_t p = 0; p <= end_page && p < 64; p++)
-                    s->dirty_pages |= (1ULL << p);
             }
             break;
         case VBE_DISPI_INDEX_XRES:
@@ -3136,7 +3132,7 @@ void IRAM_ATTR vga_mem_write16(VGAState *s, uint32_t addr, uint16_t val16)
     mask = (1 << plane);
     if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
         /* Mark 4KB page dirty for double buffering (addr is byte offset) */
-        s->dirty_pages |= (1ULL << (addr >> 12));
+
         * (uint16_t *) &(s->vga_ram[addr]) = val;
     }
 }
@@ -3185,7 +3181,7 @@ void IRAM_ATTR vga_mem_write32(VGAState *s, uint32_t addr, uint32_t val)
     mask = (1 << plane);
     if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
         /* Mark 4KB page dirty for double buffering (addr is byte offset) */
-        s->dirty_pages |= (1ULL << (addr >> 12));
+
         * (uint32_t *) &(s->vga_ram[addr]) = val;
     }
 }
@@ -3209,11 +3205,6 @@ bool IRAM_ATTR vga_mem_write_string(VGAState *s, uint32_t addr, uint8_t *buf, in
                 return false;
 
             /* Mark dirty pages for double buffering (addr is dword offset) */
-            uint32_t start_page = addr >> 10;
-            uint32_t end_page = (addr + len - 1) >> 10;
-            for (uint32_t p = start_page; p <= end_page && p < 64; p++)
-                s->dirty_pages |= (1ULL << p);
-
             /* Write each byte to the selected plane */
             uint8_t *dst = s->vga_ram + addr * 4 + target_plane;
             for (int i = 0; i < len; i++) {
@@ -3254,10 +3245,6 @@ bool IRAM_ATTR vga_mem_write_string(VGAState *s, uint32_t addr, uint8_t *buf, in
         mask = (1 << plane);
         if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
             /* Mark dirty pages for double buffering (addr is byte offset) */
-            uint32_t start_page = addr >> 12;
-            uint32_t end_page = (addr + len - 1) >> 12;
-            for (uint32_t p = start_page; p <= end_page && p < 64; p++)
-                s->dirty_pages |= (1ULL << p);
             memcpy(s->vga_ram + addr, buf, len);
             return true;
         }
@@ -3277,11 +3264,6 @@ bool IRAM_ATTR vga_mem_write_string(VGAState *s, uint32_t addr, uint8_t *buf, in
                 return false;
 
             /* Mark dirty pages for double buffering (addr is dword offset) */
-            uint32_t start_page = addr >> 10;
-            uint32_t end_page = (addr + len - 1) >> 10;
-            for (uint32_t p = start_page; p <= end_page && p < 64; p++)
-                s->dirty_pages |= (1ULL << p);
-
             /* Write each byte to the selected plane */
             uint8_t *dst = s->vga_ram + addr * 4 + target_plane;
             for (int i = 0; i < len; i++) {
@@ -3316,7 +3298,7 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
             if (addr * 4 >= s->vga_ram_size)
                 return;
             /* Mark 4KB page dirty for double buffering (addr is dword offset) */
-            s->dirty_pages |= (1ULL << (addr >> 10));
+
             uint8_t pmask = s->cached_plane_mask;
             if (pmask == 0x0f) {
                 ((uint32_t *)s->vga_ram)[addr] = s->latch;
@@ -3331,7 +3313,7 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
             if (addr * 4 + 3 >= s->vga_ram_size)
                 return;
             /* Mark 4KB page dirty for double buffering (addr is dword offset) */
-            s->dirty_pages |= (1ULL << (addr >> 10));
+
             uint32_t val32 = val | (val << 8) | (val << 16) | (val << 24);
             uint8_t pmask = s->cached_plane_mask;
             if (pmask == 0x0f) {
@@ -3375,7 +3357,7 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
         mask = (1 << plane);
         if (s->sr[VGA_SEQ_PLANE_WRITE] & mask) {
             /* Mark 4KB page dirty for double buffering */
-            s->dirty_pages |= (1ULL << (addr >> 12));
+    
             s->vga_ram[addr] = val;
 #ifdef DEBUG_VGA_MEM
             printf("vga: chain4: [0x" TARGET_FMT_plx "]\n", addr);
@@ -3398,7 +3380,7 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
                 return;
             }
             /* Mark 4KB page dirty for double buffering */
-            s->dirty_pages |= (1ULL << (addr >> 12));
+    
             s->vga_ram[addr] = val;
 #ifdef DEBUG_VGA_MEM
             printf("vga: odd/even: [0x" TARGET_FMT_plx "]\n", addr);
@@ -3419,7 +3401,7 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
                 return;
 
             /* Mark 4KB page dirty for double buffering (addr is dword offset) */
-            s->dirty_pages |= (1ULL << (addr >> 10));
+
 
             {
                 uint32_t latch_val = s->latch;
@@ -3444,7 +3426,7 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
                 return;
 
             /* Mark 4KB page dirty for double buffering (addr is dword offset) */
-            s->dirty_pages |= (1ULL << (addr >> 10));
+
 
             /* Replicate byte to 32 bits */
             uint32_t val32 = val8 | (val8 << 8);
@@ -3538,8 +3520,6 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
         if (addr * sizeof(uint32_t) >= s->vga_ram_size) {
             return;
         }
-        /* Mark 4KB page dirty for double buffering (addr is dword offset) */
-        s->dirty_pages |= (1ULL << (addr >> 10));
         ((uint32_t *)s->vga_ram)[addr] =
             (((uint32_t *)s->vga_ram)[addr] & ~write_mask) |
             (val & write_mask);
@@ -3826,11 +3806,6 @@ bool IRAM_ATTR vga_mem_copy_string(VGAState *s, uint32_t dst, uint32_t src, int 
         return false;
 
     /* Mark dirty pages for double buffering (dst is dword offset) */
-    uint32_t start_page = dst >> 10;
-    uint32_t end_page = (dst + len - 1) >> 10;
-    for (uint32_t p = start_page; p <= end_page && p < 64; p++)
-        s->dirty_pages |= (1ULL << p);
-
     uint8_t pmask = s->cached_plane_mask;
     uint32_t *vram32 = (uint32_t *)s->vga_ram;
 
@@ -3878,11 +3853,6 @@ void vga_get_modex_state(VGAState *s, uint8_t **ram, uint32_t *ram_size,
 void vga_direct_mark_dirty(VGAState *s, uint32_t addr, int len)
 {
     /* Mark 4KB pages dirty for double buffering (addr is byte offset) */
-    uint32_t start_page = addr >> 12;
-    uint32_t end_page = (addr + len - 1) >> 12;
-    for (uint32_t p = start_page; p <= end_page && p < 64; p++)
-        s->dirty_pages |= (1ULL << p);
-
     /* For mode 13h: 320 pixels per line, addr / 320 = line number */
     int line_start = addr / 320;
     int line_end = (addr + len - 1) / 320;
