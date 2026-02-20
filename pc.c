@@ -512,19 +512,19 @@ void pc_step(PC *pc)
 		/* Flush pending disk writes before resetting — SeaBIOS will
 		 * read from the same disk during POST and boot. */
 		ide_sync(pc->ide, pc->ide2);
-		/* Guest-initiated reset (port 64/92/CF9): don't reload BIOS from SD.
-		 * On real hardware the BIOS ROM persists across resets.  Reloading
-		 * can fail if the IO task is holding the SDMMC bus, causing an
-		 * infinite triple-fault loop when the BIOS can't be read.
+		/* Guest-initiated reset (port 64/92/CF9).
 		 * Reset all devices — on real hardware, the reset signal resets
 		 * the entire bus.  Without PIC/PIT reset, SeaBIOS POST fails
-		 * because Win95 reprograms interrupt vectors and timer modes. */
+		 * because Win95 reprograms interrupt vectors and timer modes.
+		 * Must reload BIOS to clear SeaBIOS's HaveRunPost flag —
+		 * otherwise SeaBIOS enters handle_resume() → hard reboot loop.
+		 * ide_sync() above ensures the SDMMC bus is free for SD reads. */
 		memset(pc->phys_mem, 0, 0xa0000);  /* clear conventional memory */
 		i8259_reset(pc->pic);
 		i8254_reset(pc->pit);
 		i8042_reset(pc->i8042);
 		pc->port92 = 0;  /* A20 disabled at reset */
-		cpui386_reset(pc->cpu);
+		load_bios_and_reset(pc);
 	}
 
 	/* Update VGA direct access pointer (detects mode changes) */
