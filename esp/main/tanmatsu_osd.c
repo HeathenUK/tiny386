@@ -785,7 +785,7 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	// Stats bar
 	snprintf(statsbar_val, sizeof(statsbar_val), "%s", globals.stats_bar_visible ? "On" : "Off");
 
-	// CPU debug
+	// Debug toggle
 	snprintf(cpudbg_val, sizeof(cpudbg_val), "%s", globals.cpu_debug_enabled ? "On" : "Off");
 
 	MenuEntry entries[SYS_COUNT] = {
@@ -796,7 +796,7 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ "PIT Burst:", 0, 0, pitburst_val },
 		{ "Mouse Speed:", 0, 0, mouse_val },
 		{ "Stats Bar:", 0, 0, statsbar_val },
-		{ "CPU Debug:", 0, 0, cpudbg_val },
+		{ "Debug:", 0, 0, cpudbg_val },
 		{ NULL, 1, 0, NULL },  // SEP1
 		{ "< Back (restart to apply)", 0, 0, NULL },
 	};

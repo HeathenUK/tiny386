@@ -84,4 +84,8 @@ int ide_get_drive_heads(IDEIFState *s, int drive);
 int ide_get_drive_sectors(IDEIFState *s, int drive);
 int64_t ide_get_drive_nb_sectors(IDEIFState *s, int drive);
 int ide_is_drive_cd(IDEIFState *s, int drive);
+
+/* Runtime debug toggle — logs all disk I/O with CRC32 checksums */
+void ide_set_debug(bool enabled);
+
 #endif /* IDE_H */

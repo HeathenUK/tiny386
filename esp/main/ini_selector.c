@@ -612,7 +612,7 @@ static void finish_selection(int idx, bool force_debug)
 	}
 	if (force_debug) {
 		globals.cpu_debug_enabled = true;
-		ESP_LOGI(TAG, "Ctrl+Enter: forcing CPU Debug ON for boot");
+		ESP_LOGI(TAG, "Ctrl+Enter: forcing Debug ON for boot");
 	}
 
 	if (s_auto_boot) {
