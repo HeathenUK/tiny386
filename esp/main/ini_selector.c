@@ -21,6 +21,7 @@
 #include <errno.h>
 
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -675,13 +676,16 @@ int ini_selector_handle_key(int scancode)
 	case 0x2e: /* C */
 		begin_edit(EDIT_CLONE);
 		break;
-	case 0x01: /* Escape — in auto_boot mode, just cancel countdown.
-	            * In switch mode (no auto_boot), cancel and go back. */
-		if (!s_auto_boot) {
+	case 0x01: /* Escape */
+		if (globals.pc) {
+			/* Emulator is running (OSD config switch): cancel and go back */
 			globals.ini_selector_done = true;
 			globals.ini_selector_active = false;
 			return 1;
 		}
+		/* No running emulator (boot or APM shutdown): exit to launcher */
+		globals.ini_selector_active = false;
+		esp_restart();
 		break;
 	}
 	return 0;
@@ -851,7 +855,9 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 		sel_draw_text(LEFT_X, FOOTER_Y + 2, msg, C_TITLE, LOG_W - 20);
 	} else {
 		sel_draw_text(LEFT_X, FOOTER_Y + 2,
-		              "Up/Down:Navigate  Enter:Select  Ctrl+Enter:Debug  R:Rename  C:Clone  Esc:Cancel",
+		              globals.pc
+		                ? "Up/Down:Navigate  Enter:Select  Ctrl+Enter:Debug  R:Rename  C:Clone  Esc:Back"
+		                : "Up/Down:Navigate  Enter:Select  Ctrl+Enter:Debug  R:Rename  C:Clone  Esc:Exit",
 		              C_SEP, 0);
 	}
 }

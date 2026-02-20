@@ -265,7 +265,11 @@ static int is_av_separator(int item) {
 }
 
 static int is_sys_separator(int item) {
+#ifdef CPU_DIAG
 	return item == SYS_SEP1;
+#else
+	return item == SYS_SEP1 || item == SYS_CPU_DEBUG;
+#endif
 }
 
 // Get just the filename from a path
@@ -785,8 +789,10 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	// Stats bar
 	snprintf(statsbar_val, sizeof(statsbar_val), "%s", globals.stats_bar_visible ? "On" : "Off");
 
-	// Debug toggle
+#ifdef CPU_DIAG
+	// Debug toggle (only available when CPU_DIAG is compiled in)
 	snprintf(cpudbg_val, sizeof(cpudbg_val), "%s", globals.cpu_debug_enabled ? "On" : "Off");
+#endif
 
 	MenuEntry entries[SYS_COUNT] = {
 		{ "CPU:", 0, 0, cpu_val },
@@ -796,7 +802,11 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ "PIT Burst:", 0, 0, pitburst_val },
 		{ "Mouse Speed:", 0, 0, mouse_val },
 		{ "Stats Bar:", 0, 0, statsbar_val },
+#ifdef CPU_DIAG
 		{ "Debug:", 0, 0, cpudbg_val },
+#else
+		{ NULL, 1, 0, NULL },  // CPU_DIAG not compiled: hide Debug toggle
+#endif
 		{ NULL, 1, 0, NULL },  // SEP1
 		{ "< Back (restart to apply)", 0, 0, NULL },
 	};
@@ -1761,9 +1771,11 @@ static void handle_sys_adjust(OSD *osd, int delta)
 		globals.stats_bar_visible = !globals.stats_bar_visible;
 		globals.stats_collecting = globals.stats_bar_visible;
 		break;
+#ifdef CPU_DIAG
 	case SYS_CPU_DEBUG:
 		globals.cpu_debug_enabled = !globals.cpu_debug_enabled;
 		break;
+#endif
 	}
 }
 
@@ -2029,8 +2041,10 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 				} else if (osd->sys_sel == SYS_STATS_BAR) {
 					globals.stats_bar_visible = !globals.stats_bar_visible;
 					globals.stats_collecting = globals.stats_bar_visible;
-				} else if (osd->sys_sel == SYS_CPU_DEBUG) {
+	#ifdef CPU_DIAG
+			} else if (osd->sys_sel == SYS_CPU_DEBUG) {
 				globals.cpu_debug_enabled = !globals.cpu_debug_enabled;
+#endif
 			}
 			break;
 		case SC_ESC:

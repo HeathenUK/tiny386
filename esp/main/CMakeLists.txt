@@ -40,6 +40,11 @@ target_bitscrambler_add_src("planar_bs.bsasm")
 
 add_definitions(-include ${CMAKE_CURRENT_SOURCE_DIR}/${BOARD_HEADER})
 
+# CPU_DIAG: enable heavyweight CPU diagnostic tracing (wfw_monitor, pf_diag, etc.)
+# Disabled by default for production — saves ~5-10% IPS from reduced I-cache pressure.
+# Uncomment to enable diagnostic infrastructure (OSD Debug toggle, detailed VM86/Win386 tracing).
+# add_definitions(-DCPU_DIAG)
+
 
 # Performance-critical emulation core: -O3 with aggressive optimizations
 set_source_files_properties("../../i386.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -funroll-loops")

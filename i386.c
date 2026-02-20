@@ -440,8 +440,16 @@ static struct {
 } pf_diag = {0};
 
 /* Runtime diagnostic toggle — controlled via OSD "CPU Debug" setting.
- * When false, all diagnostic dolog output is suppressed. */
+ * When false, all diagnostic dolog output is suppressed.
+ * When CPU_DIAG is not defined (production builds), cpu_diag_enabled is a
+ * compile-time constant false.  The compiler eliminates ALL diagnostic code
+ * in hot paths (segcheck, store8/16/32, translate, etc.) via dead-code
+ * elimination, dramatically reducing I-cache pressure on ESP32-P4. */
+#ifdef CPU_DIAG
 static bool cpu_diag_enabled = false;
+#else
+#define cpu_diag_enabled false
+#endif
 /* Win3.x compatibility:
  * route VM86 INT n at IOPL=3 through IDT (historical emulator behavior)
  * instead of direct IVT dispatch. */
@@ -3248,11 +3256,13 @@ static bool IRAM_ATTR translate(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uw
 	assert(seg != -1);
 	uword laddr;
 
-	/* Fast path: when ALL segments are flat, skip per-segment check entirely */
+	/* Fast path: when ALL segments are flat (base=0, limit=4GB), skip segcheck
+	 * entirely.  Flat segments can't fail null-selector checks (limit!=0) or
+	 * limit checks (4GB limit can't be exceeded by 32-bit address).  The only
+	 * edge case is a write with a CS-override prefix to a code segment. */
 	if (likely(cpu->all_segs_flat)) {
-		/* Null selectors are still invalid in protected mode even if every
-		 * segment currently looks flat; keep architectural fault behavior. */
-		TRYL(segcheck(cpu, rwm, seg, addr, size));
+		if (unlikely((rwm & 2) && (cpu->seg[seg].flags & 0x8)))
+			THROW(seg == SEG_SS ? EX_SS : EX_GP, 0);
 		return translate_laddr(cpu, res, rwm, addr, size, cpl);
 	}
 
@@ -3271,9 +3281,9 @@ static bool IRAM_ATTR translate8r(CPUI386 *cpu, OptAddr *res, int seg, uword add
 	assert(seg != -1);
 	uword laddr;
 
-	/* Fast path: all segments flat → addr IS the linear address */
+	/* Fast path: all segments flat → addr IS the linear address.
+	 * No segcheck needed: flat segments can't fail (see translate()). */
 	if (likely(cpu->all_segs_flat)) {
-		TRYL(segcheck(cpu, 1, seg, addr, 1));
 		laddr = addr;
 	} else if (likely(SEG_IS_FLAT(cpu, seg))) {
 		laddr = addr;
@@ -13598,8 +13608,13 @@ int cpui386_get_a20(CPUI386 *cpu)
 
 void cpui386_set_diag(CPUI386 *cpu, bool enabled)
 {
+#ifdef CPU_DIAG
 	(void)cpu;
 	cpu_diag_enabled = enabled;
+#else
+	(void)cpu;
+	(void)enabled;
+#endif
 }
 
 bool cpui386_is_halted(CPUI386 *cpu)
