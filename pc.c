@@ -583,6 +583,7 @@ void pc_step(PC *pc)
 	static uint32_t stat_last_hle_call = 0;
 	static uint32_t stat_last_disk_read = 0;
 	static uint32_t stat_last_disk_written = 0;
+	static CpuDetailCounters stat_last_detail = {0};
 
 	uint32_t t0 = get_uticks();
 
@@ -627,7 +628,7 @@ void pc_step(PC *pc)
 	i8257_dma_run(pc->isa_hdma);
 	ide_poll_async();
 	uint32_t t1 = 0, t2 = 0;
-	bool collecting = globals.stats_collecting;
+	bool collecting = globals.stats_collecting || globals.stats_log_active;
 	if (collecting) t1 = get_uticks();  /* After peripherals */
 	cpui386_set_diag(pc->cpu, globals.cpu_debug_enabled);
 	cpui386_step(pc->cpu, batch_size);
@@ -748,6 +749,22 @@ void pc_step(PC *pc)
 			stat_last_disk_read = cur_disk_r;
 			stat_last_disk_written = cur_disk_w;
 
+			/* Detailed operation counters */
+			CpuDetailCounters cur_detail;
+			cpui386_get_detail_counters(pc->cpu, &cur_detail);
+			CpuDetailCounters detail_delta;
+			detail_delta.seg_loads   = cur_detail.seg_loads   - stat_last_detail.seg_loads;
+			detail_delta.exceptions  = cur_detail.exceptions  - stat_last_detail.exceptions;
+			detail_delta.gp_faults   = cur_detail.gp_faults   - stat_last_detail.gp_faults;
+			detail_delta.page_faults = cur_detail.page_faults - stat_last_detail.page_faults;
+			detail_delta.sw_ints     = cur_detail.sw_ints     - stat_last_detail.sw_ints;
+			detail_delta.irets       = cur_detail.irets       - stat_last_detail.irets;
+			detail_delta.io_ops      = cur_detail.io_ops      - stat_last_detail.io_ops;
+			detail_delta.cr_writes   = cur_detail.cr_writes   - stat_last_detail.cr_writes;
+			detail_delta.far_calls   = cur_detail.far_calls   - stat_last_detail.far_calls;
+			detail_delta.seg_cache_hits = cur_detail.seg_cache_hits - stat_last_detail.seg_cache_hits;
+			stat_last_detail = cur_detail;
+
 			/* Heap diagnostics (once per 2s — lightweight) */
 			globals.emu_free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
 			globals.emu_free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -757,6 +774,87 @@ void pc_step(PC *pc)
 			stat_periph_us = 0;
 			stat_calls = 0;
 			stat_last_report = t2;
+
+			/* Periodic stats log (Meta+F2) */
+			if (globals.stats_log_active) {
+				CpuSnapshot snap;
+				cpui386_snapshot(pc->cpu, &snap);
+				fprintf(stderr,
+				    "[perf] IPS=%u.%02uM bat=%u cpu=%u%% hlt=%u%% "
+				    "vga=%ufps tlb=%uK irq=%u disk=%uKB/s "
+				    "seq=%u%% fus=%u%% hle=%u%% "
+				    "@ %04X:%08X CPL=%d%s%s\n",
+				    globals.emu_cycles_per_sec / 1000000,
+				    (globals.emu_cycles_per_sec / 10000) % 100,
+				    globals.emu_batch_size,
+				    globals.emu_cpu_percent, globals.emu_hlt_pct,
+				    globals.emu_vga_fps,
+				    globals.emu_tlb_miss_per_sec / 1000,
+				    globals.emu_irq_per_sec,
+				    globals.emu_disk_kb_per_sec,
+				    globals.emu_seq_pct, globals.emu_fusion_pct,
+				    globals.emu_hle_pct,
+				    snap.cs, snap.eip, snap.cpl,
+				    snap.vm86 ? " VM86" : "",
+				    snap.halt ? " HLT" : "");
+				/* Per-second rates for detailed ops */
+				uint32_t ds = elapsed_us / 1000000; /* seconds in window */
+				if (ds == 0) ds = 1;
+				/* seg_loads includes cache hits; show hit rate */
+				uint32_t seg_total = detail_delta.seg_loads;
+				uint32_t seg_hits = detail_delta.seg_cache_hits;
+				uint32_t seg_hit_pct = seg_total > 0 ? (seg_hits * 100 / seg_total) : 0;
+				fprintf(stderr,
+				    "[prof] seg=%uK(%u%%hit) int=%u iret=%u io=%uK "
+				    "exc=%u(gp=%u,pf=%u) cr=%u far=%u\n",
+				    (uint32_t)(seg_total / ds / 1000),
+				    seg_hit_pct,
+				    (uint32_t)(detail_delta.sw_ints / ds),
+				    (uint32_t)(detail_delta.irets / ds),
+				    (uint32_t)(detail_delta.io_ops / ds / 1000),
+				    (uint32_t)(detail_delta.exceptions / ds),
+				    (uint32_t)(detail_delta.gp_faults / ds),
+				    (uint32_t)(detail_delta.page_faults / ds),
+				    (uint32_t)(detail_delta.cr_writes / ds),
+				    (uint32_t)(detail_delta.far_calls / ds));
+			}
+		}
+	}
+
+	/* One-shot stats dump (Meta+F1) — zero overhead, just reads state */
+	if (globals.stats_dump_pending) {
+		globals.stats_dump_pending = false;
+		CpuSnapshot snap;
+		cpui386_snapshot(pc->cpu, &snap);
+		fprintf(stderr,
+		    "=== Performance Snapshot ===\n"
+		    "  CPU: %u.%02uM IPS  batch=%u  cpu=%u%% periph=%u%%\n"
+		    "  Idle: %u%% HLT  VGA: %u fps\n"
+		    "  Cache: TLB miss %uK/s  seq=%u%%  fusion=%u%%  HLE=%u%%\n"
+		    "  I/O: disk %u KB/s  IRQ %u/s\n"
+		    "  Mem: SRAM %uK free  PSRAM %uK free\n",
+		    globals.emu_cycles_per_sec / 1000000,
+		    (globals.emu_cycles_per_sec / 10000) % 100,
+		    globals.emu_batch_size,
+		    globals.emu_cpu_percent, globals.emu_periph_percent,
+		    globals.emu_hlt_pct, globals.emu_vga_fps,
+		    globals.emu_tlb_miss_per_sec / 1000,
+		    globals.emu_seq_pct, globals.emu_fusion_pct,
+		    globals.emu_hle_pct,
+		    globals.emu_disk_kb_per_sec, globals.emu_irq_per_sec,
+		    globals.emu_free_sram / 1024,
+		    globals.emu_free_psram / 1024);
+		fprintf(stderr,
+		    "  State: CS:EIP=%04X:%08X SS:ESP=%04X:%08X CPL=%d%s%s%s\n",
+		    snap.cs, snap.eip, snap.ss, snap.esp, snap.cpl,
+		    snap.vm86 ? " VM86" : "",
+		    snap.halt ? " HLT" : "",
+		    snap.pe ? (snap.pg ? " PE+PG" : " PE") : " REAL");
+		if (snap.code_len > 0) {
+			fprintf(stderr, "  Code:");
+			for (int i = 0; i < snap.code_len; i++)
+				fprintf(stderr, " %02X", snap.code[i]);
+			fprintf(stderr, "\n");
 		}
 	}
 

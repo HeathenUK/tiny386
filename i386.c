@@ -102,6 +102,7 @@ struct CPUI386 {
 		uword limit;
 		uword flags;
 	} seg[8];
+	uint8_t seg_cache_valid;  /* Bitmask: bit N set = seg[N] cache valid for same-sel skip */
 
 	struct {
 		uword base;
@@ -203,6 +204,18 @@ struct CPUI386 {
 	uint32_t fusion_count;     /* CMP/TEST+Jcc macro-op fusions */
 	uint32_t hle_hit_count;    /* BIOS HLE calls intercepted */
 	uint32_t hle_call_count;   /* BIOS HLE calls attempted */
+
+	/* Detailed operation counters — incremented in already-expensive paths */
+	uint32_t seg_load_count;   /* Protected-mode segment loads (set_seg PM path) */
+	uint32_t exc_count;        /* Total exceptions delivered (via call_isr) */
+	uint32_t exc_gp_count;     /* #GP exceptions */
+	uint32_t exc_pf_count;     /* #PF exceptions */
+	uint32_t int_count;        /* Software INT instructions */
+	uint32_t iret_count;       /* IRET instructions */
+	uint32_t io_count;         /* I/O instructions (IN/OUT) */
+	uint32_t cr_write_count;   /* MOV to CR0/CR3 */
+	uint32_t far_call_count;   /* Far CALL/JMP (pmcall) */
+	uint32_t seg_cache_hit_count; /* Segment cache hits (same-sel skip) */
 };
 
 #define dolog(...) fprintf(stderr, __VA_ARGS__)
@@ -4054,6 +4067,16 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 		return true;
 	}
 
+	cpu->seg_load_count++;
+
+	/* Segment descriptor cache: if same selector and cache is valid,
+	 * skip the descriptor table read + validation entirely.
+	 * Invalidated on LGDT/LLDT/task switch/CR0 PE change. */
+	if ((cpu->seg_cache_valid & (1 << seg)) && sel == cpu->seg[seg].sel) {
+		cpu->seg_cache_hit_count++;
+		return true;
+	}
+
 	/* Protected-mode data-segment null selector semantics:
 	 * DS/ES/FS/GS accept null selectors and become unusable until reloaded.
 	 * SS null is always invalid (#GP(0)).
@@ -4188,6 +4211,7 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 		}
 		wfw_monitor.sel0127_prov.count++;
 	}
+	cpu->seg_cache_valid |= (1 << seg);
 	return true;
 }
 
@@ -4208,6 +4232,7 @@ static inline void clear_segs(CPUI386 *cpu)
 				/* Clear flat flag - segment is now null */
 				cpu->seg_flat &= ~(1 << segs[i]);
 				cpu->all_segs_flat = false;
+				cpu->seg_cache_valid &= ~(1 << segs[i]);
 			}
 		}
 	}
@@ -6701,12 +6726,14 @@ static void cpu_diag_log_int2f(CPUI386 *cpu)
 	TRY(fetch8(cpu, &modrm)); \
 	int reg = (modrm >> 3) & 7; \
 	int rm = modrm & 7; \
+	cpu->cr_write_count++; \
 	if (reg == 0) { \
 		u32 old_cr0 = cpu->cr0; \
 		u32 new_cr0 = lreg32(rm); \
 		if ((new_cr0 ^ cpu->cr0) & (CR0_PG | CR0_WP | 1)) { \
 			tlb_clear(cpu); \
 			SEQ_INVALIDATE(cpu); \
+			cpu->seg_cache_valid = 0; \
 			if ((new_cr0 ^ cpu->cr0) & 1) { \
 				cpu->int8_cache_valid = false; \
 				cpu->int8_warmup_counter = 0; \
@@ -7515,6 +7542,7 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 }
 
 #define INT(i, li, _) \
+	cpu->int_count++; \
 	/*dolog("int %02x %08x %04x:%08x\n", li(i), REGi[0], SEGi(SEG_CS), cpu->ip);*/ \
 	if (unlikely(cpu_diag_enabled) && li(i) == 0x21) { \
 		cpu_diag_log_int21(cpu); \
@@ -7627,6 +7655,7 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 	}
 
 #define IRET() \
+	cpu->iret_count++; \
 	if ((cpu->cr0 & 1) && (!(cpu->flags & VM) || get_IOPL(cpu) < 3)) { \
 		TRY(pmret(cpu, opsz16, 0, true)); \
 	} else if (opsz16) { \
@@ -8571,6 +8600,7 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 	cpu->next_ip = li(i);
 
 #define JMPFAR(addr, seg) \
+	cpu->far_call_count++; \
 	if ((cpu->cr0 & 1) && !(cpu->flags & VM)) { \
 		TRY(pmcall(cpu, opsz16, addr, seg, true)); \
 	} else { \
@@ -8579,6 +8609,7 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 	}
 
 #define CALLFAR(addr, seg) \
+	cpu->far_call_count++; \
 	if ((cpu->cr0 & 1) && !(cpu->flags & VM)) { \
 		TRY(pmcall(cpu, opsz16, addr, seg, false)); \
 	} else { \
@@ -8763,7 +8794,8 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 #define LGDT(addr) \
 	LXXX(addr) \
 	cpu->gdt.base = base; \
-	cpu->gdt.limit = limit;
+	cpu->gdt.limit = limit; \
+	cpu->seg_cache_valid = 0;
 
 #define LIDT(addr) \
 	LXXX(addr) \
@@ -8774,7 +8806,8 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 
 #define LLDT(a, la, sa) \
 	if (cpu->cpl != 0) THROW(EX_GP, 0); \
-	TRY(set_seg(cpu, SEG_LDT, la(a)));
+	TRY(set_seg(cpu, SEG_LDT, la(a))); \
+	cpu->seg_cache_valid = 0;
 
 #define SLDT(a, la, sa) \
 	sa(a, cpu->seg[SEG_LDT].sel);
@@ -8874,6 +8907,7 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 
 static bool check_ioperm(CPUI386 *cpu, int port, int bit_width)
 {
+	cpu->io_count++;
 	/* Locked rule (Intel 80386 PRM + IA-32 SDM):
 	 * - VM86: IN/OUT always consult the TSS I/O bitmap (independent of IOPL).
 	 * - PM non-VM86: consult bitmap only when CPL > IOPL.
@@ -10667,6 +10701,7 @@ GRPEND
 enum { TS_JMP, TS_CALL, TS_IRET };
 static bool task_switch(CPUI386 *cpu, int tss, int sw_type)
 {
+	cpu->seg_cache_valid = 0;
 	OptAddr meml;
 	int oldtss = cpu->seg[SEG_TR].sel;
 	int tr_type = cpu->seg[SEG_TR].flags & 0xf;
@@ -13055,6 +13090,11 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 		int orig_exc = cpu->excno;
 		cpu->next_ip = cpu->ip;
 
+		/* Operation counters for profiling */
+		cpu->exc_count++;
+		if (orig_exc == EX_GP) cpu->exc_gp_count++;
+		else if (orig_exc == EX_PF) cpu->exc_pf_count++;
+
 		/* Count real exceptions here (not in call_isr) to avoid
 		 * conflating with PIC IRQs sharing vectors 0-31. */
 		if (unlikely(cpu_diag_enabled) && win386_diag.active && orig_exc < 32)
@@ -13476,6 +13516,7 @@ void cpui386_reset(CPUI386 *cpu)
 	cpu->gdt.limit = 0;
 	cpu->int8_cache_valid = false;
 	cpu->int8_warmup_counter = 0;  /* Reset INT 8 cache */
+	cpu->seg_cache_valid = 0;
 
 	cpu->cr0 = cpu->fpu ? 0x10 : 0;
 	cpu->cr2 = 0;
@@ -13591,6 +13632,54 @@ void cpui386_get_perf_counters(CPUI386 *cpu, uint32_t *tlb_miss, uint32_t *irq,
 	*fusion = cpu->fusion_count;
 	*hle_hit = cpu->hle_hit_count;
 	*hle_call = cpu->hle_call_count;
+}
+
+void cpui386_get_detail_counters(CPUI386 *cpu, CpuDetailCounters *out)
+{
+	out->seg_loads = cpu->seg_load_count;
+	out->exceptions = cpu->exc_count;
+	out->gp_faults = cpu->exc_gp_count;
+	out->page_faults = cpu->exc_pf_count;
+	out->sw_ints = cpu->int_count;
+	out->irets = cpu->iret_count;
+	out->io_ops = cpu->io_count;
+	out->cr_writes = cpu->cr_write_count;
+	out->far_calls = cpu->far_call_count;
+	out->seg_cache_hits = cpu->seg_cache_hit_count;
+}
+
+void cpui386_snapshot(CPUI386 *cpu, CpuSnapshot *snap)
+{
+	snap->cs = cpu->seg[SEG_CS].sel;
+	snap->eip = cpu->ip;
+	snap->ss = cpu->seg[SEG_SS].sel;
+	snap->esp = cpu->gprx[4].r32;
+	snap->cpl = cpu->cpl;
+	snap->vm86 = !!(cpu->flags & 0x20000);  /* VM flag */
+	snap->pe = !!(cpu->cr0 & 1);
+	snap->pg = !!(cpu->cr0 & 0x80000000);
+	snap->halt = cpu->halt;
+
+	/* Read up to 16 instruction bytes at CS:EIP.
+	 * Use linear address (seg base + EIP), then walk page table if paging. */
+	uint32_t linear = cpu->seg[SEG_CS].base + cpu->ip;
+	snap->code_len = 0;
+	for (int i = 0; i < 16; i++) {
+		uint32_t addr = linear + i;
+		if (cpu->cr0 & 0x80000000) {
+			/* Paging enabled: walk page tables (read-only, no faults) */
+			uint32_t pde = *(uint32_t *)(cpu->phys_mem + (cpu->cr3 & 0xFFFFF000) + ((addr >> 20) & 0xFFC));
+			if (!(pde & 1)) break;  /* not present */
+			uint32_t pte = *(uint32_t *)(cpu->phys_mem + (pde & 0xFFFFF000) + ((addr >> 10) & 0xFFC));
+			if (!(pte & 1)) break;  /* not present */
+			addr = (pte & 0xFFFFF000) | (addr & 0xFFF);
+		}
+		if (addr < (uint32_t)cpu->phys_mem_size)
+			snap->code[i] = cpu->phys_mem[addr];
+		else
+			break;
+		snap->code_len = i + 1;
+	}
 }
 
 CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)

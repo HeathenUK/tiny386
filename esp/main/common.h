@@ -97,6 +97,10 @@ struct Globals {
 	bool _Atomic ini_selector_done;       // Selection complete, path is ready
 	char ini_selected_path[256];  // Selected INI path (result from selector)
 
+	// Performance logging (Meta+F1 dump, Meta+F2 periodic)
+	bool _Atomic stats_dump_pending;      // One-shot stats dump to console
+	bool _Atomic stats_log_active;        // Periodic stats logging to console
+
 	// INI switch (runtime)
 	bool _Atomic screenshot_pending;      // Screenshot requested (Meta+S)
 

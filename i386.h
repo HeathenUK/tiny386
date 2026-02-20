@@ -99,6 +99,33 @@ bool cpui386_is_halted(CPUI386 *cpu);
 void cpui386_get_perf_counters(CPUI386 *cpu, uint32_t *tlb_miss, uint32_t *irq,
                                uint32_t *fusion, uint32_t *hle_hit, uint32_t *hle_call);
 
+/* Detailed operation counters for profiling Win95/PM workloads */
+typedef struct {
+	uint32_t seg_loads;    /* Protected-mode segment loads */
+	uint32_t exceptions;   /* Total exceptions delivered */
+	uint32_t gp_faults;    /* #GP exceptions */
+	uint32_t page_faults;  /* #PF exceptions */
+	uint32_t sw_ints;      /* Software INT instructions */
+	uint32_t irets;        /* IRET instructions */
+	uint32_t io_ops;       /* I/O instructions (IN/OUT) */
+	uint32_t cr_writes;    /* MOV to CR0/CR3 */
+	uint32_t far_calls;    /* Far CALL/JMP (pmcall) */
+	uint32_t seg_cache_hits; /* Segment cache hits (same-sel skip) */
+} CpuDetailCounters;
+
+void cpui386_get_detail_counters(CPUI386 *cpu, CpuDetailCounters *out);
+
+/* Lightweight CPU state snapshot for profiling — no hot-path cost */
+typedef struct {
+	uint32_t cs, eip, ss, esp;
+	int cpl;
+	bool vm86, pe, pg, halt;
+	uint8_t code[16];  /* instruction bytes at CS:EIP */
+	int code_len;      /* valid bytes in code[] */
+} CpuSnapshot;
+
+void cpui386_snapshot(CPUI386 *cpu, CpuSnapshot *snap);
+
 /* Reset stale pool-allocated statics for INI switch (PSRAM/pcram zeroed) */
 void i386_reset_flags_tables_for_reinit(void);
 

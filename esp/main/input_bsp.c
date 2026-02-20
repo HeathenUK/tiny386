@@ -351,7 +351,24 @@ static void input_task(void *arg)
 						}
 					}
 
-					// META+F1-F6 -> F7-F12 (Tanmatsu only has F1-F6 keys)
+					// META+F1 -> Dump stats to console
+					if (meta_held && is_down && code == SC_F1) {
+						globals.stats_dump_pending = true;
+						meta_consumed = true;
+						vTaskDelay(5 / portTICK_PERIOD_MS);
+						continue;
+					}
+
+					// META+F2 -> Toggle periodic stats logging
+					if (meta_held && is_down && code == SC_F2) {
+						globals.stats_log_active = !globals.stats_log_active;
+						meta_consumed = true;
+						vTaskDelay(5 / portTICK_PERIOD_MS);
+						continue;
+					}
+
+					// META+F3-F6 -> F9-F12 (Tanmatsu only has F1-F6 keys)
+					// (F7/F8 sacrificed for stats dump/log)
 					if (meta_held && code >= SC_F1 && code <= SC_F6) {
 						code = (code - SC_F1) + SC_F7;  // Map F1-F6 to F7-F12
 						meta_consumed = true;
