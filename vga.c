@@ -34,6 +34,7 @@
 
 #include "esp_attr.h"
 #include "esp_timer.h"
+#include "esp_cache.h"
 #include "common.h"
 
 #include "driver/bitscrambler_loopback.h"
@@ -358,6 +359,9 @@ struct VGAState {
     uint32_t retrace_time;
     int retrace_phase;
     int render_pending;  /* Set by 3DA polling optimization when V_RETRACE entered */
+    /* Scroll register snapshot — captured at render trigger to avoid race with CPU core */
+    uint32_t snap_start_addr;
+    uint8_t snap_panning;
     int force_8dm;
     int force_graphic_clear;  /* Force clear when switching to graphics mode */
 
@@ -1723,7 +1727,10 @@ static void vga_graphic_refresh(VGAState *s,
     }
     multi_run = multi_scan;
 
-    uint32_t start_addr = s->cr[0x0d] | (s->cr[0x0c] << 8);
+    /* Use snapshotted scroll registers to avoid race with CPU core.
+     * The snapshot is taken at render trigger time (vga_step or 3DA fast-forward)
+     * BEFORE the guest can react to retrace and update scroll position. */
+    uint32_t start_addr = s->snap_start_addr;
     uint32_t line_offset = s->cr[0x13];
     line_offset <<= 3;
     uint32_t line_compare = s->cr[0x18] |
@@ -1752,6 +1759,13 @@ static void vga_graphic_refresh(VGAState *s,
     uint32_t vram_wrap_size = vram_addr_mask + 1; /* wrap boundary */
     addr1 &= vram_addr_mask;
     uint8_t *vram = s->vga_ram;
+
+    /* Invalidate core 0's cache for VRAM so we see core 1's latest writes.
+     * Core 1 (CPU emulator) writes VRAM through its L1 cache; without this,
+     * core 0 may read stale VRAM data → tearing during software scroll. */
+    esp_cache_msync(vram, s->vga_ram_size,
+                    ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+
     uint32_t palette[256];
     uint32_t palette_before[16];  /* For mid-frame palette switching (top) */
     uint32_t palette_after[16];   /* For mid-frame palette switching (bottom) */
@@ -1872,12 +1886,12 @@ static void vga_graphic_refresh(VGAState *s,
     else
         split_y = (line_compare < (uint32_t)h) ? (int)line_compare : h;
 
-    /* Pixel panning: sub-character-clock horizontal shift (AR[0x13]) */
+    /* Pixel panning: use snapshotted AR[0x13] to avoid race with CPU core */
     int panning;
     if (shift_control <= 1)
-        panning = s->ar[0x13] & 7;      /* Planar/EGA: 0-7 pixel shift */
+        panning = s->snap_panning & 7;      /* Planar/EGA: 0-7 pixel shift */
     else
-        panning = (s->ar[0x13] >> 1) & 3; /* 256-color: 0-3 pixel shift */
+        panning = (s->snap_panning >> 1) & 3; /* 256-color: 0-3 pixel shift */
 
     /* BitScrambler batch state — accumulate dirty planar lines, DMA in one shot */
     int bs_batch_count = 0;
@@ -1887,6 +1901,18 @@ static void vga_graphic_refresh(VGAState *s,
     int bs_xdiv = 0;
     int bs_panning = 0;
     uint32_t *bs_batch_palette = NULL;  /* palette active for current batch */
+
+    /* Detect scroll register changes between frames.  When start_addr or
+     * panning changes, every scanline's visual content shifts even though
+     * the underlying VRAM bytes may hash identically.  Force all lines
+     * dirty so the hash-based skip in the planar path re-renders them. */
+    static uint32_t prev_start_addr = ~0u;
+    static uint8_t  prev_panning_raw = 0xFF;
+    if (start_addr != prev_start_addr || s->snap_panning != prev_panning_raw) {
+        vga_mark_all_dirty();
+        prev_start_addr = start_addr;
+        prev_panning_raw = s->snap_panning;
+    }
 
     for (int y = 0; y < h; y++) {
         /* VGA split screen: reset display address at line_compare */
@@ -1947,8 +1973,11 @@ static void vga_graphic_refresh(VGAState *s,
             {
             int gather_bytes = vram_line_bytes + (panning > 0 ? 4 : 0);
             if (bs_planar_handle && gather_bytes <= BS_MAX_LINE_BYTES) {
-                /* Rebuild palette LUTs if palette changed (hash-based detection) */
-                build_bs_palette_luts(cur_palette, cpe_mask);
+                /* Rebuild palette LUTs if palette changed (hash-based detection).
+                 * If palette changed, mark all lines dirty so hash-matched lines
+                 * still re-render with the new colors. */
+                if (build_bs_palette_luts(cur_palette, cpe_mask))
+                    vga_mark_all_dirty();
 
                 /* Dirty line check via hash comparison */
                 if (y < VGA_MAX_LINES) {
@@ -2452,13 +2481,16 @@ int vga_step(VGAState *s)
             s->st01 |= ST01_V_RETRACE;
             s->retrace_phase = 2;
             s->retrace_time = now + 833;
+            /* Render at start of vblank: captures the previous frame's
+             * complete state before the guest reacts to retrace and starts
+             * drawing the next frame. Timer-based path — no delay needed
+             * since the guest hasn't detected retrace yet. */
+            s->snap_start_addr = s->cr[0x0d] | (s->cr[0x0c] << 8);
+            s->snap_panning = s->ar[0x13];
+            ret = 1;
         } else {
             s->st01 &= ~(ST01_V_RETRACE | ST01_DISP_ENABLE);
             s->retrace_phase = 0;
-            /* Render at end of vblank: gives the guest the full vblank
-             * period to complete cursor XOR and other vblank-synced work
-             * before we capture the framebuffer. */
-            ret = 1;
             /* Reset mid-frame palette tracking for new frame */
             s->hblank_poll_count = 0;
             s->retrace_time = now + 15000/3;
@@ -2686,11 +2718,15 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
                         s->st01 |= ST01_V_RETRACE;
                         s->retrace_phase = 2;
                         s->retrace_time = now + 833;
+                        /* Render at start of vblank (matches vga_step logic).
+                         * Snapshot scroll regs NOW — the guest IN hasn't returned yet
+                         * so it hasn't had a chance to update start_addr/panning. */
+                        s->snap_start_addr = s->cr[0x0d] | (s->cr[0x0c] << 8);
+                        s->snap_panning = s->ar[0x13];
+                        s->render_pending = 1;
                     } else {
                         s->st01 &= ~(ST01_V_RETRACE | ST01_DISP_ENABLE);
                         s->retrace_phase = 0;
-                        /* Render at end of vblank (matches vga_step logic) */
-                        s->render_pending = 1;
                         /* Reset mid-frame palette tracking for new frame */
                         s->hblank_poll_count = 0;
                         s->retrace_time = now + 15000/3;
@@ -3321,8 +3357,6 @@ void IRAM_ATTR vga_mem_write(VGAState *s, uint32_t addr, uint8_t val8)
             /* Write mode 0: direct write all planes (fast == 2) */
             if (addr * 4 + 3 >= s->vga_ram_size)
                 return;
-            /* Mark 4KB page dirty for double buffering (addr is dword offset) */
-
             uint32_t val32 = val | (val << 8) | (val << 16) | (val << 24);
             uint8_t pmask = s->cached_plane_mask;
             if (pmask == 0x0f) {

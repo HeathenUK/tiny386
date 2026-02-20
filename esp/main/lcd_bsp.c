@@ -422,6 +422,11 @@ static void IRAM_ATTR rotate_vga_to_display(uint16_t *fb, uint16_t *fb_rotated)
 
 	// Try PPA first if not already failed
 	if (!use_software_rotation && ppa_srm_handle) {
+		/* Flush VGA framebuffer from CPU cache to PSRAM before PPA DMA reads it.
+		 * Without this, PPA may read stale cache lines → scanline misalignment. */
+		size_t fb_size = (size_t)vga_width * vga_height * sizeof(uint16_t);
+		esp_cache_msync(fb, fb_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
 		/* PPA reads native VGA content and scales with pixel doubling.
 		 * scale_x includes pixel_double factor (e.g., 2x for mode 13h).
 		 * This offloads pixel doubling from CPU to PPA hardware. */
@@ -506,6 +511,9 @@ static void screenshot_capture(uint16_t *fb, int width, int height)
 	}
 
 	size_t in_size = (size_t)width * height * 2;
+
+	/* Flush fb cache before JPEG DMA reads it */
+	esp_cache_msync(fb, in_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
 
 	/* Allocate output buffer with proper cache-line alignment for DMA */
 	size_t out_alloc = in_size / 5 + 4096;
@@ -683,6 +691,60 @@ void vga_task(void *arg)
 		if (globals.screenshot_pending && globals.fb) {
 			globals.screenshot_pending = false;
 			screenshot_capture((uint16_t *)globals.fb, vga_width, vga_height);
+		}
+
+		/* Burst capture: save consecutive frames as JPEGs for motion analysis */
+		if (globals.burst_capture_remaining > 0 && globals.fb) {
+			static int burst_seq = 0;
+			int remaining = globals.burst_capture_remaining;
+			if (remaining == 20) {
+				burst_seq = 0;  /* Reset sequence on new burst */
+				toast_show("Burst capture...");
+			}
+			/* Encode and save this frame */
+			if (jpeg_enc) {
+				/* Flush fb cache before JPEG DMA reads it */
+				size_t in_size = (size_t)vga_width * vga_height * 2;
+				esp_cache_msync(globals.fb, in_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+				size_t out_alloc = in_size / 5 + 4096;
+				jpeg_encode_memory_alloc_cfg_t out_mem_cfg = {
+					.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER,
+				};
+				size_t out_actual = 0;
+				uint8_t *out_buf = (uint8_t *)jpeg_alloc_encoder_mem(
+					out_alloc, &out_mem_cfg, &out_actual);
+				if (out_buf) {
+					jpeg_encode_cfg_t enc_cfg = {
+						.width = vga_width,
+						.height = vga_height,
+						.src_type = JPEG_ENCODE_IN_FORMAT_RGB565,
+						.sub_sample = JPEG_DOWN_SAMPLING_YUV420,
+						.image_quality = 90,
+					};
+					uint32_t jpg_size = 0;
+					esp_err_t ret = jpeg_encoder_process(jpeg_enc, &enc_cfg,
+						(const uint8_t *)globals.fb, in_size,
+						out_buf, out_actual, &jpg_size);
+					if (ret == ESP_OK) {
+						char fname[48];
+						snprintf(fname, sizeof(fname),
+						         "/sdcard/burst_%03d.jpg", burst_seq);
+						FILE *f = fopen(fname, "wb");
+						if (f) {
+							fwrite(out_buf, 1, jpg_size, f);
+							fclose(f);
+						}
+					}
+					free(out_buf);
+				}
+			}
+			burst_seq++;
+			globals.burst_capture_remaining = remaining - 1;
+			if (remaining - 1 == 0) {
+				char msg[48];
+				snprintf(msg, sizeof(msg), "Burst: %d frames saved", burst_seq);
+				toast_show(msg);
+			}
 		}
 
 		// Rotate + overlay into our buffer, then DMA to panel FB at TE

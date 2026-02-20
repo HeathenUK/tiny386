@@ -103,6 +103,7 @@ struct Globals {
 
 	// INI switch (runtime)
 	bool _Atomic screenshot_pending;      // Screenshot requested (Meta+S)
+	int _Atomic burst_capture_remaining;  // Burst capture: frames left (Meta+B)
 
 	bool _Atomic ini_switch_pending;      // Switch to different INI requested
 	char ini_switch_path[256];    // Path to new INI file

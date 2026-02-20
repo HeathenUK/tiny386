@@ -390,6 +390,14 @@ static void input_task(void *arg)
 						continue;
 					}
 
+					// META+B -> Burst capture (~1 second of frames)
+					if (meta_held && is_down && code == 0x30) {
+						globals.burst_capture_remaining = 20;
+						meta_consumed = true;
+						vTaskDelay(5 / portTICK_PERIOD_MS);
+						continue;
+					}
+
 					handle_scancode(code, is_down);
 				}
 
