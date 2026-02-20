@@ -1348,6 +1348,8 @@ void sb16_mixer_write_indexb(void *opaque, uint32_t nport, uint32_t val)
     s->mixer_nreg = val;
 }
 
+static int SB_read_DMA(void *opaque, int nchan, int dma_pos, int dma_len);
+
 void sb16_mixer_write_datab(void *opaque, uint32_t nport, uint32_t val)
 {
     SB16State *s = opaque;
@@ -1372,19 +1374,33 @@ void sb16_mixer_write_datab(void *opaque, uint32_t nport, uint32_t val)
 
     case 0x81:
         {
-            int dma, hdma;
+            int dma = s->dma, hdma = s->hdma;
 
-            dma = __builtin_ctz (val & 0xf);
-            hdma = __builtin_ctz (val & 0xf0);
-            if (dma != s->dma || hdma != s->hdma) {
-                qemu_log_mask(LOG_GUEST_ERROR, "attempt to change DMA 8bit"
-                              " %d(%d), 16bit %d(%d) (val=%#x)\n", dma, s->dma,
-                              hdma, s->hdma, val);
+            if (val & 0xf)
+                dma = __builtin_ctz(val & 0xf);
+            if (val & 0xf0)
+                hdma = __builtin_ctz(val & 0xf0);
+            if (dma != s->dma) {
+                dolog("DMA 8bit channel %d -> %d\n", s->dma, dma);
+                /* Move handler and DREQ to new channel */
+                i8257_dma_register_channel(s->isa_dma, s->dma, NULL, NULL);
+                if (s->dma_running && !s->use_hdma)
+                    i8257_dma_release_DREQ(s->isa_dma, s->dma);
+                s->dma = dma;
+                i8257_dma_register_channel(s->isa_dma, s->dma, SB_read_DMA, s);
+                if (s->dma_running && !s->use_hdma)
+                    i8257_dma_hold_DREQ(s->isa_dma, s->dma);
             }
-#if 0
-            s->dma = dma;
-            s->hdma = hdma;
-#endif
+            if (hdma != s->hdma) {
+                dolog("DMA 16bit channel %d -> %d\n", s->hdma, hdma);
+                i8257_dma_register_channel(s->isa_hdma, s->hdma, NULL, NULL);
+                if (s->dma_running && s->use_hdma)
+                    i8257_dma_release_DREQ(s->isa_hdma, s->hdma);
+                s->hdma = hdma;
+                i8257_dma_register_channel(s->isa_hdma, s->hdma, SB_read_DMA, s);
+                if (s->dma_running && s->use_hdma)
+                    i8257_dma_hold_DREQ(s->isa_hdma, s->hdma);
+            }
         }
         break;
 
