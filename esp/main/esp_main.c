@@ -474,19 +474,14 @@ static void i386_task(void *arg)
 	long pcram_off_base = pcram_off;
 	long psram_off_base = psram_off;
 
-	/* ── Main emulation loop (re-enters on INI switch) ──────────── */
+	/* ── Main emulation loop (re-enters on INI switch or APM shutdown) ── */
 	for (;;) {
 		fprintf(stderr, "Loading INI: %s\n", ini_path);
 		int ret = pc_main(ini_path);
 
-		if (ret != 1) {
-			/* Normal shutdown or error — stop */
-			break;
-		}
-
-		/* INI switch requested — tear down and reinitialise */
-		fprintf(stderr, "INI switch: resetting pcram (%ld -> %ld) psram (%ld -> %ld)\n",
-		        pcram_off, pcram_off_base, psram_off, psram_off_base);
+		/* Common teardown: reset memory pools and stale statics */
+		fprintf(stderr, "pc_main returned %d, resetting pcram (%ld -> %ld) psram (%ld -> %ld)\n",
+		        ret, pcram_off, pcram_off_base, psram_off, psram_off_base);
 		pcram_off = pcram_off_base;
 		memset(pcram + pcram_off_base, 0,
 		       pcram_len - pcram_off_base);
@@ -506,10 +501,21 @@ static void i386_task(void *arg)
 		/* Clear BIT0 so that vga_task / input_task know PC is gone */
 		xEventGroupClearBits(global_event_group, BIT0);
 
-		/* Pick up the new path that was set by the OSD or selector */
-		ini_path = globals.ini_switch_path;
-
-		fprintf(stderr, "Restarting with: %s\n", ini_path);
+		if (ret == 1) {
+			/* INI switch — pick up the new path set by OSD */
+			ini_path = globals.ini_switch_path;
+			fprintf(stderr, "INI switch to: %s\n", ini_path);
+		} else {
+			/* APM shutdown or error — show INI selector (no auto-boot) */
+			fprintf(stderr, "Guest shutdown — showing INI selector\n");
+			ini_selector_start(false);
+			while (!globals.ini_selector_done)
+				vTaskDelay(pdMS_TO_TICKS(50));
+			ini_path = globals.ini_selected_path;
+			if (!ini_path[0]) {
+				ini_path = globals.current_ini_path;
+			}
+		}
 	}
 
 	vTaskDelete(NULL);
