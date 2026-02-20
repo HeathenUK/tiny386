@@ -630,7 +630,6 @@ void pc_step(PC *pc)
 	bool collecting = globals.stats_collecting;
 	if (collecting) t1 = get_uticks();  /* After peripherals */
 	cpui386_set_diag(pc->cpu, globals.cpu_debug_enabled);
-	ide_set_debug(globals.cpu_debug_enabled);
 	cpui386_step(pc->cpu, batch_size);
 
 	/* HLT fast-forward: if CPU is still halted after peripheral servicing

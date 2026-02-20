@@ -44,23 +44,6 @@
 #include <stdbool.h>
 #define IDE_ACTIVITY() led_activity_hdd()
 
-/* ---- Disk I/O debug trace ---- */
-static bool ide_debug = false;
-
-void ide_set_debug(bool enabled) { ide_debug = enabled; }
-
-/* Minimal CRC32 for data checksums — no table, compact */
-static uint32_t ide_crc32(const uint8_t *buf, int len)
-{
-    uint32_t crc = 0xFFFFFFFF;
-    for (int i = 0; i < len; i++) {
-        crc ^= buf[i];
-        for (int j = 0; j < 8; j++)
-            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
-    }
-    return ~crc;
-}
-
 #define SDMMC_RETRY_COUNT 8
 #define SDMMC_RETRY_DELAY_MS 2
 static SemaphoreHandle_t sdmmc_io_mutex = NULL;
@@ -758,13 +741,6 @@ static void ide_sector_read_cb(void *opaque, int ret)
         }
     }
 #endif
-    if (ide_debug) {
-        int64_t sec = ide_get_sector(s);
-        for (int i = 0; i < n; i++)
-            fprintf(stderr, "[R] lba=%lld crc=%08x\n",
-                    (long long)(sec - n + i),
-                    ide_crc32(s->io_buffer + i * 512, 512));
-    }
     ide_set_sector(s, ide_get_sector(s) + n);
     s->nsector = (s->nsector - n) & 0xff;
     if (s->nsector == 0)
@@ -796,12 +772,6 @@ static void ide_sector_write_cb1(IDEState *s)
     printf("write sector=%" PRId64 "  count=%d\n",
            sector_num, s->io_nb_sectors);
 #endif
-    if (ide_debug) {
-        for (int i = 0; i < s->io_nb_sectors; i++)
-            fprintf(stderr, "[W] lba=%lld crc=%08x\n",
-                    (long long)(sector_num + i),
-                    ide_crc32(s->io_buffer + i * 512, 512));
-    }
     IDE_ACTIVITY();
     ret = s->bs->write_async(s->bs, sector_num, s->io_buffer, s->io_nb_sectors,
                              ide_sector_write_cb2, s);
@@ -2472,8 +2442,6 @@ static void io_task(void *arg)
                     batch++;
                 }
 
-                if (ide_debug)
-                    fprintf(stderr, "[D] sd=%u batch=%u\n", sd_start, batch);
                 esp_err_t werr = sdmmc_write_sectors_retry(wcache.card,
                                                            wcache.data + t * SECTOR_SIZE,
                                                            sd_start, batch);
@@ -2596,16 +2564,12 @@ static void wcache_flush(void)
         return;
     uint32_t h = __atomic_load_n(&wcache.head, __ATOMIC_ACQUIRE);
     uint32_t t = __atomic_load_n(&wcache.tail, __ATOMIC_ACQUIRE);
-    if (ide_debug)
-        fprintf(stderr, "[FLUSH] head=%u tail=%u pending=%u\n", h, t, h - t);
     /* Wake the IO task in case it's sleeping */
     xSemaphoreGive(wcache.not_empty);
     /* Spin until drained */
     while (__atomic_load_n(&wcache.tail, __ATOMIC_ACQUIRE) !=
            __atomic_load_n(&wcache.head, __ATOMIC_ACQUIRE))
         vTaskDelay(1);
-    if (ide_debug)
-        fprintf(stderr, "[FLUSH] done\n");
 }
 
 static void wcache_report_stats(void)
@@ -3065,9 +3029,6 @@ static int bf_write_async(BlockDevice *bs,
                 if (sd_sector == (uint32_t)-1)
                     return -1;
                 int chunk = (n < contig) ? n : contig;
-                if (ide_debug)
-                    fprintf(stderr, "[E] disk=%llu file=%u sd=%u n=%d contig=%d\n",
-                            (unsigned long long)sector_num, file_sector, sd_sector, chunk, contig);
                 wcache_enqueue(bf, sector_num, sd_sector, buf, chunk);
                 buf += chunk * SECTOR_SIZE;
                 file_sector += chunk;
@@ -3832,12 +3793,6 @@ int ide_block_read(BlockDevice *bs, uint64_t sector_num, uint8_t *buf, int nsect
     ret = bs->read_async(bs, sector_num, buf, nsectors, NULL, NULL);
     if (ret == 0) {
         ide_stat_sectors_read += nsectors;
-        if (ide_debug) {
-            for (int i = 0; i < nsectors; i++)
-                fprintf(stderr, "[HR] lba=%lld crc=%08x\n",
-                        (long long)(sector_num + i),
-                        ide_crc32(buf + i * 512, 512));
-        }
     }
     return (ret <= 0) ? ret : -1;
 }
@@ -3847,12 +3802,6 @@ int ide_block_write(BlockDevice *bs, uint64_t sector_num, const uint8_t *buf, in
     int ret;
     if (!bs || !buf || nsectors <= 0)
         return -1;
-    if (ide_debug) {
-        for (int i = 0; i < nsectors; i++)
-            fprintf(stderr, "[HW] lba=%lld crc=%08x\n",
-                    (long long)(sector_num + i),
-                    ide_crc32(buf + i * 512, 512));
-    }
     ret = bs->write_async(bs, sector_num, buf, nsectors, NULL, NULL);
     if (ret == 0) ide_stat_sectors_written += nsectors;
     return (ret <= 0) ? ret : -1;
@@ -4460,14 +4409,10 @@ static void ide_sync_if(IDEIFState *s)
 
 void ide_sync(IDEIFState *ide, IDEIFState *ide2)
 {
-    if (ide_debug)
-        fprintf(stderr, "[SYNC] begin\n");
     wcache_flush();
     wcache_report_stats();
     ide_sync_if(ide);
     ide_sync_if(ide2);
-    if (ide_debug)
-        fprintf(stderr, "[SYNC] done\n");
 }
 
 /* Close all open file handles on an IDE interface (for teardown). */

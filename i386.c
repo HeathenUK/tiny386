@@ -6747,6 +6747,42 @@ static void cpu_diag_log_int2f(CPUI386 *cpu)
 static bool call_isr(CPUI386 *cpu, int no, bool pusherr, int ext);
 static bool call_isr_vm86_softint(CPUI386 *cpu, int no);
 
+/* Translate a linear address range to a contiguous physical address.
+ * Returns the physical address of the first byte, or (u32)-1 if unmapped
+ * or the physical pages are not contiguous (in which case HLE should fall
+ * back to the BIOS so the normal paged memory path handles it). */
+static u32 hle_lin_to_phys(CPUI386 *cpu, u32 linear, u32 size)
+{
+	if (!(cpu->cr0 & CR0_PG)) {
+		u32 pa = linear & cpu->a20_mask;
+		if ((uint64_t)pa + size > (uint64_t)cpu->phys_mem_size)
+			return (u32)-1;
+		return pa;
+	}
+	u32 first_pa;
+	if (!laddr_to_paddr_noexcept(cpu, linear, &first_pa))
+		return (u32)-1;
+	if (size <= 1)
+		return first_pa;
+	/* Walk each page boundary and verify physical contiguity */
+	u32 end = linear + size - 1;
+	u32 next_page = (linear & ~0xFFFu) + 0x1000;
+	u32 expected_pa = (first_pa & ~0xFFFu) + 0x1000;
+	while (next_page <= (end & ~0xFFFu)) {
+		u32 pa;
+		if (!laddr_to_paddr_noexcept(cpu, next_page, &pa))
+			return (u32)-1;
+		if (pa != expected_pa)
+			return (u32)-1;
+		next_page += 0x1000;
+		expected_pa += 0x1000;
+	}
+	if (first_pa >= (u32)cpu->phys_mem_size ||
+	    first_pa + size - 1 >= (u32)cpu->phys_mem_size)
+		return (u32)-1;
+	return first_pa;
+}
+
 /* BIOS High-Level Emulation: intercept INT 15h calls that use problematic
  * GCC -m16 encodings.  SeaBIOS compiles handle_1587() with -m16, producing
  * 67h-prefixed LGDT that Win386/Win95 VMM can't decode in V86 mode.
@@ -7230,11 +7266,12 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 			if (count > 128) count = 128;
 
 			uint64_t lba = ((uint64_t)cyl * heads + head) * spt + (sec - 1);
-			u32 buf_phys = (cpu->seg[SEG_ES].base + (lreg16(3) & 0xFFFF)) & cpu->a20_mask;
+			u32 buf_lin = (cpu->seg[SEG_ES].base + (lreg16(3) & 0xFFFF)) & cpu->a20_mask;
+			u32 buf_phys = hle_lin_to_phys(cpu, buf_lin, (u32)count * 512);
+			if (buf_phys == (u32)-1)
+				return false; /* non-contiguous or unmapped — fall back to BIOS */
 
-			/* Bounds check */
-			if ((uint64_t)buf_phys + (uint64_t)count * 512 > (uint64_t)cpu->phys_mem_size ||
-			    lba + count > (uint64_t)total_sectors) {
+			if (lba + count > (uint64_t)total_sectors) {
 				sreg16(0, (lreg16(0) & 0x00FF) | 0x0400); /* AH=4, sector not found */
 				refresh_flags(cpu);
 				cpu->cc.mask = 0;
@@ -7311,8 +7348,9 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 			/* Extended read/write. DAP at DS:SI:
 			 * [0] u8 size, [1] u8 0, [2] u16 count,
 			 * [4] u16 buf_off, [6] u16 buf_seg, [8] u64 lba */
-			u32 dap_phys = (cpu->seg[SEG_DS].base + (lreg16(6) & 0xFFFF)) & cpu->a20_mask;
-			if (dap_phys + 16 > (u32)cpu->phys_mem_size)
+			u32 dap_lin = (cpu->seg[SEG_DS].base + (lreg16(6) & 0xFFFF)) & cpu->a20_mask;
+			u32 dap_phys = hle_lin_to_phys(cpu, dap_lin, 16);
+			if (dap_phys == (u32)-1)
 				return false;
 
 			u8 *dap = (u8 *)&cpu->phys_mem[dap_phys];
@@ -7332,9 +7370,12 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 				return true;
 			}
 
-			u32 buf_phys = (((u32)buf_seg << 4) + buf_off) & cpu->a20_mask;
-			if ((uint64_t)buf_phys + (uint64_t)count * 512 > (uint64_t)cpu->phys_mem_size ||
-			    lba + count > (uint64_t)total_sectors) {
+			u32 buf_lin = (((u32)buf_seg << 4) + buf_off) & cpu->a20_mask;
+			u32 buf_phys = hle_lin_to_phys(cpu, buf_lin, (u32)count * 512);
+			if (buf_phys == (u32)-1)
+				return false; /* non-contiguous or unmapped — fall back to BIOS */
+
+			if (lba + count > (uint64_t)total_sectors) {
 				sreg16(0, (lreg16(0) & 0x00FF) | 0x0400); /* AH=4 */
 				refresh_flags(cpu);
 				cpu->cc.mask = 0;
@@ -7368,8 +7409,9 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 			 * Minimum 26 bytes: [0] u16 size, [2] u16 flags,
 			 * [4] u32 cyls, [8] u32 heads, [12] u32 spt,
 			 * [16] u64 total_sectors, [24] u16 bytes_per_sector */
-			u32 res_phys = (cpu->seg[SEG_DS].base + (lreg16(6) & 0xFFFF)) & cpu->a20_mask;
-			if (res_phys + 26 > (u32)cpu->phys_mem_size)
+			u32 res_lin = (cpu->seg[SEG_DS].base + (lreg16(6) & 0xFFFF)) & cpu->a20_mask;
+			u32 res_phys = hle_lin_to_phys(cpu, res_lin, 26);
+			if (res_phys == (u32)-1)
 				return false;
 
 			u8 *res = (u8 *)&cpu->phys_mem[res_phys];
@@ -7417,15 +7459,16 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 		u32 gdt_lin = (cpu->seg[SEG_ES].base + si) & cpu->a20_mask;
 		u32 byte_count = (u32)cx * 2;
 
-		/* Bounds check GDT access (need 48 bytes: 6 descriptors x 8) */
-		if (gdt_lin + 48 > (u32)cpu->phys_mem_size)
+		/* Translate GDT pointer through page tables if paging is on */
+		u32 gdt_phys = hle_lin_to_phys(cpu, gdt_lin, 48);
+		if (gdt_phys == (u32)-1)
 			return false; /* fall through to BIOS */
 
 		if (byte_count == 0) goto hle87_ok;
 
 		/* Extract 32-bit base addresses from segment descriptors */
-		u8 *sd = &cpu->phys_mem[gdt_lin + 0x10]; /* source = descriptor 2 */
-		u8 *dd = &cpu->phys_mem[gdt_lin + 0x18]; /* dest   = descriptor 3 */
+		u8 *sd = &cpu->phys_mem[gdt_phys + 0x10]; /* source = descriptor 2 */
+		u8 *dd = &cpu->phys_mem[gdt_phys + 0x18]; /* dest   = descriptor 3 */
 		u32 src = sd[2] | (sd[3] << 8) | (sd[4] << 16) | (sd[7] << 24);
 		u32 dst = dd[2] | (dd[3] << 8) | (dd[4] << 16) | (dd[7] << 24);
 
