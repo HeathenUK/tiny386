@@ -48,6 +48,10 @@
 #define SDMMC_RETRY_DELAY_MS 2
 static SemaphoreHandle_t sdmmc_io_mutex = NULL;
 
+/* I/O stats: counts ALL disk activity (HLE + emulated IDE + CD-ROM) */
+static uint32_t ide_stat_sectors_read;
+static uint32_t ide_stat_sectors_written;
+
 static esp_err_t sdmmc_read_sectors_retry(sdmmc_card_t *card, void *dst,
                                           size_t start_sector, size_t sector_count)
 {
@@ -693,6 +697,7 @@ static void ide_sector_read(IDEState *s)
 #endif
     s->io_nb_sectors = n;
     IDE_ACTIVITY();
+    ide_stat_sectors_read += n;
     ret = s->bs->read_async(s->bs, sector_num, s->io_buffer, n,
                             ide_sector_read_cb, s);
     if (ret < 0) {
@@ -773,6 +778,7 @@ static void ide_sector_write_cb1(IDEState *s)
            sector_num, s->io_nb_sectors);
 #endif
     IDE_ACTIVITY();
+    ide_stat_sectors_written += s->io_nb_sectors;
     ret = s->bs->write_async(s->bs, sector_num, s->io_buffer, s->io_nb_sectors,
                              ide_sector_write_cb2, s);
     if (ret < 0) {
@@ -1212,6 +1218,8 @@ static int cd_read_sector(BlockDevice *bs, int lba, uint8_t *buf,
     case 2048:
         ret = bs->read_async(bs, (int64_t)lba << 2, buf, 4,
                              NULL, NULL); // XXX
+        if (ret >= 0)
+            ide_stat_sectors_read += 4;  /* 4 x 512-byte sectors per CD sector */
         break;
     default:
         ret = -1;
@@ -3781,9 +3789,6 @@ int ide_block_reopen_rw(BlockDevice *bs, const char *filename)
     /* Not currently supported for generic RW block devices. */
     return -1;
 }
-
-static uint32_t ide_stat_sectors_read;
-static uint32_t ide_stat_sectors_written;
 
 int ide_block_read(BlockDevice *bs, uint64_t sector_num, uint8_t *buf, int nsectors)
 {
