@@ -7222,7 +7222,10 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 	}
 
 	/* ---- INT 13h: Disk ---- */
-	if (intno == 0x13 && !v86_vmm) {
+	/* DISABLED: HLE bypasses BIOS INT 13h entirely during DOS boot, leaving
+	 * BIOS internal state (BDA disk status, IDE controller) uninitialized.
+	 * Win386 depends on this state when it later does V86 disk I/O. */
+	if (0 && intno == 0x13 && !v86_vmm) {
 		u8 ah13 = (lreg32(0) >> 8) & 0xFF;
 		u8 dl = lreg32(2) & 0xFF; /* drive number */
 
@@ -7271,12 +7274,8 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 		}
 
 		if (ah13 == 0x00) {
-			/* Reset disk — noop for HLE */
-			sreg16(0, lreg16(0) & 0x00FF); /* AH = 0 */
-			refresh_flags(cpu);
-			cpu->cc.mask = 0;
-			cpu->flags &= ~CF;
-			return true;
+			/* Reset disk — let BIOS handle (has side effects on controller state) */
+			return false;
 		}
 
 		if (ah13 == 0x02 || ah13 == 0x03) {
@@ -7337,51 +7336,11 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 			return true;
 		}
 
-		if (ah13 == 0x08) {
-			/* Get drive parameters.
-			 * Returns: CH=max cyl low 8, CL=max sec | (max cyl hi << 6),
-			 *          DH=max head, DL=drive count, AH=0, CF=0 */
-			int max_cyl = cyls - 1;
-			int max_head = heads - 1;
-			int max_sec = spt;
-			sreg16(0, lreg16(0) & 0x00FF); /* AH=0 */
-			sreg16(1, (max_cyl & 0xFF) << 8 | (max_sec & 0x3F) | ((max_cyl >> 2) & 0xC0));
-			sreg16(2, (drive_count & 0xFF) | ((max_head & 0xFF) << 8)); /* DL=drive count, DH=max_head */
-			sreg16(3, (lreg16(3) & 0xFF00)); /* BL=0 (floppy type, N/A for HD) */
-			refresh_flags(cpu);
-			cpu->cc.mask = 0;
-			cpu->flags &= ~CF;
-			return true;
-		}
+		/* AH=08h, 15h, 41h: Let BIOS handle informational/control calls.
+		 * HLE responses may differ from BIOS (geometry, EDD support) which
+		 * can confuse Win386 when it later queries the BIOS in V86 mode. */
 
-		if (ah13 == 0x15) {
-			/* Get disk type. Returns AH=3 (hard disk) for fixed disks. */
-			/* CX:DX = total sectors */
-			u32 ts = (total_sectors > 0xFFFFFFFF) ? 0xFFFFFFFF : (u32)total_sectors;
-			sreg16(0, (lreg16(0) & 0x00FF) | 0x0300); /* AH=3 */
-			sreg16(1, (ts >> 16) & 0xFFFF); /* CX = high word */
-			sreg16(2, ts & 0xFFFF);         /* DX = low word */
-			refresh_flags(cpu);
-			cpu->cc.mask = 0;
-			cpu->flags &= ~CF;
-			return true;
-		}
-
-		if (ah13 == 0x41) {
-			/* Check extensions present.
-			 * BX=0x55AA on entry → BX=0xAA55, AH=version, CX=API bitmap */
-			if (lreg16(3) != 0x55AA)
-				return false;
-			sreg16(3, 0xAA55); /* BX = signature */
-			sreg16(0, (lreg16(0) & 0x00FF) | 0x2100); /* AH = 0x21 (version 2.1) */
-			sreg16(1, 0x0001); /* CX = API subset: extended disk access */
-			refresh_flags(cpu);
-			cpu->cc.mask = 0;
-			cpu->flags &= ~CF;
-			return true;
-		}
-
-		if (ah13 == 0x42 || ah13 == 0x43) {
+		if (0 && (ah13 == 0x42 || ah13 == 0x43)) {
 			/* Extended read/write. DAP at DS:SI:
 			 * [0] u8 size, [1] u8 0, [2] u16 count,
 			 * [4] u16 buf_off, [6] u16 buf_seg, [8] u64 lba */
@@ -7441,7 +7400,7 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 			return true;
 		}
 
-		if (ah13 == 0x48) {
+		if (0 && ah13 == 0x48) {
 			/* Get extended drive parameters. Result buffer at DS:SI.
 			 * Minimum 26 bytes: [0] u16 size, [2] u16 flags,
 			 * [4] u32 cyls, [8] u32 heads, [12] u32 spt,

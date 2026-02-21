@@ -1760,11 +1760,9 @@ static void vga_graphic_refresh(VGAState *s,
     addr1 &= vram_addr_mask;
     uint8_t *vram = s->vga_ram;
 
-    /* Invalidate core 0's cache for VRAM so we see core 1's latest writes.
-     * Core 1 (CPU emulator) writes VRAM through its L1 cache; without this,
-     * core 0 may read stale VRAM data → tearing during software scroll. */
-    esp_cache_msync(vram, s->vga_ram_size,
-                    ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    /* TODO: VRAM cache coherency between cores.  M2C invalidate was tried
+     * here but causes scanline artifacts in planar modes (Mode 12h) because
+     * it exposes partially-written VRAM from core 1. Disabled for now. */
 
     uint32_t palette[256];
     uint32_t palette_before[16];  /* For mid-frame palette switching (top) */
