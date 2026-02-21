@@ -16,6 +16,8 @@ int pc_batch_size_setting = 0;
 int pc_last_batch_size = 0;
 // PIT burst catch-up: 1=enabled (default), 0=disabled
 int pc_pit_burst_setting = 1;
+// Accuracy mode: 0=full (default), 1=fast
+int pc_accuracy_setting = 0;
 
 #define cpu_raise_irq cpui386_raise_irq
 #define cpu_get_cycle cpui386_get_cycle
@@ -235,6 +237,10 @@ static void pc_io_write(void *o, int addr, u8 val)
 	switch(addr) {
 	case 0x80: case 0xed:
 		/* used by linux, for io delay */
+		return;
+	case 0xe9:
+		/* Bochs-style debug console: guest character → host serial */
+		printf("%c", val);
 		return;
 	case 0x20: case 0x21: case 0xa0: case 0xa1:
 		i8259_ioport_write(pc->pic, addr, val);
@@ -1547,6 +1553,11 @@ int parse_conf_ini(void* user, const char* section,
 				conf->batch_size = bs;
 			} else if (NAME("pit_burst")) {
 				conf->pit_burst = atoi(value) ? 1 : 0;
+			} else if (NAME("accuracy")) {
+				if (strcmp(value, "fast") == 0)
+					conf->accuracy = 1;
+				else
+					conf->accuracy = 0;
 			}
 		}
 #undef SEC

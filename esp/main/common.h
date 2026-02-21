@@ -91,6 +91,7 @@ struct Globals {
 	int cpu_gen;                  // CPU generation (3=386, 4=486, 5=586)
 	int fpu;                      // FPU enabled (0/1)
 	int mem_size_mb;              // Guest RAM in MB (actual, after PSRAM cap)
+	int accuracy;                         // 0=full, 1=fast (DOS compat mode)
 	bool _Atomic cpu_debug_enabled;       // CPU debug instrumentation enabled (OSD toggle)
 
 	// INI selector state

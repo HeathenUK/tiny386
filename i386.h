@@ -95,6 +95,7 @@ void cpu_setflags(CPUI386 *cpu, uword set_mask, uword clear_mask);
 uword cpu_getflags(CPUI386 *cpu);
 void cpu_abort(CPUI386 *cpu, int code);
 void cpui386_set_diag(CPUI386 *cpu, bool enabled);
+void cpui386_set_fast_mode(CPUI386 *cpu, bool enabled);
 bool cpui386_is_halted(CPUI386 *cpu);
 void cpui386_get_perf_counters(CPUI386 *cpu, uint32_t *tlb_miss, uint32_t *irq,
                                uint32_t *fusion, uint32_t *hle_hit, uint32_t *hle_call);

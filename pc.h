@@ -117,6 +117,7 @@ typedef struct {
 	int usb_passthru; // 1=enabled, 0=disabled - pass USB storage to emulator (ESP32 only)
 	int hda_heads;    // 0=auto-detect, or override CHS heads for hda
 	int hda_spt;      // 0=auto-detect, or override CHS sectors-per-track for hda
+	int accuracy;     // 0=full (default), 1=fast (skip non-essential checks)
 	const char *ini_path;  // Path to ini file for saving settings
 } PCConfig;
 
@@ -136,6 +137,8 @@ extern int pc_batch_size_setting;
 extern int pc_last_batch_size;
 // PIT burst catch-up setting: 1=enabled, 0=disabled
 extern int pc_pit_burst_setting;
+// Accuracy mode: 0=full (default), 1=fast (skip non-essential checks)
+extern int pc_accuracy_setting;
 
 int parse_conf_ini(void* user, const char* section,
 		   const char* name, const char* value);

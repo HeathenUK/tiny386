@@ -109,6 +109,7 @@ typedef enum {
 	SYS_MEMSIZE,
 	SYS_BATCH,
 	SYS_PIT_BURST,
+	SYS_ACCURACY,
 	SYS_MOUSE_SPEED,
 	SYS_STATS_BAR,
 	SYS_CPU_DEBUG,
@@ -160,6 +161,8 @@ struct OSD {
 	int mem_size_mb; // Memory in MB (1 to 24)
 	int batch_size;  // 0=auto, or fixed value (512-4096 in 256 increments)
 	int pit_burst;   // 1=enabled, 0=disabled
+	int accuracy;    // 0=full, 1=fast
+	int boot_accuracy; // accuracy at boot (core switch requires reboot)
 	int mouse_speed; // 1-10, mouse emulation speed
 	int usb_passthru; // 1=enabled (default), 0=disabled (requires restart)
 
@@ -759,7 +762,7 @@ static const char *cpu_gen_names[] = { "i386", "i486", "i586" };
 // Render system settings submenu
 static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], pitburst_val[16], mouse_val[16], statsbar_val[16], cpudbg_val[16];
+	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], pitburst_val[16], accuracy_val[16], mouse_val[16], statsbar_val[16], cpudbg_val[16];
 
 	// CPU generation (3=386, 4=486, 5=586)
 	int gen_idx = osd->cpu_gen - 3;
@@ -783,6 +786,12 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	// PIT burst catch-up
 	snprintf(pitburst_val, sizeof(pitburst_val), "%s", osd->pit_burst ? "On" : "Off");
 
+	// Accuracy mode (show reboot indicator when changed from boot-time value)
+	if (osd->accuracy != osd->boot_accuracy)
+		snprintf(accuracy_val, sizeof(accuracy_val), "%s (reboot)", osd->accuracy ? "Fast" : "Full");
+	else
+		snprintf(accuracy_val, sizeof(accuracy_val), "%s", osd->accuracy ? "Fast" : "Full");
+
 	// Mouse speed (1-10)
 	snprintf(mouse_val, sizeof(mouse_val), "%d", osd->mouse_speed);
 
@@ -800,6 +809,7 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 		{ "Memory:", 0, 0, mem_val },
 		{ "Batch:", 0, 0, batch_val },
 		{ "PIT Burst:", 0, 0, pitburst_val },
+		{ "Accuracy:", 0, 0, accuracy_val },
 		{ "Mouse Speed:", 0, 0, mouse_val },
 		{ "Stats Bar:", 0, 0, statsbar_val },
 #ifdef CPU_DIAG
@@ -1662,8 +1672,10 @@ static int handle_main_select(OSD *osd)
 			                              osd->cpu_gen, osd->fpu, osd_get_mem_size_bytes(osd),
 			                              osd->brightness, osd->volume, osd->frame_skip,
 			                              osd->batch_size, osd->pit_burst, osd->mouse_speed,
-			                              osd->usb_passthru);
+			                              osd->usb_passthru, osd->accuracy);
 			if (rc == 0) {
+				// Sync restart-only settings to globals for next restart
+				globals.accuracy = osd->accuracy;
 				toast_show("Settings saved");
 			} else {
 				toast_show("Save failed");
@@ -1683,10 +1695,17 @@ static int handle_main_select(OSD *osd)
 	case MAIN_RESTART_EMU:
 		toast_show("Restarting emulator...");
 		led_activity_off();  // Clear activity LEDs
-		// Copy new HDA path to globals for esp_main to use
-		strncpy(globals.emu_new_hda_path, osd->hda_path, sizeof(globals.emu_new_hda_path) - 1);
-		globals.emu_new_hda_path[sizeof(globals.emu_new_hda_path) - 1] = '\0';
-		globals.emu_restart_pending = true;  // Signal emulator restart (reload config)
+		// Sync OSD settings to globals so they persist across restart
+		globals.accuracy = osd->accuracy;
+		// Use full INI switch path (teardown + re-parse) so saved
+		// settings like cpu_gen, accuracy, mem_size take effect.
+		// Copy current INI path as the "new" INI to reload.
+		if (osd->pc && osd->pc->ini_path) {
+			strncpy(globals.ini_switch_path, osd->pc->ini_path,
+				sizeof(globals.ini_switch_path) - 1);
+			globals.ini_switch_path[sizeof(globals.ini_switch_path) - 1] = '\0';
+		}
+		globals.ini_switch_pending = true;
 		return 1;  // Close OSD
 	case MAIN_EXIT_LAUNCHER:
 		led_activity_off();  // Clear activity LEDs
@@ -1759,6 +1778,9 @@ static void handle_sys_adjust(OSD *osd, int delta)
 		// Apply immediately (takes effect next pc_step)
 		pc_pit_burst_setting = osd->pit_burst;
 		break;
+	case SYS_ACCURACY:
+		osd->accuracy = !osd->accuracy;
+		break;
 	case SYS_MOUSE_SPEED:
 		osd->mouse_speed += delta;
 		if (osd->mouse_speed < 1) osd->mouse_speed = 10;  // Wrap
@@ -1796,6 +1818,8 @@ OSD *osd_init(void)
 	osd->frame_skip = vga_frame_skip_max;  // Load from config
 	osd->batch_size = pc_batch_size_setting;  // Load from config (0=auto)
 	osd->pit_burst = pc_pit_burst_setting ? 1 : 0;  // Load from config (1=enabled)
+	osd->accuracy = pc_accuracy_setting ? 1 : 0;  // Load from config (0=full)
+	osd->boot_accuracy = osd->accuracy;  // Remember boot-time value for reboot indicator
 	osd->mouse_speed = globals.mouse_speed > 0 ? globals.mouse_speed : 5;  // Load from config, default 5
 	osd->usb_passthru = globals.usb_passthru >= 0 ? globals.usb_passthru : 1;  // Default enabled
 
@@ -1878,6 +1902,8 @@ void osd_refresh(OSD *osd)
 	osd->frame_skip = vga_frame_skip_max;
 	osd->batch_size = pc_batch_size_setting;
 	osd->pit_burst = pc_pit_burst_setting ? 1 : 0;
+	osd->accuracy = pc_accuracy_setting ? 1 : 0;
+	osd->boot_accuracy = osd->accuracy;  // INI reload = full restart, core re-selected
 	osd->mouse_speed = globals.mouse_speed > 0 ? globals.mouse_speed : osd->mouse_speed;
 	if (globals.usb_passthru >= 0)
 		osd->usb_passthru = globals.usb_passthru;
@@ -2038,6 +2064,8 @@ int osd_handle_key(OSD *osd, int keycode, int down)
 				} else if (osd->sys_sel == SYS_PIT_BURST) {
 					osd->pit_burst = !osd->pit_burst;
 					pc_pit_burst_setting = osd->pit_burst;
+				} else if (osd->sys_sel == SYS_ACCURACY) {
+					osd->accuracy = !osd->accuracy;
 				} else if (osd->sys_sel == SYS_STATS_BAR) {
 					globals.stats_bar_visible = !globals.stats_bar_visible;
 					globals.stats_collecting = globals.stats_bar_visible;

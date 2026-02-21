@@ -447,7 +447,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
                          int cpu_gen, int fpu, long mem_size,
                          int brightness, int volume, int frame_skip,
                          int batch_size, int pit_burst, int mouse_speed,
-                         int usb_passthru)
+                         int usb_passthru, int accuracy)
 {
 	if (!ini_path) return -1;
 	if (boot_order < 0 || boot_order >= BOOT_ORDER_COUNT)
@@ -475,7 +475,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 	int found_boot_order = -1, found_hda = -1, found_fda = -1, found_fdb = -1;
 	int found_cda = -1, found_cdb = -1, found_cdc = -1, found_cdd = -1;
 	int found_mem_size = -1;
-	int found_gen = -1, found_fpu = -1, found_batch_size = -1, found_pit_burst = -1;
+	int found_gen = -1, found_fpu = -1, found_batch_size = -1, found_pit_burst = -1, found_accuracy = -1;
 	int found_brightness = -1, found_volume = -1, found_frame_skip = -1;
 	int found_mouse_speed = -1, found_usb_passthru = -1;
 
@@ -556,6 +556,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			else if (line_starts_with(line, "fpu")) found_fpu = line_count;
 			else if (line_starts_with(line, "batch_size")) found_batch_size = line_count;
 			else if (line_starts_with(line, "pit_burst")) found_pit_burst = line_count;
+			else if (line_starts_with(line, "accuracy")) found_accuracy = line_count;
 		}
 
 		line_count++;
@@ -621,6 +622,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 			fprintf(f, "batch_size = %d\n", batch_size);
 			} else if (i == found_pit_burst) {
 				fprintf(f, "pit_burst = %d\n", pit_burst ? 1 : 0);
+		} else if (i == found_accuracy) {
+				fprintf(f, "accuracy = %s\n", accuracy ? "fast" : "full");
 			} else {
 				fputs(lines[i] ? lines[i] : "", f);
 			}
@@ -668,6 +671,8 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 					fprintf(f, "batch_size = %d\n", batch_size);
 				if (found_pit_burst < 0)
 					fprintf(f, "pit_burst = %d\n", pit_burst ? 1 : 0);
+				if (found_accuracy < 0)
+					fprintf(f, "accuracy = %s\n", accuracy ? "fast" : "full");
 			}
 
 	}
@@ -697,6 +702,7 @@ int save_settings_to_ini(const char *ini_path, int boot_order,
 		fprintf(f, "fpu = %d\n", fpu);
 		fprintf(f, "batch_size = %d\n", batch_size);
 		fprintf(f, "pit_burst = %d\n", pit_burst ? 1 : 0);
+		fprintf(f, "accuracy = %s\n", accuracy ? "fast" : "full");
 	}
 
 	/* Ensure INI is written to physical media before closing */

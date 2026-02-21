@@ -22,6 +22,7 @@
 #include "../../vga.h"
 #include "../../ide.h"
 #include "../../misc.h"
+#include "../../cpu_dispatch.h"
 #include "common.h"
 #include "ini_selector.h"
 #include <errno.h>
@@ -30,6 +31,7 @@
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "mouse_emu.h"
+#include "hal/clk_tree_ll.h"
 
 /* From storage.c */
 extern bool storage_sd_mounted(void);
@@ -250,6 +252,7 @@ static int pc_main(const char *file)
 	lcd_set_vga_dimensions(conf.width, conf.height);
 
 	Console *console = console_init(conf.width, conf.height);
+	cpu_select_core(conf.accuracy == 1);
 	PC *pc = pc_new(redraw, stub, console, console->fb, &conf);
 	console->pc = pc;
 	globals.pc = pc;
@@ -260,7 +263,9 @@ static int pc_main(const char *file)
 	vga_frame_skip_max = conf.frame_skip;
 	pc_batch_size_setting = conf.batch_size;
 	pc_pit_burst_setting = conf.pit_burst;
+	pc_accuracy_setting = conf.accuracy;
 	fprintf(stderr, "PIT burst catch-up: %s\n", pc_pit_burst_setting ? "enabled" : "disabled");
+	fprintf(stderr, "Accuracy mode: %s\n", pc_accuracy_setting ? "fast" : "full");
 
 	/* Store settings in globals for input_bsp and OSD to use */
 	globals.brightness = clamp_brightness(conf.brightness);
@@ -270,11 +275,13 @@ static int pc_main(const char *file)
 	globals.usb_passthru = conf.usb_passthru;
 	globals.cpu_gen = conf.cpu_gen;
 	globals.fpu = conf.fpu;
+	globals.accuracy = conf.accuracy;
 	globals.mem_size_mb = (int)(conf.mem_size / (1024 * 1024));
 	mouse_emu_set_speed(conf.mouse_speed);
 	xEventGroupSetBits(global_event_group, BIT0);
 
 	load_bios_and_reset(pc);
+	cpui386_set_fast_mode(pc->cpu, (bool)pc_accuracy_setting);
 
 	int ret = 0;
 	pc->boot_start_time = get_uticks();
@@ -313,30 +320,6 @@ static int pc_main(const char *file)
 			pc->boot_start_time = get_uticks();
 		}
 
-		// Check for emulator restart request (e.g., HDD change)
-		if (globals.emu_restart_pending) {
-			globals.emu_restart_pending = false;
-			// Flush all disk data before restart
-			ide_sync(pc->ide, pc->ide2);
-			// Change HDD if new path was provided
-			if (globals.emu_new_hda_path[0]) {
-				fprintf(stderr, "Restart: changing HDD to %s\n", globals.emu_new_hda_path);
-				ide_change_hdd(pc->ide, 0, globals.emu_new_hda_path);
-				// Update PC's stored hda_path
-				pc->hda_path = strdup(globals.emu_new_hda_path);
-			}
-			// Clear VGA framebuffers
-			if (globals.fb && globals.vga_width > 0 && globals.vga_height > 0) {
-				memset(globals.fb, 0, globals.vga_width * globals.vga_height * sizeof(uint16_t));
-			}
-			if (globals.fb_rotated) {
-				memset(globals.fb_rotated, 0, 480 * 800 * sizeof(uint16_t));
-			}
-			// Full reset
-			pc_reset(pc);
-			pc->boot_start_time = get_uticks();
-			fprintf(stderr, "Restart: done\n");
-		}
 		pc_step(pc);
 		// CRITICAL: Use vTaskDelay() not taskYIELD() to let IDLE task run.
 		// taskYIELD only yields to equal/higher priority tasks, but IDLE
@@ -568,6 +551,7 @@ static void wifi_task(void *arg)
 
 void app_main(void)
 {
+	clk_ll_cpll_set_config(400, 40);
 	global_event_group = xEventGroupCreate();
 	globals.usb_passthru = -1;  // Sentinel: not yet loaded from INI
 	globals.brightness = BRIGHTNESS_BOOT_DEFAULT;  // INI selector default before config load

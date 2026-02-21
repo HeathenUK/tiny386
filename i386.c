@@ -190,6 +190,7 @@ struct CPUI386 {
 	/* True when ALL 6 data/code segments are flat (seg_flat == 0x3F).
 	 * Allows a single branch to skip all segment translation overhead. */
 	bool all_segs_flat;
+	bool fast_mode;       // Skip non-essential correctness checks (DOS compat mode)
 
 #ifdef I386_SEQ_FASTPATH
 	uword seq_phys;
@@ -3266,8 +3267,8 @@ static bool IRAM_ATTR translate(CPUI386 *cpu, OptAddr *res, int rwm, int seg, uw
 		return translate_laddr(cpu, res, rwm, addr, size, cpl);
 	}
 
-	if (likely(SEG_IS_FLAT(cpu, seg))) {
-		laddr = addr;
+	if (likely(cpu->fast_mode || SEG_IS_FLAT(cpu, seg))) {
+		laddr = cpu->seg[seg].base + addr;
 	} else {
 		laddr = cpu->seg[seg].base + addr;
 		TRYL(segcheck(cpu, rwm, seg, addr, size));
@@ -3285,8 +3286,8 @@ static bool IRAM_ATTR translate8r(CPUI386 *cpu, OptAddr *res, int seg, uword add
 	 * No segcheck needed: flat segments can't fail (see translate()). */
 	if (likely(cpu->all_segs_flat)) {
 		laddr = addr;
-	} else if (likely(SEG_IS_FLAT(cpu, seg))) {
-		laddr = addr;
+	} else if (likely(cpu->fast_mode || SEG_IS_FLAT(cpu, seg))) {
+		laddr = cpu->seg[seg].base + addr;
 	} else {
 		laddr = cpu->seg[seg].base + addr;
 		TRYL(segcheck(cpu, 1, seg, addr, 1));
@@ -4841,6 +4842,7 @@ static int exc_ring_pos = 0;
 
 static void cpu_monitor_dump(CPUI386 *cpu, const char *reason)
 {
+	if (!cpu_diag_enabled) return;
 	uint32_t gp_total = 0;
 	uint32_t dpmi_0006 = 0, dpmi_0703 = 0, dpmi_0007 = 0, dpmi_0008 = 0;
 	uint32_t dpmi_0501 = 0, dpmi_0004 = 0;
@@ -6714,62 +6716,74 @@ static void cpu_diag_log_int2f(CPUI386 *cpu)
 	if (opsz16) sreg16(2, sext16(-(sext16(lreg16(0)) >> 31))); \
 	else sreg32(2, sext32(-(sext32(lreg32(0)) >> 31)));
 
-#define MOVFC() \
-	if (cpu->cpl != 0) THROW(EX_GP, 0); \
-	TRY(fetch8(cpu, &modrm)); \
-	int reg = (modrm >> 3) & 7; \
-	int rm = modrm & 7; \
-	if (reg == 0) { \
-		sreg32(rm, cpu->cr0); \
-	} else if (reg == 2) { \
-		sreg32(rm, cpu->cr2); \
-	} else if (reg == 3) { \
-		sreg32(rm, cpu->cr3); \
-	} else if (reg == 4) { \
-		/* CR4 exists on Pentium+ (gen >= 5), not 486. */ \
-		if (cpu->gen < 5) THROW0(EX_UD); \
-		sreg32(rm, cpu->cr4); \
+/* Cold system instruction handlers — executed only during mode switches/init */
+static bool __attribute__((noinline, cold))
+exec_movfc(CPUI386 *cpu)
+{
+	u8 modrm;
+	if (cpu->cpl != 0) THROW(EX_GP, 0);
+	TRY(fetch8(cpu, &modrm));
+	int reg = (modrm >> 3) & 7;
+	int rm = modrm & 7;
+	if (reg == 0) {
+		sreg32(rm, cpu->cr0);
+	} else if (reg == 2) {
+		sreg32(rm, cpu->cr2);
+	} else if (reg == 3) {
+		sreg32(rm, cpu->cr3);
+	} else if (reg == 4) {
+		if (cpu->gen < 5) THROW0(EX_UD);
+		sreg32(rm, cpu->cr4);
 	} else THROW0(EX_UD);
+	return true;
+}
 
-#define MOVTC() \
-	if (cpu->cpl != 0) THROW(EX_GP, 0); \
-	TRY(fetch8(cpu, &modrm)); \
-	int reg = (modrm >> 3) & 7; \
-	int rm = modrm & 7; \
-	cpu->cr_write_count++; \
-	if (reg == 0) { \
-		u32 old_cr0 = cpu->cr0; \
-		u32 new_cr0 = lreg32(rm); \
-		if ((new_cr0 ^ cpu->cr0) & (CR0_PG | CR0_WP | 1)) { \
-			tlb_clear(cpu); \
-			SEQ_INVALIDATE(cpu); \
-			cpu->seg_cache_valid = 0; \
-			if ((new_cr0 ^ cpu->cr0) & 1) { \
-				cpu->int8_cache_valid = false; \
-				cpu->int8_warmup_counter = 0; \
-			} \
-		} \
-		if (cpu->fpu) new_cr0 |= 0x10; \
-		if (unlikely(cpu_diag_enabled) && new_cr0 != old_cr0) \
-			cpu_diag_log_cr0_transition(cpu, old_cr0, new_cr0); \
-		cpu->cr0 = new_cr0; \
-	} else if (reg == 2) { \
-		cpu->cr2 = lreg32(rm); \
-	} else if (reg == 3) { \
-		cpu->cr3 = lreg32(rm); \
-		tlb_flush_generation(cpu); \
-		SEQ_INVALIDATE(cpu); \
-		if (unlikely(cpu_diag_enabled && pf_diag.active)) pf_diag.cr3_write_count++; \
-	} else if (reg == 4) { \
-		/* CR4 exists on Pentium+ (gen >= 5), not 486. */ \
-		if (cpu->gen < 5) THROW0(EX_UD); \
-		u32 new_cr4 = lreg32(rm) & CR4_PSE; \
-		if ((new_cr4 ^ cpu->cr4) & CR4_PSE) { \
-			tlb_clear(cpu); \
-			SEQ_INVALIDATE(cpu); \
-		} \
-		cpu->cr4 = new_cr4; \
+static bool __attribute__((noinline, cold))
+exec_movtc(CPUI386 *cpu)
+{
+	u8 modrm;
+	if (cpu->cpl != 0) THROW(EX_GP, 0);
+	TRY(fetch8(cpu, &modrm));
+	int reg = (modrm >> 3) & 7;
+	int rm = modrm & 7;
+	cpu->cr_write_count++;
+	if (reg == 0) {
+		u32 old_cr0 = cpu->cr0;
+		u32 new_cr0 = lreg32(rm);
+		if ((new_cr0 ^ cpu->cr0) & (CR0_PG | CR0_WP | 1)) {
+			tlb_clear(cpu);
+			SEQ_INVALIDATE(cpu);
+			cpu->seg_cache_valid = 0;
+			if ((new_cr0 ^ cpu->cr0) & 1) {
+				cpu->int8_cache_valid = false;
+				cpu->int8_warmup_counter = 0;
+			}
+		}
+		if (cpu->fpu) new_cr0 |= 0x10;
+		if (unlikely(cpu_diag_enabled) && new_cr0 != old_cr0)
+			cpu_diag_log_cr0_transition(cpu, old_cr0, new_cr0);
+		cpu->cr0 = new_cr0;
+	} else if (reg == 2) {
+		cpu->cr2 = lreg32(rm);
+	} else if (reg == 3) {
+		cpu->cr3 = lreg32(rm);
+		tlb_flush_generation(cpu);
+		SEQ_INVALIDATE(cpu);
+		if (unlikely(cpu_diag_enabled && pf_diag.active)) pf_diag.cr3_write_count++;
+	} else if (reg == 4) {
+		if (cpu->gen < 5) THROW0(EX_UD);
+		u32 new_cr4 = lreg32(rm) & CR4_PSE;
+		if ((new_cr4 ^ cpu->cr4) & CR4_PSE) {
+			tlb_clear(cpu);
+			SEQ_INVALIDATE(cpu);
+		}
+		cpu->cr4 = new_cr4;
 	} else THROW0(EX_UD);
+	return true;
+}
+
+#define MOVFC() TRY(exec_movfc(cpu))
+#define MOVTC() TRY(exec_movtc(cpu))
 
 #define INT3() \
 	cpu->ip = cpu->next_ip; \
@@ -7539,7 +7553,7 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 			cpu->hle_hit_count++; \
 			cpu->ip = cpu->next_ip; \
 		} else if ((cpu->flags & VM)) { \
-			if(get_IOPL(cpu) < 3) { \
+			if(!cpu->fast_mode && get_IOPL(cpu) < 3) { \
 				wfw_monitor_log_vm86_int_event(cpu, (uint8_t)li(i), 0); \
 				if (unlikely(cpu_diag_enabled) && win386_diag.active) { \
 					wfw_monitor.v86_int_gp_counts[(uint8_t)li(i)]++; \
@@ -7625,7 +7639,7 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 
 #define IRET() \
 	cpu->iret_count++; \
-	if ((cpu->cr0 & 1) && (!(cpu->flags & VM) || get_IOPL(cpu) < 3)) { \
+	if ((cpu->cr0 & 1) && (!(cpu->flags & VM) || (!cpu->fast_mode && get_IOPL(cpu) < 3))) { \
 		TRY(pmret(cpu, opsz16, 0, true)); \
 	} else if (opsz16) { \
 		/* 16-bit IRET in real/V86 mode */ \
@@ -7788,12 +7802,12 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 	cpu->flags |= CF;
 
 #define CLI() \
-	if (get_IOPL(cpu) < cpu->cpl) THROW(EX_GP, 0); \
+	if (!cpu->fast_mode && get_IOPL(cpu) < cpu->cpl) THROW(EX_GP, 0); \
 	cpu->flags &= ~IF;
 
 /* STI: interrupts enabled at the end of the **next** instruction */
 #define STI() \
-	if (get_IOPL(cpu) < cpu->cpl) THROW(EX_GP, 0); \
+	if (!cpu->fast_mode && get_IOPL(cpu) < cpu->cpl) THROW(EX_GP, 0); \
 	cpu->flags |= IF; \
 	if (cpu->intr || stepcount < 2) stepcount = 2;
 
@@ -7872,7 +7886,7 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 #define POP() if (opsz16) { POP_helper(16) } else { POP_helper(32) }
 
 #define PUSHF() \
-	if ((cpu->flags & VM) && get_IOPL(cpu) < 3) THROW(EX_GP, 0); \
+	if (!cpu->fast_mode && (cpu->flags & VM) && get_IOPL(cpu) < 3) THROW(EX_GP, 0); \
 	if (opsz16) { \
 		uword sp = lreg32(4); \
 		TRY(translate16(cpu, &meml, 2, SEG_SS, (sp - 2) & sp_mask)); \
@@ -7895,7 +7909,7 @@ static bool bios_hle_int(CPUI386 *cpu, int intno)
 #define EFLAGS_MASK (cpu->flags_mask)
 
 #define POPF() \
-	if ((cpu->flags & VM) && get_IOPL(cpu) < 3) THROW(EX_GP, 0); \
+	if (!cpu->fast_mode && (cpu->flags & VM) && get_IOPL(cpu) < 3) THROW(EX_GP, 0); \
 	uword mask = VM; \
 	if (cpu->cr0 & 1) { \
 		if (cpu->cpl > 0) mask |= IOPL; \
@@ -8813,17 +8827,30 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 #define STR(a, la, sa) \
 	sa(a, cpu->seg[SEG_TR].sel);
 
-#define MOVFD() \
-	TRY(fetch8(cpu, &modrm)); \
-	int reg = (modrm >> 3) & 7; \
-	int rm = modrm & 7; \
+static bool __attribute__((noinline, cold))
+exec_movfd(CPUI386 *cpu)
+{
+	u8 modrm;
+	TRY(fetch8(cpu, &modrm));
+	int reg = (modrm >> 3) & 7;
+	int rm = modrm & 7;
 	sreg32(rm, cpu->dr[reg]);
+	return true;
+}
 
-#define MOVTD() \
-	TRY(fetch8(cpu, &modrm)); \
-	int reg = (modrm >> 3) & 7; \
-	int rm = modrm & 7; \
+static bool __attribute__((noinline, cold))
+exec_movtd(CPUI386 *cpu)
+{
+	u8 modrm;
+	TRY(fetch8(cpu, &modrm));
+	int reg = (modrm >> 3) & 7;
+	int rm = modrm & 7;
 	cpu->dr[reg] = lreg32(rm);
+	return true;
+}
+
+#define MOVFD() TRY(exec_movfd(cpu))
+#define MOVTD() TRY(exec_movtd(cpu))
 
 #define MOVFT() \
 	TRY(fetch8(cpu, &modrm));
@@ -8877,6 +8904,7 @@ static bool enter_helper(CPUI386 *cpu, bool opsz16, uword sp_mask,
 static bool check_ioperm(CPUI386 *cpu, int port, int bit_width)
 {
 	cpu->io_count++;
+	if (cpu->fast_mode) return true;
 	/* Locked rule (Intel 80386 PRM + IA-32 SDM):
 	 * - VM86: IN/OUT always consult the TSS I/O bitmap (independent of IOPL).
 	 * - PM non-VM86: consult bitmap only when CPL > IOPL.
@@ -9030,27 +9058,110 @@ static bool check_v86_int_redirect(CPUI386 *cpu, int intno)
 #define WAIT() \
 	if ((cpu->cr0 & 0xa) == 0xa) THROW0(EX_NM);
 
-// ...
-#define AAD(i, li, _) \
-	u8 al = lreg8(0); \
-	u8 ah = lreg8(4); \
-	u8 imm = li(i); \
-	u8 res = al + ah * imm; \
-	sreg8(0, res); \
-	sreg8(4, 0); \
-	cpu->flags &= ~(OF | AF | CF); /* undocumented */ \
-	cpu->cc.dst = sext8(res); \
+/* Cold BCD/ASCII-adjust handlers — never executed by DOS/Win3.11/Win95 */
+static bool __attribute__((noinline, cold))
+exec_aad(CPUI386 *cpu, u8 imm)
+{
+	u8 al = lreg8(0);
+	u8 ah = lreg8(4);
+	u8 res = al + ah * imm;
+	sreg8(0, res);
+	sreg8(4, 0);
+	cpu->flags &= ~(OF | AF | CF);
+	cpu->cc.dst = sext8(res);
 	cpu->cc.mask = ZF | SF | PF;
+	return true;
+}
 
-#define AAM(i, li, _) \
-	u8 al = lreg8(0); \
-	u8 imm = li(i); \
-	u8 res = al % imm; \
-	sreg8(4, al / imm); \
-	sreg8(0, res); \
-	cpu->flags &= ~(OF | AF | CF); /* undocumented */ \
-	cpu->cc.dst = sext8(res); \
+static bool __attribute__((noinline, cold))
+exec_aam(CPUI386 *cpu, u8 imm)
+{
+	u8 al = lreg8(0);
+	if (imm == 0) { cpu->excno = EX_DE; return false; }
+	u8 res = al % imm;
+	sreg8(4, al / imm);
+	sreg8(0, res);
+	cpu->flags &= ~(OF | AF | CF);
+	cpu->cc.dst = sext8(res);
 	cpu->cc.mask = ZF | SF | PF;
+	return true;
+}
+
+static bool __attribute__((noinline, cold))
+exec_daa(CPUI386 *cpu)
+{
+	u8 al = lreg8(0);
+	int cf = get_CF(cpu);
+	cpu->flags &= ~CF;
+	if ((al & 0xf) > 9 || get_AF(cpu)) {
+		sreg8(0, al + 6);
+		if (cf || al > 0xff - 6) cpu->flags |= CF;
+		cpu->flags |= AF;
+	} else {
+		cpu->flags &= ~AF;
+	}
+	if (al > 0x99 || cf) {
+		sreg8(0, lreg8(0) + 0x60);
+		cpu->flags |= CF;
+	}
+	cpu->cc.dst = sext8(lreg8(0));
+	cpu->cc.mask = ZF | SF | PF;
+	return true;
+}
+
+static bool __attribute__((noinline, cold))
+exec_das(CPUI386 *cpu)
+{
+	u8 al = lreg8(0);
+	int cf = get_CF(cpu);
+	cpu->flags &= ~CF;
+	if ((al & 0xf) > 9 || get_AF(cpu)) {
+		sreg8(0, al - 6);
+		if (cf || al < 6) cpu->flags |= CF;
+		cpu->flags |= AF;
+	} else {
+		cpu->flags &= ~AF;
+	}
+	if (al > 0x99 || cf) {
+		sreg8(0, lreg8(0) - 0x60);
+		cpu->flags |= CF;
+	}
+	cpu->cc.dst = sext8(lreg8(0));
+	cpu->cc.mask = ZF | SF | PF;
+	return true;
+}
+
+static bool __attribute__((noinline, cold))
+exec_aaa(CPUI386 *cpu)
+{
+	if ((lreg8(0) & 0xf) > 9 || get_AF(cpu)) {
+		sreg16(0, lreg16(0) + 0x106);
+		cpu->flags |= AF | CF;
+	} else {
+		cpu->flags &= ~(AF | CF);
+	}
+	cpu->cc.mask = ZF | SF | PF;
+	sreg8(0, lreg8(0) & 0xf);
+	return true;
+}
+
+static bool __attribute__((noinline, cold))
+exec_aas(CPUI386 *cpu)
+{
+	if ((lreg8(0) & 0xf) > 9 || get_AF(cpu)) {
+		sreg16(0, lreg16(0) - 6);
+		sreg8(4, lreg8(4) - 1);
+		cpu->flags |= AF | CF;
+	} else {
+		cpu->flags &= ~(AF | CF);
+	}
+	cpu->cc.mask = ZF | SF | PF;
+	sreg8(0, lreg8(0) & 0xf);
+	return true;
+}
+
+#define AAD(i, li, _) TRY(exec_aad(cpu, li(i)))
+#define AAM(i, li, _) TRY(exec_aam(cpu, li(i)))
 
 #define SALC() \
 	if (get_CF(cpu)) sreg8(0, 0xff); else sreg8(0, 0x00);
@@ -9068,62 +9179,10 @@ static bool check_v86_int_redirect(CPUI386 *cpu, int intno)
 		sreg8(0, laddr8(&meml)); \
 	}
 
-#define DAA() \
-	u8 al = lreg8(0); \
-	int cf = get_CF(cpu); \
-	cpu->flags &= ~CF; \
-	if ((al & 0xf) > 9 || get_AF(cpu)) { \
-		sreg8(0, al + 6); \
-		if (cf || al > 0xff - 6) cpu->flags |= CF; \
-		cpu->flags |= AF; \
-	} else { \
-		cpu->flags &= ~AF; \
-	} \
-	if (al > 0x99 || cf) { \
-		sreg8(0, lreg8(0) + 0x60); \
-		cpu->flags |= CF; \
-	} \
-	cpu->cc.dst = sext8(lreg8(0)); \
-	cpu->cc.mask = ZF | SF | PF;
-
-#define DAS() \
-	u8 al = lreg8(0); \
-	int cf = get_CF(cpu); \
-	cpu->flags &= ~CF; \
-	if ((al & 0xf) > 9 || get_AF(cpu)) { \
-		sreg8(0, al - 6); \
-		if (cf || al < 6) cpu->flags |= CF; \
-		cpu->flags |= AF; \
-	} else { \
-		cpu->flags &= ~AF; \
-	} \
-	if (al > 0x99 || cf) { \
-		sreg8(0, lreg8(0) - 0x60); \
-		cpu->flags |= CF; \
-	} \
-	cpu->cc.dst = sext8(lreg8(0)); \
-	cpu->cc.mask = ZF | SF | PF;
-
-#define AAA() \
-	if ((lreg8(0) & 0xf) > 9 || get_AF(cpu)) { \
-		sreg16(0, lreg16(0) + 0x106); \
-		cpu->flags |= AF | CF; \
-	} else { \
-		cpu->flags &= ~(AF | CF); \
-	} \
-	cpu->cc.mask = ZF | SF | PF; \
-	sreg8(0, lreg8(0) & 0xf);
-
-#define AAS() \
-	if ((lreg8(0) & 0xf) > 9 || get_AF(cpu)) { \
-		sreg16(0, lreg16(0) - 6); \
-		sreg8(4, lreg8(4) - 1); \
-		cpu->flags |= AF | CF; \
-	} else { \
-		cpu->flags &= ~(AF | CF); \
-	} \
-	cpu->cc.mask = ZF | SF | PF; \
-	sreg8(0, lreg8(0) & 0xf);
+#define DAA() TRY(exec_daa(cpu))
+#define DAS() TRY(exec_das(cpu))
+#define AAA() TRY(exec_aaa(cpu))
+#define AAS() TRY(exec_aas(cpu))
 
 static bool larsl_helper(CPUI386 *cpu, int sel, uword *ar, uword *sl, int *zf)
 {
@@ -9383,49 +9442,52 @@ static const u32 cpuid_signature[] = {
 	[6] = 0x0686,  /* Pentium III Coppermine (family 6, model 8, stepping 6) */
 };
 
-#define CPUID() \
-	if (cpu->gen < 5) THROW0(EX_UD); \
-	switch (REGi(0)) { \
-	case 0: \
-		REGi(0) = 1; \
-		/* "TINY 386 CPU" — non-Intel vendor avoids Win95 Intel-specific code paths \
-		 * that assume MSR/TSC/Pentium errata handling we don't fully implement. \
-		 * "GenuineIntel" triggers Win95 RDTSC-based calibration that fails with \
-		 * our emulated cycle-count TSC. */ \
-		REGi(3) = 0x594e4954;  /* "TINY" */ \
-		REGi(2) = 0x20363833;  /* " 386" */ \
-		REGi(1) = 0x20555043;  /* " CPU" */ \
-		break; \
-	case 1: { \
-		int gen = cpu->gen < 3 ? 3 : (cpu->gen > 6 ? 6 : cpu->gen); \
-		REGi(0) = cpuid_signature[gen]; \
-		REGi(3) = 0; \
-		/* EDX feature flags */ \
-		REGi(2) = 0x100;  /* CMPXCHG8B */ \
-		if (cpu->fpu) REGi(2) |= 1;  /* FPU on-chip */ \
-		if (cpu->gen > 5) REGi(2) |= 0x8830;  /* RDTSC, CMOV, FXSR, FXSAVE */ \
-		if (cpu->gen > 5 && cpu->fpu) REGi(2) |= CPUID_SIMD_FEATURE; \
-		REGi(1) = 0; \
-		break; \
-	} \
-	default: \
-		REGi(0) = 0; \
-		REGi(3) = 0; \
-		REGi(2) = 0; \
-		REGi(1) = 0; \
-		break; \
+static bool __attribute__((noinline, cold))
+exec_cpuid(CPUI386 *cpu)
+{
+	if (cpu->gen < 5) THROW0(EX_UD);
+	switch (REGi(0)) {
+	case 0:
+		REGi(0) = 1;
+		REGi(3) = 0x594e4954;  /* "TINY" */
+		REGi(2) = 0x20363833;  /* " 386" */
+		REGi(1) = 0x20555043;  /* " CPU" */
+		break;
+	case 1: {
+		int gen = cpu->gen < 3 ? 3 : (cpu->gen > 6 ? 6 : cpu->gen);
+		REGi(0) = cpuid_signature[gen];
+		REGi(3) = 0;
+		REGi(2) = 0x100;  /* CMPXCHG8B */
+		if (cpu->fpu) REGi(2) |= 1;
+		if (cpu->gen > 5) REGi(2) |= 0x8830;
+		if (cpu->gen > 5 && cpu->fpu) REGi(2) |= CPUID_SIMD_FEATURE;
+		REGi(1) = 0;
+		break;
 	}
+	default:
+		REGi(0) = 0;
+		REGi(3) = 0;
+		REGi(2) = 0;
+		REGi(1) = 0;
+		break;
+	}
+	return true;
+}
 
-/* RDTSC returns emulated cycle count, scaled to approximate real timing.
- * This provides more realistic timing for DOS-era benchmarks that use RDTSC.
- */
-#define RDTSC() \
-	if (cpu->gen < 5) THROW0(EX_UD); \
-	/* Lazy-sync TSC from cycle counter (avoids 64-bit increment per instruction) */ \
-	cpu->tsc += (uint32_t)((uint32_t)cpu->cycle - (uint32_t)cpu->tsc_sync_cycle); \
-	cpu->tsc_sync_cycle = cpu->cycle; \
-	REGi(0) = (u32)cpu->tsc; \
+#define CPUID() TRY(exec_cpuid(cpu))
+
+static bool __attribute__((noinline, cold))
+exec_rdtsc(CPUI386 *cpu)
+{
+	if (cpu->gen < 5) THROW0(EX_UD);
+	cpu->tsc += (uint32_t)((uint32_t)cpu->cycle - (uint32_t)cpu->tsc_sync_cycle);
+	cpu->tsc_sync_cycle = cpu->cycle;
+	REGi(0) = (u32)cpu->tsc;
 	REGi(2) = (u32)(cpu->tsc >> 32);
+	return true;
+}
+
+#define RDTSC() do { cpu->cycle = local_cycle; TRY(exec_rdtsc(cpu)); } while(0)
 
 #define Mq Ms
 #define CMPXCH8B(addr) \
@@ -9456,25 +9518,36 @@ static const u32 cpuid_signature[] = {
 	COND() \
 	if (cond) sa(a, lb(b));
 
-#define WRMSR() \
-	if (cpu->gen < 5) THROW0(EX_UD); \
-	if (cpu->cpl != 0) THROW(EX_GP, 0); \
-	switch (REGi(1)) { \
-	case 0x174: cpu->sysenter.cs = REGi(0); break; \
-	case 0x176: cpu->sysenter.eip = REGi(0); break; \
-	case 0x175: cpu->sysenter.esp = REGi(0); break; \
-	default: cpu_debug(cpu); THROW(EX_GP, 0); \
+static bool __attribute__((noinline, cold))
+exec_wrmsr(CPUI386 *cpu)
+{
+	if (cpu->gen < 5) THROW0(EX_UD);
+	if (cpu->cpl != 0) THROW(EX_GP, 0);
+	switch (REGi(1)) {
+	case 0x174: cpu->sysenter.cs = REGi(0); break;
+	case 0x176: cpu->sysenter.eip = REGi(0); break;
+	case 0x175: cpu->sysenter.esp = REGi(0); break;
+	default: cpu_debug(cpu); THROW(EX_GP, 0);
 	}
+	return true;
+}
 
-#define RDMSR() \
-	if (cpu->gen < 5) THROW0(EX_UD); \
-	if (cpu->cpl != 0) THROW(EX_GP, 0); \
-	switch (REGi(1)) { \
-	case 0x174: REGi(0) = cpu->sysenter.cs; REGi(2) = 0; break; \
-	case 0x176: REGi(0) = cpu->sysenter.eip; REGi(2) = 0; break; \
-	case 0x175: REGi(0) = cpu->sysenter.esp; REGi(2) = 0; break; \
-	default: cpu_debug(cpu); THROW(EX_GP, 0); \
+static bool __attribute__((noinline, cold))
+exec_rdmsr(CPUI386 *cpu)
+{
+	if (cpu->gen < 5) THROW0(EX_UD);
+	if (cpu->cpl != 0) THROW(EX_GP, 0);
+	switch (REGi(1)) {
+	case 0x174: REGi(0) = cpu->sysenter.cs; REGi(2) = 0; break;
+	case 0x176: REGi(0) = cpu->sysenter.eip; REGi(2) = 0; break;
+	case 0x175: REGi(0) = cpu->sysenter.esp; REGi(2) = 0; break;
+	default: cpu_debug(cpu); THROW(EX_GP, 0);
 	}
+	return true;
+}
+
+#define WRMSR() TRY(exec_wrmsr(cpu))
+#define RDMSR() TRY(exec_rdmsr(cpu))
 
 static void __sysenter(CPUI386 *cpu, int pl, int cs)
 {
@@ -9492,20 +9565,31 @@ static void __sysenter(CPUI386 *cpu, int pl, int cs)
 	cpu->seg[SEG_SS].flags = SEG_B_BIT | 0x53 | (pl << 5);
 }
 
-#define SYSENTER() \
-	if (cpu->gen < 6) THROW0(EX_UD); \
-	if (!(cpu->cr0 & 1) || (cpu->sysenter.cs & ~0x3) == 0) THROW(EX_GP, 0); \
-	cpu->flags &= ~(VM | IF); \
-	__sysenter(cpu, 0, cpu->sysenter.cs); \
-	REGi(4) = cpu->sysenter.esp; \
+static bool __attribute__((noinline, cold))
+exec_sysenter(CPUI386 *cpu)
+{
+	if (cpu->gen < 6) THROW0(EX_UD);
+	if (!(cpu->cr0 & 1) || (cpu->sysenter.cs & ~0x3) == 0) THROW(EX_GP, 0);
+	cpu->flags &= ~(VM | IF);
+	__sysenter(cpu, 0, cpu->sysenter.cs);
+	REGi(4) = cpu->sysenter.esp;
 	cpu->next_ip = cpu->sysenter.eip;
+	return true;
+}
 
-#define SYSEXIT() \
-	if (cpu->gen < 6) THROW0(EX_UD); \
-	if (!(cpu->cr0 & 1) || (cpu->sysenter.cs & ~0x3) == 0 || cpu->cpl) THROW(EX_GP, 0); \
-	__sysenter(cpu, 3, cpu->sysenter.cs + 16); \
-	REGi(4) = REGi(1); \
+static bool __attribute__((noinline, cold))
+exec_sysexit(CPUI386 *cpu)
+{
+	if (cpu->gen < 6) THROW0(EX_UD);
+	if (!(cpu->cr0 & 1) || (cpu->sysenter.cs & ~0x3) == 0 || cpu->cpl) THROW(EX_GP, 0);
+	__sysenter(cpu, 3, cpu->sysenter.cs + 16);
+	REGi(4) = REGi(1);
 	cpu->next_ip = REGi(2);
+	return true;
+}
+
+#define SYSENTER() TRY(exec_sysenter(cpu))
+#define SYSEXIT() TRY(exec_sysexit(cpu))
 
 #if defined(I386_ENABLE_MMX) || defined(I386_ENABLE_SSE)
 #define SIMD_i386_c
@@ -9564,6 +9648,18 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	u8 modrm;
 	OptAddr meml;
 	uword addr;
+	uint32_t local_cycle = cpu->cycle;
+
+	/* Redefine TRY/THROW within cpu_exec1 to use goto for cycle sync on exception exit */
+#undef TRY
+#undef TRYL
+#undef THROW
+#undef THROW0
+#define TRY(f) if(!(f)) { goto cpu_exec1_exc; }
+#define TRYL(f) if(unlikely(!(f))) { goto cpu_exec1_exc; }
+#define THROW(ex, err) do { cpu->excno = (ex); cpu->excerr = (err); goto cpu_exec1_exc; } while(0)
+#define THROW0(ex) do { cpu->excno = (ex); goto cpu_exec1_exc; } while(0)
+
 	/* seq_active persists across cpu_exec1 calls:
 	 * ip check at iteration top handles cross-call correctness */
 	for (; stepcount > 0; stepcount--) {
@@ -9580,6 +9676,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 
 	if (code16) cpu->next_ip &= 0xffff;
 	cpu->ip = cpu->next_ip;
+#ifdef CPU_DIAG
 	if (unlikely(wfw_monitor.ud63_fe95_0127.trace_active))
 		wfw_ud63_trace_step(cpu);
 
@@ -9609,6 +9706,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 		dpmi_trace.entry_ax = lreg16(0);
 		dpmi_trace.entry_es = cpu->seg[SEG_ES].sel;
 	}
+#endif /* CPU_DIAG */
 
 	/* Save TF before this instruction — POPF/IRET may change it, but
 	 * the trap fires based on TF state when the instruction started. */
@@ -9643,7 +9741,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 				cpu->pf_pos = 1;
 				cpu->pf_avail = 8;
 				cpu->next_ip++;
-				cpu->cycle++;
+				local_cycle++;
 				cpu->seq_phys = nphys;
 				cpu->seq_prev_ip = cpu->ip;
 				goto seq_dispatch;
@@ -9680,7 +9778,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			TRY(fetch8(cpu, &b1));
 		}
 	}
-	cpu->cycle++;
+	local_cycle++;
 #ifdef I386_SEQ_FASTPATH
 	seq_dispatch: ;
 #endif
@@ -10663,8 +10761,22 @@ GRPEND
 	edefault: default_ud;
 	}
 	}
+	cpu->cycle = local_cycle;
 	return true;
+cpu_exec1_exc:
+	cpu->cycle = local_cycle;
+	return false;
 }
+
+/* Restore original TRY/THROW after cpu_exec1 */
+#undef TRY
+#undef TRYL
+#undef THROW
+#undef THROW0
+#define TRY(f) if(!(f)) { return false; }
+#define TRYL(f) if(unlikely(!(f))) { return false; }
+#define THROW(ex, err) do { cpu->excno = (ex); cpu->excerr = (err); return false; } while(0)
+#define THROW0(ex) do { cpu->excno = (ex); return false; } while(0)
 
 // XXX: incomplete
 enum { TS_JMP, TS_CALL, TS_IRET };
@@ -13574,6 +13686,11 @@ void cpui386_set_diag(CPUI386 *cpu, bool enabled)
 	(void)cpu;
 	(void)enabled;
 #endif
+}
+
+void cpui386_set_fast_mode(CPUI386 *cpu, bool enabled)
+{
+	cpu->fast_mode = enabled;
 }
 
 bool cpui386_is_halted(CPUI386 *cpu)

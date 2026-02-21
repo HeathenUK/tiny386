@@ -10,6 +10,8 @@
 #include "../../ini.h"
 #include "vga_font_8x16.h"
 #include "toast.h"
+#include "file_browser.h"
+#include "../../misc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +73,7 @@ typedef struct {
 	bool valid;                 /* ini_parse succeeded */
 	char cpu[16];
 	char fpu[12];
+	char accuracy[12];
 	char mem[16];
 	char hda[52];
 	char cda[52];
@@ -94,6 +97,7 @@ typedef enum {
 	EDIT_NONE = 0,
 	EDIT_RENAME,
 	EDIT_CLONE,
+	EDIT_SETTINGS,
 } EditMode;
 
 #define MAX_EDIT_BASE (MAX_INI_NAME - 5)  /* room for ".ini" + NUL */
@@ -102,8 +106,42 @@ static char s_edit_name[MAX_EDIT_BASE + 1];
 static int  s_edit_len;
 static char s_edit_source_name[MAX_INI_NAME];
 
+/* ── Settings Editor State ───────────────────────────────────── */
+typedef struct {
+	const char *section;
+	const char *key;
+	const char *label;       /* 10-char padded label */
+	bool is_file;
+	const char * const *display;
+	const char * const *ini_val;
+	int num_options;
+	int current;
+	bool modified;           /* User changed this field */
+	char file_value[256];    /* Full absolute path */
+	char file_display[52];   /* Basename for display */
+} SettingsField;
+
+#define NUM_SETTINGS_FIELDS 8
+static SettingsField s_sfields[NUM_SETTINGS_FIELDS];
+static int  s_settings_field;
+static bool s_settings_dirty;
+
+/* File browser sub-view within settings editor */
+static bool s_browse_active;
+static int  s_browse_target_field;
+static char s_browse_path[FB_MAX_PATH];
+static FBEntry s_browse_entries[FB_MAX_FILES];
+static int  s_browse_count;
+static int  s_browse_sel;
+static int  s_browse_scroll;
+
+#define BROWSE_EJECT_TYPE (-3)
+static const FBCustomEntry s_browse_custom[] = { { "[Eject]", BROWSE_EJECT_TYPE } };
+
 static void scan_ini_files(void);
 static void parse_preview(IniFileEntry *e);
+static void sel_fill_rect(int x, int y, int w, int h, uint16_t color);
+static int sel_draw_text(int x, int y, const char *text, uint16_t color, int max_w);
 
 /* How many list entries fit on screen */
 #define VISIBLE_LINES ((PANEL_BOT - LIST_Y) / (FONT_H + 2))
@@ -388,6 +426,573 @@ static int handle_edit_key(int scancode)
 	}
 }
 
+/* ── Settings Editor Functions ───────────────────────────────── */
+
+static void path_to_basename(const char *path, char *out, size_t out_sz)
+{
+	if (!out || out_sz == 0) return;
+	if (!path || !path[0]) { out[0] = '\0'; return; }
+	const char *name = strrchr(path, '/');
+	name = name ? name + 1 : path;
+	size_t len = strlen(name);
+	if (len >= out_sz) len = out_sz - 1;
+	memcpy(out, name, len);
+	out[len] = '\0';
+}
+
+static void resolve_ini_path(const char *raw, char *out, size_t out_sz)
+{
+	if (!out || out_sz == 0) return;
+	if (!raw || !raw[0]) { out[0] = '\0'; return; }
+	if (raw[0] == '/')
+		snprintf(out, out_sz, "%s", raw);
+	else
+		snprintf(out, out_sz, "%s/%s", INI_DIR, raw);
+}
+
+static void make_relative_path(const char *abs_path, char *out, size_t out_sz)
+{
+	if (!out || out_sz == 0) return;
+	if (!abs_path || !abs_path[0]) { out[0] = '\0'; return; }
+	size_t pfx_len = strlen(INI_DIR);
+	if (strncmp(abs_path, INI_DIR, pfx_len) == 0 && abs_path[pfx_len] == '/')
+		snprintf(out, out_sz, "%s", abs_path + pfx_len + 1);
+	else
+		snprintf(out, out_sz, "%s", abs_path);
+}
+
+/* Parse raw INI values for file fields (preview only stores basenames) */
+typedef struct {
+	char hda[256], cda[256], fda[256];
+} RawIniVals;
+
+static int raw_val_handler(void *user, const char *section,
+                           const char *name, const char *value)
+{
+	RawIniVals *r = user;
+	if (strcmp(section, "pc") == 0) {
+		if (strcmp(name, "hda") == 0)
+			snprintf(r->hda, sizeof(r->hda), "%s", value);
+		else if (strcmp(name, "cda") == 0)
+			snprintf(r->cda, sizeof(r->cda), "%s", value);
+		else if (strcmp(name, "fda") == 0)
+			snprintf(r->fda, sizeof(r->fda), "%s", value);
+	}
+	return 1;
+}
+
+static int find_cycle_index(const char * const *arr, int count, const char *val)
+{
+	if (!val || !val[0]) return 0;
+	for (int i = 0; i < count; i++) {
+		if (strcasecmp(arr[i], val) == 0) return i;
+	}
+	return 0;
+}
+
+/* Cycle option arrays */
+static const char *cpu_display[] = { "i386", "i486", "i586" };
+static const char *cpu_ini_val[] = { "3", "4", "5" };
+
+static const char *fpu_display[] = { "On", "Off" };
+static const char *fpu_ini_val[] = { "1", "0" };
+
+static const char *acc_display[] = { "Fast", "Full" };
+static const char *acc_ini_val[] = { "fast", "full" };
+
+static const char *mem_display[] = { "4M", "8M", "16M", "24M" };
+static const char *mem_ini_val[] = { "4M", "8M", "16M", "24M" };
+
+/* boot_order_names and BOOT_ORDER_COUNT from misc.h */
+
+static void begin_settings_edit(void)
+{
+	if (s_count <= 0 || s_sel < 0 || s_sel >= s_count) return;
+	IniFileEntry *e = &s_files[s_sel];
+	parse_preview(e);
+	if (!e->valid) {
+		toast_show("Cannot edit invalid INI");
+		return;
+	}
+
+	/* Init field definitions */
+	s_sfields[0] = (SettingsField){
+		.section = "cpu", .key = "gen", .label = "CPU:      ",
+		.display = cpu_display, .ini_val = cpu_ini_val, .num_options = 3
+	};
+	s_sfields[1] = (SettingsField){
+		.section = "cpu", .key = "fpu", .label = "FPU:      ",
+		.display = fpu_display, .ini_val = fpu_ini_val, .num_options = 2
+	};
+	s_sfields[2] = (SettingsField){
+		.section = "cpu", .key = "accuracy", .label = "Accuracy: ",
+		.display = acc_display, .ini_val = acc_ini_val, .num_options = 2
+	};
+	s_sfields[3] = (SettingsField){
+		.section = "pc", .key = "mem_size", .label = "Memory:   ",
+		.display = mem_display, .ini_val = mem_ini_val, .num_options = 4
+	};
+	s_sfields[4] = (SettingsField){
+		.section = "pc", .key = "hda", .label = "HDA:      ",
+		.is_file = true
+	};
+	s_sfields[5] = (SettingsField){
+		.section = "pc", .key = "cda", .label = "CD-ROM:   ",
+		.is_file = true
+	};
+	s_sfields[6] = (SettingsField){
+		.section = "pc", .key = "fda", .label = "Floppy A: ",
+		.is_file = true
+	};
+	s_sfields[7] = (SettingsField){
+		.section = "pc", .key = "boot_order", .label = "Boot:     ",
+		.display = boot_order_names, .ini_val = boot_order_names,
+		.num_options = BOOT_ORDER_COUNT
+	};
+
+	/* Match current preview values to cycle indices */
+	s_sfields[0].current = find_cycle_index(cpu_display, 3, e->cpu);
+	s_sfields[1].current = find_cycle_index(fpu_display, 2, e->fpu);
+	s_sfields[2].current = find_cycle_index(acc_display, 2, e->accuracy);
+	s_sfields[3].current = find_cycle_index(mem_ini_val, 4, e->mem);
+	s_sfields[7].current = find_cycle_index(boot_order_names, BOOT_ORDER_COUNT, e->boot);
+
+	/* Get raw file paths (preview only stores basenames) */
+	RawIniVals raw = {0};
+	ini_parse(e->path, raw_val_handler, &raw);
+
+	struct { int idx; char *raw; } file_map[] = {
+		{4, raw.hda}, {5, raw.cda}, {6, raw.fda}
+	};
+	for (int i = 0; i < 3; i++) {
+		int fi = file_map[i].idx;
+		if (file_map[i].raw[0]) {
+			resolve_ini_path(file_map[i].raw, s_sfields[fi].file_value,
+			                 sizeof(s_sfields[fi].file_value));
+			path_to_basename(s_sfields[fi].file_value, s_sfields[fi].file_display,
+			                 sizeof(s_sfields[fi].file_display));
+		} else {
+			s_sfields[fi].file_value[0] = '\0';
+			s_sfields[fi].file_display[0] = '\0';
+		}
+	}
+
+	s_settings_field = 0;
+	s_settings_dirty = false;
+	s_browse_active = false;
+	s_edit_mode = EDIT_SETTINGS;
+}
+
+static void cancel_settings_edit(void)
+{
+	s_edit_mode = EDIT_NONE;
+	s_browse_active = false;
+	toast_show("Edit cancelled");
+}
+
+static bool ini_update_fields(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (!f) return false;
+
+	char *inbuf = malloc(4096);
+	char *outbuf = malloc(8192);
+	if (!inbuf || !outbuf) {
+		free(inbuf); free(outbuf);
+		fclose(f);
+		return false;
+	}
+
+	size_t inlen = fread(inbuf, 1, 4095, f);
+	fclose(f);
+	inbuf[inlen] = '\0';
+
+	size_t outpos = 0;
+	bool written[NUM_SETTINGS_FIELDS] = {0};
+	char cur_section[64] = "";
+
+	/* Helper: append one field's value to output */
+	#define APPEND_FIELD(idx) do { \
+		SettingsField *_sf = &s_sfields[idx]; \
+		if (_sf->is_file) { \
+			if (_sf->file_value[0]) { \
+				char _rel[256]; \
+				make_relative_path(_sf->file_value, _rel, sizeof(_rel)); \
+				int _n = snprintf(outbuf + outpos, 8192 - outpos, \
+					"%s = %s\n", _sf->key, _rel); \
+				if (_n > 0 && outpos + _n < 8192) outpos += _n; \
+			} \
+		} else { \
+			int _n = snprintf(outbuf + outpos, 8192 - outpos, \
+				"%s = %s\n", _sf->key, _sf->ini_val[_sf->current]); \
+			if (_n > 0 && outpos + _n < 8192) outpos += _n; \
+		} \
+		written[idx] = true; \
+	} while (0)
+
+	/* Flush unwritten MODIFIED fields for cur_section before switching */
+	#define FLUSH_SECTION() do { \
+		for (int _i = 0; _i < NUM_SETTINGS_FIELDS; _i++) { \
+			if (!written[_i] && s_sfields[_i].modified && \
+			    strcmp(s_sfields[_i].section, cur_section) == 0) \
+				APPEND_FIELD(_i); \
+		} \
+	} while (0)
+
+	char *line = inbuf;
+	while (line && *line && outpos < 7000) {
+		char *eol = strchr(line, '\n');
+		size_t linelen = eol ? (size_t)(eol - line) : strlen(line);
+
+		/* Copy line to temp buffer for safe parsing */
+		char lbuf[512];
+		size_t ll = linelen < sizeof(lbuf) - 1 ? linelen : sizeof(lbuf) - 1;
+		memcpy(lbuf, line, ll);
+		lbuf[ll] = '\0';
+
+		const char *trimmed = lbuf;
+		while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+
+		if (trimmed[0] == '[') {
+			/* Section header — flush previous section first */
+			FLUSH_SECTION();
+			const char *end = strchr(trimmed + 1, ']');
+			if (end) {
+				size_t slen = end - trimmed - 1;
+				if (slen >= sizeof(cur_section)) slen = sizeof(cur_section) - 1;
+				memcpy(cur_section, trimmed + 1, slen);
+				cur_section[slen] = '\0';
+			}
+			/* Copy section line as-is */
+			memcpy(outbuf + outpos, line, linelen);
+			outpos += linelen;
+			outbuf[outpos++] = '\n';
+		} else if (trimmed[0] == '#' || trimmed[0] == ';' || trimmed[0] == '\0') {
+			/* Comment or blank line — copy as-is */
+			memcpy(outbuf + outpos, line, linelen);
+			outpos += linelen;
+			outbuf[outpos++] = '\n';
+		} else {
+			/* key = value line */
+			const char *eq = strchr(trimmed, '=');
+			if (eq) {
+				size_t klen = eq - trimmed;
+				while (klen > 0 && (trimmed[klen - 1] == ' ' ||
+				       trimmed[klen - 1] == '\t'))
+					klen--;
+				char key[64];
+				if (klen >= sizeof(key)) klen = sizeof(key) - 1;
+				memcpy(key, trimmed, klen);
+				key[klen] = '\0';
+
+				bool replaced = false;
+				for (int i = 0; i < NUM_SETTINGS_FIELDS; i++) {
+					if (!written[i] && s_sfields[i].modified &&
+					    strcmp(s_sfields[i].section, cur_section) == 0 &&
+					    strcmp(s_sfields[i].key, key) == 0) {
+						APPEND_FIELD(i);
+						replaced = true;
+						break;
+					}
+				}
+				if (!replaced) {
+					memcpy(outbuf + outpos, line, linelen);
+					outpos += linelen;
+					outbuf[outpos++] = '\n';
+				}
+			} else {
+				/* Malformed — copy as-is */
+				memcpy(outbuf + outpos, line, linelen);
+				outpos += linelen;
+				outbuf[outpos++] = '\n';
+			}
+		}
+
+		line = eol ? eol + 1 : NULL;
+	}
+
+	/* Flush remaining fields for the last section */
+	FLUSH_SECTION();
+
+	/* Append modified fields for sections that never appeared in the file */
+	const char *needed[] = { "pc", "cpu" };
+	for (int s = 0; s < 2; s++) {
+		bool any = false;
+		for (int i = 0; i < NUM_SETTINGS_FIELDS; i++) {
+			if (!written[i] && s_sfields[i].modified &&
+			    strcmp(s_sfields[i].section, needed[s]) == 0) {
+				if (!any) {
+					int n = snprintf(outbuf + outpos, 8192 - outpos,
+						"\n[%s]\n", needed[s]);
+					if (n > 0 && outpos + n < 8192) outpos += n;
+					any = true;
+				}
+				APPEND_FIELD(i);
+			}
+		}
+	}
+
+	#undef APPEND_FIELD
+	#undef FLUSH_SECTION
+
+	f = fopen(path, "w");
+	if (!f) { free(inbuf); free(outbuf); return false; }
+	fwrite(outbuf, 1, outpos, f);
+	fclose(f);
+	free(inbuf);
+	free(outbuf);
+	return true;
+}
+
+static void finish_settings_edit(void)
+{
+	if (s_sel < 0 || s_sel >= s_count) {
+		cancel_settings_edit();
+		return;
+	}
+	IniFileEntry *e = &s_files[s_sel];
+	if (!ini_update_fields(e->path)) {
+		toast_show("Save failed");
+		return;
+	}
+	/* Bump mtime and re-parse preview */
+	utime(e->path, NULL);
+	e->parsed = false;
+	parse_preview(e);
+	s_edit_mode = EDIT_NONE;
+	s_browse_active = false;
+	toast_show("Settings saved");
+}
+
+static void open_file_browser(int field_idx)
+{
+	s_browse_active = true;
+	s_browse_target_field = field_idx;
+
+	/* Start directory: parent of current file, or INI_DIR */
+	if (s_sfields[field_idx].file_value[0]) {
+		snprintf(s_browse_path, sizeof(s_browse_path), "%s",
+		         s_sfields[field_idx].file_value);
+		char *slash = strrchr(s_browse_path, '/');
+		if (slash && slash != s_browse_path)
+			*slash = '\0';
+		else
+			snprintf(s_browse_path, sizeof(s_browse_path), "%s", INI_DIR);
+	} else {
+		snprintf(s_browse_path, sizeof(s_browse_path), "%s", INI_DIR);
+	}
+
+	fb_scan_directory(s_browse_path, sizeof(s_browse_path),
+	                  s_browse_entries, FB_MAX_FILES,
+	                  &s_browse_count, &s_browse_sel, &s_browse_scroll,
+	                  globals.usb_vfs_mounted,
+	                  s_browse_custom, 1, 1);
+}
+
+static int handle_browse_key(int scancode)
+{
+	switch (scancode) {
+	case 0x48: /* Up */
+		if (s_browse_sel > 0) s_browse_sel--;
+		break;
+	case 0x50: /* Down */
+		if (s_browse_sel < s_browse_count - 1) s_browse_sel++;
+		break;
+	case 0x1c: /* Enter */ {
+		if (s_browse_sel < 0 || s_browse_sel >= s_browse_count)
+			break;
+		char fullpath[256];
+		int out_type = 0;
+		int ret = fb_select_entry(s_browse_path, sizeof(s_browse_path),
+		                          &s_browse_entries[s_browse_sel],
+		                          globals.usb_vfs_mounted,
+		                          fullpath, sizeof(fullpath), &out_type);
+		if (ret == 1) {
+			/* File selected */
+			int fi = s_browse_target_field;
+			snprintf(s_sfields[fi].file_value,
+			         sizeof(s_sfields[fi].file_value), "%s", fullpath);
+			path_to_basename(fullpath, s_sfields[fi].file_display,
+			                 sizeof(s_sfields[fi].file_display));
+			s_sfields[fi].modified = true;
+			s_settings_dirty = true;
+			s_browse_active = false;
+		} else if (ret == -1 && out_type == BROWSE_EJECT_TYPE) {
+			/* Eject — clear field */
+			int fi = s_browse_target_field;
+			s_sfields[fi].file_value[0] = '\0';
+			s_sfields[fi].file_display[0] = '\0';
+			s_sfields[fi].modified = true;
+			s_settings_dirty = true;
+			s_browse_active = false;
+		} else {
+			/* Directory navigation or storage switch — rescan */
+			fb_scan_directory(s_browse_path, sizeof(s_browse_path),
+			                  s_browse_entries, FB_MAX_FILES,
+			                  &s_browse_count, &s_browse_sel,
+			                  &s_browse_scroll,
+			                  globals.usb_vfs_mounted,
+			                  s_browse_custom, 1, 1);
+		}
+		break;
+	}
+	case 0x01: /* Escape */
+		s_browse_active = false;
+		break;
+	}
+	return 0;
+}
+
+static int handle_settings_key(int scancode)
+{
+	if (s_browse_active)
+		return handle_browse_key(scancode);
+
+	switch (scancode) {
+	case 0x48: /* Up */
+		s_settings_field--;
+		if (s_settings_field < 0)
+			s_settings_field = NUM_SETTINGS_FIELDS - 1;
+		break;
+	case 0x50: /* Down */
+		s_settings_field++;
+		if (s_settings_field >= NUM_SETTINGS_FIELDS)
+			s_settings_field = 0;
+		break;
+	case 0x4b: /* Left */ {
+		SettingsField *sf = &s_sfields[s_settings_field];
+		if (!sf->is_file) {
+			sf->current--;
+			if (sf->current < 0) sf->current = sf->num_options - 1;
+			sf->modified = true;
+			s_settings_dirty = true;
+		}
+		break;
+	}
+	case 0x4d: /* Right */ {
+		SettingsField *sf = &s_sfields[s_settings_field];
+		if (!sf->is_file) {
+			sf->current = (sf->current + 1) % sf->num_options;
+			sf->modified = true;
+			s_settings_dirty = true;
+		}
+		break;
+	}
+	case 0x1c: /* Enter */
+		if (s_sfields[s_settings_field].is_file)
+			open_file_browser(s_settings_field);
+		else
+			finish_settings_edit();
+		break;
+	case 0x01: /* Escape */
+		cancel_settings_edit();
+		break;
+	}
+	return 0;
+}
+
+static void draw_settings_panel(void)
+{
+	int px = RIGHT_X + 8;
+	int py = LIST_Y + 2;
+
+	sel_draw_text(px, py, "Edit Settings", C_TITLE, 0);
+	py += FONT_H + 4;
+	sel_fill_rect(px, py, RIGHT_W - 16, 1, C_SEP);
+	py += 6;
+
+	int line_h = FONT_H + 4;
+	for (int i = 0; i < NUM_SETTINGS_FIELDS; i++) {
+		SettingsField *sf = &s_sfields[i];
+
+		/* Extra spacing before file fields group and boot field */
+		if (i == 4 || i == 7) py += 6;
+
+		if (i == s_settings_field)
+			sel_fill_rect(RIGHT_X + 4, py - 1, RIGHT_W - 8, line_h, C_HILITE);
+
+		sel_draw_text(px, py, sf->label, C_DIM, 0);
+		int lx = px + strlen(sf->label) * FONT_W;
+
+		if (sf->is_file) {
+			const char *disp = sf->file_display[0] ? sf->file_display : "(none)";
+			sel_draw_text(lx, py, disp, C_VALUE,
+			              RIGHT_W - (lx - RIGHT_X) - 80);
+			if (i == s_settings_field)
+				sel_draw_text(RIGHT_X + RIGHT_W - 70, py, "[Enter]", C_DIM, 0);
+		} else {
+			if (i == s_settings_field) {
+				char buf[80];
+				snprintf(buf, sizeof(buf), "< %s >", sf->display[sf->current]);
+				sel_draw_text(lx, py, buf, C_VALUE,
+				              RIGHT_W - (lx - RIGHT_X) - 10);
+			} else {
+				sel_draw_text(lx, py, sf->display[sf->current], C_VALUE,
+				              RIGHT_W - (lx - RIGHT_X) - 10);
+			}
+		}
+		py += line_h;
+	}
+}
+
+#define BROWSE_VISIBLE ((PANEL_BOT - LIST_Y - 30) / (FONT_H + 2))
+
+static void render_browse_panel(void)
+{
+	int px = RIGHT_X + 8;
+	int py = LIST_Y + 2;
+
+	/* Title: current path (truncated to fit) */
+	sel_draw_text(px, py, s_browse_path, C_TITLE, RIGHT_W - 16);
+	py += FONT_H + 4;
+	sel_fill_rect(px, py, RIGHT_W - 16, 1, C_SEP);
+	py += 6;
+
+	/* Adjust scroll to keep selection visible */
+	if (s_browse_sel < s_browse_scroll)
+		s_browse_scroll = s_browse_sel;
+	if (s_browse_sel >= s_browse_scroll + BROWSE_VISIBLE)
+		s_browse_scroll = s_browse_sel - BROWSE_VISIBLE + 1;
+
+	int line_h = FONT_H + 2;
+	for (int i = s_browse_scroll;
+	     i < s_browse_count && i < s_browse_scroll + BROWSE_VISIBLE;
+	     i++) {
+		if (i == s_browse_sel)
+			sel_fill_rect(RIGHT_X + 4, py, RIGHT_W - 8, line_h, C_HILITE);
+
+		FBEntry *be = &s_browse_entries[i];
+		uint16_t color = C_TEXT;
+		char display[80];
+
+		if (be->is_dir == FB_TYPE_DIR) {
+			snprintf(display, sizeof(display), "%s/", be->name);
+			color = C_TITLE;
+		} else if (be->is_dir < 0) {
+			snprintf(display, sizeof(display), "%s", be->name);
+			color = C_DIM;
+		} else {
+			snprintf(display, sizeof(display), "%s", be->name);
+		}
+
+		sel_draw_text(px, py + 1, display, color, RIGHT_W - 16);
+		py += line_h;
+	}
+
+	/* Scroll indicator */
+	if (s_browse_count > BROWSE_VISIBLE) {
+		int track_start = LIST_Y + 30;
+		int track_h = PANEL_BOT - track_start;
+		int thumb_h = track_h * BROWSE_VISIBLE / s_browse_count;
+		if (thumb_h < 8) thumb_h = 8;
+		int max_scroll = s_browse_count - BROWSE_VISIBLE;
+		int thumb_y = track_start;
+		if (max_scroll > 0)
+			thumb_y += (track_h - thumb_h) * s_browse_scroll / max_scroll;
+		sel_fill_rect(RIGHT_X + RIGHT_W - 6, thumb_y, 3, thumb_h, C_SEP);
+	}
+}
+
 /* ── Portrait coordinate transform (same as toast.c) ────────────── */
 static uint16_t *s_fb;
 static int s_phys_w, s_phys_h;
@@ -484,6 +1089,9 @@ static int preview_handler(void *user, const char *section,
 			snprintf(e->cpu, sizeof(e->cpu), "%s", names[idx]);
 		} else if (NM("fpu")) {
 			snprintf(e->fpu, sizeof(e->fpu), "%s", atoi(value) ? "On" : "Off");
+		} else if (NM("accuracy")) {
+			snprintf(e->accuracy, sizeof(e->accuracy), "%s",
+				strcmp(value, "fast") == 0 ? "Fast" : "Full");
 		}
 	}
 #undef SEC
@@ -499,6 +1107,7 @@ static void parse_preview(IniFileEntry *e)
 	/* Defaults */
 	strcpy(e->cpu, "i486");
 	strcpy(e->fpu, "Off");
+	strcpy(e->accuracy, "Full");
 	strcpy(e->mem, "8M");
 	e->hda[0] = e->cda[0] = e->fda[0] = 0;
 	strcpy(e->bios, "(default)");
@@ -611,10 +1220,14 @@ static void finish_selection(int idx, bool force_debug)
 		path = s_files[idx].path;
 		utime(path, NULL);  /* bump mtime so it sorts first next boot */
 	}
+#ifdef CPU_DIAG
 	if (force_debug) {
 		globals.cpu_debug_enabled = true;
 		ESP_LOGI(TAG, "Ctrl+Enter: forcing Debug ON for boot");
 	}
+#else
+	(void)force_debug;
+#endif
 
 	if (globals.pc) {
 		/* Runtime: emulator is running — trigger INI switch via emu loop */
@@ -645,6 +1258,9 @@ int ini_selector_handle_key(int scancode)
 		s_countdown = -1;
 	}
 
+	if (s_edit_mode == EDIT_SETTINGS) {
+		return handle_settings_key(scancode);
+	}
 	if (s_edit_mode != EDIT_NONE) {
 		return handle_edit_key(scancode);
 	}
@@ -676,6 +1292,9 @@ int ini_selector_handle_key(int scancode)
 		break;
 	case 0x2e: /* C */
 		begin_edit(EDIT_CLONE);
+		break;
+	case 0x12: /* E */
+		begin_settings_edit();
 		break;
 	case 0x01: /* Escape */
 		if (globals.pc) {
@@ -793,7 +1412,7 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 		}
 	}
 
-	/* ── Right panel: settings preview ─────────────────────────── */
+	/* ── Right panel ──────────────────────────────────────────── */
 	sel_fill_rect(RIGHT_X - 2, LIST_Y - 2, RIGHT_W + 4, PANEL_BOT - LIST_Y + 4, C_PANEL);
 	/* Border */
 	sel_fill_rect(RIGHT_X - 2, LIST_Y - 2, RIGHT_W + 4, 1, C_BORDER);
@@ -801,7 +1420,12 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 	sel_fill_rect(RIGHT_X - 2, LIST_Y - 2, 1, PANEL_BOT - LIST_Y + 5, C_BORDER);
 	sel_fill_rect(RIGHT_X + RIGHT_W + 1, LIST_Y - 2, 1, PANEL_BOT - LIST_Y + 5, C_BORDER);
 
-	if (s_count > 0 && s_sel >= 0 && s_sel < s_count) {
+	if (s_edit_mode == EDIT_SETTINGS) {
+		if (s_browse_active)
+			render_browse_panel();
+		else
+			draw_settings_panel();
+	} else if (s_count > 0 && s_sel >= 0 && s_sel < s_count) {
 		IniFileEntry *e = &s_files[s_sel];
 		parse_preview(e);  /* no-op if already parsed */
 
@@ -820,6 +1444,7 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 			py += 4; /* extra spacing */
 			draw_preview_line(px, &py, "CPU:      ", e->cpu, C_VALUE);
 			draw_preview_line(px, &py, "FPU:      ", e->fpu, C_VALUE);
+			draw_preview_line(px, &py, "Accuracy: ", e->accuracy, C_VALUE);
 			draw_preview_line(px, &py, "Memory:   ", e->mem, C_VALUE);
 			py += 4;
 			draw_preview_line(px, &py, "BIOS:     ", e->bios, C_VALUE);
@@ -848,6 +1473,14 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 		snprintf(msg, sizeof(msg), "Auto-boot \"%.40s\" in %d...",
 		         s_files[0].name, s_countdown);
 		sel_draw_text(LEFT_X, FOOTER_Y + 2, msg, C_TITLE, LOG_W - 20);
+	} else if (s_edit_mode == EDIT_SETTINGS) {
+		if (s_browse_active)
+			sel_draw_text(LEFT_X, FOOTER_Y + 2,
+			              "Up/Dn:Navigate  Enter:Select  Esc:Back", C_SEP, 0);
+		else
+			sel_draw_text(LEFT_X, FOOTER_Y + 2,
+			              "Up/Dn:Field  Lt/Rt:Change  Enter:Save/Browse  Esc:Cancel",
+			              C_SEP, 0);
 	} else if (s_edit_mode != EDIT_NONE) {
 		char msg[120];
 		const char *verb = (s_edit_mode == EDIT_RENAME) ? "Rename to: " : "Clone as: ";
@@ -855,10 +1488,18 @@ void ini_selector_render(uint16_t *fb, int phys_w, int phys_h, int pitch)
 		         verb, s_edit_name);
 		sel_draw_text(LEFT_X, FOOTER_Y + 2, msg, C_TITLE, LOG_W - 20);
 	} else {
+#ifdef CPU_DIAG
 		sel_draw_text(LEFT_X, FOOTER_Y + 2,
 		              globals.pc
-		                ? "Up/Down:Navigate  Enter:Select  Ctrl+Enter:Debug  R:Rename  C:Clone  Esc:Back"
-		                : "Up/Down:Navigate  Enter:Select  Ctrl+Enter:Debug  R:Rename  C:Clone  Esc:Exit",
+		                ? "Up/Dn:Nav  Enter:Select  Ctrl+Enter:Debug  R:Rename  C:Clone  E:Edit  Esc:Back"
+		                : "Up/Dn:Nav  Enter:Select  Ctrl+Enter:Debug  R:Rename  C:Clone  E:Edit  Esc:Exit",
 		              C_SEP, 0);
+#else
+		sel_draw_text(LEFT_X, FOOTER_Y + 2,
+		              globals.pc
+		                ? "Up/Dn:Navigate  Enter:Select  R:Rename  C:Clone  E:Edit  Esc:Back"
+		                : "Up/Dn:Navigate  Enter:Select  R:Rename  C:Clone  E:Edit  Esc:Exit",
+		              C_SEP, 0);
+#endif
 	}
 }

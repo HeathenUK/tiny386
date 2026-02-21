@@ -1,8 +1,11 @@
 set(COMMON_SRCS
     "esp_main.c"
     "../../adlib.c"
-    "../../fpu.c"
-    "../../i386.c"
+    "../../i386_build_fast.c"
+    "../../i386_build_full.c"
+    "../../fpu_build_fast.c"
+    "../../fpu_build_full.c"
+    "../../cpu_dispatch.c"
     "../../i8042.c"
     "../../i8254.c"
     "../../i8259.c"
@@ -26,7 +29,7 @@ set(OPL_SRCS
 )
 
 # Tanmatsu (ESP32-P4) sources
-set(BOARD_SRCS "lcd_bsp.c" "input_bsp.c" "tanmatsu_osd.c" "toast.c" "led_activity.c" "mouse_emu.c" "vga_pie.S" "usb_host.c" "wifi.c" "ini_selector.c")
+set(BOARD_SRCS "lcd_bsp.c" "input_bsp.c" "tanmatsu_osd.c" "toast.c" "led_activity.c" "mouse_emu.c" "vga_pie.S" "usb_host.c" "wifi.c" "ini_selector.c" "file_browser.c")
 set(BOARD_HEADER "board_tanmatsu.h")
 
 idf_component_register(SRCS ${COMMON_SRCS} ${OPL_SRCS} ${BOARD_SRCS}
@@ -47,8 +50,13 @@ add_definitions(-include ${CMAKE_CURRENT_SOURCE_DIR}/${BOARD_HEADER})
 
 
 # Performance-critical emulation core: -O3 with aggressive optimizations
-set_source_files_properties("../../i386.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -funroll-loops")
-set_source_files_properties("../../fpu.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -ffast-math -funroll-loops")
+# Fast core: lean ~6K lines, targets DOS games
+set_source_files_properties("../../i386_build_fast.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-unroll-loops")
+# Full core: ~14K lines, targets Windows 3.11/95/NT
+set_source_files_properties("../../i386_build_full.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-unroll-loops")
+# FPU: both copies get same flags
+set_source_files_properties("../../fpu_build_fast.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -ffast-math -funroll-loops")
+set_source_files_properties("../../fpu_build_full.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -ffast-math -funroll-loops")
 set_source_files_properties("../../pc.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("../../i8254.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("../../i8259.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
