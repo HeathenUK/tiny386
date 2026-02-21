@@ -616,14 +616,8 @@ static void finish_selection(int idx, bool force_debug)
 		ESP_LOGI(TAG, "Ctrl+Enter: forcing Debug ON for boot");
 	}
 
-	if (s_auto_boot) {
-		/* Boot-time: i386_task is waiting for ini_selector_done */
-		strncpy(globals.ini_selected_path, path,
-		        sizeof(globals.ini_selected_path) - 1);
-		globals.ini_selected_path[sizeof(globals.ini_selected_path) - 1] = '\0';
-		globals.ini_selector_done = true;
-	} else {
-		/* Runtime: trigger an INI switch via the emulator loop */
+	if (globals.pc) {
+		/* Runtime: emulator is running — trigger INI switch via emu loop */
 		if (path[0]) {
 			strncpy(globals.ini_switch_path, path,
 			        sizeof(globals.ini_switch_path) - 1);
@@ -631,6 +625,13 @@ static void finish_selection(int idx, bool force_debug)
 			globals.ini_switch_pending = true;
 		}
 		/* If path is empty (Esc pressed), just deactivate selector */
+	} else {
+		/* Boot-time or post-shutdown: i386_task is waiting on
+		 * ini_selector_done.  Store path and signal. */
+		strncpy(globals.ini_selected_path, path,
+		        sizeof(globals.ini_selected_path) - 1);
+		globals.ini_selected_path[sizeof(globals.ini_selected_path) - 1] = '\0';
+		globals.ini_selector_done = true;
 	}
 
 	globals.ini_selector_active = false;
