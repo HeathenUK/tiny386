@@ -57,10 +57,11 @@ static const char *TAG = "input_bsp";
 static bool meta_held = false;
 static bool meta_consumed = false;  // Set if META+combo was used
 
-// OSD key repeat state
+// Key repeat state (OSD, INI selector, and emulator typematic)
 #define KEY_REPEAT_DELAY_MS   400   // Initial delay before repeat starts
 #define KEY_REPEAT_INTERVAL_MS 80   // Interval between repeats
 static uint8_t repeat_keycode = 0;  // Currently held repeatable key (0 = none)
+static bool repeat_is_e0 = false;   // Whether repeat key needs E0 prefix (emulator)
 static uint32_t repeat_next_ms = 0; // When to fire next repeat
 
 // Ctrl key scancode
@@ -100,8 +101,14 @@ static void handle_scancode(uint8_t code, int is_down)
 			ESP_LOGI(TAG, "OSD disabled");
 		}
 	} else if (globals.kbd) {
-		repeat_keycode = 0;
 		ps2_put_keycode(globals.kbd, is_down, code);
+		/* Typematic repeat for emulator — track held key */
+		if (is_down) {
+			repeat_keycode = code;
+			repeat_next_ms = esp_log_timestamp() + KEY_REPEAT_DELAY_MS;
+		} else if (code == repeat_keycode) {
+			repeat_keycode = 0;
+		}
 	}
 }
 
@@ -219,9 +226,7 @@ static void input_task(void *arg)
 
 		// Use short timeout when key repeat is active, otherwise block
 		TickType_t wait_ticks = portMAX_DELAY;
-		bool repeat_active = (repeat_keycode != 0) &&
-		                     (globals.osd_enabled || globals.ini_selector_active);
-		if (repeat_active) {
+		if (repeat_keycode != 0) {
 			uint32_t now = esp_log_timestamp();
 			if (now >= repeat_next_ms) {
 				// Fire repeat event
@@ -229,6 +234,11 @@ static void input_task(void *arg)
 					ini_selector_handle_key(repeat_keycode);
 				} else if (globals.osd_enabled) {
 					osd_handle_key(globals.osd, repeat_keycode, 1);
+				} else if (globals.kbd) {
+					// Typematic repeat to emulator
+					if (repeat_is_e0)
+						ps2_put_keycode(globals.kbd, 1, 0xE0);
+					ps2_put_keycode(globals.kbd, 1, repeat_keycode);
 				}
 				repeat_next_ms = now + KEY_REPEAT_INTERVAL_MS;
 			}
@@ -335,12 +345,17 @@ static void input_task(void *arg)
 						vTaskDelay(1 / portTICK_PERIOD_MS);
 					}
 
+					repeat_is_e0 = true;
 					handle_scancode(code, is_down);
 				} else {
 					// Regular scancode
 					uint8_t code = scancode & 0xFF;
 					int is_down = !(code & BSP_INPUT_SCANCODE_RELEASE_MODIFIER);
 					code &= ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
+
+					// Fn key -> Caps Lock (Tanmatsu has no Caps Lock)
+					if (code == 0x55)
+						code = 0x3A;
 
 					// Block space key when mouse mode is active
 					// (mouse_emu handles L/M/R sections via navigation events)
@@ -351,24 +366,24 @@ static void input_task(void *arg)
 						}
 					}
 
-					// META+F1 -> Dump stats to console
-					if (meta_held && is_down && code == SC_F1) {
+					// META+F5 -> Dump stats to console
+					if (meta_held && is_down && code == SC_F5) {
 						globals.stats_dump_pending = true;
 						meta_consumed = true;
 						vTaskDelay(5 / portTICK_PERIOD_MS);
 						continue;
 					}
 
-					// META+F2 -> Toggle periodic stats logging
-					if (meta_held && is_down && code == SC_F2) {
+					// META+F6 -> Toggle periodic stats logging
+					if (meta_held && is_down && code == SC_F6) {
 						globals.stats_log_active = !globals.stats_log_active;
 						meta_consumed = true;
 						vTaskDelay(5 / portTICK_PERIOD_MS);
 						continue;
 					}
 
-					// META+F3-F6 -> F9-F12 (Tanmatsu only has F1-F6 keys)
-					// (F7/F8 sacrificed for stats dump/log)
+					// META+F1-F6 -> F7-F12 (Tanmatsu only has F1-F6 keys)
+					// (F11/F12 sacrificed for stats dump/log)
 					if (meta_held && code >= SC_F1 && code <= SC_F6) {
 						code = (code - SC_F1) + SC_F7;  // Map F1-F6 to F7-F12
 						meta_consumed = true;
@@ -398,6 +413,7 @@ static void input_task(void *arg)
 						continue;
 					}
 
+					repeat_is_e0 = false;
 					handle_scancode(code, is_down);
 				}
 
