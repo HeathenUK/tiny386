@@ -2244,6 +2244,8 @@ static struct {
     SemaphoreHandle_t sd_mutex;         /* protects all sdmmc_read/write calls */
     sdmmc_card_t *card;
     int active;
+    volatile int stop_requested;        /* signal io_task to exit */
+    TaskHandle_t task_handle;           /* io_task handle for cleanup */
 
     /* Lookup telemetry */
     uint64_t lookup_calls;
@@ -2382,6 +2384,9 @@ static void io_task(void *arg)
     for (;;) {
         xSemaphoreTake(wcache.not_empty, portMAX_DELAY);
 
+        if (wcache.stop_requested)
+            break;
+
         /* Phase 3: async reads have priority over writes */
         if (__atomic_load_n(&async_read.pending, __ATOMIC_ACQUIRE)) {
             BlockDeviceFile *bf = async_read.bf;
@@ -2468,6 +2473,8 @@ static void io_task(void *arg)
             }
         }
     }
+    fprintf(stderr, "io_task: exiting\n");
+    vTaskDelete(NULL);
 }
 
 static void wcache_init(void)
@@ -2496,8 +2503,9 @@ static void wcache_init(void)
     wcache.card = (sdmmc_card_t *)rawsd;
     wcache.head = 0;
     wcache.tail = 0;
+    wcache.stop_requested = 0;
     wcache.active = 1;
-    xTaskCreatePinnedToCore(io_task, "ide_io", 4096, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(io_task, "ide_io", 4096, NULL, 2, &wcache.task_handle, 0);
     fprintf(stderr, "wcache: %dKB ring buffer on core 0\n",
             WCACHE_SLOTS * SECTOR_SIZE / 1024);
 }
@@ -2578,6 +2586,50 @@ static void wcache_flush(void)
     while (__atomic_load_n(&wcache.tail, __ATOMIC_ACQUIRE) !=
            __atomic_load_n(&wcache.head, __ATOMIC_ACQUIRE))
         vTaskDelay(1);
+}
+
+/* Drain pending writes, stop io_task, and tear down wcache for INI switch.
+ * Must be called BEFORE ide_close_files() to prevent dangling pointer access. */
+static void wcache_shutdown(void)
+{
+    if (!wcache.active)
+        return;
+    /* First drain all pending writes */
+    wcache_flush();
+    /* Signal io_task to exit and wake it */
+    wcache.stop_requested = 1;
+    xSemaphoreGive(wcache.not_empty);
+    /* Wait for io_task to actually exit (up to 2 seconds) */
+    for (int i = 0; i < 200 && wcache.task_handle; i++) {
+        if (eTaskGetState(wcache.task_handle) == eDeleted)
+            break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    vTaskDelay(pdMS_TO_TICKS(20)); /* let FreeRTOS clean up task */
+    /* Reset all wcache state so wcache_init() re-creates everything */
+    if (wcache.data) { free(wcache.data); wcache.data = NULL; }
+    if (wcache.index) { free(wcache.index); wcache.index = NULL; }
+    if (wcache.not_empty) { vSemaphoreDelete(wcache.not_empty); wcache.not_empty = NULL; }
+    /* Note: sd_mutex is shared (sdmmc_io_mutex), don't delete it */
+    wcache.head = 0;
+    wcache.tail = 0;
+    wcache.task_handle = NULL;
+    wcache.active = 0;
+    wcache.stop_requested = 0;
+    memset(wcache.meta, 0, sizeof(wcache.meta));
+    /* Reset telemetry */
+    wcache.lookup_calls = 0;
+    wcache.lookup_hits = 0;
+    wcache.lookup_index_hits = 0;
+    wcache.lookup_index_stale = 0;
+    wcache.lookup_index_out_of_range = 0;
+    wcache.lookup_fallback_hits = 0;
+    wcache.lookup_fallback_misses = 0;
+    wcache.lookup_scan_steps = 0;
+    wcache.lookup_reported_calls = 0;
+    /* Clear async read state */
+    memset(&async_read, 0, sizeof(async_read));
+    fprintf(stderr, "wcache: shutdown complete\n");
 }
 
 static void wcache_report_stats(void)
@@ -3357,6 +3409,9 @@ static SectorCache *sector_cache = NULL;
 void ide_reset_statics(void)
 {
     sector_cache = NULL;
+    /* wcache_shutdown() should have been called already by ide_close_files(),
+     * but ensure wcache.active is 0 so wcache_init() re-creates everything. */
+    wcache.active = 0;
 }
 
 static void cache_init(void)
@@ -4401,8 +4456,13 @@ void ide_poll_async(void)
 static void ide_sync_if(IDEIFState *s)
 {
     if (!s) return;
+    extern int usbmsc_read_async(BlockDevice *, uint64_t, uint8_t *, int,
+                                  BlockDeviceCompletionFunc *, void *);
     for (int i = 0; i < 2; i++) {
         if (!s->drives[i] || !s->drives[i]->bs) continue;
+        /* Skip USB drives — they don't use stdio FILE handles */
+        if (s->drives[i]->bs->read_async == usbmsc_read_async)
+            continue;
         BlockDeviceFile *bf = s->drives[i]->bs->opaque;
         if (bf && bf->f && bf->mode == BF_MODE_RW && bf->dirty) {
             fflush(bf->f);
@@ -4420,13 +4480,23 @@ void ide_sync(IDEIFState *ide, IDEIFState *ide2)
     ide_sync_if(ide2);
 }
 
-/* Close all open file handles on an IDE interface (for teardown). */
+/* Close all open file handles on an IDE interface (for teardown).
+ * Skips USB passthrough drives (BlockDeviceUSB) — they use bounce buffers,
+ * not stdio FILE handles.  Casting bs->opaque to BlockDeviceFile for a USB
+ * drive would misinterpret the bounce pointer as a FILE*, crashing in
+ * newlib's lock acquire. */
 static void ide_close_files_if(IDEIFState *s)
 {
     if (!s) return;
     for (int i = 0; i < 2; i++) {
         if (!s->drives[i] || !s->drives[i]->bs) continue;
-        BlockDeviceFile *bf = s->drives[i]->bs->opaque;
+        BlockDevice *bs = s->drives[i]->bs;
+        /* USB drives use usbmsc_read_async — skip them entirely */
+        extern int usbmsc_read_async(BlockDevice *, uint64_t, uint8_t *, int,
+                                      BlockDeviceCompletionFunc *, void *);
+        if (bs->read_async == usbmsc_read_async)
+            continue;
+        BlockDeviceFile *bf = bs->opaque;
         if (bf && bf->f) {
             fflush(bf->f);
             fsync(fileno(bf->f));
@@ -4438,6 +4508,9 @@ static void ide_close_files_if(IDEIFState *s)
 
 void ide_close_files(IDEIFState *ide, IDEIFState *ide2)
 {
+    /* Stop io_task before closing file handles — prevents dangling pointer
+     * access from the background write task on core 0. */
+    wcache_shutdown();
     ide_close_files_if(ide);
     ide_close_files_if(ide2);
 }

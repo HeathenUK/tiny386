@@ -44,6 +44,7 @@ struct Globals {
 	char emu_new_hda_path[256]; // New HDA path for restart (set by OSD)
 	bool _Atomic vga_force_redraw; // Force full VGA redraw (e.g., after OSD closes)
 	bool _Atomic batch_reset_pending; // Reset dynamic batch size (on VGA mode change)
+	bool _Atomic teardown_ack; // VGA task confirms it stopped rendering (for safe INI switch)
 	uint8_t key_pressed[KEYCODE_MAX];  // Key state tracking
 	int vga_width;     // VGA framebuffer dimensions for OSD rendering
 	int vga_height;

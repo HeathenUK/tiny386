@@ -668,7 +668,7 @@ void vga_task(void *arg)
 			continue;
 		}
 
-		/* ── PC not ready — idle until BIT0 ──────────────────── */
+		/* ── PC not ready — idle until globals.pc is set again ── */
 		if (!globals.pc) {
 			/* Clear display once when PC goes away (INI switch).
 			 * Without this, the old session's last frame lingers. */
@@ -677,6 +677,9 @@ void vga_task(void *arg)
 				if (xSemaphoreTake(te_sem, pdMS_TO_TICKS(100)) == pdTRUE)
 					bsp_display_blit(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, fb_rotated);
 				pc_gone_cleared = true;
+				/* Signal core 1 that we've stopped rendering —
+				 * safe to zero PSRAM pools now. */
+				globals.teardown_ack = true;
 			}
 			vTaskDelay(pdMS_TO_TICKS(50));
 			continue;

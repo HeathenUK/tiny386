@@ -360,7 +360,10 @@ static int pc_main(const char *file)
 	ide_close_files(pc->ide, pc->ide2);
 	emulink_close(pc->emulink);
 
-	/* Invalidate globals so other tasks stop using stale pointers */
+	/* Invalidate globals so other tasks stop using stale pointers.
+	 * Clear teardown_ack BEFORE setting pc=NULL so VGA task's ack
+	 * doesn't get lost in a race with the wait loop after pc_main. */
+	globals.teardown_ack = false;
 	globals.pc = NULL;
 	globals.kbd = NULL;
 	globals.mouse = NULL;
@@ -478,6 +481,15 @@ static void i386_task(void *arg)
 	for (;;) {
 		fprintf(stderr, "Loading INI: %s\n", ini_path);
 		int ret = pc_main(ini_path);
+
+		/* Wait for VGA task (core 0) to confirm it stopped rendering
+		 * before we zero the memory pools.  Without this, the VGA task
+		 * can be mid-render using pointers into PSRAM that we're about
+		 * to memset to zero → store/load access fault on core 0. */
+		for (int i = 0; i < 100 && !globals.teardown_ack; i++)
+			vTaskDelay(pdMS_TO_TICKS(10));
+		if (!globals.teardown_ack)
+			fprintf(stderr, "WARNING: VGA task did not ack teardown in 1s\n");
 
 		/* Common teardown: reset memory pools and stale statics */
 		fprintf(stderr, "pc_main returned %d, resetting pcram (%ld -> %ld) psram (%ld -> %ld)\n",
