@@ -4637,7 +4637,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 #else
 	static const IRAM_ATTR void *pfxlabel[] = {
 /* 0x00 */	&&f0x00, &&fast_0x01, &&f0x02, &&fast_0x03, &&f0x04, &&f0x05, &&f0x06, &&f0x07,
-/* 0x08 */	&&f0x08, &&fast_0x09, &&f0x0a, &&fast_0x0b, &&f0x0c, &&f0x0d, &&f0x0e, &&f0x0f,
+/* 0x08 */	&&f0x08, &&fast_0x09, &&f0x0a, &&fast_0x0b, &&f0x0c, &&f0x0d, &&f0x0e, &&fast_0x0f,
 /* 0x10 */	&&f0x10, &&f0x11, &&f0x12, &&f0x13, &&f0x14, &&f0x15, &&f0x16, &&f0x17,
 /* 0x18 */	&&f0x18, &&f0x19, &&f0x1a, &&f0x1b, &&f0x1c, &&f0x1d, &&f0x1e, &&f0x1f,
 /* 0x20 */	&&f0x20, &&fast_0x21, &&f0x22, &&fast_0x23, &&f0x24, &&f0x25, &&pfx26, &&f0x27,
@@ -4993,6 +4993,44 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			continue;
 		}
 		goto f0xb8;
+	}
+
+	fast_0x0f: {  /* Fast path for Jcc rel32 (0F 80-8F, no 66h override) */
+		if (likely(!opsz16 && cpu->pf_pos + 5 <= cpu->pf_avail)) {
+			u8 b2 = cpu->pf_ptr[cpu->pf_pos];
+			if (likely((b2 & 0xf0) == 0x80)) {
+#ifdef OPCODE_PROFILE
+				cpu->opcode_0f_freq[b2]++;
+#endif
+				int p = cpu->pf_pos + 1;
+				sword d = (s32)(cpu->pf_ptr[p] | ((u32)cpu->pf_ptr[p+1] << 8)
+				         | ((u32)cpu->pf_ptr[p+2] << 16) | ((u32)cpu->pf_ptr[p+3] << 24));
+				cpu->pf_pos = p + 4;
+				cpu->next_ip += 5;
+				int cond;
+				switch (b2 & 0xf) {
+				case 0x0: cond =  get_OF(cpu); break;
+				case 0x1: cond = !get_OF(cpu); break;
+				case 0x2: cond =  get_CF(cpu); break;
+				case 0x3: cond = !get_CF(cpu); break;
+				case 0x4: cond =  get_ZF(cpu); break;
+				case 0x5: cond = !get_ZF(cpu); break;
+				case 0x6: cond =  get_ZF(cpu) ||  get_CF(cpu); break;
+				case 0x7: cond = !get_ZF(cpu) && !get_CF(cpu); break;
+				case 0x8: cond =  get_SF(cpu); break;
+				case 0x9: cond = !get_SF(cpu); break;
+				case 0xa: cond =  get_PF(cpu); break;
+				case 0xb: cond = !get_PF(cpu); break;
+				case 0xc: cond =  get_SF(cpu) != get_OF(cpu); break;
+				case 0xd: cond =  get_SF(cpu) == get_OF(cpu); break;
+				case 0xe: cond =  get_ZF(cpu) || get_SF(cpu) != get_OF(cpu); break;
+				default:  cond = !get_ZF(cpu) && get_SF(cpu) == get_OF(cpu); break;
+				}
+				if (cond) cpu->next_ip += d;
+				continue;
+			}
+		}
+		goto f0x0f;
 	}
 
 	/* Reg-to-reg ALU fast paths (mod=3 only) */
