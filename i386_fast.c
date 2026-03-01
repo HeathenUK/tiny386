@@ -152,6 +152,8 @@ struct CPUI386 {
 	 * Allows a single branch to skip all segment translation overhead. */
 	bool all_segs_flat;
 
+	uint32_t fusion_count;     /* CMP/TEST+Jcc macro-op fusions */
+
 #ifdef OPCODE_PROFILE
 	uint32_t opcode_freq[256];
 	uint32_t opcode_0f_freq[256];
@@ -4655,10 +4657,10 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 /* 0x80 */	&&f0x80, &&f0x81, &&f0x82, &&fast_0x83, &&f0x84, &&fast_0x85, &&f0x86, &&f0x87,
 /* 0x88 */	&&f0x88, &&fast_0x89, &&f0x8a, &&fast_0x8b, &&f0x8c, &&f0x8d, &&f0x8e, &&f0x8f,
 /* 0x90 */	&&f0x90, &&f0x91, &&f0x92, &&f0x93, &&f0x94, &&f0x95, &&f0x96, &&f0x97,
-/* 0x98 */	&&f0x98, &&f0x99, &&f0x9a, &&f0x9b, &&f0x9c, &&f0x9d, &&f0x9e, &&f0x9f,
+/* 0x98 */	&&fast_0x98, &&f0x99, &&f0x9a, &&f0x9b, &&f0x9c, &&f0x9d, &&f0x9e, &&f0x9f,
 /* 0xa0 */	&&f0xa0, &&f0xa1, &&f0xa2, &&f0xa3, &&f0xa4, &&f0xa5, &&f0xa6, &&f0xa7,
 /* 0xa8 */	&&f0xa8, &&f0xa9, &&f0xaa, &&f0xab, &&f0xac, &&f0xad, &&f0xae, &&f0xaf,
-/* 0xb0 */	&&f0xb0, &&f0xb1, &&f0xb2, &&f0xb3, &&f0xb4, &&f0xb5, &&f0xb6, &&f0xb7,
+/* 0xb0 */	&&fast_movimm8, &&fast_movimm8, &&fast_movimm8, &&fast_movimm8, &&fast_movimm8, &&fast_movimm8, &&fast_movimm8, &&fast_movimm8,
 /* 0xb8 */	&&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm, &&fast_movimm,
 /* 0xc0 */	&&f0xc0, &&f0xc1, &&f0xc2, &&fast_0xc3, &&f0xc4, &&f0xc5, &&f0xc6, &&f0xc7,
 /* 0xc8 */	&&f0xc8, &&f0xc9, &&f0xca, &&f0xcb, &&f0xcc, &&f0xcd, &&f0xce, &&f0xcf,
@@ -4994,6 +4996,120 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 		}
 		goto f0xb8;
 	}
+	fast_movimm8: {  /* MOV r8, imm8 (0xb0-0xb7) */
+		if (likely(cpu->pf_pos < cpu->pf_avail)) {
+			u8 imm = cpu->pf_ptr[cpu->pf_pos++];
+			cpu->next_ip++;
+			sreg8(b1 & 7, imm);
+			continue;
+		}
+		goto f0xb0;
+	}
+	fast_0x98: {  /* CWDE (32-bit, no 66h prefix) */
+		if (likely(!opsz16)) {
+			sreg32(0, (u32)(s32)(s16)lreg16(0));
+			continue;
+		}
+		goto f0x98;
+	}
+
+	/* CMP/TEST + Jcc macro-op fusion: evaluate branch from cc state directly,
+	 * skip a full dispatch cycle. Exclude JP/JNP (0xA/0xB) — parity not worth inlining. */
+#define EVAL_COND_SUB(_s1, _s2, _d, _ci, _cond) do { \
+	int _cf = (u32)(_s1) < (u32)(_s2); \
+	int _zf = ((_d) == 0); \
+	int _sf = ((sword)(_d) < 0); \
+	int _of = ((sword)(((_s1) ^ (_s2)) & ((_d) ^ (_s1))) < 0); \
+	switch (_ci) { \
+	case 0x0: _cond =  _of; break; \
+	case 0x1: _cond = !_of; break; \
+	case 0x2: _cond =  _cf; break; \
+	case 0x3: _cond = !_cf; break; \
+	case 0x4: _cond =  _zf; break; \
+	case 0x5: _cond = !_zf; break; \
+	case 0x6: _cond =  _zf || _cf; break; \
+	case 0x7: _cond = !_zf && !_cf; break; \
+	case 0x8: _cond =  _sf; break; \
+	case 0x9: _cond = !_sf; break; \
+	case 0xc: _cond =  _sf != _of; break; \
+	case 0xd: _cond =  _sf == _of; break; \
+	case 0xe: _cond =  _zf || (_sf != _of); break; \
+	default:  _cond = !_zf && (_sf == _of); break; \
+	} \
+} while(0)
+
+#define EVAL_COND_AND(_d, _ci, _cond) do { \
+	int _zf = ((_d) == 0); \
+	int _sf = ((sword)(_d) < 0); \
+	switch (_ci) { \
+	case 0x0: _cond = 0; break; \
+	case 0x1: _cond = 1; break; \
+	case 0x2: _cond = 0; break; \
+	case 0x3: _cond = 1; break; \
+	case 0x4: _cond =  _zf; break; \
+	case 0x5: _cond = !_zf; break; \
+	case 0x6: _cond =  _zf; break; \
+	case 0x7: _cond = !_zf; break; \
+	case 0x8: _cond =  _sf; break; \
+	case 0x9: _cond = !_sf; break; \
+	case 0xc: _cond =  _sf; break; \
+	case 0xd: _cond = !_sf; break; \
+	case 0xe: _cond = _zf || _sf; break; \
+	default:  _cond = !_zf && !_sf; break; \
+	} \
+} while(0)
+
+#define TRY_FUSE_JCC_SUB(cpu) do { \
+	if (likely((cpu)->pf_pos + 1 < (cpu)->pf_avail)) { \
+		u8 _nb = (cpu)->pf_ptr[(cpu)->pf_pos]; \
+		if (likely((_nb & 0xF0) == 0x70) && (_nb & 0xf) != 0xa && (_nb & 0xf) != 0xb) { \
+			s32 _disp = (s8)(cpu)->pf_ptr[(cpu)->pf_pos + 1]; \
+			(cpu)->pf_pos += 2; (cpu)->next_ip += 2; (cpu)->cycle++; \
+			int _cond; \
+			EVAL_COND_SUB((cpu)->cc.src1, (cpu)->cc.src2, (cpu)->cc.dst, _nb & 0xf, _cond); \
+			if (_cond) (cpu)->next_ip += _disp; \
+			(cpu)->fusion_count++; continue; \
+		} \
+		if (_nb == 0x0F && (cpu)->pf_pos + 5 < (cpu)->pf_avail) { \
+			u8 _jop = (cpu)->pf_ptr[(cpu)->pf_pos + 1]; \
+			if ((_jop & 0xF0) == 0x80 && (_jop & 0xf) != 0xa && (_jop & 0xf) != 0xb) { \
+				const u8 *_p = &(cpu)->pf_ptr[(cpu)->pf_pos + 2]; \
+				s32 _disp = (s32)(_p[0] | ((u32)_p[1] << 8) | ((u32)_p[2] << 16) | ((u32)_p[3] << 24)); \
+				(cpu)->pf_pos += 6; (cpu)->next_ip += 6; (cpu)->cycle++; \
+				int _cond; \
+				EVAL_COND_SUB((cpu)->cc.src1, (cpu)->cc.src2, (cpu)->cc.dst, _jop & 0xf, _cond); \
+				if (_cond) (cpu)->next_ip += _disp; \
+				(cpu)->fusion_count++; continue; \
+			} \
+		} \
+	} \
+} while(0)
+
+#define TRY_FUSE_JCC_AND(cpu) do { \
+	if (likely((cpu)->pf_pos + 1 < (cpu)->pf_avail)) { \
+		u8 _nb = (cpu)->pf_ptr[(cpu)->pf_pos]; \
+		if (likely((_nb & 0xF0) == 0x70) && (_nb & 0xf) != 0xa && (_nb & 0xf) != 0xb) { \
+			s32 _disp = (s8)(cpu)->pf_ptr[(cpu)->pf_pos + 1]; \
+			(cpu)->pf_pos += 2; (cpu)->next_ip += 2; (cpu)->cycle++; \
+			int _cond; \
+			EVAL_COND_AND((cpu)->cc.dst, _nb & 0xf, _cond); \
+			if (_cond) (cpu)->next_ip += _disp; \
+			(cpu)->fusion_count++; continue; \
+		} \
+		if (_nb == 0x0F && (cpu)->pf_pos + 5 < (cpu)->pf_avail) { \
+			u8 _jop = (cpu)->pf_ptr[(cpu)->pf_pos + 1]; \
+			if ((_jop & 0xF0) == 0x80 && (_jop & 0xf) != 0xa && (_jop & 0xf) != 0xb) { \
+				const u8 *_p = &(cpu)->pf_ptr[(cpu)->pf_pos + 2]; \
+				s32 _disp = (s32)(_p[0] | ((u32)_p[1] << 8) | ((u32)_p[2] << 16) | ((u32)_p[3] << 24)); \
+				(cpu)->pf_pos += 6; (cpu)->next_ip += 6; (cpu)->cycle++; \
+				int _cond; \
+				EVAL_COND_AND((cpu)->cc.dst, _jop & 0xf, _cond); \
+				if (_cond) (cpu)->next_ip += _disp; \
+				(cpu)->fusion_count++; continue; \
+			} \
+		} \
+	} \
+} while(0)
 
 	fast_0x0f: {  /* Fast path for Jcc rel32 (0F 80-8F, no 66h override) */
 		if (likely(!opsz16 && cpu->pf_pos + 5 <= cpu->pf_avail)) {
@@ -5115,6 +5231,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			cpu->cc.dst = sext32((u32)(cpu->cc.src1 - cpu->cc.src2));
 			cpu->cc.op = CC_SUB;
 			cpu->cc.mask = CF | PF | AF | ZF | SF | OF;
+			TRY_FUSE_JCC_SUB(cpu);
 			continue;
 		}
 		goto f0x39;
@@ -5128,6 +5245,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			cpu->cc.dst = sext32((u32)(cpu->cc.src1 - cpu->cc.src2));
 			cpu->cc.op = CC_SUB;
 			cpu->cc.mask = CF | PF | AF | ZF | SF | OF;
+			TRY_FUSE_JCC_SUB(cpu);
 			continue;
 		}
 		goto f0x3b;
@@ -5139,6 +5257,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 			cpu->cc.dst = sext32(lreg32(rm) & lreg32(reg));
 			cpu->cc.op = CC_AND;
 			cpu->cc.mask = CF | PF | ZF | SF | OF;
+			TRY_FUSE_JCC_AND(cpu);
 			continue;
 		}
 		goto f0x85;
@@ -5300,6 +5419,7 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 				cpu->cc.dst = sext32((u32)(val - imm32));
 				cpu->cc.op = CC_SUB;
 				cpu->cc.mask = CF | PF | AF | ZF | SF | OF;
+				TRY_FUSE_JCC_SUB(cpu);
 				break;
 			case 1: /* OR */
 				cpu->cc.dst = sext32(val | imm32);
@@ -6692,8 +6812,10 @@ void cpui386_set_diag(CPUI386 *cpu, bool enabled) { (void)cpu; (void)enabled; }
 void cpui386_set_fast_mode(CPUI386 *cpu, bool enabled) { (void)cpu; (void)enabled; /* fast core always fast */ }
 bool cpui386_is_halted(CPUI386 *cpu) { return cpu->halt; }
 
-void cpui386_get_perf_counters(CPUI386 *cpu, uint32_t *a, uint32_t *b,
-    uint32_t *c, uint32_t *d, uint32_t *e) { *a=*b=*c=*d=*e=0; (void)cpu; }
+void cpui386_get_perf_counters(CPUI386 *cpu, uint32_t *tlb_miss, uint32_t *irq,
+    uint32_t *fusion, uint32_t *hle_hit, uint32_t *hle_call) {
+    *tlb_miss = 0; *irq = 0; *fusion = cpu->fusion_count; *hle_hit = 0; *hle_call = 0;
+}
 
 void cpui386_get_detail_counters(CPUI386 *cpu, CpuDetailCounters *out) {
     memset(out, 0, sizeof(*out)); (void)cpu; }
