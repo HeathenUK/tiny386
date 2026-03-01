@@ -57,6 +57,9 @@ void vga_set_cursor_pos(VGAState *s, uint16_t addr);
 /* Set CRTC cursor shape registers (called from HLE) */
 void vga_set_cursor_shape(VGAState *s, uint8_t start, uint8_t end);
 
+/* Mode generation counter — incremented on SR/GR/bank changes */
+uint32_t vga_get_mode_generation(VGAState *s);
+
 /* Debug functions */
 void vga_debug_direct_conditions(VGAState *s);
 void vga_dump_io_trace(void);

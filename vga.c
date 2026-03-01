@@ -393,6 +393,7 @@ struct VGAState {
     uint8_t palette_after_switch[768];  /* For mid-frame palette switching (bottom) */
     int palette_switch_scanline;        /* -1 if no switch, else scanline number */
     uint32_t palette_generation;        /* Incremented on DAC writes for dirty tracking */
+    uint32_t mode_generation;           /* Incremented on SR/GR/bank_offset changes */
     uint32_t palette_before_gen;        /* Generation of palette_before_switch */
     uint32_t palette_after_gen;         /* Generation of palette_after_switch */
     int hblank_poll_count;              /* Count of 0x3DA reads (hblank counting) */
@@ -2767,6 +2768,7 @@ uint32_t vga_ioport_read(VGAState *s, uint32_t addr)
  * Called when SR or GR registers change. */
 static inline void vga_update_cached_state(VGAState *s)
 {
+    s->mode_generation++;
     s->cached_plane_mask = s->sr[VGA_SEQ_PLANE_WRITE];
     s->cached_write_mode = s->gr[VGA_GFX_MODE] & 3;
     s->cached_chain4 = (s->sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M) ? 1 : 0;
@@ -2995,6 +2997,7 @@ void vbe_write(VGAState *s, uint32_t offset, uint32_t val)
                 s->vbe_regs[VBE_DISPI_INDEX_Y_OFFSET] = 0;
             } else {
                 s->bank_offset = 0;
+                s->mode_generation++;
             }
             s->dac_8bit = (val & VBE_DISPI_8BIT_DAC) > 0;
             s->vbe_regs[s->vbe_index] = val;
@@ -3021,6 +3024,7 @@ void vbe_write(VGAState *s, uint32_t offset, uint32_t val)
             val &= (s->vga_ram_size >> 16) - 1;
             s->vbe_regs[s->vbe_index] = val;
             s->bank_offset = (val << 16);
+            s->mode_generation++;
             break;
         }
     }
@@ -3888,6 +3892,11 @@ void vga_get_modex_state(VGAState *s, uint8_t **ram, uint32_t *ram_size,
     *plane_mask = 0;
     *read_plane = 0;
     *latch = NULL;
+}
+
+uint32_t vga_get_mode_generation(VGAState *s)
+{
+    return s->mode_generation;
 }
 
 /* Mark VGA lines dirty after direct write (addr is VGA-relative, 0-0xFFFF) */

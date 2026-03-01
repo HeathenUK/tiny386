@@ -58,12 +58,17 @@ typedef struct PITChannelState {
 	uint64_t irq_suppressed_count;
 	uint32_t last_irq_time;
 	int irq;
+	uint32_t state_gen;       /* Incremented on mode/counter/gate changes */
 } PITChannelState;
 
 struct PITState {
 	PITChannelState channels[3];
 	void *pic;
 	void (*set_irq)(void *pic, int irq, int level);
+	/* Cache for pit_next_irq_us() — avoid 64-bit division when state unchanged */
+	uint32_t cached_irq_gen;
+	uint32_t cached_irq_us;
+	uint32_t cached_irq_time;  /* get_uticks() when cached */
 };
 
 uint32_t get_uticks();
@@ -139,6 +144,7 @@ static inline void pit_load_count(PITState *pit, PITChannelState *s, int val)
 	s->count = val;
 	s->last_out = pit_get_out1(s, s->count_load_time);
 	s->load_count++;
+	s->state_gen++;
 }
 
 /* if already latched, do not latch again */
@@ -195,6 +201,7 @@ void i8254_ioport_write(PITState *pit, uint32_t addr, uint32_t val)
 					s->mode = mode;
 					s->last_out = pit_get_out1(s, get_uticks());
 					s->bcd = val & 1;
+					s->state_gen++;
 					/* XXX: update irq timer ? */
 				}
 			}
@@ -393,6 +400,7 @@ void pit_set_gate(PITState *pit, int channel, int val)
 		break;
 	}
 	s->gate = val;
+	s->state_gen++;
 }
 
 int pit_get_initial_count(PITState *pit, int channel)
@@ -522,6 +530,14 @@ uint32_t pit_next_irq_us(PITState *pit)
 		return 0;
 
 	uint32_t uticks = get_uticks();
+
+	/* Cache hit: if PIT state unchanged, subtract elapsed time from cached result */
+	if (s->state_gen == pit->cached_irq_gen && pit->cached_irq_us > 0) {
+		uint32_t elapsed = uticks - pit->cached_irq_time;
+		if (elapsed < pit->cached_irq_us)
+			return pit->cached_irq_us - elapsed;
+	}
+
 	uint32_t d = ((uint64_t)(uticks - s->count_load_time)) * PIT_FREQ / 1000000;
 
 	/* How many PIT ticks until the next IRQ fires? */
@@ -533,6 +549,12 @@ uint32_t pit_next_irq_us(PITState *pit)
 
 	/* Cap at 10ms for UI responsiveness */
 	if (us > 10000) us = 10000;
+
+	/* Update cache */
+	pit->cached_irq_gen = s->state_gen;
+	pit->cached_irq_us = us;
+	pit->cached_irq_time = uticks;
+
 	return us;
 }
 

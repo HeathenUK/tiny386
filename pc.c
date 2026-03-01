@@ -536,31 +536,36 @@ void pc_step(PC *pc)
 	/* Update VGA direct access pointer (detects mode changes) */
 	{
 		static u8 *last_direct = (u8*)1;  /* Invalid initial value to force first report */
-		u8 *new_direct = vga_get_direct_ptr(pc->vga);
-		if (new_direct != last_direct) {
-			if (new_direct) {
-				fprintf(stderr, "VGA direct mode ENABLED at %p\n", (void*)new_direct);
-			} else {
-				/* Debug: report why disabled */
-				vga_debug_direct_conditions(pc->vga);
+		static uint32_t last_vga_gen = 0;
+		uint32_t cur_vga_gen = vga_get_mode_generation(pc->vga);
+		if (cur_vga_gen != last_vga_gen) {
+			last_vga_gen = cur_vga_gen;
+
+			u8 *new_direct = vga_get_direct_ptr(pc->vga);
+			if (new_direct != last_direct) {
+				if (new_direct) {
+					fprintf(stderr, "VGA direct mode ENABLED at %p\n", (void*)new_direct);
+				} else {
+					vga_debug_direct_conditions(pc->vga);
+				}
+				last_direct = new_direct;
 			}
-			last_direct = new_direct;
+			pc->cpu_cb->vga_direct = new_direct;
+
+			/* Update Mode X inline fast path state */
+			vga_get_modex_state(pc->vga, &pc->cpu_cb->vga_modex_ram,
+			                    &pc->cpu_cb->vga_modex_ram_size,
+			                    &pc->cpu_cb->vga_modex_write_mode,
+			                    &pc->cpu_cb->vga_modex_plane_mask,
+			                    &pc->cpu_cb->vga_modex_read_plane,
+			                    &pc->cpu_cb->vga_modex_latch);
+
+			/* Update text mode fast path state */
+			vga_get_text_state(pc->vga, &pc->cpu_cb->vga_text_ram,
+			                   &pc->cpu_cb->vga_text_phys_base,
+			                   &pc->cpu_cb->vga_text_phys_end,
+			                   &pc->cpu_cb->vga_text_dirty_pages);
 		}
-		pc->cpu_cb->vga_direct = new_direct;
-
-		/* Update Mode X inline fast path state */
-		vga_get_modex_state(pc->vga, &pc->cpu_cb->vga_modex_ram,
-		                    &pc->cpu_cb->vga_modex_ram_size,
-		                    &pc->cpu_cb->vga_modex_write_mode,
-		                    &pc->cpu_cb->vga_modex_plane_mask,
-		                    &pc->cpu_cb->vga_modex_read_plane,
-		                    &pc->cpu_cb->vga_modex_latch);
-
-		/* Update text mode fast path state */
-		vga_get_text_state(pc->vga, &pc->cpu_cb->vga_text_ram,
-		                   &pc->cpu_cb->vga_text_phys_base,
-		                   &pc->cpu_cb->vga_text_phys_end,
-		                   &pc->cpu_cb->vga_text_dirty_pages);
 	}
 
 	/* Check if VGA mode changed - reset batch for new program (dynamic mode only) */
@@ -823,6 +828,67 @@ void pc_step(PC *pc)
 				    (uint32_t)(detail_delta.page_faults / ds),
 				    (uint32_t)(detail_delta.cr_writes / ds),
 				    (uint32_t)(detail_delta.far_calls / ds));
+
+				/* Opcode frequency histogram (compiled with OPCODE_PROFILE) */
+				{
+					static uint32_t freq[256], freq_0f[256];
+					cpui386_get_opcode_histogram(pc->cpu, freq, freq_0f);
+					/* Check if any data collected */
+					uint32_t total = 0;
+					for (int i = 0; i < 256; i++) total += freq[i];
+					if (total > 0) {
+						/* Find top 10 primary opcodes */
+						uint8_t top[10] = {0};
+						for (int t = 0; t < 10; t++) {
+							uint32_t best = 0;
+							for (int i = 0; i < 256; i++) {
+								bool skip = false;
+								for (int j = 0; j < t; j++)
+									if (top[j] == i) { skip = true; break; }
+								if (!skip && freq[i] > best) {
+									best = freq[i]; top[t] = i;
+								}
+							}
+						}
+						fprintf(stderr, "[opcode] top10:");
+						for (int t = 0; t < 10; t++) {
+							uint8_t op = top[t];
+							if (freq[op] == 0) break;
+							fprintf(stderr, " %02X=%u.%u%%", op,
+							    (uint32_t)(freq[op] * 100 / total),
+							    (uint32_t)(freq[op] * 1000 / total) % 10);
+						}
+						fprintf(stderr, "\n");
+
+						/* Top 5 two-byte (0F xx) */
+						uint32_t total_0f = 0;
+						for (int i = 0; i < 256; i++) total_0f += freq_0f[i];
+						if (total_0f > 0) {
+							uint8_t top2[5] = {0};
+							for (int t = 0; t < 5; t++) {
+								uint32_t best = 0;
+								for (int i = 0; i < 256; i++) {
+									bool skip = false;
+									for (int j = 0; j < t; j++)
+										if (top2[j] == i) { skip = true; break; }
+									if (!skip && freq_0f[i] > best) {
+										best = freq_0f[i]; top2[t] = i;
+									}
+								}
+							}
+							fprintf(stderr, "[opcode] top5 0F:");
+							for (int t = 0; t < 5; t++) {
+								uint8_t op = top2[t];
+								if (freq_0f[op] == 0) break;
+								fprintf(stderr, " 0F%02X=%u.%u%%", op,
+								    (uint32_t)(freq_0f[op] * 100 / total_0f),
+								    (uint32_t)(freq_0f[op] * 1000 / total_0f) % 10);
+							}
+							fprintf(stderr, "\n");
+						}
+						cpui386_reset_opcode_histogram(pc->cpu);
+					}
+				}
 			}
 		}
 	}

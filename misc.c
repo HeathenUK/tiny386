@@ -95,6 +95,11 @@ struct CMOS {
 	uint32_t irq_period;
 	void *pic;
 	void (*set_irq)(void *pic, int irq, int level);
+	/* Cache for cmos_next_irq_us() */
+	uint32_t state_gen;        /* Incremented on timer config changes */
+	uint32_t cached_irq_gen;   /* state_gen at time of cache fill */
+	uint32_t cached_irq_us;
+	uint32_t cached_irq_time;
 };
 
 static int bin2bcd(int a)
@@ -294,6 +299,7 @@ static void cmos_update_timer(CMOS *s)
 		s->irq_timeout = (cmos_get_timer(s) + s->irq_period) &
 			~(s->irq_period - 1);
 	}
+	s->state_gen++;
 }
 
 void cmos_update_irq(CMOS *s)
@@ -319,13 +325,30 @@ uint32_t cmos_next_irq_us(CMOS *s)
 	if (!(s->data[RTC_REG_B] & REG_B_PIE) || s->irq_period == 0)
 		return UINT32_MAX;
 
+	uint32_t uticks = get_uticks();
+
+	/* Cache hit: if CMOS timer state unchanged, subtract elapsed time */
+	if (s->state_gen == s->cached_irq_gen && s->cached_irq_us > 0 &&
+	    s->cached_irq_us < UINT32_MAX) {
+		uint32_t elapsed = uticks - s->cached_irq_time;
+		if (elapsed < s->cached_irq_us)
+			return s->cached_irq_us - elapsed;
+	}
+
 	uint32_t now = cmos_get_timer(s);
 	int32_t remaining = (int32_t)(s->irq_timeout - now);
 	if (remaining <= 0)
 		return 0;  /* IRQ already due */
 
 	/* Convert 32768 Hz ticks to microseconds */
-	return (uint64_t)(uint32_t)remaining * 1000000 / CMOS_FREQ;
+	uint32_t us = (uint64_t)(uint32_t)remaining * 1000000 / CMOS_FREQ;
+
+	/* Update cache */
+	s->cached_irq_gen = s->state_gen;
+	s->cached_irq_us = us;
+	s->cached_irq_time = uticks;
+
+	return us;
 }
 
 uint8_t cmos_ioport_read(CMOS *cmos, int addr)

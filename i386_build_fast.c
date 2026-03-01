@@ -21,6 +21,8 @@
 #define cpui386_get_perf_counters  fast_cpui386_get_perf_counters
 #define cpui386_get_detail_counters fast_cpui386_get_detail_counters
 #define cpui386_snapshot         fast_cpui386_snapshot
+#define cpui386_get_opcode_histogram  fast_cpui386_get_opcode_histogram
+#define cpui386_reset_opcode_histogram fast_cpui386_reset_opcode_histogram
 
 /* cpu_* functions called by fpu.c (14 functions) */
 #define cpu_load8    fast_cpu_load8

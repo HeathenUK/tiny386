@@ -151,6 +151,11 @@ struct CPUI386 {
 	/* True when ALL 6 data/code segments are flat (seg_flat == 0x3F).
 	 * Allows a single branch to skip all segment translation overhead. */
 	bool all_segs_flat;
+
+#ifdef OPCODE_PROFILE
+	uint32_t opcode_freq[256];
+	uint32_t opcode_0f_freq[256];
+#endif
 };
 
 #define dolog(...) fprintf(stderr, __VA_ARGS__)
@@ -4597,6 +4602,9 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	}
 	cpu->cycle++;
 	cpu->tsc++;  /* Base cycle for instruction fetch */
+#ifdef OPCODE_PROFILE
+	cpu->opcode_freq[b1]++;
+#endif
 
 	// prefix
 	bool opsz16 = code16;
@@ -5397,6 +5405,9 @@ GRPEND
 
 	ecase(0x0f): { // two byte
 		TRY(fetch8(cpu, &b1));
+#ifdef OPCODE_PROFILE
+		cpu->opcode_0f_freq[b1]++;
+#endif
 		switch(b1) {
 #define I2(_case, _rm, _rwm, _op) _case { _rm(_rwm, _op); ebreak; }
 #include "i386ins.def"
@@ -6654,6 +6665,25 @@ void cpui386_snapshot(CPUI386 *cpu, CpuSnapshot *snap) {
     snap->cs = cpu->seg[SEG_CS].sel; snap->eip = cpu->ip;
     snap->ss = cpu->seg[SEG_SS].sel; snap->cpl = cpu->cpl;
     snap->pe = !!(cpu->cr0 & 1); snap->halt = cpu->halt; }
+
+void cpui386_get_opcode_histogram(CPUI386 *cpu, uint32_t *freq, uint32_t *freq_0f) {
+#ifdef OPCODE_PROFILE
+    memcpy(freq, cpu->opcode_freq, 256 * sizeof(uint32_t));
+    memcpy(freq_0f, cpu->opcode_0f_freq, 256 * sizeof(uint32_t));
+#else
+    memset(freq, 0, 256 * sizeof(uint32_t));
+    memset(freq_0f, 0, 256 * sizeof(uint32_t));
+#endif
+}
+
+void cpui386_reset_opcode_histogram(CPUI386 *cpu) {
+#ifdef OPCODE_PROFILE
+    memset(cpu->opcode_freq, 0, sizeof(cpu->opcode_freq));
+    memset(cpu->opcode_0f_freq, 0, sizeof(cpu->opcode_0f_freq));
+#else
+    (void)cpu;
+#endif
+}
 
 void i386_reset_flags_tables_for_reinit(void) {
     flags_add8 = NULL;

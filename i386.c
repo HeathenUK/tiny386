@@ -1640,6 +1640,14 @@ void i386_init_flags_tables(void)
 /* Reset flags table pointers so they'll be re-initialized on next cpui386_new().
  * Called during INI switch after PSRAM pool is zeroed — tables allocated from
  * psmalloc() are now dangling.  Heap-allocated tables are still valid. */
+void cpui386_get_opcode_histogram(CPUI386 *cpu, uint32_t *freq, uint32_t *freq_0f) {
+	(void)cpu;
+	memset(freq, 0, 256 * sizeof(uint32_t));
+	memset(freq_0f, 0, 256 * sizeof(uint32_t));
+}
+
+void cpui386_reset_opcode_histogram(CPUI386 *cpu) { (void)cpu; }
+
 void i386_reset_flags_tables_for_reinit(void)
 {
 	/* flags_logic8 is in TCM (always valid). Only NULL-ify psram-allocated

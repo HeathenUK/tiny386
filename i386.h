@@ -127,6 +127,10 @@ typedef struct {
 
 void cpui386_snapshot(CPUI386 *cpu, CpuSnapshot *snap);
 
+/* Opcode frequency profiler (compiled in with OPCODE_PROFILE) */
+void cpui386_get_opcode_histogram(CPUI386 *cpu, uint32_t *freq, uint32_t *freq_0f);
+void cpui386_reset_opcode_histogram(CPUI386 *cpu);
+
 /* Reset stale pool-allocated statics for INI switch (PSRAM/pcram zeroed) */
 void i386_reset_flags_tables_for_reinit(void);
 

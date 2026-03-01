@@ -37,6 +37,8 @@ extern void fast_cpui386_get_perf_counters(CPUI386 *cpu, uint32_t *a, uint32_t *
                                            uint32_t *c, uint32_t *d, uint32_t *e);
 extern void fast_cpui386_get_detail_counters(CPUI386 *cpu, CpuDetailCounters *out);
 extern void fast_cpui386_snapshot(CPUI386 *cpu, CpuSnapshot *snap);
+extern void fast_cpui386_get_opcode_histogram(CPUI386 *cpu, uint32_t *freq, uint32_t *freq_0f);
+extern void fast_cpui386_reset_opcode_histogram(CPUI386 *cpu);
 extern void fast_i386_reset_flags_tables_for_reinit(void);
 
 /* Full core (i386.c via i386_build_full.c) */
@@ -58,6 +60,8 @@ extern void full_cpui386_get_perf_counters(CPUI386 *cpu, uint32_t *a, uint32_t *
                                            uint32_t *c, uint32_t *d, uint32_t *e);
 extern void full_cpui386_get_detail_counters(CPUI386 *cpu, CpuDetailCounters *out);
 extern void full_cpui386_snapshot(CPUI386 *cpu, CpuSnapshot *snap);
+extern void full_cpui386_get_opcode_histogram(CPUI386 *cpu, uint32_t *freq, uint32_t *freq_0f);
+extern void full_cpui386_reset_opcode_histogram(CPUI386 *cpu);
 extern void full_i386_reset_flags_tables_for_reinit(void);
 
 /* --- Dispatch functions --- */
@@ -163,6 +167,18 @@ void cpui386_snapshot(CPUI386 *cpu, CpuSnapshot *snap)
 {
 	if (use_fast_core) fast_cpui386_snapshot(cpu, snap);
 	else full_cpui386_snapshot(cpu, snap);
+}
+
+void cpui386_get_opcode_histogram(CPUI386 *cpu, uint32_t *freq, uint32_t *freq_0f)
+{
+	if (use_fast_core) fast_cpui386_get_opcode_histogram(cpu, freq, freq_0f);
+	else full_cpui386_get_opcode_histogram(cpu, freq, freq_0f);
+}
+
+void cpui386_reset_opcode_histogram(CPUI386 *cpu)
+{
+	if (use_fast_core) fast_cpui386_reset_opcode_histogram(cpu);
+	else full_cpui386_reset_opcode_histogram(cpu);
 }
 
 /* Reset BOTH cores' flag tables — INI switch may change active core */
