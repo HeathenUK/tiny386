@@ -1775,6 +1775,7 @@ static inline int get_IOPL(CPUI386 *cpu)
 	return (cpu->flags & IOPL) >> 12;
 }
 
+#ifdef CPU_DIAG
 static inline void wfw_monitor_log_vm86_int_event(CPUI386 *cpu, uint8_t vec, uint8_t path)
 {
 	if (unlikely(cpu_diag_enabled) && win386_diag.active &&
@@ -1886,6 +1887,14 @@ static inline void wfw_monitor_note_int13_return(CPUI386 *cpu, uint16_t ret_cs, 
 			  ((uint32_t)wfw_monitor.v86_int13_req_ax << 16) |
 			  ((ret_flags & CF) ? 1u : 0u));
 }
+#else /* !CPU_DIAG */
+#define wfw_monitor_log_vm86_int_event(cpu, vec, path) ((void)0)
+#define wfw_mode_char(cpu) ((uint8_t)'R')
+#define wfw_mode_from_state(flags, cr0) ((uint8_t)'R')
+#define wfw_flow_push_here(cpu, tag, vec, extra) ((void)0)
+#define wfw_abort_tail_push(cpu, vec, ax, bx, cx, dx) ((void)0)
+#define wfw_monitor_note_int13_return(cpu, cs, ip, fl) ((void)0)
+#endif /* CPU_DIAG */
 
 /* MMU */
 #define CR0_PG (1<<31)
@@ -2209,6 +2218,7 @@ static bool laddr_to_paddr_noexcept(CPUI386 *cpu, uint32_t laddr, uint32_t *out_
 	return true;
 }
 
+#ifdef CPU_DIAG
 static inline uint32_t wfw_desc_base_u32(uint32_t w1, uint32_t w2)
 {
 	return (w1 >> 16) | ((w2 & 0xffu) << 16) | (w2 & 0xff000000u);
@@ -2333,6 +2343,9 @@ static inline void wfw_note_ldt_window_store(CPUI386 *cpu, uint32_t paddr, uint8
 		break;
 	}
 }
+#else /* !CPU_DIAG */
+#define wfw_note_ldt_window_store(cpu, paddr, size, val) ((void)0)
+#endif /* CPU_DIAG */
 
 /* Read the base address of a selector from GDT/LDT without throwing. */
 static uint32_t desc_base_noexcept(CPUI386 *cpu, uint16_t sel)
@@ -2658,6 +2671,7 @@ static void vm86_decode_fault_instruction(CPUI386 *cpu, char *buf, size_t buflen
 	}
 }
 
+#ifdef CPU_DIAG
 static uint8_t wfw_capture_cs_bytes(CPUI386 *cpu, uint8_t out[8])
 {
 	uint8_t n = 0, b = 0;
@@ -3005,6 +3019,10 @@ static inline void wfw_ud63_note_resume(CPUI386 *cpu, uint16_t newcs, uword newi
 	}
 	wfw_monitor.pending_ud63_idx = -1;
 }
+#else /* !CPU_DIAG */
+#define wfw_swint_dpl_note_resume(cpu, cs, ip, fl) ((void)0)
+#define wfw_ud63_note_resume(cpu, cs, ip, fl, ds) ((void)0)
+#endif /* CPU_DIAG */
 
 static const char *seg_name(int seg)
 {
@@ -3972,6 +3990,7 @@ static inline void update_seg_flat(CPUI386 *cpu, int seg)
 	cpu->all_segs_flat = (cpu->seg_flat == 0x3F);
 }
 
+#ifdef CPU_DIAG
 /* Capture source/class for DS<-0127 loads (e.g. MOV DS,r/m16 vs POP DS vs LDS). */
 static inline void wfw_note_ds0127_load(CPUI386 *cpu, uint16_t sel_val)
 {
@@ -4055,6 +4074,9 @@ static inline void wfw_note_ds0127_load(CPUI386 *cpu, uint16_t sel_val)
 		break;
 	}
 }
+#else /* !CPU_DIAG */
+#define wfw_note_ds0127_load(cpu, sel) ((void)0)
+#endif /* CPU_DIAG */
 
 static bool set_seg(CPUI386 *cpu, int seg, int sel)
 {
@@ -4776,6 +4798,7 @@ static inline void clear_segs(CPUI386 *cpu)
 #define lseg(i) ((u16) SEGi((i)))
 #define set_sp(v, mask) (sreg32(4, ((v) & mask) | (lreg32(4) & ~mask)))
 
+#ifdef CPU_DIAG
 static void cpu_diag_copy_seg_string(CPUI386 *cpu, int seg, uword off, int cpl,
 	char term, char *out, size_t outsz)
 {
@@ -4832,6 +4855,7 @@ static void cpu_diag_log_cr0_transition(CPUI386 *cpu, uword old_cr0, uword new_c
 		!!(old_cr0 & CR0_PG), !!(new_cr0 & CR0_PG),
 		cpu->seg[SEG_CS].sel, cpu->ip);
 }
+#endif /* CPU_DIAG — pause for exc_ring (used by non-diagnostic code) */
 
 /* Exception ring buffer — file-scope for post-mortem dump from cpui386_step */
 #define EXC_RING_SIZE 1024
@@ -4839,7 +4863,7 @@ static void cpu_diag_log_cr0_transition(CPUI386 *cpu, uword old_cr0, uword new_c
 static struct { uint8_t no; uint8_t mode; uint16_t cs; uint32_t ip; uint32_t err; uint32_t cr2; } exc_ring[EXC_RING_SIZE];
 static int exc_ring_pos = 0;
 
-
+#ifdef CPU_DIAG
 static void cpu_monitor_dump(CPUI386 *cpu, const char *reason)
 {
 	if (!cpu_diag_enabled) return;
@@ -6110,6 +6134,11 @@ static void cpu_diag_log_int2f(CPUI386 *cpu)
 	}
 	win386_diag.int2f_count++;
 }
+#else /* !CPU_DIAG */
+#define cpu_diag_log_cr0_transition(cpu, o, n) ((void)0)
+#define cpu_diag_log_int21(cpu) ((void)0)
+#define cpu_diag_log_int2f(cpu) ((void)0)
+#endif /* CPU_DIAG */
 
 /*
  * instructions
@@ -9597,7 +9626,7 @@ exec_sysexit(CPUI386 *cpu)
 #undef SIMD_i386_c
 #endif
 
-static bool pmcall(CPUI386 *cpu, bool opsz16, uword addr, int sel, bool isjmp);
+static bool __attribute__((cold)) pmcall(CPUI386 *cpu, bool opsz16, uword addr, int sel, bool isjmp);
 static bool IRAM_ATTR pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret);
 
 static bool verbose;
@@ -10780,7 +10809,7 @@ cpu_exec1_exc:
 
 // XXX: incomplete
 enum { TS_JMP, TS_CALL, TS_IRET };
-static bool task_switch(CPUI386 *cpu, int tss, int sw_type)
+static bool __attribute__((cold)) task_switch(CPUI386 *cpu, int tss, int sw_type)
 {
 	cpu->seg_cache_valid = 0;
 	OptAddr meml;
@@ -10863,7 +10892,7 @@ static bool task_switch(CPUI386 *cpu, int tss, int sw_type)
 	return true;
 }
 
-static bool pmcall(CPUI386 *cpu, bool opsz16, uword addr, int sel, bool isjmp)
+static bool __attribute__((cold)) pmcall(CPUI386 *cpu, bool opsz16, uword addr, int sel, bool isjmp)
 {
 	sel = sel & 0xffff;
 	uword sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;

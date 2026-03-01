@@ -368,6 +368,16 @@ void i8259_reset(PicState2 *s)
 	pic_reset(&s->pics[1]);
 }
 
+/* DIAG: dump PIC state for debugging */
+void i8259_diag_dump(void *opaque)
+{
+	PicState2 *s = (PicState2 *)opaque;
+	fprintf(stderr, "  PIC master: IRR=%02x IMR=%02x ISR=%02x base=%02x\n",
+		s->pics[0].irr, s->pics[0].imr, s->pics[0].isr, s->pics[0].irq_base);
+	fprintf(stderr, "  PIC slave:  IRR=%02x IMR=%02x ISR=%02x base=%02x\n",
+		s->pics[1].irr, s->pics[1].imr, s->pics[1].isr, s->pics[1].irq_base);
+}
+
 /* Check if an IRQ is pending (in irr or isr) */
 int i8259_irq_pending(PicState2 *s, int irq)
 {

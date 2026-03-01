@@ -581,8 +581,10 @@ static void ide_set_signature(IDEState *s)
     }
 }
 
-static void ide_abort_command(IDEState *s) 
+static void ide_abort_command(IDEState *s)
 {
+    if (s->drive_kind == IDE_CD)
+        fprintf(stderr, "DIAG: ide_abort_command on CD-ROM! status was %02x\n", s->status);
     s->status = READY_STAT | ERR_STAT;
     s->error = ABRT_ERR;
 }
@@ -635,6 +637,8 @@ static void ide_transfer_start2(IDEState *s, int off, int size,
 
 static void ide_transfer_stop2(IDEState *s)
 {
+    if (s->drive_kind == IDE_CD && (s->status & DRQ_STAT))
+        fprintf(stderr, "DIAG: ide_transfer_stop2 clearing DRQ on CD-ROM! status=%02x\n", s->status);
     s->end_transfer_func = ide_transfer_stop2;
     s->data_index = 0;
     s->data_end = 0;
@@ -1375,6 +1379,9 @@ static void ide_atapi_cmd(IDEState *s)
 
     packet = s->io_buffer;
     buf = s->io_buffer;
+    fprintf(stderr, "DIAG: ide_atapi_cmd CDB: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+          packet[0], packet[1], packet[2], packet[3], packet[4], packet[5],
+          packet[6], packet[7], packet[8], packet[9], packet[10], packet[11]);
 #ifdef DEBUG_IDE_ATAPI
     {
         int i;
@@ -1733,6 +1740,8 @@ static void idecd_exec_cmd(IDEState *s, int val)
         s->status = READY_STAT | SEEK_STAT;
         s->nsector = 1;
         ide_transfer_start2(s, 0, ATAPI_PACKET_SIZE, ide_atapi_cmd);
+        fprintf(stderr, "DIAG: ATAPI PACKET issued, status=%02x DRQ=%d data=%d/%d\n",
+              s->status, !!(s->status & DRQ_STAT), s->data_index, s->data_end);
         ide_set_irq(s);
         break;
     case WIN_PIDENTIFY:
@@ -1913,7 +1922,7 @@ void ide_data_writew(void *opaque, uint32_t val)
     IDEState *s = s1->cur_drive;
     int p;
     uint8_t *tab;
-    
+
     if (!s)
         return;
     p = s->data_index;

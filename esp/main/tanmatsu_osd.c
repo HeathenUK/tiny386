@@ -1849,13 +1849,13 @@ void osd_attach_ide(OSD *osd, void *ide, void *ide2)
 void osd_attach_pc(OSD *osd, void *pc)
 {
 	osd->pc = pc;
-	// Initialize hda_path from PC config if not already set by user
-	if (osd->hda_path[0] == '\0') {
-		PC *p = (PC *)pc;
-		if (p->hda_path && p->hda_path[0]) {
-			strncpy(osd->hda_path, p->hda_path, MAX_PATH_LEN - 1);
-			osd->hda_path[MAX_PATH_LEN - 1] = '\0';
-		}
+	// Always sync hda_path from PC config (may change on INI switch/restart)
+	PC *p = (PC *)pc;
+	if (p->hda_path && p->hda_path[0]) {
+		strncpy(osd->hda_path, p->hda_path, MAX_PATH_LEN - 1);
+		osd->hda_path[MAX_PATH_LEN - 1] = '\0';
+	} else {
+		osd->hda_path[0] = '\0';
 	}
 }
 
