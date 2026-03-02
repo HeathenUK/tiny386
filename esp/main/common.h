@@ -93,6 +93,7 @@ struct Globals {
 	int mem_size_mb;              // Guest RAM in MB (actual, after PSRAM cap)
 	int accuracy;                         // 0=full, 1=fast (DOS compat mode)
 	bool _Atomic cpu_debug_enabled;       // CPU debug instrumentation enabled (OSD toggle)
+	int sound_device;             // 0=SB16+AdLib, 1=GUS (requires restart)
 
 	// INI selector state
 	bool _Atomic ini_selector_active;     // INI selector screen is showing

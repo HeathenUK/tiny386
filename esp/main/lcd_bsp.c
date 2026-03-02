@@ -38,8 +38,9 @@
 
 static const char *TAG = "lcd_bsp";
 
-// PPA client handle for rotation
+// PPA client handles
 static ppa_client_handle_t ppa_srm_handle = NULL;
+static ppa_client_handle_t ppa_fill_handle = NULL;
 
 // Physical display dimensions (portrait orientation)
 #define DISPLAY_WIDTH  480
@@ -72,6 +73,19 @@ static esp_err_t ppa_init(void)
 		return ret;
 	}
 	ESP_LOGI(TAG, "PPA SRM client registered for rotation");
+
+	/* Register a fill client for hardware-accelerated rectangle fills */
+	ppa_client_config_t fill_config = {
+		.oper_type = PPA_OPERATION_FILL,
+		.max_pending_trans_num = 1,
+	};
+	esp_err_t fill_ret = ppa_register_client(&fill_config, &ppa_fill_handle);
+	if (fill_ret != ESP_OK) {
+		ESP_LOGW(TAG, "PPA fill client failed: %s (software fallback)",
+		         esp_err_to_name(fill_ret));
+		/* Non-fatal — overlay_fill_rect falls back to software */
+	}
+
 	return ESP_OK;
 }
 
@@ -212,15 +226,63 @@ static void update_scale_params(void)
 #define OSD_COLOR_VALUE   0x87FF  // Light cyan for values
 
 // Draw filled rectangle (portrait buffer coordinates)
+// Uses PPA hardware fill for large rects, software for small ones
 static void overlay_fill_rect(uint16_t *fb, int x, int y, int w, int h, uint16_t color)
 {
-	for (int dy = 0; dy < h; dy++) {
-		if (y + dy < 0 || y + dy >= DISPLAY_HEIGHT) continue;
-		uint16_t *row = fb + (y + dy) * DISPLAY_WIDTH;
-		for (int dx = 0; dx < w; dx++) {
-			if (x + dx < 0 || x + dx >= DISPLAY_WIDTH) continue;
-			row[x + dx] = color;
+	/* Clamp to display bounds */
+	if (x < 0) { w += x; x = 0; }
+	if (y < 0) { h += y; y = 0; }
+	if (x + w > DISPLAY_WIDTH)  w = DISPLAY_WIDTH - x;
+	if (y + h > DISPLAY_HEIGHT) h = DISPLAY_HEIGHT - y;
+	if (w <= 0 || h <= 0) return;
+
+	/* PPA hardware fill for large rectangles */
+	if (ppa_fill_handle && fb == fb_rotated && w >= 8 && h >= 4) {
+		/* Convert RGB565 to ARGB8888 */
+		uint8_t r5 = (color >> 11) & 0x1F;
+		uint8_t g6 = (color >> 5) & 0x3F;
+		uint8_t b5 = color & 0x1F;
+		color_pixel_argb8888_data_t argb = {
+			.val = (0xFF << 24) |
+			       ((r5 << 3 | r5 >> 2) << 16) |
+			       ((g6 << 2 | g6 >> 4) << 8) |
+			       (b5 << 3 | b5 >> 2)
+		};
+
+		/* Flush CPU writes so PPA sees current buffer state */
+		size_t fb_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
+		esp_cache_msync(fb, fb_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+
+		ppa_fill_oper_config_t fill_cfg = {
+			.out = {
+				.buffer = fb,
+				.buffer_size = fb_size,
+				.pic_w = DISPLAY_WIDTH,
+				.pic_h = DISPLAY_HEIGHT,
+				.block_offset_x = x,
+				.block_offset_y = y,
+				.fill_cm = PPA_FILL_COLOR_MODE_RGB565,
+			},
+			.fill_block_w = w,
+			.fill_block_h = h,
+			.fill_argb_color = argb,
+			.mode = PPA_TRANS_MODE_BLOCKING,
+		};
+
+		if (ppa_do_fill(ppa_fill_handle, &fill_cfg) == ESP_OK) {
+			/* Invalidate cache so CPU sees PPA output */
+			esp_cache_msync(fb, fb_size,
+			                ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+			return;
 		}
+		/* Fall through to software on PPA failure */
+	}
+
+	/* Software fallback */
+	for (int dy = 0; dy < h; dy++) {
+		uint16_t *row = fb + (y + dy) * DISPLAY_WIDTH;
+		for (int dx = 0; dx < w; dx++)
+			row[x + dx] = color;
 	}
 }
 
@@ -668,6 +730,7 @@ void vga_task(void *arg)
 	globals.fb_rotated = fb_rotated;
 
 	xEventGroupSetBits(global_event_group, BIT1);  // Signal display ready
+
 
 	ESP_LOGI(TAG, "Starting display loop");
 

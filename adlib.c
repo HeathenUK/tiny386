@@ -86,9 +86,20 @@ void adlib_write(void *opaque, uint32_t nport, uint32_t val)
     AdlibState *s = opaque;
     int a = nport & 3;
 
-    s->active = 1;
+    /* Fire any naturally expired timers before processing the write,
+     * so timer events aren't lost if the audio callback hasn't run yet. */
+    uint32_t now = get_uticks();
+    for (int n = 0; n < 2; n++) {
+        if (s->ticking[n]) {
+            uint32_t elapsed = now - s->timer_start[n];
+            if (elapsed >= s->timer_expire[n]) {
+                OPLTimerOver(s->opl, n);
+                s->timer_start[n] = now;
+            }
+        }
+    }
 
-    adlib_kill_timers (s);
+    s->active = 1;
 
     OPLWrite (s->opl, a, val);
 }
@@ -98,7 +109,22 @@ uint32_t adlib_read(void *opaque, uint32_t nport)
     AdlibState *s = opaque;
     int a = nport & 3;
 
-    adlib_kill_timers (s);
+    /* On status read, check and fire any expired timers so the caller
+     * sees up-to-date overflow flags.  This is critical for OPL detection
+     * which starts a timer and reads status within microseconds — faster
+     * than the audio callback cycle. */
+    if (a == 0) {
+        uint32_t now = get_uticks();
+        for (int n = 0; n < 2; n++) {
+            if (s->ticking[n]) {
+                uint32_t elapsed = now - s->timer_start[n];
+                if (elapsed >= s->timer_expire[n]) {
+                    OPLTimerOver(s->opl, n);
+                    s->timer_start[n] = now;
+                }
+            }
+        }
+    }
 
     return OPLRead (s->opl, a);
 }

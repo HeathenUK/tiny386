@@ -47,11 +47,11 @@ void fb_scan_directory(char *path, size_t path_sz,
     }
 
     if (usb_vfs_mounted && *count < max_entries) {
-        if (strcmp(path, "/sdcard") == 0) {
+        if (strncmp(path, "/sdcard", 7) == 0) {
             copy_str(entries[*count].name, sizeof(entries[*count].name), "[USB Storage]");
             entries[*count].is_dir = FB_TYPE_SWITCH_STORAGE;
             (*count)++;
-        } else if (strcmp(path, "/usb") == 0) {
+        } else if (strncmp(path, "/usb", 4) == 0) {
             copy_str(entries[*count].name, sizeof(entries[*count].name), "[SD Card]");
             entries[*count].is_dir = FB_TYPE_SWITCH_STORAGE;
             (*count)++;
@@ -93,7 +93,7 @@ void fb_scan_directory(char *path, size_t path_sz,
     closedir(dir);
 
     int sort_start = custom_count;
-    if (usb_vfs_mounted && (strcmp(path, "/sdcard") == 0 || strcmp(path, "/usb") == 0)) {
+    if (usb_vfs_mounted && (strncmp(path, "/sdcard", 7) == 0 || strncmp(path, "/usb", 4) == 0)) {
         sort_start++;
     }
     if (add_parent && strlen(path) > 1 && strcmp(path, "/sdcard") != 0 && strcmp(path, "/usb") != 0) {
@@ -131,7 +131,7 @@ int fb_select_entry(char *path, size_t path_sz,
 
     if (entry->is_dir == FB_TYPE_SWITCH_STORAGE) {
         if (usb_vfs_mounted) {
-            if (strcmp(path, "/sdcard") == 0) copy_str(path, path_sz, "/usb");
+            if (strncmp(path, "/sdcard", 7) == 0) copy_str(path, path_sz, "/usb");
             else copy_str(path, path_sz, "/sdcard");
         }
         return 0;

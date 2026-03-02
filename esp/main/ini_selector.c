@@ -81,6 +81,7 @@ typedef struct {
 	char bios[52];
 	char vgabios[52];
 	char boot[52];
+	char sound[12];
 } IniFileEntry;
 
 /* ── Selector state (file-scoped) ─────────────────────────────────── */
@@ -121,7 +122,7 @@ typedef struct {
 	char file_display[52];   /* Basename for display */
 } SettingsField;
 
-#define NUM_SETTINGS_FIELDS 8
+#define NUM_SETTINGS_FIELDS 9
 static SettingsField s_sfields[NUM_SETTINGS_FIELDS];
 static int  s_settings_field;
 static bool s_settings_dirty;
@@ -500,6 +501,9 @@ static const char *fpu_ini_val[] = { "1", "0" };
 static const char *acc_display[] = { "Fast", "Full" };
 static const char *acc_ini_val[] = { "fast", "full" };
 
+static const char *snd_display[] = { "SB16", "GUS" };
+static const char *snd_ini_val[] = { "sb16", "gus" };
+
 static const char *mem_display[] = { "4M", "8M", "16M", "24M" };
 static const char *mem_ini_val[] = { "4M", "8M", "16M", "24M" };
 
@@ -529,22 +533,26 @@ static void begin_settings_edit(void)
 		.display = acc_display, .ini_val = acc_ini_val, .num_options = 2
 	};
 	s_sfields[3] = (SettingsField){
+		.section = "pc", .key = "sound_device", .label = "Sound:    ",
+		.display = snd_display, .ini_val = snd_ini_val, .num_options = 2
+	};
+	s_sfields[4] = (SettingsField){
 		.section = "pc", .key = "mem_size", .label = "Memory:   ",
 		.display = mem_display, .ini_val = mem_ini_val, .num_options = 4
 	};
-	s_sfields[4] = (SettingsField){
+	s_sfields[5] = (SettingsField){
 		.section = "pc", .key = "hda", .label = "HDA:      ",
 		.is_file = true
 	};
-	s_sfields[5] = (SettingsField){
+	s_sfields[6] = (SettingsField){
 		.section = "pc", .key = "cda", .label = "CD-ROM:   ",
 		.is_file = true
 	};
-	s_sfields[6] = (SettingsField){
+	s_sfields[7] = (SettingsField){
 		.section = "pc", .key = "fda", .label = "Floppy A: ",
 		.is_file = true
 	};
-	s_sfields[7] = (SettingsField){
+	s_sfields[8] = (SettingsField){
 		.section = "pc", .key = "boot_order", .label = "Boot:     ",
 		.display = boot_order_names, .ini_val = boot_order_names,
 		.num_options = BOOT_ORDER_COUNT
@@ -554,15 +562,16 @@ static void begin_settings_edit(void)
 	s_sfields[0].current = find_cycle_index(cpu_display, 3, e->cpu);
 	s_sfields[1].current = find_cycle_index(fpu_display, 2, e->fpu);
 	s_sfields[2].current = find_cycle_index(acc_display, 2, e->accuracy);
-	s_sfields[3].current = find_cycle_index(mem_ini_val, 4, e->mem);
-	s_sfields[7].current = find_cycle_index(boot_order_names, BOOT_ORDER_COUNT, e->boot);
+	s_sfields[3].current = find_cycle_index(snd_display, 2, e->sound[0] ? e->sound : "SB16");
+	s_sfields[4].current = find_cycle_index(mem_ini_val, 4, e->mem);
+	s_sfields[8].current = find_cycle_index(boot_order_names, BOOT_ORDER_COUNT, e->boot);
 
 	/* Get raw file paths (preview only stores basenames) */
 	RawIniVals raw = {0};
 	ini_parse(e->path, raw_val_handler, &raw);
 
 	struct { int idx; char *raw; } file_map[] = {
-		{4, raw.hda}, {5, raw.cda}, {6, raw.fda}
+		{5, raw.hda}, {6, raw.cda}, {7, raw.fda}
 	};
 	for (int i = 0; i < 3; i++) {
 		int fi = file_map[i].idx;
@@ -1078,6 +1087,9 @@ static int preview_handler(void *user, const char *section,
 			snprintf(e->fda, sizeof(e->fda), "%s", p ? p + 1 : value);
 		} else if (NM("boot_order")) {
 			snprintf(e->boot, sizeof(e->boot), "%s", value);
+		} else if (NM("sound_device")) {
+			snprintf(e->sound, sizeof(e->sound), "%s",
+				strcasecmp(value, "gus") == 0 ? "GUS" : "SB16");
 		}
 	} else if (SEC("cpu")) {
 		if (NM("gen")) {

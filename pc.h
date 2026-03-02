@@ -16,6 +16,7 @@
 #include "ne2000.h"
 #include "i8257.h"
 #include "sb16.h"
+#include "gus.h"
 #include "pcspk.h"
 #include "pci.h"
 #include "ini.h"
@@ -59,6 +60,7 @@ typedef struct {
 	NE2000State *ne2000;
 	I8257State *isa_dma, *isa_hdma;
 	SB16State *sb16;
+	GUSState *gus;
 	PCSpkState *pcspk;
 
 	I440FXState *i440fx;
@@ -115,6 +117,7 @@ typedef struct {
 	int volume;      // 0-100 audio volume (ESP32 only)
 	int mouse_speed; // 1-10 mouse emulation speed (ESP32 only)
 	int usb_passthru; // 1=enabled, 0=disabled - pass USB storage to emulator (ESP32 only)
+	int sound_device; // 0=SB16+AdLib (default), 1=GUS
 	int hda_heads;    // 0=auto-detect, or override CHS heads for hda
 	int hda_spt;      // 0=auto-detect, or override CHS sectors-per-track for hda
 	int accuracy;     // 0=full (default), 1=fast (skip non-essential checks)

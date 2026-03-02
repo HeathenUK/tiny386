@@ -48,7 +48,6 @@ static inline void *psram_malloc(size_t size) {
 
 /* PIE (SIMD) functions for ESP32-P4 - defined in vga_pie.S */
 extern void pie_write_8pixels(uint16_t *dst, uint16_t *colors);
-extern void pie_write_8pixels_doubled(uint16_t *dst, uint16_t *colors);
 extern void pie_memcpy_128(void *dst, const void *src, size_t n);
 extern void pie_render_8pixels_mode13(uint16_t *dst, const uint8_t *indices, const uint16_t *palette);
 extern void pie_render_glyph(uint8_t *tile, const uint8_t *font_ptr, int cheight,
@@ -1270,13 +1269,34 @@ static void render_glyph_tile(uint8_t *tile, const uint8_t *font_ptr,
     }
 }
 
-/* Update font cache from VGA RAM - called when font pointer changes */
+/* Update font cache from VGA RAM - called when font pointer changes.
+ * Detects both pointer changes AND in-place data changes (e.g. BIOS
+ * loading an 8x8 font over the existing 8x16 font at the same offset). */
 static void update_font_cache(VGAState *s, const uint8_t *font_base)
 {
     if (!s->font_cache) return;
 
     uint32_t font_offset = font_base - s->vga_ram;
-    if (font_offset == s->font_cache_base) return;  /* Font unchanged */
+
+    if (font_offset == s->font_cache_base) {
+        /* Pointer unchanged — check if font data was modified in-place.
+         * Compare a few sentinel characters (0, 'A', 128, 255) to catch
+         * any real-world font change with minimal PSRAM reads. */
+        int changed = 0;
+        static const int sentinels[] = {0, 65, 128, 255};
+        for (int i = 0; i < 4 && !changed; i++) {
+            int ch = sentinels[i];
+            const uint8_t *src = font_base + ch * 32 * 4;
+            const uint8_t *dst = s->font_cache + ch * 16 * 4;
+            for (int row = 0; row < 16; row++) {
+                if (src[row * 4] != dst[row * 4]) {
+                    changed = 1;
+                    break;
+                }
+            }
+        }
+        if (!changed) return;
+    }
 
     /* Copy font data to cache (256 chars * 16 rows * 4 bytes stride) */
     for (int ch = 0; ch < 256; ch++) {
@@ -2151,53 +2171,6 @@ static void vga_graphic_refresh(VGAState *s,
         }
 
         /*
-         * Fast path for VGA 256-color mode (mode 13h and similar)
-         * Conditions: BPP==16, shift_control==2, bpp==8, xdiv==2
-         */
-        if (shift_control == 2 && bpp == 8 && xdiv == 2) {
-            /* Debug: trace fast path usage (only on first scanline of first frame) */
-            if (y == 0 && !vga256_fast_logged) {
-                fprintf(stderr, "VGA: VGA256 (w=%d h=%d i0=%d stride=%d fbw=%d)\n",
-                        w, h, i0, fb_dev->stride, fb_dev->width);
-                vga256_fast_logged = 1;
-            }
-            uint16_t *fb_row = (uint16_t *)(fb_dev->fb_data + i0 + y * fb_dev->stride);
-            /* Calculate source bytes: use min of display width and VRAM line width */
-            /* line_offset is the VRAM bytes per line (CR[0x13] << 3) */
-            int src_from_display = w / 2;  /* Source pixels based on display width */
-            int src_from_vram = (line_offset > 0) ? line_offset : src_from_display;
-            int src_bytes = (src_from_display < src_from_vram) ? src_from_display : src_from_vram;
-            int num_chunks = src_bytes >> 3;  /* Process 8 source pixels at a time */
-
-            for (int chunk = 0; chunk < num_chunks; chunk++) {
-                uint8_t *vram_ptr = vram + addr + chunk * 8;
-                /* Read 8 palette indices and look up colors */
-                uint16_t colors[8] __attribute__((aligned(16)));
-                colors[0] = palette[vram_ptr[0]];
-                colors[1] = palette[vram_ptr[1]];
-                colors[2] = palette[vram_ptr[2]];
-                colors[3] = palette[vram_ptr[3]];
-                colors[4] = palette[vram_ptr[4]];
-                colors[5] = palette[vram_ptr[5]];
-                colors[6] = palette[vram_ptr[6]];
-                colors[7] = palette[vram_ptr[7]];
-
-                /* Write 16 pixels (8 source pixels doubled) using 32-bit stores */
-                uint32_t *fb32 = (uint32_t *)fb_row;
-                fb32[0] = colors[0] | (colors[0] << 16);
-                fb32[1] = colors[1] | (colors[1] << 16);
-                fb32[2] = colors[2] | (colors[2] << 16);
-                fb32[3] = colors[3] | (colors[3] << 16);
-                fb32[4] = colors[4] | (colors[4] << 16);
-                fb32[5] = colors[5] | (colors[5] << 16);
-                fb32[6] = colors[6] | (colors[6] << 16);
-                fb32[7] = colors[7] | (colors[7] << 16);
-                fb_row += 16;
-            }
-            goto next_line;
-        }
-
-        /*
          * Optimized fast path for VGA 256-color native output (Tanmatsu with PPA scaling)
          * Conditions: shift_control==2, bpp==8, xdiv==1 (no CPU pixel doubling)
          *
@@ -2247,6 +2220,35 @@ static void vga_graphic_refresh(VGAState *s,
             if (pixels_left >= 8) {
                 pie_render_8pixels_mode13((uint16_t *)fb32, src, pal);
             }
+            goto next_line;
+        }
+
+        /*
+         * Fast path for VBE 16-bit RGB565 mode.
+         * When BPP==16 and VBE bpp==16, VRAM and framebuffer are both RGB565 —
+         * each scanline is a direct memcpy. Uses dirty line tracking + PIE SIMD.
+         */
+        if (shift_control == 2 && bpp == 16 && xdiv == 1) {
+            int src_bytes = w * 2;
+            uint8_t *vram_line = vram + addr;
+
+            /* Check if this line changed using fast hash comparison */
+            if (y < VGA_MAX_LINES) {
+                uint32_t line_hash = vga_hash_line(vram_line, src_bytes);
+                if (line_hash == vga_prev_line_hash[y] && !vga_is_line_dirty(y)) {
+                    goto next_line;
+                }
+                vga_prev_line_hash[y] = line_hash;
+            }
+
+            uint8_t *fb_row = fb_dev->fb_data + i0 + y * fb_dev->stride;
+
+            /* Use PIE 128-bit memcpy for aligned bulk, scalar for tail */
+            int aligned_bytes = src_bytes & ~15;
+            if (aligned_bytes > 0)
+                pie_memcpy_128(fb_row, vram_line, aligned_bytes);
+            if (src_bytes > aligned_bytes)
+                memcpy(fb_row + aligned_bytes, vram_line + aligned_bytes, src_bytes - aligned_bytes);
             goto next_line;
         }
 #endif

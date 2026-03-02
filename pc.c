@@ -19,6 +19,7 @@ int pc_pit_burst_setting = 1;
 // Accuracy mode: 0=full (default), 1=fast
 int pc_accuracy_setting = 0;
 
+
 #define cpu_raise_irq cpui386_raise_irq
 #define cpu_get_cycle cpui386_get_cycle
 
@@ -33,18 +34,14 @@ static u8 pc_io_read(void *o, int addr)
 	case 0x20: case 0x21: case 0xa0: case 0xa1:
 		val = i8259_ioport_read(pc->pic, addr);
 		return val;
-	case 0x3f8: case 0x3f9: case 0x3fa: case 0x3fb:
-	case 0x3fc: case 0x3fd: case 0x3fe: case 0x3ff:
+	case 0x3f8 ... 0x3ff:
 		val = 0xff;
 		if (pc->enable_serial)
 			val = u8250_reg_read(pc->serial, addr - 0x3f8);
 		return val;
-	case 0x2f8: case 0x2f9: case 0x2fa: case 0x2fb:
-	case 0x2fc: case 0x2fd: case 0x2fe: case 0x2ff:
-	case 0x2e8: case 0x2e9: case 0x2ea: case 0x2eb:
-	case 0x2ec: case 0x2ed: case 0x2ee: case 0x2ef:
-	case 0x3e8: case 0x3e9: case 0x3ea: case 0x3eb:
-	case 0x3ec: case 0x3ed: case 0x3ee: case 0x3ef:
+	case 0x2e8 ... 0x2ef:
+	case 0x2f8 ... 0x2ff:
+	case 0x3e8 ... 0x3ef:
 		return 0;
 	case 0x42:
 		/* read delay for PIT channel 2 */
@@ -57,12 +54,10 @@ static u8 pc_io_read(void *o, int addr)
 	case 0x70: case 0x71:
 		val = cmos_ioport_read(pc->cmos, addr);
 		return val;
-	case 0x1f0: case 0x1f1: case 0x1f2: case 0x1f3:
-	case 0x1f4: case 0x1f5: case 0x1f6: case 0x1f7:
+	case 0x1f0 ... 0x1f7:
 		val = ide_ioport_read(pc->ide, addr - 0x1f0);
 		return val;
-	case 0x170: case 0x171: case 0x172: case 0x173:
-	case 0x174: case 0x175: case 0x176: case 0x177:
+	case 0x170 ... 0x177:
 		val = ide_ioport_read(pc->ide2, addr - 0x170);
 		return val;
 	case 0x3f6:
@@ -71,14 +66,7 @@ static u8 pc_io_read(void *o, int addr)
 	case 0x376:
 		val = ide_status_read(pc->ide2);
 		return val;
-	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
-	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
-	case 0x3c8: case 0x3c9: case 0x3ca: case 0x3cb:
-	case 0x3cc: case 0x3cd: case 0x3ce: case 0x3cf:
-	case 0x3d0: case 0x3d1: case 0x3d2: case 0x3d3:
-	case 0x3d4: case 0x3d5: case 0x3d6: case 0x3d7:
-	case 0x3d8: case 0x3d9: case 0x3da: case 0x3db:
-	case 0x3dc: case 0x3dd: case 0x3de: case 0x3df:
+	case 0x3c0 ... 0x3df:
 		val = vga_ioport_read(pc->vga, addr);
 		return val;
 	case 0x92:
@@ -92,17 +80,17 @@ static u8 pc_io_read(void *o, int addr)
 	case 0x61:
 		val = pcspk_ioport_read(pc->pcspk);
 		return val;
-	case 0x220: case 0x221: case 0x222: case 0x223:
-	case 0x228: case 0x229:
-	case 0x388: case 0x389: case 0x38a: case 0x38b:
+	case 0x220 ... 0x223:
+	case 0x228 ... 0x229:
+		if (pc->adlib) return adlib_read(pc->adlib, addr);
+		return 0xff;
+	case 0x388 ... 0x38b:
+		if (pc->gus) return gus_adlib_read(pc->gus, addr);
 		return adlib_read(pc->adlib, addr);
-	case 0xcfc: case 0xcfd: case 0xcfe: case 0xcff:
+	case 0xcfc ... 0xcff:
 		val = i440fx_read_data(pc->i440fx, addr - 0xcfc, 0);
 		return val;
-	case 0x300: case 0x301: case 0x302: case 0x303:
-	case 0x304: case 0x305: case 0x306: case 0x307:
-	case 0x308: case 0x309: case 0x30a: case 0x30b:
-	case 0x30c: case 0x30d: case 0x30e: case 0x30f:
+	case 0x300 ... 0x30f:
 		val = ne2000_ioport_read(pc->ne2000, addr);
 		return val;
 	case 0x310:
@@ -111,12 +99,10 @@ static u8 pc_io_read(void *o, int addr)
 	case 0x31f:
 		val = ne2000_reset_ioport_read(pc->ne2000, addr);
 		return val;
-	case 0x00: case 0x01: case 0x02: case 0x03:
-	case 0x04: case 0x05: case 0x06: case 0x07:
+	case 0x00 ... 0x07:
 		val = i8257_read_chan(pc->isa_dma, addr - 0x00, 1);
 		return val;
-	case 0x08: case 0x09: case 0x0a: case 0x0b:
-	case 0x0c: case 0x0d: case 0x0e: case 0x0f:
+	case 0x08 ... 0x0f:
 		val = i8257_read_cont(pc->isa_dma, addr - 0x08, 1);
 		return val;
 	case 0x81: case 0x82: case 0x83: case 0x87:
@@ -140,17 +126,22 @@ static u8 pc_io_read(void *o, int addr)
 		val = i8257_read_pageh(pc->isa_hdma, addr - 0x488);
 		return val;
 	case 0x225:
-		val = sb16_mixer_read(pc->sb16, addr);
-		return val;
-	case 0x226: case 0x22a: case 0x22c: case 0x22d: case 0x22e: case 0x22f:
-		val = sb16_dsp_read(pc->sb16, addr);
-		return val;
+		if (pc->sb16) { val = sb16_mixer_read(pc->sb16, addr); return val; }
+		return 0xff;
+	case 0x226: case 0x22a: case 0x22c ... 0x22f:
+		if (pc->sb16) { val = sb16_dsp_read(pc->sb16, addr); return val; }
+		return 0xff;
+	case 0x240 ... 0x24f:
+		if (pc->gus) return gus_read(pc->gus, addr);
+		return 0xff;
+	case 0x340 ... 0x347:
+		if (pc->gus) return gus_read_gf1(pc->gus, addr);
+		return 0xff;
 	case 0xf1f4:
 		val = 0;
 		emulink_data_read_string(pc->emulink, &val, 1, 1);
 		return val;
 	default:
-		//fprintf(stderr, "in 0x%x <= 0x%x\n", addr, 0xff);
 		return 0xff;
 	}
 }
@@ -180,12 +171,14 @@ static u16 pc_io_read16(void *o, int addr)
 		val = ne2000_asic_ioport_read(pc->ne2000, addr);
 		return val;
 	case 0x220:
-		return adlib_read(pc->adlib, addr);
-	default:
-#ifdef DEBUG_IO
-		fprintf(stderr, "inw 0x%x <= 0x%x\n", addr, 0xffff);
-#endif
+		if (pc->adlib) return adlib_read(pc->adlib, addr);
 		return 0xffff;
+	case 0x344:
+		if (pc->gus) return gus_read_gf1_16(pc->gus, addr);
+		return 0xffff;
+	default:
+		/* ISA bus splits 16-bit I/O to 8-bit devices into two byte reads */
+		return pc_io_read(o, addr) | ((u16)pc_io_read(o, addr + 1) << 8);
 	}
 }
 
@@ -212,9 +205,9 @@ static u32 pc_io_read32(void *o, int addr)
 		val = emulink_status_read(pc->emulink);
 		return val;
 	default:
-		fprintf(stderr, "ind 0x%x <= 0x%x\n", addr, 0xffffffff);
+		/* ISA bus splits 32-bit I/O into two 16-bit reads */
+		return pc_io_read16(o, addr) | ((u32)pc_io_read16(o, addr + 2) << 16);
 	}
-	return 0xffffffff;
 }
 
 static int pc_io_read_string(void *o, int addr, uint8_t *buf, int size, int count)
@@ -234,6 +227,7 @@ static int pc_io_read_string(void *o, int addr, uint8_t *buf, int size, int coun
 static void pc_io_write(void *o, int addr, u8 val)
 {
 	PC *pc = o;
+
 	switch(addr) {
 	case 0x80: case 0xed:
 		/* used by linux, for io delay */
@@ -245,29 +239,23 @@ static void pc_io_write(void *o, int addr, u8 val)
 	case 0x20: case 0x21: case 0xa0: case 0xa1:
 		i8259_ioport_write(pc->pic, addr, val);
 		return;
-	case 0x3f8: case 0x3f9: case 0x3fa: case 0x3fb:
-	case 0x3fc: case 0x3fd: case 0x3fe: case 0x3ff:
+	case 0x3f8 ... 0x3ff:
 		u8250_reg_write(pc->serial, addr - 0x3f8, val);
 		return;
-	case 0x2f8: case 0x2f9: case 0x2fa: case 0x2fb:
-	case 0x2fc: case 0x2fd: case 0x2fe: case 0x2ff:
-	case 0x2e8: case 0x2e9: case 0x2ea: case 0x2eb:
-	case 0x2ec: case 0x2ed: case 0x2ee: case 0x2ef:
-	case 0x3e8: case 0x3e9: case 0x3ea: case 0x3eb:
-	case 0x3ec: case 0x3ed: case 0x3ee: case 0x3ef:
+	case 0x2e8 ... 0x2ef:
+	case 0x2f8 ... 0x2ff:
+	case 0x3e8 ... 0x3ef:
 		return;
-	case 0x40: case 0x41: case 0x42: case 0x43:
+	case 0x40 ... 0x43:
 		i8254_ioport_write(pc->pit, addr, val);
 		return;
 	case 0x70: case 0x71:
 		cmos_ioport_write(pc->cmos, addr, val);
 		return;
-	case 0x1f0: case 0x1f1: case 0x1f2: case 0x1f3:
-	case 0x1f4: case 0x1f5: case 0x1f6: case 0x1f7:
+	case 0x1f0 ... 0x1f7:
 		ide_ioport_write(pc->ide, addr - 0x1f0, val);
 		return;
-	case 0x170: case 0x171: case 0x172: case 0x173:
-	case 0x174: case 0x175: case 0x176: case 0x177:
+	case 0x170 ... 0x177:
 		ide_ioport_write(pc->ide2, addr - 0x170, val);
 		return;
 	case 0x3f6:
@@ -276,14 +264,7 @@ static void pc_io_write(void *o, int addr, u8 val)
 	case 0x376:
 		ide_cmd_write(pc->ide2, val);
 		return;
-	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
-	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
-	case 0x3c8: case 0x3c9: case 0x3ca: case 0x3cb:
-	case 0x3cc: case 0x3cd: case 0x3ce: case 0x3cf:
-	case 0x3d0: case 0x3d1: case 0x3d2: case 0x3d3:
-	case 0x3d4: case 0x3d5: case 0x3d6: case 0x3d7:
-	case 0x3d8: case 0x3d9: case 0x3da: case 0x3db:
-	case 0x3dc: case 0x3dd: case 0x3de: case 0x3df:
+	case 0x3c0 ... 0x3df:
 		vga_ioport_write(pc->vga, addr, val);
 		return;
 	case 0x402:
@@ -316,9 +297,12 @@ static void pc_io_write(void *o, int addr, u8 val)
 	case 0x61:
 		pcspk_ioport_write(pc->pcspk, val);
 		return;
-	case 0x220: case 0x221: case 0x222: case 0x223:
-	case 0x228: case 0x229:
-	case 0x388: case 0x389: case 0x38a: case 0x38b:
+	case 0x220 ... 0x223:
+	case 0x228 ... 0x229:
+		if (pc->adlib) adlib_write(pc->adlib, addr, val);
+		return;
+	case 0x388 ... 0x38b:
+		if (pc->gus) { gus_adlib_write(pc->gus, addr, val); return; }
 		adlib_write(pc->adlib, addr, val);
 		return;
 	case 0x8900:
@@ -334,13 +318,10 @@ static void pc_io_write(void *o, int addr, u8 val)
 		default : pc->shutdown_state = 0; break;
 		}
 		return;
-	case 0xcfc: case 0xcfd: case 0xcfe: case 0xcff:
+	case 0xcfc ... 0xcff:
 		i440fx_write_data(pc->i440fx, addr - 0xcfc, val, 0);
 		return;
-	case 0x300: case 0x301: case 0x302: case 0x303:
-	case 0x304: case 0x305: case 0x306: case 0x307:
-	case 0x308: case 0x309: case 0x30a: case 0x30b:
-	case 0x30c: case 0x30d: case 0x30e: case 0x30f:
+	case 0x300 ... 0x30f:
 		ne2000_ioport_write(pc->ne2000, addr, val);
 		return;
 	case 0x310:
@@ -349,12 +330,10 @@ static void pc_io_write(void *o, int addr, u8 val)
 	case 0x31f:
 		ne2000_reset_ioport_write(pc->ne2000, addr, val);
 		return;
-	case 0x00: case 0x01: case 0x02: case 0x03:
-	case 0x04: case 0x05: case 0x06: case 0x07:
+	case 0x00 ... 0x07:
 		i8257_write_chan(pc->isa_dma, addr - 0x00, val, 1);
 		return;
-	case 0x08: case 0x09: case 0x0a: case 0x0b:
-	case 0x0c: case 0x0d: case 0x0e: case 0x0f:
+	case 0x08 ... 0x0f:
 		i8257_write_cont(pc->isa_dma, addr - 0x08, val, 1);
 		return;
 	case 0x81: case 0x82: case 0x83: case 0x87:
@@ -378,19 +357,24 @@ static void pc_io_write(void *o, int addr, u8 val)
 		i8257_write_pageh(pc->isa_hdma, addr - 0x488, val);
 		return;
 	case 0x224:
-		sb16_mixer_write_indexb(pc->sb16, addr, val);
+		if (pc->sb16) sb16_mixer_write_indexb(pc->sb16, addr, val);
 		return;
 	case 0x225:
-		sb16_mixer_write_datab(pc->sb16, addr, val);
+		if (pc->sb16) sb16_mixer_write_datab(pc->sb16, addr, val);
 		return;
 	case 0x226: case 0x22c:
-		sb16_dsp_write(pc->sb16, addr, val);
+		if (pc->sb16) sb16_dsp_write(pc->sb16, addr, val);
+		return;
+	case 0x240 ... 0x24f:
+		if (pc->gus) gus_write(pc->gus, addr, val);
+		return;
+	case 0x340 ... 0x347:
+		if (pc->gus) gus_write_gf1(pc->gus, addr, val);
 		return;
 	case 0xf1f4:
 		emulink_data_write_string(pc->emulink, &val, 1, 1);
 		return;
 	default:
-		// fprintf(stderr, "out 0x%x => 0x%x\n", val, addr);
 		return;
 	}
 }
@@ -405,14 +389,7 @@ static void pc_io_write16(void *o, int addr, u16 val)
 	case 0x170:
 		ide_data_writew(pc->ide2, val);
 		return;
-	case 0x3c0: case 0x3c1: case 0x3c2: case 0x3c3:
-	case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7:
-	case 0x3c8: case 0x3c9: case 0x3ca: case 0x3cb:
-	case 0x3cc: case 0x3cd: case 0x3ce: case 0x3cf:
-	case 0x3d0: case 0x3d1: case 0x3d2: case 0x3d3:
-	case 0x3d4: case 0x3d5: case 0x3d6: case 0x3d7:
-	case 0x3d8: case 0x3d9: case 0x3da: case 0x3db:
-	case 0x3dc: case 0x3dd: case 0x3de:
+	case 0x3c0 ... 0x3de:
 		vga_ioport_write(pc->vga, addr, val & 0xff);
 		vga_ioport_write(pc->vga, addr + 1, (val >> 8) & 0xff);
 		return;
@@ -425,10 +402,13 @@ static void pc_io_write16(void *o, int addr, u16 val)
 	case 0x310:
 		ne2000_asic_ioport_write(pc->ne2000, addr, val);
 		return;
+	case 0x344:
+		if (pc->gus) gus_write_gf1_16(pc->gus, addr, val);
+		return;
 	default:
-#ifdef DEBUG_IO
-		fprintf(stderr, "outw 0x%x => 0x%x\n", val, addr);
-#endif
+		/* ISA bus splits 16-bit I/O to 8-bit devices into two byte writes */
+		pc_io_write(o, addr, val & 0xff);
+		pc_io_write(o, addr + 1, (val >> 8) & 0xff);
 		return;
 	}
 }
@@ -456,7 +436,9 @@ static void pc_io_write32(void *o, int addr, u32 val)
 		emulink_data_write(pc->emulink, val);
 		return;
 	default:
-		// fprintf(stderr, "outd 0x%x => 0x%x\n", val, addr);
+		/* ISA bus splits 32-bit I/O into two 16-bit writes */
+		pc_io_write16(o, addr, val & 0xffff);
+		pc_io_write16(o, addr + 2, (val >> 16) & 0xffff);
 		return;
 	}
 }
@@ -1340,15 +1322,26 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 			       1, 12, pc->pic, set_irq,
 			       pc, pc_reset_request);
 	i8042_set_a20_cb(pc->i8042, pc_set_a20, pc_get_a20);
-	pc->adlib = adlib_new();
 	pc->ne2000 = isa_ne2000_init(0x300, 9, pc->pic, set_irq);
 	pc->isa_dma = i8257_new(pc->phys_mem, pc->phys_mem_size,
 				0x00, 0x80, 0x480, 0);
 	pc->isa_hdma = i8257_new(pc->phys_mem, pc->phys_mem_size,
 				 0xc0, 0x88, 0x488, 1);
-	pc->sb16 = sb16_new(0x220, 5,
-			    pc->isa_dma, pc->isa_hdma,
-			    pc->pic, set_irq);
+	fprintf(stderr, "Sound device: %s\n", conf->sound_device == 1 ? "GUS" : "SB16+AdLib");
+	if (conf->sound_device == 1) {
+		/* GUS mode: no SB16 or AdLib (GUS Classic had no OPL chip) */
+		pc->adlib = NULL;
+		pc->sb16 = NULL;
+		pc->gus = gus_new(0x240, 7, 3,
+				   pc->isa_dma, pc->pic, set_irq);
+	} else {
+		/* SB16 mode (default): SB16 + AdLib/OPL */
+		pc->adlib = adlib_new();
+		pc->sb16 = sb16_new(0x220, 5,
+				    pc->isa_dma, pc->isa_hdma,
+				    pc->pic, set_irq);
+		pc->gus = NULL;
+	}
 	pc->pcspk = pcspk_init(pc->pit);
 	pc->port92 = 0;  /* A20 disabled at reset (bit 1 = 0) */
 	pc->shutdown_state = 0;
@@ -1366,44 +1359,42 @@ void mixer_callback (void *opaque, uint8_t *stream, int free)
 		return;
 	}
 	assert(free / 2 <= MIXER_BUF_LEN);
-	memset(tmpbuf, 0, MIXER_BUF_LEN);
-	if (!pc->adlib || !pc->sb16 || !pc->pcspk) {
-		memset(stream, 0, free);
-		return;
-	}
-	adlib_callback(pc->adlib, tmpbuf, free / 2); // s16, mono
-	sb16_audio_callback(pc->sb16, stream, free); // s16, stereo
-
-	/* Get volume levels from SB16 mixer (0-7 scale per channel) */
-	int fm_vol_l, fm_vol_r;
-	int voice_vol_l, voice_vol_r;
-	int master_vol_l, master_vol_r;
-	sb16_get_fm_volume(pc->sb16, &fm_vol_l, &fm_vol_r);
-	sb16_get_voice_volume(pc->sb16, &voice_vol_l, &voice_vol_r);
-	sb16_get_master_volume(pc->sb16, &master_vol_l, &master_vol_r);
-
+	memset(stream, 0, free);
 	int16_t *d2 = (int16_t *) stream;
-	int16_t *d1 = (int16_t *) tmpbuf;
-	for (int i = 0; i < free / 2; i += 2) {
-		/* Apply FM volume to OPL samples (0-7 range, 7 = full volume) */
-		int fm_l = (d1[i / 2] * fm_vol_l) / 7;
-		int fm_r = (d1[i / 2] * fm_vol_r) / 7;
-		/* Apply voice volume to SB16 digital audio */
-		int voice_l = (d2[i] * voice_vol_l) / 7;
-		int voice_r = (d2[i + 1] * voice_vol_r) / 7;
-		/* Mix FM with voice */
-		int mix_l = voice_l + fm_l;
-		int mix_r = voice_r + fm_r;
-		/* Apply master volume */
-		mix_l = (mix_l * master_vol_l) / 7;
-		mix_r = (mix_r * master_vol_r) / 7;
-		/* Clamp to 16-bit range */
-		if (mix_l > 32767) mix_l = 32767;
-		if (mix_l < -32768) mix_l = -32768;
-		if (mix_r > 32767) mix_r = 32767;
-		if (mix_r < -32768) mix_r = -32768;
-		d2[i] = mix_l;
-		d2[i + 1] = mix_r;
+
+	if (pc->gus) {
+		/* GUS mode: GUS produces stereo output with its own volume/pan */
+		gus_audio_callback(pc->gus, stream, free);
+	} else if (pc->adlib && pc->sb16) {
+		/* SB16 mode: mix AdLib (FM) + SB16 (digital) with mixer volumes */
+		memset(tmpbuf, 0, MIXER_BUF_LEN);
+		adlib_callback(pc->adlib, tmpbuf, free / 2); // s16, mono
+		sb16_audio_callback(pc->sb16, stream, free); // s16, stereo
+
+		int fm_vol_l, fm_vol_r;
+		int voice_vol_l, voice_vol_r;
+		int master_vol_l, master_vol_r;
+		sb16_get_fm_volume(pc->sb16, &fm_vol_l, &fm_vol_r);
+		sb16_get_voice_volume(pc->sb16, &voice_vol_l, &voice_vol_r);
+		sb16_get_master_volume(pc->sb16, &master_vol_l, &master_vol_r);
+
+		int16_t *d1 = (int16_t *) tmpbuf;
+		for (int i = 0; i < free / 2; i += 2) {
+			int fm_l = (d1[i / 2] * fm_vol_l) / 7;
+			int fm_r = (d1[i / 2] * fm_vol_r) / 7;
+			int voice_l = (d2[i] * voice_vol_l) / 7;
+			int voice_r = (d2[i + 1] * voice_vol_r) / 7;
+			int mix_l = voice_l + fm_l;
+			int mix_r = voice_r + fm_r;
+			mix_l = (mix_l * master_vol_l) / 7;
+			mix_r = (mix_r * master_vol_r) / 7;
+			if (mix_l > 32767) mix_l = 32767;
+			if (mix_l < -32768) mix_l = -32768;
+			if (mix_r > 32767) mix_r = 32767;
+			if (mix_r < -32768) mix_r = -32768;
+			d2[i] = mix_l;
+			d2[i + 1] = mix_r;
+		}
 	}
 
 	/* PC Speaker bypasses SB16 mixer (separate circuit on real hardware) */
@@ -1586,6 +1577,12 @@ int parse_conf_ini(void* user, const char* section,
 			if (conf->mouse_speed > 10) conf->mouse_speed = 10;
 		} else if (NAME("usb_passthru")) {
 			conf->usb_passthru = atoi(value) ? 1 : 0;
+		} else if (NAME("sound_device")) {
+			if (strcasecmp(value, "gus") == 0)
+				conf->sound_device = 1;
+			else
+				conf->sound_device = 0;  /* sb16 (default) */
+			fprintf(stderr, "INI: sound_device = %s (parsed as %d)\n", value, conf->sound_device);
 		}
 	} else if (SEC("display")) {
 		if (NAME("width")) {
