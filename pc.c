@@ -85,7 +85,6 @@ static u8 pc_io_read(void *o, int addr)
 		if (pc->adlib) return adlib_read(pc->adlib, addr);
 		return 0xff;
 	case 0x388 ... 0x38b:
-		if (pc->gus) return gus_adlib_read(pc->gus, addr);
 		return adlib_read(pc->adlib, addr);
 	case 0xcfc ... 0xcff:
 		val = i440fx_read_data(pc->i440fx, addr - 0xcfc, 0);
@@ -131,12 +130,6 @@ static u8 pc_io_read(void *o, int addr)
 	case 0x226: case 0x22a: case 0x22c ... 0x22f:
 		if (pc->sb16) { val = sb16_dsp_read(pc->sb16, addr); return val; }
 		return 0xff;
-	case 0x240 ... 0x24f:
-		if (pc->gus) return gus_read(pc->gus, addr);
-		return 0xff;
-	case 0x340 ... 0x347:
-		if (pc->gus) return gus_read_gf1(pc->gus, addr);
-		return 0xff;
 	case 0xf1f4:
 		val = 0;
 		emulink_data_read_string(pc->emulink, &val, 1, 1);
@@ -172,9 +165,6 @@ static u16 pc_io_read16(void *o, int addr)
 		return val;
 	case 0x220:
 		if (pc->adlib) return adlib_read(pc->adlib, addr);
-		return 0xffff;
-	case 0x344:
-		if (pc->gus) return gus_read_gf1_16(pc->gus, addr);
 		return 0xffff;
 	default:
 		/* ISA bus splits 16-bit I/O to 8-bit devices into two byte reads */
@@ -302,7 +292,6 @@ static void pc_io_write(void *o, int addr, u8 val)
 		if (pc->adlib) adlib_write(pc->adlib, addr, val);
 		return;
 	case 0x388 ... 0x38b:
-		if (pc->gus) { gus_adlib_write(pc->gus, addr, val); return; }
 		adlib_write(pc->adlib, addr, val);
 		return;
 	case 0x8900:
@@ -365,12 +354,6 @@ static void pc_io_write(void *o, int addr, u8 val)
 	case 0x226: case 0x22c:
 		if (pc->sb16) sb16_dsp_write(pc->sb16, addr, val);
 		return;
-	case 0x240 ... 0x24f:
-		if (pc->gus) gus_write(pc->gus, addr, val);
-		return;
-	case 0x340 ... 0x347:
-		if (pc->gus) gus_write_gf1(pc->gus, addr, val);
-		return;
 	case 0xf1f4:
 		emulink_data_write_string(pc->emulink, &val, 1, 1);
 		return;
@@ -401,9 +384,6 @@ static void pc_io_write16(void *o, int addr, u16 val)
 		return;
 	case 0x310:
 		ne2000_asic_ioport_write(pc->ne2000, addr, val);
-		return;
-	case 0x344:
-		if (pc->gus) gus_write_gf1_16(pc->gus, addr, val);
 		return;
 	default:
 		/* ISA bus splits 16-bit I/O to 8-bit devices into two byte writes */
@@ -1327,21 +1307,10 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void (*poll)(void *), void *redraw_data,
 				0x00, 0x80, 0x480, 0);
 	pc->isa_hdma = i8257_new(pc->phys_mem, pc->phys_mem_size,
 				 0xc0, 0x88, 0x488, 1);
-	fprintf(stderr, "Sound device: %s\n", conf->sound_device == 1 ? "GUS" : "SB16+AdLib");
-	if (conf->sound_device == 1) {
-		/* GUS mode: no SB16 or AdLib (GUS Classic had no OPL chip) */
-		pc->adlib = NULL;
-		pc->sb16 = NULL;
-		pc->gus = gus_new(0x240, 7, 3,
-				   pc->isa_dma, pc->pic, set_irq);
-	} else {
-		/* SB16 mode (default): SB16 + AdLib/OPL */
-		pc->adlib = adlib_new();
-		pc->sb16 = sb16_new(0x220, 5,
-				    pc->isa_dma, pc->isa_hdma,
-				    pc->pic, set_irq);
-		pc->gus = NULL;
-	}
+	pc->adlib = adlib_new();
+	pc->sb16 = sb16_new(0x220, 5,
+			    pc->isa_dma, pc->isa_hdma,
+			    pc->pic, set_irq);
 	pc->pcspk = pcspk_init(pc->pit);
 	pc->port92 = 0;  /* A20 disabled at reset (bit 1 = 0) */
 	pc->shutdown_state = 0;
@@ -1362,10 +1331,7 @@ void mixer_callback (void *opaque, uint8_t *stream, int free)
 	memset(stream, 0, free);
 	int16_t *d2 = (int16_t *) stream;
 
-	if (pc->gus) {
-		/* GUS mode: GUS produces stereo output with its own volume/pan */
-		gus_audio_callback(pc->gus, stream, free);
-	} else if (pc->adlib && pc->sb16) {
+	if (pc->adlib && pc->sb16) {
 		/* SB16 mode: mix AdLib (FM) + SB16 (digital) with mixer volumes */
 		memset(tmpbuf, 0, MIXER_BUF_LEN);
 		adlib_callback(pc->adlib, tmpbuf, free / 2); // s16, mono
@@ -1577,12 +1543,6 @@ int parse_conf_ini(void* user, const char* section,
 			if (conf->mouse_speed > 10) conf->mouse_speed = 10;
 		} else if (NAME("usb_passthru")) {
 			conf->usb_passthru = atoi(value) ? 1 : 0;
-		} else if (NAME("sound_device")) {
-			if (strcasecmp(value, "gus") == 0)
-				conf->sound_device = 1;
-			else
-				conf->sound_device = 0;  /* sb16 (default) */
-			fprintf(stderr, "INI: sound_device = %s (parsed as %d)\n", value, conf->sound_device);
 		}
 	} else if (SEC("display")) {
 		if (NAME("width")) {

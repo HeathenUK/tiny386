@@ -277,7 +277,6 @@ static int pc_main(const char *file)
 	globals.fpu = conf.fpu;
 	globals.accuracy = conf.accuracy;
 	globals.mem_size_mb = (int)(conf.mem_size / (1024 * 1024));
-	globals.sound_device = conf.sound_device;
 	mouse_emu_set_speed(conf.mouse_speed);
 	xEventGroupSetBits(global_event_group, BIT0);
 

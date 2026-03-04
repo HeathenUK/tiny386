@@ -106,7 +106,6 @@ typedef enum {
 typedef enum {
 	SYS_CPU_GEN = 0,
 	SYS_FPU,
-	SYS_SOUND_DEVICE,
 	SYS_MEMSIZE,
 	SYS_BATCH,
 	SYS_PIT_BURST,
@@ -166,7 +165,6 @@ struct OSD {
 	int boot_accuracy; // accuracy at boot (core switch requires reboot)
 	int mouse_speed; // 1-10, mouse emulation speed
 	int usb_passthru; // 1=enabled (default), 0=disabled (requires restart)
-	int sound_device; // 0=SB16+AdLib, 1=GUS (requires restart)
 
 	// File browser state
 	int browser_target;  // Which drive slot we're browsing for
@@ -764,7 +762,7 @@ static const char *cpu_gen_names[] = { "i386", "i486", "i586" };
 // Render system settings submenu
 static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 {
-	char cpu_val[16], fpu_val[16], sound_val[16], mem_val[16], batch_val[16], pitburst_val[16], accuracy_val[16], mouse_val[16], statsbar_val[16], cpudbg_val[16];
+	char cpu_val[16], fpu_val[16], mem_val[16], batch_val[16], pitburst_val[16], accuracy_val[16], mouse_val[16], statsbar_val[16], cpudbg_val[16];
 
 	// CPU generation (3=386, 4=486, 5=586)
 	int gen_idx = osd->cpu_gen - 3;
@@ -774,9 +772,6 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 
 	// FPU
 	snprintf(fpu_val, sizeof(fpu_val), "%s", osd->fpu ? "Enabled" : "Disabled");
-
-	// Sound device
-	snprintf(sound_val, sizeof(sound_val), "%s", osd->sound_device ? "GUS" : "SB16");
 
 	// Memory size
 	snprintf(mem_val, sizeof(mem_val), "%d MB", osd->mem_size_mb);
@@ -811,7 +806,6 @@ static void render_sys_menu(OSD *osd, uint8_t *pixels, int w, int h, int pitch)
 	MenuEntry entries[SYS_COUNT] = {
 		{ "CPU:", 0, 0, cpu_val },
 		{ "FPU:", 0, 0, fpu_val },
-		{ "Sound:", 0, 0, sound_val },
 		{ "Memory:", 0, 0, mem_val },
 		{ "Batch:", 0, 0, batch_val },
 		{ "PIT Burst:", 0, 0, pitburst_val },
@@ -1678,7 +1672,7 @@ static int handle_main_select(OSD *osd)
 			                              osd->cpu_gen, osd->fpu, osd_get_mem_size_bytes(osd),
 			                              osd->brightness, osd->volume, osd->frame_skip,
 			                              osd->batch_size, osd->pit_burst, osd->mouse_speed,
-			                              osd->usb_passthru, osd->accuracy, osd->sound_device);
+			                              osd->usb_passthru, osd->accuracy);
 			if (rc == 0) {
 				// Sync all OSD settings to globals so osd_refresh()
 				// sees the saved values if OSD is reopened before reboot
@@ -1688,7 +1682,6 @@ static int handle_main_select(OSD *osd)
 				globals.mouse_speed = osd->mouse_speed;
 				globals.usb_passthru = osd->usb_passthru;
 				globals.accuracy = osd->accuracy;
-				globals.sound_device = osd->sound_device;
 				toast_show("Settings saved");
 			} else {
 				toast_show("Save failed");
@@ -1715,7 +1708,6 @@ static int handle_main_select(OSD *osd)
 		globals.mouse_speed = osd->mouse_speed;
 		globals.usb_passthru = osd->usb_passthru;
 		globals.accuracy = osd->accuracy;
-		globals.sound_device = osd->sound_device;
 		// Use full INI switch path (teardown + re-parse) so saved
 		// settings like cpu_gen, accuracy, mem_size take effect.
 		// Copy current INI path as the "new" INI to reload.
@@ -1772,9 +1764,6 @@ static void handle_sys_adjust(OSD *osd, int delta)
 		break;
 	case SYS_FPU:
 		osd->fpu = !osd->fpu;
-		break;
-	case SYS_SOUND_DEVICE:
-		osd->sound_device = !osd->sound_device;
 		break;
 	case SYS_MEMSIZE:
 		// Adjust in 1MB increments, max 24MB, min 1MB
@@ -1890,7 +1879,6 @@ void osd_set_system_config(OSD *osd, int cpu_gen, int fpu, long mem_size)
 {
 	osd->cpu_gen = cpu_gen;
 	osd->fpu = fpu;
-	osd->sound_device = globals.sound_device;
 	// Convert bytes to MB
 	osd->mem_size_mb = (int)(mem_size / (1024 * 1024));
 	if (osd->mem_size_mb < 1) osd->mem_size_mb = 1;
@@ -1930,7 +1918,6 @@ void osd_refresh(OSD *osd)
 	osd->mouse_speed = globals.mouse_speed > 0 ? globals.mouse_speed : osd->mouse_speed;
 	if (globals.usb_passthru >= 0)
 		osd->usb_passthru = globals.usb_passthru;
-	osd->sound_device = globals.sound_device;
 }
 
 void osd_handle_mouse_motion(OSD *osd, int x, int y)
