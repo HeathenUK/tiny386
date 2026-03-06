@@ -324,6 +324,9 @@ void i8254_update_irq(PITState *pit)
 					}
 				}
 				s->last_irq_count += s->count;
+				/* Rebase time reference to avoid 32-bit wraparound (~35 min) */
+				if (uticks - s->count_load_time > (1u << 31))
+					pit_load_count(pit, s, s->count);
 			}
 			break;
 	default:
@@ -469,6 +472,8 @@ bool pit_fire_single_irq(PITState *pit)
 	s->irq_pulse_count++;
 	s->last_irq_time = uticks;
 	s->last_irq_count += s->count;
+	if (uticks - s->count_load_time > (1u << 31))
+		pit_load_count(pit, s, s->count);
 
 	return true;
 }
@@ -517,6 +522,8 @@ bool pit_burst_fire(PITState *pit, uint32_t d, int irq)
 	s->irq_pulse_count++;
 	s->last_irq_time = uticks;
 	s->last_irq_count += s->count;
+	if (uticks - s->count_load_time > (1u << 31))
+		pit_load_count(pit, s, s->count);
 	return true;
 }
 
