@@ -60,9 +60,10 @@ static bool meta_consumed = false;  // Set if META+combo was used
 // Key repeat state (OSD, INI selector, and emulator typematic)
 #define KEY_REPEAT_DELAY_MS   400   // Initial delay before repeat starts
 #define KEY_REPEAT_INTERVAL_MS 80   // Interval between repeats
-static uint8_t repeat_keycode = 0;  // Currently held repeatable key (0 = none)
-static bool repeat_is_e0 = false;   // Whether repeat key needs E0 prefix (emulator)
-static uint32_t repeat_next_ms = 0; // When to fire next repeat
+static uint8_t repeat_keycode = 0;      // Currently held repeatable key (0 = none)
+static uint8_t repeat_phys_code = 0;    // Physical scancode (before remapping)
+static bool repeat_is_e0 = false;       // Whether repeat key needs E0 prefix (emulator)
+static uint32_t repeat_next_ms = 0;     // When to fire next repeat
 
 // Ctrl key scancode
 #define SC_LEFT_CTRL  0x1D
@@ -106,8 +107,9 @@ static void handle_scancode(uint8_t code, int is_down)
 		if (is_down) {
 			repeat_keycode = code;
 			repeat_next_ms = esp_log_timestamp() + KEY_REPEAT_DELAY_MS;
-		} else if (code == repeat_keycode) {
+		} else if (code == repeat_keycode || code == repeat_phys_code) {
 			repeat_keycode = 0;
+			repeat_phys_code = 0;
 		}
 	}
 }
@@ -227,6 +229,16 @@ static void input_task(void *arg)
 		// Use short timeout when key repeat is active, otherwise block
 		TickType_t wait_ticks = portMAX_DELAY;
 		if (repeat_keycode != 0) {
+			/* Safety: verify the physical key is still held.
+			 * This catches cases where the release event was consumed
+			 * by a continue path (mouse mode, meta shortcuts, etc.) */
+			if (repeat_phys_code != 0 && repeat_phys_code < KEYCODE_MAX &&
+			    !globals.key_pressed[repeat_phys_code]) {
+				repeat_keycode = 0;
+				repeat_phys_code = 0;
+			}
+		}
+		if (repeat_keycode != 0) {
 			uint32_t now = esp_log_timestamp();
 			if (now >= repeat_next_ms) {
 				// Fire repeat event
@@ -249,6 +261,31 @@ static void input_task(void *arg)
 			// The BSP provides scancodes in AT keyboard format
 			if (event.type == INPUT_EVENT_TYPE_SCANCODE) {
 				uint16_t scancode = event.args_scancode.scancode;
+
+				/* Track raw physical key state for ALL scancodes,
+				 * even those consumed by shortcuts. This lets the
+				 * repeat safety check detect released keys.
+				 * Also: if a key release matches the current repeat key,
+				 * send the break code NOW before any continue path can
+				 * swallow the event. Without this, the guest never sees
+				 * key-up and its own typematic keeps repeating. */
+				{
+					uint8_t raw = scancode & 0xFF;
+					int raw_down = !(raw & BSP_INPUT_SCANCODE_RELEASE_MODIFIER);
+					raw &= ~BSP_INPUT_SCANCODE_RELEASE_MODIFIER;
+					if (raw < KEYCODE_MAX)
+						globals.key_pressed[raw] = raw_down;
+					if (!raw_down && repeat_keycode != 0 &&
+					    raw == repeat_phys_code) {
+						if (globals.kbd && !globals.osd_enabled) {
+							if (repeat_is_e0)
+								ps2_put_keycode(globals.kbd, 1, 0xE0);
+							ps2_put_keycode(globals.kbd, 0, repeat_keycode);
+						}
+						repeat_keycode = 0;
+						repeat_phys_code = 0;
+					}
+				}
 
 				/* ── INI selector active: simple routing ──────── */
 				if (globals.ini_selector_active) {
@@ -346,6 +383,7 @@ static void input_task(void *arg)
 					}
 
 					repeat_is_e0 = true;
+					if (is_down) repeat_phys_code = code;
 					handle_scancode(code, is_down);
 				} else {
 					// Regular scancode
@@ -414,6 +452,7 @@ static void input_task(void *arg)
 					}
 
 					repeat_is_e0 = false;
+					if (is_down) repeat_phys_code = scancode & 0x7F;
 					handle_scancode(code, is_down);
 				}
 
