@@ -116,11 +116,11 @@ struct CPUI386 {
 
 	struct {
 		int op;
+		int mask;     /* moved adjacent to op for combined store */
 		uword dst;
 		uword dst2;
 		uword src1;
 		uword src2;
-		uword mask;
 	} cc;
 
 	struct {
