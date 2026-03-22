@@ -100,6 +100,11 @@ struct CPUI386 {
 	uint8_t pf_pos;
 	uint8_t pf_avail;
 
+	/* Sequential fast path — skip TLB for consecutive same-page instructions */
+	uword seq_phys;
+	uword seq_prev_ip;
+	bool seq_active;
+
 	struct {
 		int op;
 		uword dst;
@@ -4584,6 +4589,29 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 	if (code16) cpu->next_ip &= 0xffff;
 	cpu->ip = cpu->next_ip;
 
+	/* Sequential fast path: if previous instruction was on the same page
+	 * and execution is linear, derive physical address without TLB lookup. */
+	if (likely(cpu->seq_active)) {
+		uword prev_len = cpu->pf_pos;
+		if (likely(cpu->ip == cpu->seq_prev_ip + prev_len)) {
+			uword nphys = cpu->seq_phys + prev_len;
+			unsigned page_off = nphys & 0xFFF;
+			if (likely(page_off != 0 && page_off < 0xFF8)) {
+				cpu->pf_ptr = cpu->phys_mem + nphys;
+				b1 = cpu->pf_ptr[0];
+				cpu->pf_pos = 1;
+				cpu->pf_avail = 8;
+				cpu->next_ip++;
+				cpu->seq_phys = nphys;
+				cpu->seq_prev_ip = cpu->ip;
+				cpu->cycle++;
+				cpu->tsc++;
+				goto seq_dispatch;
+			}
+		}
+		cpu->seq_active = false;
+	}
+
 	/* Fused prefetch + opcode fetch: set prefetch pointer and read first byte
 	 * in one step, avoiding the redundant pf_pos check in fetch8. */
 	{
@@ -4593,21 +4621,27 @@ static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 		if (likely((pf_laddr ^ cpu->ifetch.laddr) < (4096 - 7))) {
 			cpu->pf_ptr = cpu->phys_mem + (cpu->ifetch.xaddr ^ pf_laddr);
 			b1 = cpu->pf_ptr[0];
+			/* Start sequential tracking */
+			cpu->seq_phys = cpu->ifetch.xaddr ^ pf_laddr;
+			cpu->seq_prev_ip = cpu->ip;
+			cpu->seq_active = true;
 			cpu->pf_pos = 1;
 			cpu->pf_avail = 8;
 			cpu->next_ip++;
 		} else {
 			cpu->pf_avail = 0;
 			cpu->pf_pos = 0;
+			cpu->seq_active = false;
 			TRY(fetch8(cpu, &b1));
 		}
 	}
 	cpu->cycle++;
-	cpu->tsc++;  /* Base cycle for instruction fetch */
+	cpu->tsc++;
 #ifdef OPCODE_PROFILE
 	cpu->opcode_freq[b1]++;
 #endif
 
+seq_dispatch: ;  /* Sequential path jumps here — all vars above are initialized */
 	// prefix
 	bool opsz16 = code16;
 	bool adsz16 = code16;
@@ -6698,6 +6732,7 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 	default: assert(false);
 	}
 	cpu->gen = gen;
+	cpu->seq_active = false;
 
 	cpu->tlb.size = tlb_size;
 	// Allocate TLB in internal RAM for fastest access
