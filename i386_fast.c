@@ -4558,6 +4558,160 @@ static bool __attribute__((cold)) pmret(CPUI386 *cpu, bool opsz16, int off, bool
 #define C_16(_1, ...) CX(_1) C_15(__VA_ARGS__)
 #define C(...) PASTE(C_, ARGCOUNT(__VA_ARGS__))(__VA_ARGS__)
 
+/* --- Subroutine-threaded handler for MOV r32, imm32 (0xB8-0xBF) ---
+ * Extracted as a separate function so RV32's Return Address Stack (RAS)
+ * predictor can predict the return, vs computed goto which uses the
+ * weaker Branch Target Buffer (BTB). */
+static bool __attribute__((noinline))
+st_handler_movimm32(CPUI386 *cpu, uint8_t b1)
+{
+    if (likely(cpu->pf_pos + 4 <= cpu->pf_avail)) {
+        int p = cpu->pf_pos;
+        u32 imm = cpu->pf_ptr[p] | ((u32)cpu->pf_ptr[p+1] << 8)
+                 | ((u32)cpu->pf_ptr[p+2] << 16) | ((u32)cpu->pf_ptr[p+3] << 24);
+        cpu->pf_pos = p + 4;
+        cpu->next_ip += 4;
+        cpu->gprx[b1 & 7].r32 = imm;
+        return true;  /* handled */
+    }
+    return false;  /* not handled — fall back to slow path */
+}
+
+/* Handler for MOV r8, imm8 (0xB0-0xB7) */
+static bool __attribute__((noinline))
+st_handler_movimm8(CPUI386 *cpu, uint8_t b1)
+{
+    if (likely(cpu->pf_pos < cpu->pf_avail)) {
+        u8 imm = cpu->pf_ptr[cpu->pf_pos++];
+        cpu->next_ip++;
+        /* sreg8 inline: set byte register */
+        int r = b1 & 7;
+        if (r < 4) {
+            cpu->gprx[r].r8[0] = imm;
+        } else {
+            cpu->gprx[r - 4].r8[1] = imm;
+        }
+        return true;
+    }
+    return false;
+}
+
+/* Handler for INC r32 (0x40-0x47) */
+static bool __attribute__((noinline))
+st_handler_inc(CPUI386 *cpu, uint8_t b1)
+{
+    int reg = b1 & 7;
+    int cf = get_CF(cpu);
+    u32 val = cpu->gprx[reg].r32;
+    cpu->cc.dst = (int32_t)(val + 1);
+    cpu->cc.op = CC_INC32;
+    SET_BIT(cpu->flags, cf, CF);
+    cpu->cc.mask = PF | AF | ZF | SF | OF;
+    cpu->gprx[reg].r32 = cpu->cc.dst;
+    return true;
+}
+
+/* Handler for DEC r32 (0x48-0x4F) */
+static bool __attribute__((noinline))
+st_handler_dec(CPUI386 *cpu, uint8_t b1)
+{
+    int reg = b1 & 7;
+    int cf = get_CF(cpu);
+    u32 val = cpu->gprx[reg].r32;
+    cpu->cc.dst = (int32_t)(val - 1);
+    cpu->cc.op = CC_DEC32;
+    SET_BIT(cpu->flags, cf, CF);
+    cpu->cc.mask = PF | AF | ZF | SF | OF;
+    cpu->gprx[reg].r32 = cpu->cc.dst;
+    return true;
+}
+
+/* Handler for PUSH r32 (0x50-0x57) — flat mode fast path */
+static bool __attribute__((noinline))
+st_handler_push(CPUI386 *cpu, uint8_t b1)
+{
+    if (likely(cpu->all_segs_flat && cpu->sp_mask == 0xFFFFFFFF)) {
+        int reg = b1 & 7;
+        u32 val = cpu->gprx[reg].r32;
+        u32 sp = cpu->gprx[4].r32 - 4;
+        cpu->gprx[4].r32 = sp;
+        *(u32 *)(cpu->phys_mem + sp) = val;
+        return true;
+    }
+    return false;
+}
+
+/* Handler for POP r32 (0x58-0x5F) — flat mode fast path */
+static bool __attribute__((noinline))
+st_handler_pop(CPUI386 *cpu, uint8_t b1)
+{
+    if (likely(cpu->all_segs_flat && cpu->sp_mask == 0xFFFFFFFF)) {
+        int reg = b1 & 7;
+        u32 sp = cpu->gprx[4].r32;
+        u32 val = *(u32 *)(cpu->phys_mem + sp);
+        cpu->gprx[4].r32 = sp + 4;
+        cpu->gprx[reg].r32 = val;
+        return true;
+    }
+    return false;
+}
+
+/* Handler for MOV Ev, Gv (0x89) — reg-reg fast path */
+static bool __attribute__((noinline))
+st_handler_mov_ev_gv(CPUI386 *cpu)
+{
+    if (likely(cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+        u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+        cpu->gprx[mrm & 7].r32 = cpu->gprx[(mrm >> 3) & 7].r32;
+        return true;
+    }
+    return false;
+}
+
+/* Handler for MOV Gv, Ev (0x8B) — reg-reg fast path */
+static bool __attribute__((noinline))
+st_handler_mov_gv_ev(CPUI386 *cpu)
+{
+    if (likely(cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
+        u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+        cpu->gprx[(mrm >> 3) & 7].r32 = cpu->gprx[mrm & 7].r32;
+        return true;
+    }
+    return false;
+}
+
+/* Handler for Jcc rel8 (0x70-0x7F) */
+static bool __attribute__((noinline))
+st_handler_jcc(CPUI386 *cpu, uint8_t b1)
+{
+    if (likely(cpu->pf_pos < cpu->pf_avail)) {
+        int32_t d = (int8_t)cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+        int cond;
+        switch (b1 & 0xf) {
+        case 0x0: cond =  get_OF(cpu); break;
+        case 0x1: cond = !get_OF(cpu); break;
+        case 0x2: cond =  get_CF(cpu); break;
+        case 0x3: cond = !get_CF(cpu); break;
+        case 0x4: cond =  get_ZF(cpu); break;
+        case 0x5: cond = !get_ZF(cpu); break;
+        case 0x6: cond =  get_ZF(cpu) ||  get_CF(cpu); break;
+        case 0x7: cond = !get_ZF(cpu) && !get_CF(cpu); break;
+        case 0x8: cond =  get_SF(cpu); break;
+        case 0x9: cond = !get_SF(cpu); break;
+        case 0xa: cond =  get_PF(cpu); break;
+        case 0xb: cond = !get_PF(cpu); break;
+        case 0xc: cond =  get_SF(cpu) != get_OF(cpu); break;
+        case 0xd: cond =  get_SF(cpu) == get_OF(cpu); break;
+        case 0xe: cond =  get_ZF(cpu) || get_SF(cpu) != get_OF(cpu); break;
+        default:  cond = !get_ZF(cpu) && get_SF(cpu) == get_OF(cpu); break;
+        }
+        if (cond) cpu->next_ip += d;
+        cpu->seq_active = false;  /* branch invalidates sequential path */
+        return true;
+    }
+    return false;
+}
+
 static bool IRAM_ATTR_CPU_EXEC1 cpu_exec1(CPUI386 *cpu, int stepcount)
 {
 #ifndef I386_OPT2
@@ -4705,6 +4859,40 @@ seq_dispatch: ;  /* Sequential path jumps here — all vars above are initialize
 /* 0xf0 */	&&pfxf0, &&f0xf1, &&pfxf2, &&pfxf3, &&f0xf4, &&f0xf5, &&f0xf6, &&f0xf7,
 /* 0xf8 */	&&f0xf8, &&f0xf9, &&f0xfa, &&f0xfb, &&f0xfc, &&f0xfd, &&f0xfe, &&f0xff,
 	};
+	/* Subroutine-threaded dispatch for hot opcodes.
+	 * RV32's RAS predicts CALL/RET perfectly vs BTB for indirect goto.
+	 * Handler returns true = handled (continue), false = need slow path. */
+	if (likely(!opsz16)) {
+		switch (b1) {
+		case 0xB8: case 0xB9: case 0xBA: case 0xBB:
+		case 0xBC: case 0xBD: case 0xBE: case 0xBF:
+			if (st_handler_movimm32(cpu, b1)) continue; break;
+		case 0xB0: case 0xB1: case 0xB2: case 0xB3:
+		case 0xB4: case 0xB5: case 0xB6: case 0xB7:
+			if (st_handler_movimm8(cpu, b1)) continue; break;
+		case 0x40: case 0x41: case 0x42: case 0x43:
+		case 0x44: case 0x45: case 0x46: case 0x47:
+			if (st_handler_inc(cpu, b1)) continue; break;
+		case 0x48: case 0x49: case 0x4A: case 0x4B:
+		case 0x4C: case 0x4D: case 0x4E: case 0x4F:
+			if (st_handler_dec(cpu, b1)) continue; break;
+		case 0x50: case 0x51: case 0x52: case 0x53:
+		case 0x54: case 0x55: case 0x56: case 0x57:
+			if (st_handler_push(cpu, b1)) continue; break;
+		case 0x58: case 0x59: case 0x5A: case 0x5B:
+		case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+			if (st_handler_pop(cpu, b1)) continue; break;
+		case 0x89:
+			if (st_handler_mov_ev_gv(cpu)) continue; break;
+		case 0x8B:
+			if (st_handler_mov_gv_ev(cpu)) continue; break;
+		case 0x70: case 0x71: case 0x72: case 0x73:
+		case 0x74: case 0x75: case 0x76: case 0x77:
+		case 0x78: case 0x79: case 0x7A: case 0x7B:
+		case 0x7C: case 0x7D: case 0x7E: case 0x7F:
+			if (st_handler_jcc(cpu, b1)) continue; break;
+		}
+	}
 	goto *pfxlabel[b1];
 #define HANDLE_PREFIX(C, STMT) \
 		pfx ## C: { \
