@@ -100,10 +100,19 @@ struct CPUI386 {
 	uint8_t pf_pos;
 	uint8_t pf_avail;
 
-	/* Sequential fast path — skip TLB for consecutive same-page instructions */
+		/* Sequential fast path — skip TLB for consecutive same-page instructions */
 	uword seq_phys;
 	uword seq_prev_ip;
 	bool seq_active;
+
+	/* Decode cache — maps physical address → subroutine handler.
+	 * 256 entries × 12 bytes = 3KB, stays in L1 D-cache.
+	 * On hit: skip opcode fetch + switch, direct CALL/RET. */
+	struct {
+		uint32_t phys;
+		bool (*handler)(CPUI386 *cpu, uint8_t b1);
+		uint8_t b1;
+	} dcache[256];
 
 	struct {
 		int op;
@@ -4689,84 +4698,67 @@ st_handler_alu_rr(CPUI386 *cpu, uint8_t b1)
         cpu->pf_pos--; cpu->next_ip--;
         return false;
     }
-    /* CMP+Jcc fusion disabled — debugging hang in DOOM init */
-    if (0 && (op == 5 || op == 7) && cpu->pf_pos + 1 < cpu->pf_avail) {
-        u8 nb = cpu->pf_ptr[cpu->pf_pos];
-        if ((nb & 0xF0) == 0x70 && (nb & 0xf) != 0xa && (nb & 0xf) != 0xb) {
-            int32_t disp = (int8_t)cpu->pf_ptr[cpu->pf_pos + 1];
-            cpu->pf_pos += 2; cpu->next_ip += 2; cpu->cycle++;
-            int cond;
-            int _cf = (u32)s1 < (u32)s2;
-            int _zf = (result == 0);
-            int _sf = ((int32_t)result < 0);
-            int _of = ((int32_t)(((s1) ^ (s2)) & ((result) ^ (s1))) < 0);
-            switch (nb & 0xf) {
-            case 0x0: cond =  _of; break; case 0x1: cond = !_of; break;
-            case 0x2: cond =  _cf; break; case 0x3: cond = !_cf; break;
-            case 0x4: cond =  _zf; break; case 0x5: cond = !_zf; break;
-            case 0x6: cond =  _zf || _cf; break; case 0x7: cond = !_zf && !_cf; break;
-            case 0x8: cond =  _sf; break; case 0x9: cond = !_sf; break;
-            case 0xc: cond =  _sf != _of; break; case 0xd: cond =  _sf == _of; break;
-            case 0xe: cond =  _zf || (_sf != _of); break;
-            default:  cond = !_zf && (_sf == _of); break;
-            }
-            if (cond) cpu->next_ip += disp;
-            cpu->seq_active = false;
-        }
-    }
-    /* TEST+Jcc fusion for AND/OR/XOR — disabled, debugging */
-    else if (0 && (op == 1 || op == 4 || op == 6) && cpu->pf_pos + 1 < cpu->pf_avail) {
-        u8 nb = cpu->pf_ptr[cpu->pf_pos];
-        if ((nb & 0xF0) == 0x70 && (nb & 0xf) != 0xa && (nb & 0xf) != 0xb) {
-            int32_t disp = (int8_t)cpu->pf_ptr[cpu->pf_pos + 1];
-            cpu->pf_pos += 2; cpu->next_ip += 2; cpu->cycle++;
-            int cond;
-            int _zf = (result == 0);
-            int _sf = ((int32_t)result < 0);
-            switch (nb & 0xf) {
-            case 0x4: cond =  _zf; break; case 0x5: cond = !_zf; break;
-            case 0x8: cond =  _sf; break; case 0x9: cond = !_sf; break;
-            case 0xc: cond =  _sf; break; case 0xd: cond = !_sf; break;
-            case 0xe: cond = _zf || _sf; break;
-            default:  cond = !_zf && !_sf; break;
-            }
-            if (cond) cpu->next_ip += disp;
-            cpu->seq_active = false;
-        }
-    }
     return true;
 }
 
 /* Handler for TEST Ev,Gv (0x85) reg-reg */
 static bool __attribute__((noinline))
-st_handler_test(CPUI386 *cpu)
+st_handler_test(CPUI386 *cpu, uint8_t b1)
 {
+    (void)b1;
     if (unlikely(cpu->pf_pos >= cpu->pf_avail || cpu->pf_ptr[cpu->pf_pos] < 0xC0))
         return false;
     u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
     u32 result = cpu->gprx[mrm & 7].r32 & cpu->gprx[(mrm >> 3) & 7].r32;
     cpu->cc.dst = (int32_t)result;
     cpu->cc.op = CC_AND; cpu->cc.mask = CF|PF|ZF|SF|OF;
-    /* TEST+Jcc fusion — disabled, debugging */
-    if (0 && cpu->pf_pos + 1 < cpu->pf_avail) {
-        u8 nb = cpu->pf_ptr[cpu->pf_pos];
-        if ((nb & 0xF0) == 0x70 && (nb & 0xf) != 0xa && (nb & 0xf) != 0xb) {
-            int32_t disp = (int8_t)cpu->pf_ptr[cpu->pf_pos + 1];
-            cpu->pf_pos += 2; cpu->next_ip += 2; cpu->cycle++;
-            int _zf = (result == 0), _sf = ((int32_t)result < 0);
-            int cond;
-            switch (nb & 0xf) {
-            case 0x4: cond = _zf; break; case 0x5: cond = !_zf; break;
-            case 0x8: cond = _sf; break; case 0x9: cond = !_sf; break;
-            case 0xc: cond = _sf; break; case 0xd: cond = !_sf; break;
-            case 0xe: cond = _zf || _sf; break;
-            default:  cond = !_zf && !_sf; break;
-            }
-            if (cond) cpu->next_ip += disp;
-            cpu->seq_active = false;
-        }
-    }
     return true;
+}
+
+/* Handler for JMP rel8 (0xEB) */
+static bool __attribute__((noinline))
+st_handler_jmp_rel8(CPUI386 *cpu, uint8_t b1)
+{
+    (void)b1;
+    if (likely(cpu->pf_pos < cpu->pf_avail)) {
+        int32_t d = (int8_t)cpu->pf_ptr[cpu->pf_pos++];
+        cpu->next_ip += 1 + d;
+        cpu->seq_active = false;
+        return true;
+    }
+    return false;
+}
+
+/* Handler for JMP rel32 (0xE9) */
+static bool __attribute__((noinline))
+st_handler_jmp_rel32(CPUI386 *cpu, uint8_t b1)
+{
+    (void)b1;
+    if (likely(cpu->pf_pos + 4 <= cpu->pf_avail)) {
+        int p = cpu->pf_pos;
+        int32_t d = (int32_t)(cpu->pf_ptr[p] | ((u32)cpu->pf_ptr[p+1] << 8)
+                   | ((u32)cpu->pf_ptr[p+2] << 16) | ((u32)cpu->pf_ptr[p+3] << 24));
+        cpu->pf_pos = p + 4;
+        cpu->next_ip += 4 + d;
+        cpu->seq_active = false;
+        return true;
+    }
+    return false;
+}
+
+/* Handler for RET near (0xC3) — flat mode fast path */
+static bool __attribute__((noinline))
+st_handler_ret(CPUI386 *cpu, uint8_t b1)
+{
+    (void)b1;
+    if (likely(cpu->all_segs_flat && cpu->sp_mask == 0xFFFFFFFF)) {
+        u32 sp = cpu->gprx[4].r32;
+        cpu->next_ip = *(u32 *)(cpu->phys_mem + sp);
+        cpu->gprx[4].r32 = sp + 4;
+        cpu->seq_active = false;
+        return true;
+    }
+    return false;
 }
 
 /* Handler for PUSH r32 (0x50-0x57) — flat mode fast path */
@@ -4801,8 +4793,9 @@ st_handler_pop(CPUI386 *cpu, uint8_t b1)
 
 /* Handler for MOV Ev, Gv (0x89) — reg-reg fast path */
 static bool __attribute__((noinline))
-st_handler_mov_ev_gv(CPUI386 *cpu)
+st_handler_mov_ev_gv(CPUI386 *cpu, uint8_t b1)
 {
+    (void)b1;
     if (likely(cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
         u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
         cpu->gprx[mrm & 7].r32 = cpu->gprx[(mrm >> 3) & 7].r32;
@@ -4813,8 +4806,9 @@ st_handler_mov_ev_gv(CPUI386 *cpu)
 
 /* Handler for MOV Gv, Ev (0x8B) — reg-reg fast path */
 static bool __attribute__((noinline))
-st_handler_mov_gv_ev(CPUI386 *cpu)
+st_handler_mov_gv_ev(CPUI386 *cpu, uint8_t b1)
 {
+    (void)b1;
     if (likely(cpu->pf_pos < cpu->pf_avail && cpu->pf_ptr[cpu->pf_pos] >= 0xC0)) {
         u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
         cpu->gprx[(mrm >> 3) & 7].r32 = cpu->gprx[mrm & 7].r32;
@@ -5002,45 +4996,100 @@ seq_dispatch: ;  /* Sequential path jumps here — all vars above are initialize
 /* 0xf0 */	&&pfxf0, &&f0xf1, &&pfxf2, &&pfxf3, &&f0xf4, &&f0xf5, &&f0xf6, &&f0xf7,
 /* 0xf8 */	&&f0xf8, &&f0xf9, &&f0xfa, &&f0xfb, &&f0xfc, &&f0xfd, &&f0xfe, &&f0xff,
 	};
-	/* Subroutine-threaded dispatch for hot opcodes.
-	 * RV32's RAS predicts CALL/RET perfectly vs BTB for indirect goto.
-	 * Handler returns true = handled (continue), false = need slow path. */
+	/* Decode cache: check if we've seen this physical address before.
+	 * On hit, call the cached handler directly (one CALL/RET via RAS).
+	 * On miss, fall through to switch dispatch, then cache the result.
+	 * Only for non-prefixed 32-bit mode (opsz16 == false). */
 	if (likely(!opsz16)) {
+		uword dc_phys = cpu->seq_active ? cpu->seq_phys :
+			(cpu->ifetch.xaddr ^ (cpu->all_segs_flat ? cpu->ip :
+			 (cpu->seg[SEG_CS].base + cpu->ip)));
+		unsigned dc_idx = (dc_phys >> 1) & 0xFF;
+		if (likely(cpu->dcache[dc_idx].phys == dc_phys && cpu->dcache[dc_idx].handler)) {
+			if (cpu->dcache[dc_idx].handler(cpu, cpu->dcache[dc_idx].b1))
+				continue;
+			/* Handler returned false — need slow path, fall through */
+		}
+
+		/* Decode cache miss — try subroutine handlers via switch */
+		typeof(cpu->dcache[0].handler) cached_handler = NULL;
 		switch (b1) {
 		case 0xB8: case 0xB9: case 0xBA: case 0xBB:
 		case 0xBC: case 0xBD: case 0xBE: case 0xBF:
-			if (st_handler_movimm32(cpu, b1)) continue; break;
+			cached_handler = st_handler_movimm32;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
 		case 0xB0: case 0xB1: case 0xB2: case 0xB3:
 		case 0xB4: case 0xB5: case 0xB6: case 0xB7:
-			if (st_handler_movimm8(cpu, b1)) continue; break;
+			cached_handler = st_handler_movimm8;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
 		case 0x40: case 0x41: case 0x42: case 0x43:
 		case 0x44: case 0x45: case 0x46: case 0x47:
-			if (st_handler_inc(cpu, b1)) continue; break;
+			cached_handler = st_handler_inc;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
 		case 0x48: case 0x49: case 0x4A: case 0x4B:
 		case 0x4C: case 0x4D: case 0x4E: case 0x4F:
-			if (st_handler_dec(cpu, b1)) continue; break;
+			cached_handler = st_handler_dec;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
 		case 0x50: case 0x51: case 0x52: case 0x53:
 		case 0x54: case 0x55: case 0x56: case 0x57:
-			if (st_handler_push(cpu, b1)) continue; break;
+			cached_handler = st_handler_push;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
 		case 0x58: case 0x59: case 0x5A: case 0x5B:
 		case 0x5C: case 0x5D: case 0x5E: case 0x5F:
-			if (st_handler_pop(cpu, b1)) continue; break;
+			cached_handler = st_handler_pop;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
 		case 0x89:
-			if (st_handler_mov_ev_gv(cpu)) continue; break;
+			cached_handler = st_handler_mov_ev_gv;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
 		case 0x8B:
-			if (st_handler_mov_gv_ev(cpu)) continue; break;
+			cached_handler = st_handler_mov_gv_ev;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
 		case 0x70: case 0x71: case 0x72: case 0x73:
 		case 0x74: case 0x75: case 0x76: case 0x77:
 		case 0x78: case 0x79: case 0x7A: case 0x7B:
 		case 0x7C: case 0x7D: case 0x7E: case 0x7F:
-			if (st_handler_jcc(cpu, b1)) continue; break;
+			cached_handler = st_handler_jcc;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
 		case 0x01: case 0x03: case 0x09: case 0x0B:
 		case 0x21: case 0x23: case 0x29: case 0x2B:
 		case 0x31: case 0x33: case 0x39: case 0x3B:
-			if (st_handler_alu_rr(cpu, b1)) continue; break;
+			cached_handler = st_handler_alu_rr;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
 		case 0x85:
-			if (st_handler_test(cpu)) continue; break;
+			cached_handler = st_handler_test;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
+		case 0xEB:
+			cached_handler = st_handler_jmp_rel8;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
+		case 0xE9:
+			cached_handler = st_handler_jmp_rel32;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
+		case 0xC3:
+			cached_handler = st_handler_ret;
+			if (cached_handler(cpu, b1)) goto dc_store;
+			break;
 		}
+		goto slow_path;
+	dc_store:
+		/* Cache the successful handler for next time */
+		cpu->dcache[dc_idx].phys = dc_phys;
+		cpu->dcache[dc_idx].handler = cached_handler;
+		cpu->dcache[dc_idx].b1 = b1;
+		continue;
+	slow_path: ;
 	}
 	goto *pfxlabel[b1];
 #define HANDLE_PREFIX(C, STMT) \
