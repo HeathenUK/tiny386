@@ -4626,6 +4626,149 @@ st_handler_dec(CPUI386 *cpu, uint8_t b1)
     return true;
 }
 
+/* Handler for ALU Ev,Gv reg-reg (0x01/0x09/0x21/0x29/0x31/0x39) and
+ * ALU Gv,Ev reg-reg (0x03/0x0B/0x23/0x2B/0x33/0x3B).
+ * Handles ADD/OR/AND/SUB/XOR/CMP when ModRM indicates register mode. */
+static bool __attribute__((noinline))
+st_handler_alu_rr(CPUI386 *cpu, uint8_t b1)
+{
+    if (unlikely(cpu->pf_pos >= cpu->pf_avail || cpu->pf_ptr[cpu->pf_pos] < 0xC0))
+        return false;
+    u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+    int rm = mrm & 7, reg = (mrm >> 3) & 7;
+    int op = (b1 >> 3) & 7;
+    /* Direction: even opcodes = Ev,Gv (dst=rm, src=reg)
+     *            odd opcodes  = Gv,Ev (dst=reg, src=rm) */
+    int dst_r, src_r;
+    if (b1 & 2) { dst_r = reg; src_r = rm; }  /* 0x03,0x0B,0x23,0x2B,0x33,0x3B */
+    else         { dst_r = rm;  src_r = reg; } /* 0x01,0x09,0x21,0x29,0x31,0x39 */
+    u32 s1 = cpu->gprx[dst_r].r32;
+    u32 s2 = cpu->gprx[src_r].r32;
+    u32 result;
+    switch (op) {
+    case 0: /* ADD */
+        result = s1 + s2;
+        cpu->cc.src1 = (int32_t)s1; cpu->cc.src2 = (int32_t)s2;
+        cpu->cc.dst = (int32_t)result;
+        cpu->cc.op = CC_ADD; cpu->cc.mask = CF|PF|AF|ZF|SF|OF;
+        cpu->gprx[dst_r].r32 = result;
+        break;
+    case 1: /* OR */
+        result = s1 | s2;
+        cpu->cc.dst = (int32_t)result;
+        cpu->cc.op = CC_OR; cpu->cc.mask = CF|PF|ZF|SF|OF;
+        cpu->gprx[dst_r].r32 = result;
+        break;
+    case 4: /* AND */
+        result = s1 & s2;
+        cpu->cc.dst = (int32_t)result;
+        cpu->cc.op = CC_AND; cpu->cc.mask = CF|PF|ZF|SF|OF;
+        cpu->gprx[dst_r].r32 = result;
+        break;
+    case 5: /* SUB */
+        result = s1 - s2;
+        cpu->cc.src1 = (int32_t)s1; cpu->cc.src2 = (int32_t)s2;
+        cpu->cc.dst = (int32_t)result;
+        cpu->cc.op = CC_SUB; cpu->cc.mask = CF|PF|AF|ZF|SF|OF;
+        cpu->gprx[dst_r].r32 = result;
+        break;
+    case 6: /* XOR */
+        result = s1 ^ s2;
+        cpu->cc.dst = (int32_t)result;
+        cpu->cc.op = CC_XOR; cpu->cc.mask = CF|PF|ZF|SF|OF;
+        cpu->gprx[dst_r].r32 = result;
+        break;
+    case 7: /* CMP — like SUB but no store */
+        result = s1 - s2;
+        cpu->cc.src1 = (int32_t)s1; cpu->cc.src2 = (int32_t)s2;
+        cpu->cc.dst = (int32_t)result;
+        cpu->cc.op = CC_SUB; cpu->cc.mask = CF|PF|AF|ZF|SF|OF;
+        break;
+    default:
+        /* ADC/SBB (ops 2,3) — need carry, fall back */
+        cpu->pf_pos--; cpu->next_ip--;
+        return false;
+    }
+    /* CMP+Jcc fusion disabled — debugging hang in DOOM init */
+    if (0 && (op == 5 || op == 7) && cpu->pf_pos + 1 < cpu->pf_avail) {
+        u8 nb = cpu->pf_ptr[cpu->pf_pos];
+        if ((nb & 0xF0) == 0x70 && (nb & 0xf) != 0xa && (nb & 0xf) != 0xb) {
+            int32_t disp = (int8_t)cpu->pf_ptr[cpu->pf_pos + 1];
+            cpu->pf_pos += 2; cpu->next_ip += 2; cpu->cycle++;
+            int cond;
+            int _cf = (u32)s1 < (u32)s2;
+            int _zf = (result == 0);
+            int _sf = ((int32_t)result < 0);
+            int _of = ((int32_t)(((s1) ^ (s2)) & ((result) ^ (s1))) < 0);
+            switch (nb & 0xf) {
+            case 0x0: cond =  _of; break; case 0x1: cond = !_of; break;
+            case 0x2: cond =  _cf; break; case 0x3: cond = !_cf; break;
+            case 0x4: cond =  _zf; break; case 0x5: cond = !_zf; break;
+            case 0x6: cond =  _zf || _cf; break; case 0x7: cond = !_zf && !_cf; break;
+            case 0x8: cond =  _sf; break; case 0x9: cond = !_sf; break;
+            case 0xc: cond =  _sf != _of; break; case 0xd: cond =  _sf == _of; break;
+            case 0xe: cond =  _zf || (_sf != _of); break;
+            default:  cond = !_zf && (_sf == _of); break;
+            }
+            if (cond) cpu->next_ip += disp;
+            cpu->seq_active = false;
+        }
+    }
+    /* TEST+Jcc fusion for AND/OR/XOR — disabled, debugging */
+    else if (0 && (op == 1 || op == 4 || op == 6) && cpu->pf_pos + 1 < cpu->pf_avail) {
+        u8 nb = cpu->pf_ptr[cpu->pf_pos];
+        if ((nb & 0xF0) == 0x70 && (nb & 0xf) != 0xa && (nb & 0xf) != 0xb) {
+            int32_t disp = (int8_t)cpu->pf_ptr[cpu->pf_pos + 1];
+            cpu->pf_pos += 2; cpu->next_ip += 2; cpu->cycle++;
+            int cond;
+            int _zf = (result == 0);
+            int _sf = ((int32_t)result < 0);
+            switch (nb & 0xf) {
+            case 0x4: cond =  _zf; break; case 0x5: cond = !_zf; break;
+            case 0x8: cond =  _sf; break; case 0x9: cond = !_sf; break;
+            case 0xc: cond =  _sf; break; case 0xd: cond = !_sf; break;
+            case 0xe: cond = _zf || _sf; break;
+            default:  cond = !_zf && !_sf; break;
+            }
+            if (cond) cpu->next_ip += disp;
+            cpu->seq_active = false;
+        }
+    }
+    return true;
+}
+
+/* Handler for TEST Ev,Gv (0x85) reg-reg */
+static bool __attribute__((noinline))
+st_handler_test(CPUI386 *cpu)
+{
+    if (unlikely(cpu->pf_pos >= cpu->pf_avail || cpu->pf_ptr[cpu->pf_pos] < 0xC0))
+        return false;
+    u8 mrm = cpu->pf_ptr[cpu->pf_pos++]; cpu->next_ip++;
+    u32 result = cpu->gprx[mrm & 7].r32 & cpu->gprx[(mrm >> 3) & 7].r32;
+    cpu->cc.dst = (int32_t)result;
+    cpu->cc.op = CC_AND; cpu->cc.mask = CF|PF|ZF|SF|OF;
+    /* TEST+Jcc fusion — disabled, debugging */
+    if (0 && cpu->pf_pos + 1 < cpu->pf_avail) {
+        u8 nb = cpu->pf_ptr[cpu->pf_pos];
+        if ((nb & 0xF0) == 0x70 && (nb & 0xf) != 0xa && (nb & 0xf) != 0xb) {
+            int32_t disp = (int8_t)cpu->pf_ptr[cpu->pf_pos + 1];
+            cpu->pf_pos += 2; cpu->next_ip += 2; cpu->cycle++;
+            int _zf = (result == 0), _sf = ((int32_t)result < 0);
+            int cond;
+            switch (nb & 0xf) {
+            case 0x4: cond = _zf; break; case 0x5: cond = !_zf; break;
+            case 0x8: cond = _sf; break; case 0x9: cond = !_sf; break;
+            case 0xc: cond = _sf; break; case 0xd: cond = !_sf; break;
+            case 0xe: cond = _zf || _sf; break;
+            default:  cond = !_zf && !_sf; break;
+            }
+            if (cond) cpu->next_ip += disp;
+            cpu->seq_active = false;
+        }
+    }
+    return true;
+}
+
 /* Handler for PUSH r32 (0x50-0x57) — flat mode fast path */
 static bool __attribute__((noinline))
 st_handler_push(CPUI386 *cpu, uint8_t b1)
@@ -4891,6 +5034,12 @@ seq_dispatch: ;  /* Sequential path jumps here — all vars above are initialize
 		case 0x78: case 0x79: case 0x7A: case 0x7B:
 		case 0x7C: case 0x7D: case 0x7E: case 0x7F:
 			if (st_handler_jcc(cpu, b1)) continue; break;
+		case 0x01: case 0x03: case 0x09: case 0x0B:
+		case 0x21: case 0x23: case 0x29: case 0x2B:
+		case 0x31: case 0x33: case 0x39: case 0x3B:
+			if (st_handler_alu_rr(cpu, b1)) continue; break;
+		case 0x85:
+			if (st_handler_test(cpu)) continue; break;
 		}
 	}
 	goto *pfxlabel[b1];
@@ -6726,8 +6875,27 @@ static inline bool exc_pushes_error(int exc) {
 	       exc == EX_SS || exc == EX_GP || exc == EX_PF;
 }
 
+extern uint32_t get_uticks(void);
+
 void cpui386_step(CPUI386 *cpu, int stepcount)
 {
+	/* IPS measurement — log every ~2 seconds */
+	static uint32_t ips_last_time = 0;
+	static uint32_t ips_last_cycle = 0;
+	uint32_t now = get_uticks();
+	if (ips_last_time && (now - ips_last_time) >= 2000000) {
+		uint32_t dt = now - ips_last_time;
+		uint32_t dc = cpu->cycle - ips_last_cycle;
+		uint32_t ips = (uint32_t)((uint64_t)dc * 1000000 / dt);
+		fprintf(stderr, "IPS: %uK (%u cycles in %ums)\n",
+			ips / 1000, dc, dt / 1000);
+		ips_last_time = now;
+		ips_last_cycle = cpu->cycle;
+	} else if (!ips_last_time) {
+		ips_last_time = now;
+		ips_last_cycle = cpu->cycle;
+	}
+
 	if ((cpu->flags & IF) && cpu->intr) {
 		cpu->intr = false;
 		cpu->halt = false;
