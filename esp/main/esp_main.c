@@ -590,9 +590,11 @@ void app_main(void)
 
 	wifi_init();     // ESP-HOSTED SDIO slot 1 — must init before SD (shared SDMMC host)
 
-	/* Allocate PSRAM pool BEFORE storage_init so tasks can start while SD mounts */
-	esp_psram_init();
-	for (long try_len = 28L * 1024 * 1024; try_len >= 8L * 1024 * 1024; try_len -= 1024 * 1024) {
+	/* Allocate PSRAM pool for guest RAM + VGA RAM + emulator tables.
+	 * Do NOT call esp_psram_init() again — ESP-IDF auto-inits PSRAM via
+	 * CONFIG_SPIRAM=y, and a redundant call corrupts PSRAM address tracking,
+	 * breaking PPA rotation. */
+	for (long try_len = 24L * 1024 * 1024; try_len >= 8L * 1024 * 1024; try_len -= 1024 * 1024) {
 		psram = heap_caps_calloc(1, try_len, MALLOC_CAP_SPIRAM);
 		if (psram) {
 			psram_len = try_len;

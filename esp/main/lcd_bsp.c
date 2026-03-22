@@ -706,7 +706,7 @@ void vga_task(void *arg)
 	// Allocate framebuffers (after BSP init, like trackmatsu)
 	size_t fb_size = VGA_MAX_WIDTH * VGA_MAX_HEIGHT * sizeof(uint16_t);
 	uint16_t *fb = heap_caps_aligned_alloc(64, fb_size,
-	                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+	                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	if (!fb) {
 		fprintf(stderr, "Failed to allocate VGA framebuffer\n");
 		vTaskDelete(NULL);
@@ -720,7 +720,7 @@ void vga_task(void *arg)
 	// bsp_display_blit DMA-copies this buffer into the panel FB.
 	size_t fb_rot_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
 	fb_rotated = heap_caps_aligned_alloc(64, fb_rot_size,
-	                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+	                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	if (!fb_rotated) {
 		fprintf(stderr, "Failed to allocate rotation framebuffer\n");
 		vTaskDelete(NULL);
@@ -728,6 +728,11 @@ void vga_task(void *arg)
 	}
 	memset(fb_rotated, 0, fb_rot_size);
 	globals.fb_rotated = fb_rotated;
+
+	fprintf(stderr, "PPA debug: fb=%p ext=%d, fb_rot=%p ext=%d, int=%d\n",
+		fb, esp_ptr_external_ram(fb),
+		fb_rotated, esp_ptr_external_ram(fb_rotated),
+		esp_ptr_internal(fb_rotated));
 
 	xEventGroupSetBits(global_event_group, BIT1);  // Signal display ready
 
