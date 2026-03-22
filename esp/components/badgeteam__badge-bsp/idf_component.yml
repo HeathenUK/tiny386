@@ -31,7 +31,6 @@ license: MIT
 repository: git://github.com/badgeteam/esp32-component-badge-bsp.git
 repository_info:
   commit_sha: f4bc578ccb013decdf31f81d2a8db438dfb06f0c
-  path: .
 targets:
 - esp32
 - esp32p4

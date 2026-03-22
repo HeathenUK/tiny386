@@ -1,3 +1,6 @@
+/* Stub for esp-hosted callback — not needed on this platform */
+int hosted_reset_slave_callback(void) { return 0; }
+
 /*
  * WiFi backend for NE2000 emulation on Tanmatsu (ESP32-P4)
  *

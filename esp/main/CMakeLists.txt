@@ -49,11 +49,11 @@ add_definitions(-include ${CMAKE_CURRENT_SOURCE_DIR}/${BOARD_HEADER})
 # add_definitions(-DCPU_DIAG)
 
 
-# Performance-critical emulation core: -O3 with aggressive optimizations
-# Fast core: lean ~6K lines, targets DOS games
-set_source_files_properties("../../i386_build_fast.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-unroll-loops")
-# Full core: ~14K lines, targets Windows 3.11/95/NT
-set_source_files_properties("../../i386_build_full.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -fno-unroll-loops")
+# Emulation core: -O3 for maximum interpreter speed.
+# Fast core: lean ~6K lines, targets DOS games.
+# Full core: ~14K lines, targets Windows 3.11/95/NT.
+set_source_files_properties("../../i386_build_fast.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
+set_source_files_properties("../../i386_build_full.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 # FPU: both copies get same flags
 set_source_files_properties("../../fpu_build_fast.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -ffast-math -funroll-loops")
 set_source_files_properties("../../fpu_build_full.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 -ffast-math -funroll-loops")

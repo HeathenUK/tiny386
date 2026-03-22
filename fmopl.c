@@ -47,7 +47,8 @@
 // TODO: free...
 void *pcmalloc(long size);
 void *psmalloc(long size);
-#define FMOPL_USE_STATIC_TABLE
+/* fmopl.inc no longer generated; compute tables at runtime */
+/* #define FMOPL_USE_STATIC_TABLE */
 
 /* -------------------- for debug --------------------- */
 /* #define OPL_OUTPUT_LOG */
@@ -470,7 +471,9 @@ static inline void OPL_CALC_CH( OPL_CH *CH )
 		if(SLOT->vib) SLOT->Cnt += (SLOT->Incr*vib/VIB_RATE);
 		else          SLOT->Cnt += SLOT->Incr;
 		/* connectoion */
-		if(CH->FB)
+		if(!CH->connect1) {
+			/* Channel not yet keyed on — skip output */
+		} else if(CH->FB)
 		{
 			int feedback1 = (CH->op1_out[0]+CH->op1_out[1])>>CH->FB;
 			CH->op1_out[1] = CH->op1_out[0];
@@ -622,27 +625,17 @@ static int OPLOpenTable( void )
 	int i,j;
 	FLOAT pom;
 
-	/* allocate dynamic tables */
-	if( (TL_TABLE = pcmalloc(TL_MAX*2*sizeof(int32_t))) == NULL)
+	/* allocate dynamic tables — use psmalloc (PSRAM) instead of pcmalloc
+	 * since these are large lookup tables that don't need to be in the
+	 * VGA memory hole (0xA0000-0xC0000 pcram pool). */
+	if( (TL_TABLE = psmalloc(TL_MAX*2*sizeof(int32_t))) == NULL)
 		return 0;
-	if( (SIN_TABLE = pcmalloc(SIN_ENT*4 *sizeof(int32_t *))) == NULL)
-	{
-		free(TL_TABLE);
+	if( (SIN_TABLE = psmalloc(SIN_ENT*4 *sizeof(int32_t *))) == NULL)
 		return 0;
-	}
-	if( (AMS_TABLE = pcmalloc(AMS_ENT*2 *sizeof(int32_t))) == NULL)
-	{
-		free(TL_TABLE);
-		free(SIN_TABLE);
+	if( (AMS_TABLE = psmalloc(AMS_ENT*2 *sizeof(int32_t))) == NULL)
 		return 0;
-	}
-	if( (VIB_TABLE = pcmalloc(VIB_ENT*2 *sizeof(int32_t))) == NULL)
-	{
-		free(TL_TABLE);
-		free(SIN_TABLE);
-		free(AMS_TABLE);
+	if( (VIB_TABLE = psmalloc(VIB_ENT*2 *sizeof(int32_t))) == NULL)
 		return 0;
-	}
 	ENV_CURVE = g_new(int32_t, 2 * EG_ENT + 1);
 	/* make total level table */
 	for (t = 0;t < EG_ENT-1 ;t++){
