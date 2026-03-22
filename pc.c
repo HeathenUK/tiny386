@@ -464,7 +464,7 @@ void pc_step(PC *pc)
 
 	/* Initialize batch_size on first call or when setting changes */
 	if (batch_size == 0 || (pc_batch_size_setting > 0 && batch_size != pc_batch_size_setting)) {
-		batch_size = (pc_batch_size_setting > 0) ? pc_batch_size_setting : 512;
+		batch_size = (pc_batch_size_setting > 0) ? pc_batch_size_setting : 1024;
 		step_time_accum = 0;
 		step_count = 0;
 	}
@@ -473,7 +473,7 @@ void pc_step(PC *pc)
 		pc->reset_request = 0;
 		/* Reset batch size on reboot - hardware detection is timing-sensitive */
 		if (pc_batch_size_setting == 0) {
-			batch_size = 512;  /* Only reset if in dynamic mode */
+			batch_size = 1024;  /* Only reset if in dynamic mode */
 		}
 		step_time_accum = 0;
 		step_count = 0;
