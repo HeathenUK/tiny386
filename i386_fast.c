@@ -106,8 +106,8 @@ struct CPUI386 {
 	bool seq_active;
 
 	/* Decode cache — maps physical address → subroutine handler.
-	 * 256 entries × 12 bytes = 3KB, stays in L1 D-cache.
-	 * On hit: skip opcode fetch + switch, direct CALL/RET. */
+	 * 256 entries × 12 bytes = 3KB. Sweet spot for L1 D-cache.
+	 * 1024 entries (12KB) was tested and was slower due to L1 pressure. */
 	struct {
 		uint32_t phys;
 		bool (*handler)(CPUI386 *cpu, uint8_t b1);
